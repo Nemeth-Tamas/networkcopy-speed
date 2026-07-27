@@ -6,6 +6,7 @@ mod iocp_probe;
 mod manifest_scan;
 mod multistream_copy;
 mod pipeline_bench;
+mod striped_file;
 
 use std::env;
 use std::error::Error;
@@ -40,6 +41,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "bench-scan" => run_manifest_scan_bench(&mut arguments),
         "probe-control" => run_control_plane_probe(&mut arguments),
         "bench-multistream-copy" => run_multistream_copy_bench(&mut arguments),
+        "bench-striped-file" => run_striped_file_bench(&mut arguments),
         "help" | "--help" | "-h" => {
             print_usage(&program);
             Ok(())
@@ -328,6 +330,40 @@ fn run_multistream_copy_bench(
     Ok(())
 }
 
+fn run_striped_file_bench(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let source = PathBuf::from(required_argument(arguments, "source file")?);
+
+    let destination = PathBuf::from(required_argument(arguments, "destination file")?);
+
+    let data_stream_count = match arguments.next() {
+        Some(value) => parse_buffer_count(&value)?,
+        None => striped_file::DEFAULT_DATA_STREAMS,
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    control_plane::validate_data_stream_count(data_stream_count)?;
+
+    println!("NetworkCopy Speed Edition striped TCP file copy");
+    println!("  Source:       {}", source.display());
+    println!("  Destination:  {}", destination.display());
+    println!("  Data streams: {data_stream_count}");
+    println!();
+
+    let report = striped_file::run(&source, &destination, data_stream_count)?;
+
+    report.print();
+    Ok(())
+}
+
 fn required_argument(
     arguments: &mut impl Iterator<Item = OsString>,
     description: &str,
@@ -392,6 +428,7 @@ fn print_usage(program: &OsStr) {
         "  {program} bench-multistream-copy <source-root> <destination-root> \
          [workers] [data-streams]"
     );
+    println!("  {program} bench-striped-file <source> <destination> [data-streams]");
     println!();
     println!(
         "The pipeline defaults to {} MiB chunks and {} reusable buffers.",
