@@ -403,7 +403,7 @@ fn validate_handshake(
     Ok(())
 }
 
-fn stripe_range(
+pub(crate) fn stripe_range(
     file_len: u64,
     stream_id: usize,
     data_stream_count: usize,
@@ -432,7 +432,7 @@ fn stripe_range(
     Ok((offset, (file_len - offset).min(stripe_size)))
 }
 
-fn read_at_retry(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+pub(crate) fn read_at_retry(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
     loop {
         match file.seek_read(buffer, offset) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -441,7 +441,7 @@ fn read_at_retry(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<usiz
     }
 }
 
-fn write_all_at(file: &File, mut buffer: &[u8], mut offset: u64) -> io::Result<()> {
+pub(crate) fn write_all_at(file: &File, mut buffer: &[u8], mut offset: u64) -> io::Result<()> {
     while !buffer.is_empty() {
         match file.seek_write(buffer, offset) {
             Ok(0) => {

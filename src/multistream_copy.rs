@@ -1,13 +1,13 @@
 use crate::control_plane::{self, ConnectionRole, Handshake, ManifestSummary};
 use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_second, format_bytes};
-use crate::manifest_scan::{self, ManifestEntry};
+use crate::manifest_scan::{self, FileClass, ManifestEntry};
+use crate::striped_file;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,7 @@ const MESSAGE_RECEIVER_READY: u8 = 0x30;
 const MESSAGE_FILE: u8 = 0x31;
 const MESSAGE_STREAM_END: u8 = 0x32;
 const MESSAGE_TRANSFER_ACK: u8 = 0x33;
+const MESSAGE_FILE_STRIPE: u8 = 0x34;
 
 const NETWORK_BUFFER_BYTES: usize = 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
@@ -90,6 +91,23 @@ struct TransferAck {
 struct LaneReport {
     files_copied: u64,
     bytes_copied: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransferTask {
+    WholeFile {
+        file_id: usize,
+    },
+    Stripe {
+        file_id: usize,
+        offset: u64,
+        length: u64,
+    },
+}
+
+#[derive(Debug)]
+struct TransferPlan {
+    lanes: Vec<Vec<TransferTask>>,
 }
 
 pub fn run(
@@ -180,7 +198,7 @@ pub fn run(
         ));
     }
 
-    let assignments = build_assignments(&manifest, data_stream_count)?;
+    let transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
 
     let data_started = Instant::now();
     let source_root = Arc::new(source_root);
@@ -188,7 +206,7 @@ pub fn run(
     let sender_reports = thread::scope(|scope| -> io::Result<Vec<LaneReport>> {
         let mut handles = Vec::with_capacity(data_stream_count);
 
-        for (stream, file_ids) in data_streams.into_iter().zip(assignments) {
+        for (stream, tasks) in data_streams.into_iter().zip(transfer_plan.lanes) {
             let lane_root = Arc::clone(&source_root);
             let lane_manifest = Arc::clone(&manifest);
 
@@ -196,7 +214,7 @@ pub fn run(
                 thread::Builder::new()
                     .name("networkcopy-data-sender".to_string())
                     .spawn_scoped(scope, move || {
-                        send_lane(stream, lane_root.as_path(), &lane_manifest, &file_ids)
+                        send_lane(stream, lane_root.as_path(), &lane_manifest, &tasks)
                     })?,
             );
         }
@@ -265,33 +283,23 @@ fn run_server(
 
     write_receiver_ready(&mut control_stream, summary)?;
 
+    let transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
+
     let manifest = Arc::new(manifest);
     let destination_root = Arc::new(destination_root);
-
-    let received: Arc<Vec<AtomicBool>> = Arc::new(
-        (0..manifest.len())
-            .map(|_| AtomicBool::new(false))
-            .collect(),
-    );
 
     let lane_reports = thread::scope(|scope| -> io::Result<Vec<LaneReport>> {
         let mut handles = Vec::with_capacity(data_stream_count);
 
-        for stream in data_streams {
+        for (stream, tasks) in data_streams.into_iter().zip(transfer_plan.lanes) {
             let lane_manifest = Arc::clone(&manifest);
             let lane_destination = Arc::clone(&destination_root);
-            let lane_received = Arc::clone(&received);
 
             handles.push(
                 thread::Builder::new()
                     .name("networkcopy-data-receiver".to_string())
                     .spawn_scoped(scope, move || {
-                        receive_lane(
-                            stream,
-                            lane_destination.as_path(),
-                            &lane_manifest,
-                            &lane_received,
-                        )
+                        receive_lane(stream, lane_destination.as_path(), &lane_manifest, &tasks)
                     })?,
             );
         }
@@ -301,15 +309,7 @@ fn run_server(
 
     let report = merge_lane_reports(lane_reports)?;
 
-    if received
-        .iter()
-        .any(|received| !received.load(Ordering::Acquire))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "one or more manifest files were not received",
-        ));
-    }
+    finalize_large_files(destination_root.as_path(), &manifest)?;
 
     let ack = TransferAck {
         files_copied: report.files_copied,
@@ -435,30 +435,70 @@ fn prepare_destination(destination_root: &Path, manifest: &[ManifestEntry]) -> i
 
     fs::create_dir_all(destination_root)?;
 
-    for entry in manifest {
+    for (file_id, entry) in manifest.iter().enumerate() {
         if let Some(parent) = entry.relative_path.parent()
             && !parent.as_os_str().is_empty()
         {
             fs::create_dir_all(destination_root.join(parent))?;
+        }
+
+        if entry.class == FileClass::Large {
+            let final_path = destination_root.join(&entry.relative_path);
+
+            let temporary_path = temporary_path(&final_path, file_id);
+
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(temporary_path)?;
+
+            file.set_len(entry.file_size)?;
         }
     }
 
     Ok(())
 }
 
-fn build_assignments(
+fn build_transfer_plan(
     manifest: &[ManifestEntry],
     data_stream_count: usize,
-) -> io::Result<Vec<Vec<usize>>> {
-    let mut file_ids: Vec<usize> = (0..manifest.len()).collect();
+) -> io::Result<TransferPlan> {
+    let mut lanes = vec![Vec::new(); data_stream_count];
 
-    file_ids
-        .sort_unstable_by(|left, right| manifest[*right].file_size.cmp(&manifest[*left].file_size));
-
-    let mut assignments = vec![Vec::new(); data_stream_count];
     let mut assigned_bytes = vec![0_u64; data_stream_count];
 
-    for file_id in file_ids {
+    let mut whole_file_ids = Vec::new();
+
+    for (file_id, entry) in manifest.iter().enumerate() {
+        if entry.class != FileClass::Large {
+            whole_file_ids.push(file_id);
+            continue;
+        }
+
+        for lane_id in 0..data_stream_count {
+            let (offset, length) =
+                striped_file::stripe_range(entry.file_size, lane_id, data_stream_count)?;
+
+            if length == 0 {
+                continue;
+            }
+
+            lanes[lane_id].push(TransferTask::Stripe {
+                file_id,
+                offset,
+                length,
+            });
+
+            assigned_bytes[lane_id] = assigned_bytes[lane_id]
+                .checked_add(length)
+                .ok_or_else(|| io::Error::other("striped lane size overflowed"))?;
+        }
+    }
+
+    whole_file_ids
+        .sort_unstable_by(|left, right| manifest[*right].file_size.cmp(&manifest[*left].file_size));
+
+    for file_id in whole_file_ids {
         let lane = assigned_bytes
             .iter()
             .enumerate()
@@ -466,62 +506,85 @@ fn build_assignments(
             .map(|(lane, _)| lane)
             .ok_or_else(|| io::Error::other("no TCP data lanes are available"))?;
 
-        assignments[lane].push(file_id);
+        lanes[lane].push(TransferTask::WholeFile { file_id });
 
         assigned_bytes[lane] = assigned_bytes[lane]
             .checked_add(manifest[file_id].file_size)
             .ok_or_else(|| io::Error::other("data-lane assignment size overflowed"))?;
     }
 
-    Ok(assignments)
+    Ok(TransferPlan { lanes })
 }
 
 fn send_lane(
     stream: TcpStream,
     source_root: &Path,
     manifest: &[ManifestEntry],
-    file_ids: &[usize],
+    tasks: &[TransferTask],
 ) -> io::Result<LaneReport> {
     let mut writer = BufWriter::with_capacity(NETWORK_BUFFER_BYTES, stream);
 
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     let mut report = LaneReport::default();
 
-    for &file_id in file_ids {
-        let entry = manifest.get(file_id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "scheduler returned an invalid file ID",
-            )
-        })?;
+    for &task in tasks {
+        match task {
+            TransferTask::WholeFile { file_id } => {
+                let entry = manifest.get(file_id).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "scheduler returned an invalid file ID",
+                    )
+                })?;
 
-        write_u8(&mut writer, MESSAGE_FILE)?;
-        write_u64(&mut writer, file_id as u64)?;
-        write_u64(&mut writer, entry.file_size)?;
+                send_whole_file(&mut writer, source_root, file_id, entry, &mut buffer)?;
 
-        let path = source_root.join(&entry.relative_path);
-        let mut file = File::open(&path)?;
+                report.files_copied = report
+                    .files_copied
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("sender file count overflowed"))?;
 
-        let current_size = file.metadata()?.len();
+                report.bytes_copied = report
+                    .bytes_copied
+                    .checked_add(entry.file_size)
+                    .ok_or_else(|| io::Error::other("sender byte count overflowed"))?;
+            }
 
-        if current_size != entry.file_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("source changed after scanning: {}", path.display()),
-            ));
+            TransferTask::Stripe {
+                file_id,
+                offset,
+                length,
+            } => {
+                let entry = manifest.get(file_id).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "scheduler returned an invalid striped file ID",
+                    )
+                })?;
+
+                send_file_stripe(
+                    &mut writer,
+                    source_root,
+                    file_id,
+                    entry,
+                    offset,
+                    length,
+                    &mut buffer,
+                )?;
+
+                if offset == 0 {
+                    report.files_copied = report
+                        .files_copied
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("sender file count overflowed"))?;
+                }
+
+                report.bytes_copied = report
+                    .bytes_copied
+                    .checked_add(length)
+                    .ok_or_else(|| io::Error::other("sender byte count overflowed"))?;
+            }
         }
-
-        copy_exact(&mut file, &mut writer, entry.file_size, &mut buffer)?;
-
-        report.files_copied = report
-            .files_copied
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("sender file count overflowed"))?;
-
-        report.bytes_copied = report
-            .bytes_copied
-            .checked_add(entry.file_size)
-            .ok_or_else(|| io::Error::other("sender byte count overflowed"))?;
     }
 
     write_u8(&mut writer, MESSAGE_STREAM_END)?;
@@ -530,25 +593,121 @@ fn send_lane(
     Ok(report)
 }
 
+fn send_whole_file(
+    writer: &mut impl Write,
+    source_root: &Path,
+    file_id: usize,
+    entry: &ManifestEntry,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    write_u8(writer, MESSAGE_FILE)?;
+    write_u64(writer, file_id as u64)?;
+    write_u64(writer, entry.file_size)?;
+
+    let path = source_root.join(&entry.relative_path);
+    let mut file = File::open(&path)?;
+
+    validate_source_size(&file, &path, entry)?;
+
+    copy_exact(&mut file, writer, entry.file_size, buffer)
+}
+
+fn send_file_stripe(
+    writer: &mut impl Write,
+    source_root: &Path,
+    file_id: usize,
+    entry: &ManifestEntry,
+    offset: u64,
+    length: u64,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    validate_stripe(entry, offset, length)?;
+
+    write_u8(writer, MESSAGE_FILE_STRIPE)?;
+    write_u64(writer, file_id as u64)?;
+    write_u64(writer, offset)?;
+    write_u64(writer, length)?;
+
+    let path = source_root.join(&entry.relative_path);
+    let file = File::open(&path)?;
+
+    validate_source_size(&file, &path, entry)?;
+
+    let mut transferred = 0_u64;
+
+    while transferred < length {
+        let requested = (length - transferred).min(buffer.len() as u64) as usize;
+
+        let read_offset = offset
+            .checked_add(transferred)
+            .ok_or_else(|| io::Error::other("stripe read offset overflowed"))?;
+
+        let read = striped_file::read_at_retry(&file, &mut buffer[..requested], read_offset)?;
+
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "source stripe ended with {} bytes remaining",
+                    length - transferred
+                ),
+            ));
+        }
+
+        writer.write_all(&buffer[..read])?;
+
+        transferred = transferred
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("stripe send byte count overflowed"))?;
+    }
+
+    Ok(())
+}
+
+fn validate_source_size(file: &File, path: &Path, entry: &ManifestEntry) -> io::Result<()> {
+    let current_size = file.metadata()?.len();
+
+    if current_size != entry.file_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("source changed after scanning: {}", path.display()),
+        ));
+    }
+
+    Ok(())
+}
+
 fn receive_lane(
     stream: TcpStream,
     destination_root: &Path,
     manifest: &[ManifestEntry],
-    received: &[AtomicBool],
+    tasks: &[TransferTask],
 ) -> io::Result<LaneReport> {
     let mut reader = BufReader::with_capacity(NETWORK_BUFFER_BYTES, stream);
 
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     let mut report = LaneReport::default();
 
-    loop {
-        match read_u8(&mut reader)? {
-            MESSAGE_FILE => {
-                let file_id_u64 = read_u64(&mut reader)?;
+    for &task in tasks {
+        match task {
+            TransferTask::WholeFile { file_id } => {
+                let message = read_u8(&mut reader)?;
 
-                let file_id = usize::try_from(file_id_u64).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "received file ID is too large")
-                })?;
+                if message != MESSAGE_FILE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("expected whole-file message, received 0x{message:02X}"),
+                    ));
+                }
+
+                let announced_file_id = read_file_id(&mut reader)?;
+
+                if announced_file_id != file_id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("received file ID {announced_file_id}, expected {file_id}"),
+                    ));
+                }
 
                 let announced_size = read_u64(&mut reader)?;
 
@@ -563,17 +722,10 @@ fn receive_lane(
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "file {file_id} announced {announced_size} \
-                             bytes but manifest expects {}",
+                            "file {file_id} announced {announced_size} bytes but manifest \
+                             expects {}",
                             entry.file_size
                         ),
-                    ));
-                }
-
-                if received[file_id].swap(true, Ordering::AcqRel) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!("file {file_id} was received twice"),
                     ));
                 }
 
@@ -590,21 +742,183 @@ fn receive_lane(
                     .ok_or_else(|| io::Error::other("receiver byte count overflowed"))?;
             }
 
-            MESSAGE_STREAM_END => break,
+            TransferTask::Stripe {
+                file_id,
+                offset,
+                length,
+            } => {
+                let message = read_u8(&mut reader)?;
 
-            unknown => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "received unknown data-lane message \
-                         0x{unknown:02X}"
-                    ),
-                ));
+                if message != MESSAGE_FILE_STRIPE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("expected stripe message, received 0x{message:02X}"),
+                    ));
+                }
+
+                let announced_file_id = read_file_id(&mut reader)?;
+
+                let announced_offset = read_u64(&mut reader)?;
+
+                let announced_length = read_u64(&mut reader)?;
+
+                if announced_file_id != file_id
+                    || announced_offset != offset
+                    || announced_length != length
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "received stripe ({announced_file_id}, {announced_offset}, \
+                             {announced_length}), expected ({file_id}, {offset}, {length})"
+                        ),
+                    ));
+                }
+
+                let entry = manifest.get(file_id).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("received unknown striped file ID {file_id}"),
+                    )
+                })?;
+
+                receive_file_stripe(
+                    &mut reader,
+                    destination_root,
+                    file_id,
+                    entry,
+                    offset,
+                    length,
+                    &mut buffer,
+                )?;
+
+                if offset == 0 {
+                    report.files_copied = report
+                        .files_copied
+                        .checked_add(1)
+                        .ok_or_else(|| io::Error::other("receiver file count overflowed"))?;
+                }
+
+                report.bytes_copied = report
+                    .bytes_copied
+                    .checked_add(length)
+                    .ok_or_else(|| io::Error::other("receiver byte count overflowed"))?;
             }
         }
     }
 
+    let final_message = read_u8(&mut reader)?;
+
+    if final_message != MESSAGE_STREAM_END {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected stream-end message, received 0x{final_message:02X}"),
+        ));
+    }
+
     Ok(report)
+}
+
+fn receive_file_stripe(
+    reader: &mut impl Read,
+    destination_root: &Path,
+    file_id: usize,
+    entry: &ManifestEntry,
+    offset: u64,
+    length: u64,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    validate_stripe(entry, offset, length)?;
+
+    let final_path = destination_root.join(&entry.relative_path);
+
+    let temporary_path = temporary_path(&final_path, file_id);
+
+    let file = OpenOptions::new().write(true).open(temporary_path)?;
+
+    let mut transferred = 0_u64;
+
+    while transferred < length {
+        let requested = (length - transferred).min(buffer.len() as u64) as usize;
+
+        let read = reader.read(&mut buffer[..requested])?;
+
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "stripe payload ended with {} bytes remaining",
+                    length - transferred
+                ),
+            ));
+        }
+
+        let write_offset = offset
+            .checked_add(transferred)
+            .ok_or_else(|| io::Error::other("stripe write offset overflowed"))?;
+
+        striped_file::write_all_at(&file, &buffer[..read], write_offset)?;
+
+        transferred = transferred
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("stripe receive byte count overflowed"))?;
+    }
+
+    Ok(())
+}
+
+fn validate_stripe(entry: &ManifestEntry, offset: u64, length: u64) -> io::Result<()> {
+    if entry.class != FileClass::Large {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stripe was assigned to a non-large file",
+        ));
+    }
+
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stripe range overflowed"))?;
+
+    if length == 0 || end > entry.file_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "stripe range {offset}..{end} exceeds file length {}",
+                entry.file_size
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn finalize_large_files(destination_root: &Path, manifest: &[ManifestEntry]) -> io::Result<()> {
+    for (file_id, entry) in manifest.iter().enumerate() {
+        if entry.class != FileClass::Large {
+            continue;
+        }
+
+        let final_path = destination_root.join(&entry.relative_path);
+
+        let temporary_path = temporary_path(&final_path, file_id);
+
+        let actual_size = fs::metadata(&temporary_path)?.len();
+
+        if actual_size != entry.file_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "striped destination has {actual_size} bytes, expected {}: {}",
+                    entry.file_size,
+                    final_path.display()
+                ),
+            ));
+        }
+
+        fs::rename(temporary_path, final_path)?;
+    }
+
+    Ok(())
 }
 
 fn receive_file(
@@ -790,6 +1104,13 @@ fn read_u8(reader: &mut impl Read) -> io::Result<u8> {
     Ok(value[0])
 }
 
+fn read_file_id(reader: &mut impl Read) -> io::Result<usize> {
+    let file_id = read_u64(reader)?;
+
+    usize::try_from(file_id)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "received file ID is too large"))
+}
+
 fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
     let mut value = [0_u8; 8];
     reader.read_exact(&mut value)?;
@@ -798,7 +1119,7 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_assignments, run};
+    use super::{TransferTask, build_transfer_plan, run};
     use crate::manifest_scan::{FileClass, ManifestEntry};
     use std::env;
     use std::fs;
@@ -807,18 +1128,42 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn scheduler_spreads_large_files_between_lanes() {
+    fn scheduler_stripes_large_files_between_all_lanes() {
         let manifest = vec![
-            entry("a.bin", 100),
-            entry("b.bin", 90),
-            entry("c.bin", 80),
-            entry("d.bin", 70),
+            entry("large.bin", 1_000, FileClass::Large),
+            entry("small.bin", 20, FileClass::Tiny),
         ];
 
-        let assignments = build_assignments(&manifest, 2).unwrap();
+        let plan = build_transfer_plan(&manifest, 2).unwrap();
 
-        assert_eq!(assignments.len(), 2);
-        assert_eq!(assignments.iter().map(Vec::len).sum::<usize>(), 4);
+        assert_eq!(plan.lanes.len(), 2);
+
+        let mut stripe_count = 0_usize;
+        let mut stripe_bytes = 0_u64;
+        let mut whole_file_count = 0_usize;
+
+        for lane in &plan.lanes {
+            for task in lane {
+                match *task {
+                    TransferTask::Stripe {
+                        file_id, length, ..
+                    } => {
+                        assert_eq!(file_id, 0);
+                        stripe_count += 1;
+                        stripe_bytes += length;
+                    }
+
+                    TransferTask::WholeFile { file_id } => {
+                        assert_eq!(file_id, 1);
+                        whole_file_count += 1;
+                    }
+                }
+            }
+        }
+
+        assert_eq!(stripe_count, 2);
+        assert_eq!(stripe_bytes, 1_000);
+        assert_eq!(whole_file_count, 1);
     }
 
     #[test]
@@ -845,7 +1190,7 @@ mod tests {
 
         fs::write(
             nested.join("large.bin"),
-            vec![0x5A_u8; 2 * 1024 * 1024 + 137],
+            vec![0x5A_u8; 64 * 1024 * 1024 + 137],
         )
         .unwrap();
 
@@ -878,13 +1223,13 @@ mod tests {
         fs::remove_dir_all(parent).unwrap();
     }
 
-    fn entry(path: &str, file_size: u64) -> ManifestEntry {
+    fn entry(path: &str, file_size: u64, class: FileClass) -> ManifestEntry {
         ManifestEntry {
             relative_path: PathBuf::from(path),
             file_size,
             last_write_time: 0,
             file_attributes: 0,
-            class: FileClass::Tiny,
+            class,
         }
     }
 }
