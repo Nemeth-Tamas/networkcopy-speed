@@ -1,4 +1,5 @@
 mod copy_bench;
+mod iocp_probe;
 mod pipeline_bench;
 
 use std::env;
@@ -28,6 +29,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     match command.to_string_lossy().as_ref() {
         "bench-copy" => run_bench_copy(&mut arguments),
         "bench-pipeline" => run_bench_pipeline(&mut arguments),
+        "probe-iocp" => run_iocp_probe(&mut arguments),
         "help" | "--help" | "-h" => {
             print_usage(&program);
             Ok(())
@@ -109,6 +111,24 @@ fn run_bench_pipeline(
     Ok(())
 }
 
+fn run_iocp_probe(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), Box<dyn Error>> {
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    println!("NetworkCopy Speed Edition native Windows IOCP probe");
+    println!();
+
+    let report = iocp_probe::run()?;
+    report.print();
+
+    Ok(())
+}
+
 fn required_argument(
     arguments: &mut impl Iterator<Item = OsString>,
     description: &str,
@@ -163,6 +183,7 @@ fn print_usage(program: &OsStr) {
     println!();
     println!("Usage:");
     println!("  {program} bench-copy <source> <destination> [buffer-mib]");
+    println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
     println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
     println!();
     println!(
