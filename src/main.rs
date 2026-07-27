@@ -4,6 +4,7 @@ mod iocp_copy;
 mod iocp_file_probe;
 mod iocp_probe;
 mod manifest_scan;
+mod multistream_copy;
 mod pipeline_bench;
 
 use std::env;
@@ -38,6 +39,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "bench-iocp-copy" => run_iocp_copy_bench(&mut arguments),
         "bench-scan" => run_manifest_scan_bench(&mut arguments),
         "probe-control" => run_control_plane_probe(&mut arguments),
+        "bench-multistream-copy" => run_multistream_copy_bench(&mut arguments),
         "help" | "--help" | "-h" => {
             print_usage(&program);
             Ok(())
@@ -277,6 +279,55 @@ fn run_control_plane_probe(
     Ok(())
 }
 
+fn run_multistream_copy_bench(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let source_root = PathBuf::from(required_argument(arguments, "source root directory")?);
+
+    let destination_root =
+        PathBuf::from(required_argument(arguments, "destination root directory")?);
+
+    let worker_count = match arguments.next() {
+        Some(value) => parse_buffer_count(&value)?,
+        None => manifest_scan::default_worker_count(),
+    };
+
+    let data_stream_count = match arguments.next() {
+        Some(value) => parse_buffer_count(&value)?,
+        None => multistream_copy::DEFAULT_DATA_STREAMS,
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    manifest_scan::validate_worker_count(worker_count)?;
+
+    control_plane::validate_data_stream_count(data_stream_count)?;
+
+    println!("NetworkCopy Speed Edition multistream TCP copy");
+    println!("  Source:       {}", source_root.display());
+    println!("  Destination:  {}", destination_root.display());
+    println!("  Scan workers: {worker_count}");
+    println!("  Data streams: {data_stream_count}");
+    println!();
+
+    let report = multistream_copy::run(
+        &source_root,
+        &destination_root,
+        worker_count,
+        data_stream_count,
+    )?;
+
+    report.print();
+
+    Ok(())
+}
+
 fn required_argument(
     arguments: &mut impl Iterator<Item = OsString>,
     description: &str,
@@ -337,6 +388,10 @@ fn print_usage(program: &OsStr) {
     println!("  {program} bench-iocp-copy <source> <destination> [chunk-mib] [operations]");
     println!("  {program} bench-scan <root-directory> [workers]");
     println!("  {program} probe-control <root-directory> [workers] [data-streams]");
+    println!(
+        "  {program} bench-multistream-copy <source-root> <destination-root> \
+         [workers] [data-streams]"
+    );
     println!();
     println!(
         "The pipeline defaults to {} MiB chunks and {} reusable buffers.",

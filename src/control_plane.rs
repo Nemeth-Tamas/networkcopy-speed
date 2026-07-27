@@ -98,24 +98,24 @@ impl ControlPlaneReport {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ConnectionRole {
+pub(crate) enum ConnectionRole {
     Control,
     Data,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Handshake {
-    role: ConnectionRole,
-    session_id: u64,
-    stream_id: u32,
-    stream_count: u32,
+pub(crate) struct Handshake {
+    pub(crate) role: ConnectionRole,
+    pub(crate) session_id: u64,
+    pub(crate) stream_id: u32,
+    pub(crate) stream_count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ManifestSummary {
-    entries: u64,
-    total_file_bytes: u64,
-    fingerprint: u64,
+pub(crate) struct ManifestSummary {
+    pub(crate) entries: u64,
+    pub(crate) total_file_bytes: u64,
+    pub(crate) fingerprint: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -367,14 +367,14 @@ fn connect_stream(address: SocketAddr) -> io::Result<TcpStream> {
     Ok(stream)
 }
 
-fn configure_stream(stream: &TcpStream) -> io::Result<()> {
+pub(crate) fn configure_stream(stream: &TcpStream) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
     stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
     Ok(())
 }
 
-fn create_session_id() -> u64 {
+pub(crate) fn create_session_id() -> u64 {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -383,7 +383,7 @@ fn create_session_id() -> u64 {
     timestamp.rotate_left(17) ^ u64::from(process::id())
 }
 
-fn write_handshake(writer: &mut impl Write, handshake: Handshake) -> io::Result<()> {
+pub(crate) fn write_handshake(writer: &mut impl Write, handshake: Handshake) -> io::Result<()> {
     writer.write_all(&PROTOCOL_MAGIC)?;
     write_u16(writer, PROTOCOL_VERSION)?;
 
@@ -400,7 +400,7 @@ fn write_handshake(writer: &mut impl Write, handshake: Handshake) -> io::Result<
     writer.flush()
 }
 
-fn read_handshake(reader: &mut impl Read) -> io::Result<Handshake> {
+pub(crate) fn read_handshake(reader: &mut impl Read) -> io::Result<Handshake> {
     let mut magic = [0_u8; 4];
     reader.read_exact(&mut magic)?;
 
@@ -449,7 +449,7 @@ fn read_handshake(reader: &mut impl Read) -> io::Result<Handshake> {
     })
 }
 
-fn send_manifest(stream: &mut TcpStream, manifest: &[ManifestEntry]) -> io::Result<u64> {
+pub(crate) fn send_manifest(stream: &mut TcpStream, manifest: &[ManifestEntry]) -> io::Result<u64> {
     let expected_summary = summarize_manifest(manifest)?;
 
     let buffered = BufWriter::with_capacity(CONTROL_BUFFER_BYTES, stream);
@@ -469,7 +469,9 @@ fn send_manifest(stream: &mut TcpStream, manifest: &[ManifestEntry]) -> io::Resu
     Ok(writer.bytes_written())
 }
 
-fn receive_manifest(stream: &mut TcpStream) -> io::Result<(ManifestSummary, u64)> {
+pub(crate) fn receive_manifest_entries(
+    stream: &mut TcpStream,
+) -> io::Result<(Vec<ManifestEntry>, ManifestSummary, u64)> {
     let buffered = BufReader::with_capacity(CONTROL_BUFFER_BYTES, stream);
 
     let mut reader = CountingReader::new(buffered);
@@ -498,6 +500,8 @@ fn receive_manifest(stream: &mut TcpStream) -> io::Result<(ManifestSummary, u64)
         fingerprint: FNV_OFFSET_BASIS,
     };
 
+    let mut manifest = Vec::new();
+
     for _ in 0..claimed_summary.entries {
         let entry = read_manifest_entry(&mut reader)?;
 
@@ -512,6 +516,8 @@ fn receive_manifest(stream: &mut TcpStream) -> io::Result<(ManifestSummary, u64)
             .ok_or_else(|| io::Error::other("received manifest byte count overflowed"))?;
 
         actual_summary.fingerprint = hash_manifest_entry(actual_summary.fingerprint, &entry);
+
+        manifest.push(entry);
     }
 
     if actual_summary != claimed_summary {
@@ -525,7 +531,13 @@ fn receive_manifest(stream: &mut TcpStream) -> io::Result<(ManifestSummary, u64)
         ));
     }
 
-    Ok((actual_summary, reader.bytes_read()))
+    Ok((manifest, actual_summary, reader.bytes_read()))
+}
+
+fn receive_manifest(stream: &mut TcpStream) -> io::Result<(ManifestSummary, u64)> {
+    let (_, summary, wire_bytes) = receive_manifest_entries(stream)?;
+
+    Ok((summary, wire_bytes))
 }
 
 fn write_manifest_entry(writer: &mut impl Write, entry: &ManifestEntry) -> io::Result<()> {
@@ -623,7 +635,7 @@ fn validate_relative_path(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn summarize_manifest(manifest: &[ManifestEntry]) -> io::Result<ManifestSummary> {
+pub(crate) fn summarize_manifest(manifest: &[ManifestEntry]) -> io::Result<ManifestSummary> {
     let mut summary = ManifestSummary {
         entries: 0,
         total_file_bytes: 0,
