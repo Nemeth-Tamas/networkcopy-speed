@@ -436,10 +436,10 @@ fn prepare_destination(destination_root: &Path, manifest: &[ManifestEntry]) -> i
     fs::create_dir_all(destination_root)?;
 
     for entry in manifest {
-        if let Some(parent) = entry.relative_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(destination_root.join(parent))?;
-            }
+        if let Some(parent) = entry.relative_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(destination_root.join(parent))?;
         }
     }
 
