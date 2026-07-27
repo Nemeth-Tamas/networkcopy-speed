@@ -86,6 +86,16 @@ impl CompletionPort {
     }
 
     pub(crate) fn wait(&self) -> io::Result<CompletionPacket> {
+        let packet = self.wait_io()?;
+
+        if let Some(error_code) = packet.error_code {
+            return Err(io::Error::from_raw_os_error(error_code));
+        }
+
+        Ok(packet)
+    }
+
+    pub(crate) fn wait_io(&self) -> io::Result<CompletionPacket> {
         let mut bytes_transferred = 0_u32;
         let mut completion_key = 0_usize;
         let mut overlapped: *mut OVERLAPPED = ptr::null_mut();
@@ -103,14 +113,23 @@ impl CompletionPort {
             )
         };
 
-        if succeeded == 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let error_code = if succeeded == 0 {
+            let error = io::Error::last_os_error();
+
+            if overlapped.is_null() {
+                return Err(error);
+            }
+
+            Some(error.raw_os_error().unwrap_or(-1))
+        } else {
+            None
+        };
 
         Ok(CompletionPacket {
             bytes_transferred,
             completion_key,
             overlapped,
+            error_code,
         })
     }
 }
@@ -128,6 +147,7 @@ pub(crate) struct CompletionPacket {
     pub(crate) bytes_transferred: u32,
     pub(crate) completion_key: usize,
     pub(crate) overlapped: *mut OVERLAPPED,
+    pub(crate) error_code: Option<i32>,
 }
 
 pub fn run() -> io::Result<ProbeReport> {
