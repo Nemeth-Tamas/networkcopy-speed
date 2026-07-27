@@ -1,3 +1,4 @@
+mod control_plane;
 mod copy_bench;
 mod iocp_copy;
 mod iocp_file_probe;
@@ -36,6 +37,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "probe-overlapped-read" => run_overlapped_read_probe(&mut arguments),
         "bench-iocp-copy" => run_iocp_copy_bench(&mut arguments),
         "bench-scan" => run_manifest_scan_bench(&mut arguments),
+        "probe-control" => run_control_plane_probe(&mut arguments),
         "help" | "--help" | "-h" => {
             print_usage(&program);
             Ok(())
@@ -236,6 +238,45 @@ fn run_manifest_scan_bench(
     Ok(())
 }
 
+fn run_control_plane_probe(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let root = PathBuf::from(required_argument(arguments, "root directory")?);
+
+    let worker_count = match arguments.next() {
+        Some(value) => parse_buffer_count(&value)?,
+        None => manifest_scan::default_worker_count(),
+    };
+
+    let data_stream_count = match arguments.next() {
+        Some(value) => parse_buffer_count(&value)?,
+        None => control_plane::DEFAULT_DATA_STREAMS,
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    manifest_scan::validate_worker_count(worker_count)?;
+    control_plane::validate_data_stream_count(data_stream_count)?;
+
+    println!("NetworkCopy Speed Edition TCP control-plane probe");
+    println!("  Root:         {}", root.display());
+    println!("  Scan workers: {worker_count}");
+    println!("  Data streams: {data_stream_count}");
+    println!();
+
+    let report = control_plane::run(&root, worker_count, data_stream_count)?;
+
+    report.print();
+
+    Ok(())
+}
+
 fn required_argument(
     arguments: &mut impl Iterator<Item = OsString>,
     description: &str,
@@ -295,6 +336,7 @@ fn print_usage(program: &OsStr) {
     println!("  {program} probe-overlapped-read <source> [read-mib]");
     println!("  {program} bench-iocp-copy <source> <destination> [chunk-mib] [operations]");
     println!("  {program} bench-scan <root-directory> [workers]");
+    println!("  {program} probe-control <root-directory> [workers] [data-streams]");
     println!();
     println!(
         "The pipeline defaults to {} MiB chunks and {} reusable buffers.",

@@ -346,11 +346,7 @@ fn scan_worker(root: &Path, queue: Arc<DirectoryQueue>) -> io::Result<WorkerResu
     let mut directories_scanned = 0_u64;
     let mut reparse_points_skipped = 0_u64;
 
-    loop {
-        let Some(directory) = queue.take_directory()? else {
-            break;
-        };
-
+    while let Some(directory) = queue.take_directory()? {
         let directory_scan = match scan_directory(root, &directory) {
             Ok(result) => result,
 
