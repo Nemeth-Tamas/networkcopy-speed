@@ -1,4 +1,5 @@
 mod copy_bench;
+mod iocp_file_probe;
 mod iocp_probe;
 mod pipeline_bench;
 
@@ -30,6 +31,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "bench-copy" => run_bench_copy(&mut arguments),
         "bench-pipeline" => run_bench_pipeline(&mut arguments),
         "probe-iocp" => run_iocp_probe(&mut arguments),
+        "probe-overlapped-read" => run_overlapped_read_probe(&mut arguments),
         "help" | "--help" | "-h" => {
             print_usage(&program);
             Ok(())
@@ -129,6 +131,35 @@ fn run_iocp_probe(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), 
     Ok(())
 }
 
+fn run_overlapped_read_probe(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let source = PathBuf::from(required_argument(arguments, "source path")?);
+
+    let read_mib = match arguments.next() {
+        Some(value) => parse_buffer_mib(&value)?,
+        None => iocp_file_probe::DEFAULT_READ_MIB,
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    println!("NetworkCopy Speed Edition native overlapped read probe");
+    println!("  Source: {}", source.display());
+    println!("  Buffer: {read_mib} MiB");
+    println!();
+
+    let report = iocp_file_probe::run(&source, read_mib)?;
+    report.print();
+
+    Ok(())
+}
+
 fn required_argument(
     arguments: &mut impl Iterator<Item = OsString>,
     description: &str,
@@ -184,7 +215,8 @@ fn print_usage(program: &OsStr) {
     println!("Usage:");
     println!("  {program} bench-copy <source> <destination> [buffer-mib]");
     println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
-    println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
+    println!("  {program} probe-iocp");
+    println!("  {program} probe-overlapped-read <source> [read-mib]");
     println!();
     println!(
         "The pipeline defaults to {} MiB chunks and {} reusable buffers.",

@@ -27,12 +27,12 @@ impl ProbeReport {
 }
 
 #[derive(Debug)]
-struct CompletionPort {
+pub(crate) struct CompletionPort {
     handle: HANDLE,
 }
 
 impl CompletionPort {
-    fn new() -> io::Result<Self> {
+    pub(crate) fn new() -> io::Result<Self> {
         // SAFETY:
         // INVALID_HANDLE_VALUE with a null existing port creates a new,
         // initially unassociated I/O completion port.
@@ -43,6 +43,26 @@ impl CompletionPort {
         }
 
         Ok(Self { handle })
+    }
+
+    pub(crate) fn associate(&self, file_handle: HANDLE, completion_key: usize) -> io::Result<()> {
+        // SAFETY:
+        // The file handle was opened for overlapped I/O, and this completion
+        // port remains valid for the duration of the association call.
+        let associated_port =
+            unsafe { CreateIoCompletionPort(file_handle, self.handle, completion_key, 0) };
+
+        if associated_port.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        if associated_port != self.handle {
+            return Err(io::Error::other(
+                "CreateIoCompletionPort returned an unexpected port handle",
+            ));
+        }
+
+        Ok(())
     }
 
     fn post(&self, bytes_transferred: u32, completion_key: usize) -> io::Result<()> {
@@ -65,7 +85,7 @@ impl CompletionPort {
         Ok(())
     }
 
-    fn wait(&self) -> io::Result<CompletionPacket> {
+    pub(crate) fn wait(&self) -> io::Result<CompletionPacket> {
         let mut bytes_transferred = 0_u32;
         let mut completion_key = 0_usize;
         let mut overlapped: *mut OVERLAPPED = ptr::null_mut();
@@ -104,10 +124,10 @@ impl Drop for CompletionPort {
 }
 
 #[derive(Debug)]
-struct CompletionPacket {
-    bytes_transferred: u32,
-    completion_key: usize,
-    overlapped: *mut OVERLAPPED,
+pub(crate) struct CompletionPacket {
+    pub(crate) bytes_transferred: u32,
+    pub(crate) completion_key: usize,
+    pub(crate) overlapped: *mut OVERLAPPED,
 }
 
 pub fn run() -> io::Result<ProbeReport> {
