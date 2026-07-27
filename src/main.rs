@@ -1,4 +1,5 @@
 mod copy_bench;
+mod pipeline_bench;
 
 use std::env;
 use std::error::Error;
@@ -26,6 +27,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     match command.to_string_lossy().as_ref() {
         "bench-copy" => run_bench_copy(&mut arguments),
+        "bench-pipeline" => run_bench_pipeline(&mut arguments),
         "help" | "--help" | "-h" => {
             print_usage(&program);
             Ok(())
@@ -67,6 +69,46 @@ fn run_bench_copy(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), 
     Ok(())
 }
 
+fn run_bench_pipeline(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let source = PathBuf::from(required_argument(arguments, "source path")?);
+    let destination = PathBuf::from(required_argument(arguments, "destination path")?);
+
+    let chunk_mib = match arguments.next() {
+        Some(value) => parse_buffer_mib(&value)?,
+        None => pipeline_bench::DEFAULT_CHUNK_MIB,
+    };
+
+    let buffer_count = match arguments.next() {
+        Some(value) => parse_buffer_count(&value)?,
+        None => pipeline_bench::DEFAULT_BUFFER_COUNT,
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    pipeline_bench::validate_config(chunk_mib, buffer_count)?;
+
+    println!("NetworkCopy Speed Edition buffered pipeline");
+    println!("  Source:      {}", source.display());
+    println!("  Destination: {}", destination.display());
+    println!("  Chunk:       {chunk_mib} MiB");
+    println!("  Buffers:     {buffer_count}");
+    println!();
+
+    let report = pipeline_bench::run(&source, &destination, chunk_mib, buffer_count)?;
+
+    report.print();
+
+    Ok(())
+}
+
 fn required_argument(
     arguments: &mut impl Iterator<Item = OsString>,
     description: &str,
@@ -98,6 +140,22 @@ fn parse_buffer_mib(value: &OsStr) -> io::Result<usize> {
     Ok(buffer_mib)
 }
 
+fn parse_buffer_count(value: &OsStr) -> io::Result<usize> {
+    let value = value.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "buffer count must contain valid Unicode digits",
+        )
+    })?;
+
+    value.parse::<usize>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid buffer count {value:?}: {error}"),
+        )
+    })
+}
+
 fn print_usage(program: &OsStr) {
     let program = program.to_string_lossy();
 
@@ -105,9 +163,11 @@ fn print_usage(program: &OsStr) {
     println!();
     println!("Usage:");
     println!("  {program} bench-copy <source> <destination> [buffer-mib]");
+    println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
     println!();
     println!(
-        "The buffer defaults to {} MiB.",
-        copy_bench::DEFAULT_BUFFER_MIB
+        "The pipeline defaults to {} MiB chunks and {} reusable buffers.",
+        pipeline_bench::DEFAULT_CHUNK_MIB,
+        pipeline_bench::DEFAULT_BUFFER_COUNT
     );
 }

@@ -121,7 +121,7 @@ pub fn buffer_bytes_from_mib(buffer_mib: usize) -> io::Result<usize> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer size overflowed"))
 }
 
-fn reject_same_file(source: &Path, destination: &Path) -> io::Result<()> {
+pub(crate) fn reject_same_file(source: &Path, destination: &Path) -> io::Result<()> {
     let source = source.canonicalize()?;
 
     let Ok(destination) = destination.canonicalize() else {
@@ -147,11 +147,11 @@ fn read_retry_interrupted(source: &mut impl Read, buffer: &mut [u8]) -> io::Resu
     }
 }
 
-fn decimal_megabytes_per_second(bytes: u64, elapsed: Duration) -> f64 {
+pub(crate) fn decimal_megabytes_per_second(bytes: u64, elapsed: Duration) -> f64 {
     throughput(bytes, elapsed, 1_000_000.0)
 }
 
-fn binary_mebibytes_per_second(bytes: u64, elapsed: Duration) -> f64 {
+pub(crate) fn binary_mebibytes_per_second(bytes: u64, elapsed: Duration) -> f64 {
     throughput(bytes, elapsed, 1024.0 * 1024.0)
 }
 
@@ -165,7 +165,7 @@ fn throughput(bytes: u64, elapsed: Duration, unit_size: f64) -> f64 {
     bytes as f64 / unit_size / seconds
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     let digits = bytes.to_string();
     let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
 
