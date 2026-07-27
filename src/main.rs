@@ -2,6 +2,7 @@ mod copy_bench;
 mod iocp_copy;
 mod iocp_file_probe;
 mod iocp_probe;
+mod manifest_scan;
 mod pipeline_bench;
 
 use std::env;
@@ -34,6 +35,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "probe-iocp" => run_iocp_probe(&mut arguments),
         "probe-overlapped-read" => run_overlapped_read_probe(&mut arguments),
         "bench-iocp-copy" => run_iocp_copy_bench(&mut arguments),
+        "bench-scan" => run_manifest_scan_bench(&mut arguments),
         "help" | "--help" | "-h" => {
             print_usage(&program);
             Ok(())
@@ -203,6 +205,37 @@ fn run_iocp_copy_bench(
     Ok(())
 }
 
+fn run_manifest_scan_bench(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let root = PathBuf::from(required_argument(arguments, "root directory")?);
+
+    let worker_count = match arguments.next() {
+        Some(value) => parse_buffer_count(&value)?,
+        None => manifest_scan::default_worker_count(),
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    manifest_scan::validate_worker_count(worker_count)?;
+
+    println!("NetworkCopy Speed Edition parallel manifest benchmark");
+    println!("  Root:    {}", root.display());
+    println!("  Workers: {worker_count}");
+    println!();
+
+    let result = manifest_scan::run(&root, worker_count)?;
+    result.report.print();
+
+    Ok(())
+}
+
 fn required_argument(
     arguments: &mut impl Iterator<Item = OsString>,
     description: &str,
@@ -261,6 +294,7 @@ fn print_usage(program: &OsStr) {
     println!("  {program} probe-iocp");
     println!("  {program} probe-overlapped-read <source> [read-mib]");
     println!("  {program} bench-iocp-copy <source> <destination> [chunk-mib] [operations]");
+    println!("  {program} bench-scan <root-directory> [workers]");
     println!();
     println!(
         "The pipeline defaults to {} MiB chunks and {} reusable buffers.",
