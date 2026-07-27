@@ -8,6 +8,10 @@ The project explores the full path from a simple synchronous copy loop to native
 
 It is currently an engineering prototype and benchmark laboratory—not yet a friendly end-user replacement for Explorer, Robocopy, or your favorite enterprise transfer appliance.
 
+> **The current sender and receiver run inside one process over TCP loopback.**
+>
+> The project does not yet provide separate commands that can be launched on two different computers. That becomes the explicit v1.0 deliverable in Milestone 8.
+
 ```text
 Platform:       Windows
 Language:       Rust
@@ -15,6 +19,8 @@ Native API:     Win32 through windows-sys
 Current tests:  22
 Current commit: 9569197
 Status:         M5 large-file striping integrated
+Release status: Experimental loopback prototype
+v1.0 target:    Real transfers between two Windows machines
 ```
 
 ---
@@ -42,6 +48,9 @@ This project investigates the pieces required for a genuinely fast transfer engi
 * Tiny-file aggregation
 * Resume and sparse-range support
 * Adaptive hashing and compression
+* Separate sender and receiver applications
+* Real transfers between two Windows machines
+* Standalone v1.0 release binaries
 
 The important rule is simple:
 
@@ -489,16 +498,17 @@ src/
 
 # Milestone status
 
-| Milestone | Description                                      | Status      |
-| --------- | ------------------------------------------------ | ----------- |
-| M0        | Measured synchronous local-copy baseline         | Complete    |
-| M1        | Reusable buffers and parallel pipeline           | Complete    |
-| M2        | Native Windows overlapped I/O and IOCP           | Complete    |
-| M3        | Fast manifest scanner and classification         | Complete    |
-| M4        | TCP control channel and multiple data streams    | Complete    |
-| M5        | Tiny-file packing and large-file striping        | In progress |
-| M6        | Adaptive compression, hashing, and memory budget | Planned     |
-| M7        | Chunk resume, sparse ranges, and delta copying   | Planned     |
+| Milestone | Description                                        | Status      |
+| --------- | -------------------------------------------------- | ----------- |
+| M0        | Measured synchronous local-copy baseline           | Complete    |
+| M1        | Reusable buffers and parallel pipeline             | Complete    |
+| M2        | Native Windows overlapped I/O and IOCP             | Complete    |
+| M3        | Fast manifest scanner and classification           | Complete    |
+| M4        | TCP control channel and multiple data streams      | Complete    |
+| M5        | Tiny-file packing and large-file striping          | In progress |
+| M6        | Adaptive compression, hashing, and memory budget   | Planned     |
+| M7        | Chunk resume, sparse ranges, and delta copying     | Planned     |
+| M8        | Two-machine operation, packaging, and v1.0 release | Planned     |
 
 Completed M5 components:
 
@@ -509,6 +519,12 @@ Completed M5 components:
 Remaining M5 component:
 
 * Tiny-file aggregation and packed transfer
+
+Release goal:
+
+* M5–M7 complete the transfer engine.
+* M8 turns that engine into an installable two-machine product.
+* The first public stable release will be tagged `v1.0.0` only after a real cross-machine acceptance test passes.
 
 ---
 
@@ -548,12 +564,144 @@ Planned work:
 * Crash-safe temporary state
 * Final verification before promotion
 
+## M8 — Two-machine operation and v1.0
+
+Milestone 8 turns the benchmark architecture into software that can actually be installed on two Windows computers and used to copy files between them.
+
+### Separate process roles
+
+The single-process loopback harness will be split into explicit receiver and sender modes.
+
+Planned command shape:
+
+```powershell
+networkcopy-speed receive `
+    --listen 0.0.0.0:47321 `
+    --destination "D:\Incoming"
+````
+
+On the sending computer:
+
+```powershell
+networkcopy-speed send `
+    --to 192.168.1.50:47321 `
+    --source "C:\Data"
+```
+
+The exact interface may change before release, but v1.0 must support launching the receiver on one Windows machine and the sender on another without modifying the source code.
+
+### Network operation
+
+The v1.0 network layer must provide:
+
+* Configurable listen address and TCP port
+* Connection to remote IPv4 and IPv6 addresses
+* Remote hostname support
+* Protocol-version negotiation
+* Feature negotiation between different builds
+* Clear connection and timeout errors
+* Graceful handling of disconnected data lanes
+* Validation that every connection belongs to the correct session
+* Configurable number of TCP data streams
+* Sensible defaults for normal LAN use
+
+### Receiver safety
+
+The receiving computer must control where files can be written.
+
+Required safeguards:
+
+* Explicit destination root selected by the receiver
+* No sender-controlled absolute destination paths
+* Rejection of `..`, drive prefixes, UNC roots, and unsafe path components
+* Temporary-file staging
+* Atomic publication of completed files
+* Cleanup or preservation of interrupted temporary files
+* Configurable behavior when destination files already exist
+* Free-space checks before transfer begins
+* Confirmation before destructive overwrite behavior
+
+### User-facing transfer workflow
+
+v1.0 must provide:
+
+* Recursive folder transfer
+* Single-file transfer
+* Human-readable progress
+* Current file and overall byte progress
+* Transfer speed
+* Elapsed time and estimated remaining time
+* File counts
+* Cancellation with clean shutdown
+* Final success or failure summary
+* Useful error messages containing the affected file or connection
+
+A non-interactive output mode should also be available for scripts and automation.
+
+### Integrity and recovery
+
+Before v1.0, remote transfers must no longer rely only on aggregate byte counts.
+
+Required integrity features:
+
+* Per-file or per-chunk cryptographic hashes
+* Receiver verification before final rename
+* Detection of source files changing during transfer
+* Explicit reporting of failed files
+* Safe retry behavior
+* Resume support for interrupted large files
+* Session state that cannot silently combine data from different transfers
+
+### Packaging
+
+v1.0 should be usable without installing Rust.
+
+Release deliverables:
+
+* Standalone optimized Windows executable
+* Version information embedded in the binary
+* GitHub or Gitea release archive
+* SHA-256 checksum for the release artifact
+* Example sender and receiver commands
+* Windows Defender and firewall notes
+* Upgrade and compatibility notes
+* License file
+* Complete README usage guide
+
+A service installer, graphical interface, and automatic discovery are optional post-v1.0 features. The first release only needs a dependable command-line workflow.
+
+### Required v1.0 acceptance test
+
+The release is not v1.0 until this succeeds:
+
+1. Copy the release executable to two separate Windows computers.
+2. Start receiver mode on computer B.
+3. Start sender mode on computer A.
+4. Transfer a mixed directory tree containing:
+
+   * Empty files
+   * Thousands of tiny files
+   * Unicode paths
+   * Medium files
+   * Multiple large files
+   * At least one file larger than 4 GiB
+5. Interrupt one transfer and resume it.
+6. Verify every received file cryptographically.
+7. Confirm that no partial file is exposed under its final name.
+8. Repeat over both a normal LAN and a direct Ethernet connection.
+
+Only after that test passes should the project be tagged:
+
+```text
+v1.0.0
+```
+
 ---
 
 # Known limitations
 
-* Sender and receiver currently run inside the same process for benchmarks.
-* Networking currently targets loopback.
+* Sender and receiver currently run inside the same process over TCP loopback; the program cannot yet copy between two computers.
+* Networking currently binds to loopback rather than exposing a configurable remote receiver.
 * Destination directories must not already exist.
 * File timestamps and attributes are serialized but not yet fully restored.
 * Reparse points are skipped rather than recreated.
@@ -599,7 +747,9 @@ scan
 → atomically publish completed files
 ```
 
-The next target is tiny-file packing, after which the project will have specialized transfer strategies for all three file classes.
+The immediate target is tiny-file packing, after which the project will have specialized transfer strategies for all three file classes.
+
+The longer path to v1.0 is equally important: split the loopback harness into real sender and receiver processes, add remote connection handling, integrity verification, resume support, user-facing progress, safe destination policies, and standalone Windows release binaries.
 
 ---
 
