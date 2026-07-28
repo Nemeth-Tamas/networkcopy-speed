@@ -1,3 +1,4 @@
+mod compression_probe;
 mod content_hash;
 mod control_plane;
 mod copy_bench;
@@ -36,6 +37,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     match command.to_string_lossy().as_ref() {
         "bench-copy" => run_bench_copy(&mut arguments),
         "bench-hash" => run_hash_bench(&mut arguments),
+        "probe-compression" => run_compression_probe(&mut arguments),
         "bench-pipeline" => run_bench_pipeline(&mut arguments),
         "probe-iocp" => run_iocp_probe(&mut arguments),
         "probe-overlapped-read" => run_overlapped_read_probe(&mut arguments),
@@ -54,6 +56,36 @@ fn run() -> Result<(), Box<dyn Error>> {
         )
         .into()),
     }
+}
+
+fn run_compression_probe(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let source = PathBuf::from(required_argument(arguments, "source path")?);
+
+    let level = match arguments.next() {
+        Some(value) => parse_compression_level(&value)?,
+
+        None => compression_probe::DEFAULT_LEVEL,
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    println!("NetworkCopy Speed Edition adaptive compression probe");
+    println!("  Source: {}", source.display());
+    println!("  Zstandard level: {level}");
+    println!();
+
+    let report = compression_probe::run(&source, level)?;
+
+    report.print();
+    Ok(())
 }
 
 fn run_hash_bench(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), Box<dyn Error>> {
@@ -405,6 +437,25 @@ fn required_argument(
     })
 }
 
+fn parse_compression_level(value: &OsStr) -> io::Result<i32> {
+    let value = value.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "compression level must contain valid Unicode digits",
+        )
+    })?;
+
+    let level = value.parse::<i32>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid compression level {value:?}: {error}"),
+        )
+    })?;
+
+    compression_probe::validate_level(level)?;
+    Ok(level)
+}
+
 fn parse_buffer_mib(value: &OsStr) -> io::Result<usize> {
     let value = value.to_str().ok_or_else(|| {
         io::Error::new(
@@ -448,6 +499,7 @@ fn print_usage(program: &OsStr) {
     println!("Usage:");
     println!("  {program} bench-copy <source> <destination> [buffer-mib]");
     println!("  {program} bench-hash <source> [buffer-mib]");
+    println!("  {program} probe-compression <source> [zstd-level]");
     println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
     println!("  {program} probe-iocp");
     println!("  {program} probe-overlapped-read <source> [read-mib]");
