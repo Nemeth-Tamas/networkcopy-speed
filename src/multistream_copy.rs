@@ -7,6 +7,7 @@ use crate::manifest_scan::{self, FileClass, ManifestEntry};
 use crate::resume_state::{ResumeJournal, ResumeStripe};
 use crate::striped_file;
 use crate::transfer_memory;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -28,6 +29,7 @@ const COPY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const TINY_PACK_TARGET_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TINY_PACK_FILES: usize = 4096;
 const CONTENT_DIGEST_BYTES: usize = 32;
+const MAX_RESUME_OFFER_STRIPES: u32 = 1_000_000;
 
 pub const DEFAULT_DATA_STREAMS: usize = 4;
 
@@ -150,6 +152,12 @@ struct TransferAck {
     bytes_copied: u64,
     data_wire_bytes: u64,
     compressed_records: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ReceiverReady {
+    summary: ManifestSummary,
+    completed_stripes: BTreeSet<ResumeStripe>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -285,11 +293,11 @@ pub fn run(
 
     let manifest_wire_bytes = control_plane::send_manifest(&mut control_stream, &manifest)?;
 
-    let receiver_summary = read_receiver_ready(&mut control_stream)?;
+    let receiver_ready = read_receiver_ready(&mut control_stream)?;
 
     let manifest_elapsed = manifest_started.elapsed();
 
-    if receiver_summary != summary {
+    if receiver_ready.summary != summary {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "receiver acknowledged a different manifest",
@@ -297,6 +305,8 @@ pub fn run(
     }
 
     let transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
+
+    validate_resume_offer(&transfer_plan, &receiver_ready.completed_stripes)?;
 
     let plan_stats = summarize_transfer_plan(&transfer_plan)?;
 
@@ -399,8 +409,6 @@ fn run_server(
 
     prepare_destination(&destination_root, &manifest)?;
 
-    write_receiver_ready(&mut control_stream, summary)?;
-
     let transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
 
     let resume_journal = ResumeJournal::new(summary.fingerprint, data_stream_count)?;
@@ -409,6 +417,14 @@ fn run_server(
 
     let resume_journal =
         ResumeJournal::load_existing(&destination_root, summary.fingerprint, data_stream_count)?;
+
+    let receiver_ready = ReceiverReady {
+        summary,
+
+        completed_stripes: resume_journal.completed_stripes().collect(),
+    };
+
+    write_receiver_ready(&mut control_stream, &receiver_ready)?;
 
     let resume_journal = Arc::new(Mutex::new(resume_journal));
 
@@ -767,6 +783,47 @@ fn summarize_transfer_plan(transfer_plan: &TransferPlan) -> io::Result<TransferP
     }
 
     Ok(stats)
+}
+
+fn planned_resume_stripes(transfer_plan: &TransferPlan) -> io::Result<BTreeSet<ResumeStripe>> {
+    let mut planned = BTreeSet::new();
+
+    for task in transfer_plan.lanes.iter().flatten() {
+        let TransferTask::Stripe {
+            file_id,
+            offset,
+            length,
+        } = task
+        else {
+            continue;
+        };
+
+        let stripe = ResumeStripe::new(*file_id, *offset, *length)?;
+
+        if !planned.insert(stripe) {
+            return Err(io::Error::other(
+                "transfer plan contains a duplicate resume stripe",
+            ));
+        }
+    }
+
+    Ok(planned)
+}
+
+fn validate_resume_offer(
+    transfer_plan: &TransferPlan,
+    offered: &BTreeSet<ResumeStripe>,
+) -> io::Result<()> {
+    let planned = planned_resume_stripes(transfer_plan)?;
+
+    if let Some(unplanned) = offered.difference(&planned).next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("receiver offered an unplanned completed stripe: {unplanned:?}"),
+        ));
+    }
+
+    Ok(())
 }
 
 fn send_lane(
@@ -1686,15 +1743,43 @@ fn merge_lane_reports(reports: Vec<LaneReport>) -> io::Result<LaneReport> {
     Ok(merged)
 }
 
-fn write_receiver_ready(writer: &mut impl Write, summary: ManifestSummary) -> io::Result<()> {
+fn write_receiver_ready(writer: &mut impl Write, ready: &ReceiverReady) -> io::Result<()> {
+    let stripe_count = u32::try_from(ready.completed_stripes.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "resume offer contains too many completed stripes",
+        )
+    })?;
+
+    if stripe_count > MAX_RESUME_OFFER_STRIPES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("resume offer contains {stripe_count} stripes, exceeding the supported limit"),
+        ));
+    }
+
     write_u8(writer, MESSAGE_RECEIVER_READY)?;
-    write_u64(writer, summary.entries)?;
-    write_u64(writer, summary.total_file_bytes)?;
-    write_u64(writer, summary.fingerprint)?;
+
+    write_u64(writer, ready.summary.entries)?;
+
+    write_u64(writer, ready.summary.total_file_bytes)?;
+
+    write_u64(writer, ready.summary.fingerprint)?;
+
+    write_u32(writer, stripe_count)?;
+
+    for stripe in &ready.completed_stripes {
+        write_u64(writer, stripe.file_id)?;
+
+        write_u64(writer, stripe.offset)?;
+
+        write_u64(writer, stripe.length)?;
+    }
+
     writer.flush()
 }
 
-fn read_receiver_ready(reader: &mut impl Read) -> io::Result<ManifestSummary> {
+fn read_receiver_ready(reader: &mut impl Read) -> io::Result<ReceiverReady> {
     let message = read_u8(reader)?;
 
     if message != MESSAGE_RECEIVER_READY {
@@ -1707,10 +1792,55 @@ fn read_receiver_ready(reader: &mut impl Read) -> io::Result<ManifestSummary> {
         ));
     }
 
-    Ok(ManifestSummary {
+    let summary = ManifestSummary {
         entries: read_u64(reader)?,
         total_file_bytes: read_u64(reader)?,
         fingerprint: read_u64(reader)?,
+    };
+
+    let stripe_count = read_u32(reader)?;
+
+    if stripe_count > MAX_RESUME_OFFER_STRIPES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "receiver offered {stripe_count} completed stripes, exceeding the supported limit"
+            ),
+        ));
+    }
+
+    let mut completed_stripes = BTreeSet::new();
+
+    for _ in 0..stripe_count {
+        let file_id = usize::try_from(read_u64(reader)?).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resume stripe file ID cannot be represented",
+            )
+        })?;
+
+        let offset = read_u64(reader)?;
+
+        let length = read_u64(reader)?;
+
+        let stripe = ResumeStripe::new(file_id, offset, length).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("received invalid resume stripe: {error}"),
+            )
+        })?;
+
+        if !completed_stripes.insert(stripe) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "receiver offered a duplicate completed stripe",
+            ));
+        }
+    }
+
+    Ok(ReceiverReady {
+        summary,
+        completed_stripes,
     })
 }
 
@@ -1892,14 +2022,17 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TINY_PACK_TARGET_BYTES, TransferTask, build_transfer_plan, copy_exact_hashed, run,
-        verify_content_digest,
+        ReceiverReady, TINY_PACK_TARGET_BYTES, TransferTask, build_transfer_plan,
+        copy_exact_hashed, read_receiver_ready, run, validate_resume_offer, verify_content_digest,
+        write_receiver_ready,
     };
+    use crate::control_plane::ManifestSummary;
     use crate::manifest_scan::{FileClass, ManifestEntry};
-    use crate::resume_state::JOURNAL_FILE_NAME;
+    use crate::resume_state::{JOURNAL_FILE_NAME, ResumeStripe};
+    use std::collections::BTreeSet;
     use std::env;
     use std::fs;
-    use std::io::Cursor;
+    use std::io::{self, Cursor};
     use std::path::PathBuf;
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2029,6 +2162,51 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 
         assert!(error.to_string().contains("BLAKE3 verification failed"));
+    }
+
+    #[test]
+    fn receiver_ready_round_trips_resume_offer() {
+        let expected = ReceiverReady {
+            summary: ManifestSummary {
+                entries: 7,
+                total_file_bytes: 12_345,
+                fingerprint: 0x1234_5678_9ABC_DEF0,
+            },
+
+            completed_stripes: BTreeSet::from([
+                ResumeStripe::new(2, 0, 4096).unwrap(),
+                ResumeStripe::new(2, 4096, 2048).unwrap(),
+            ]),
+        };
+
+        let mut bytes = Vec::new();
+
+        write_receiver_ready(&mut bytes, &expected).unwrap();
+
+        let mut reader = Cursor::new(bytes);
+
+        let actual = read_receiver_ready(&mut reader).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn resume_offer_rejects_unplanned_stripe() {
+        let manifest = vec![entry("large.bin", 1_000, FileClass::Large)];
+
+        let transfer_plan = build_transfer_plan(&manifest, 2).unwrap();
+
+        let valid = BTreeSet::from([ResumeStripe::new(0, 0, 500).unwrap()]);
+
+        validate_resume_offer(&transfer_plan, &valid).unwrap();
+
+        let invalid = BTreeSet::from([ResumeStripe::new(0, 1, 500).unwrap()]);
+
+        let error = validate_resume_offer(&transfer_plan, &invalid).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        assert!(error.to_string().contains("unplanned completed stripe",));
     }
 
     #[test]

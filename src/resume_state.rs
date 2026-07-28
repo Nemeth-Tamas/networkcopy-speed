@@ -121,6 +121,10 @@ impl ResumeJournal {
         self.completed_stripes.insert(stripe)
     }
 
+    pub(crate) fn completed_stripes(&self) -> impl Iterator<Item = ResumeStripe> + '_ {
+        self.completed_stripes.iter().copied()
+    }
+
     pub(crate) fn save_atomic(&self, destination_root: &Path) -> io::Result<()> {
         let destination_root = destination_root.canonicalize()?;
 
