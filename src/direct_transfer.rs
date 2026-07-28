@@ -35,12 +35,16 @@ pub(crate) fn send(
 ) -> io::Result<CalibratedSendReport> {
     let path = direct_discovery::discover_one()?;
 
+    let local_address = direct_address::link_local_endpoint(path.interface_index, 0)?;
+
     let receiver_address = SocketAddr::V6(path.endpoint);
 
     println!();
     println!("NetworkCopy Speed Edition direct-link sender");
 
     println!("  Local interface: {}", path.interface_index,);
+
+    println!("  Source binding:  {}", local_address,);
 
     println!("  Receiver:        {}", receiver_address,);
 

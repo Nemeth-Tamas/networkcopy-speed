@@ -16,6 +16,7 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 blake3 = "1.8.5"
 zstd = "0.13.3"
+socket2 = "0.6.1"
 
 [profile.release]
 opt-level = 3

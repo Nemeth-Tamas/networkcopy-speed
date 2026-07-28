@@ -884,7 +884,7 @@ Planned after the first real-network release:
 * [ ] Fall back to direct-link IPv4
 * [ ] Bind every control and data socket explicitly to the selected interface
 * [x] Validate the chosen TCP path
-* [ ] Run automatic calibration and folder transfer over the selected direct path
+* [x] Run automatic calibration and folder transfer over the selected direct path
 * [ ] Recover cleanly if the link disappears
 
 The intended use case is a direct copper cable between two Windows computers, with no router or switch required.

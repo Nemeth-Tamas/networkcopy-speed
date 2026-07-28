@@ -8,6 +8,7 @@ use crate::file_metadata;
 use crate::manifest_scan::{self, FileClass, ManifestEntry};
 use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
 use crate::striped_file;
+use crate::tcp_connect;
 use crate::transfer_memory;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -506,7 +507,7 @@ fn connect_with_retry_config(
     let started = Instant::now();
 
     loop {
-        match TcpStream::connect(receiver_address) {
+        match tcp_connect::connect(receiver_address) {
             Ok(stream) => {
                 return Ok(stream);
             }

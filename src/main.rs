@@ -21,6 +21,7 @@ mod network_calibration;
 mod pipeline_bench;
 mod resume_state;
 mod striped_file;
+mod tcp_connect;
 mod transfer_memory;
 mod windows_setup;
 
