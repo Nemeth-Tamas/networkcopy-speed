@@ -2334,7 +2334,7 @@ mod tests {
     use std::env;
     use std::fs;
     use std::io::{self, Cursor, Write};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2631,7 +2631,7 @@ mod tests {
         let large_file_id = scan
             .manifest
             .iter()
-            .position(|entry| entry.relative_path == PathBuf::from("large.bin"))
+            .position(|entry| entry.relative_path == Path::new("large.bin"))
             .unwrap();
 
         let transfer_plan = build_transfer_plan(&scan.manifest, 2).unwrap();
