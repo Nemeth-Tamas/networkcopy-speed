@@ -403,9 +403,12 @@ fn run_server(
 
     let transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
 
-    let mut resume_journal = ResumeJournal::new(summary.fingerprint, data_stream_count)?;
+    let resume_journal = ResumeJournal::new(summary.fingerprint, data_stream_count)?;
 
     resume_journal.save_atomic(&destination_root)?;
+
+    let resume_journal =
+        ResumeJournal::load_existing(&destination_root, summary.fingerprint, data_stream_count)?;
 
     let resume_journal = Arc::new(Mutex::new(resume_journal));
 

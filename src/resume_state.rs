@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use windows_sys::Win32::Storage::FileSystem::{
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
 };
@@ -73,6 +73,48 @@ impl ResumeJournal {
 
             completed_stripes: BTreeSet::new(),
         })
+    }
+
+    pub(crate) fn load_existing(
+        destination_root: &Path,
+        expected_manifest_fingerprint: u64,
+        expected_data_stream_count: usize,
+    ) -> io::Result<Self> {
+        let expected_data_stream_count =
+            u32::try_from(expected_data_stream_count).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "expected resume stream count cannot be represented",
+                )
+            })?;
+
+        let journal_path = destination_root.join(JOURNAL_FILE_NAME);
+
+        let journal = Self::read_path(&journal_path)?;
+
+        if journal.manifest_fingerprint != expected_manifest_fingerprint {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "resume journal manifest fingerprint is \
+                     0x{:016X}, expected 0x{expected_manifest_fingerprint:016X}",
+                    journal.manifest_fingerprint
+                ),
+            ));
+        }
+
+        if journal.data_stream_count != expected_data_stream_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "resume journal stores {} data streams, expected \
+                     {expected_data_stream_count}",
+                    journal.data_stream_count
+                ),
+            ));
+        }
+
+        Ok(journal)
     }
 
     pub(crate) fn mark_completed(&mut self, stripe: ResumeStripe) -> bool {
@@ -319,7 +361,7 @@ mod tests {
     use super::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe, TEMPORARY_JOURNAL_FILE_NAME};
     use std::env;
     use std::fs::{self, OpenOptions};
-    use std::io::Write;
+    use std::io::{self, Write};
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -339,7 +381,7 @@ mod tests {
 
         journal.save_atomic(&root).unwrap();
 
-        let loaded = ResumeJournal::read_path(&root.join(JOURNAL_FILE_NAME)).unwrap();
+        let loaded = ResumeJournal::load_existing(&root, 0x1234_5678_9ABC_DEF0, 4).unwrap();
 
         assert_eq!(loaded, journal);
 
@@ -348,6 +390,37 @@ mod tests {
         ResumeJournal::remove(&root).unwrap();
 
         assert!(!root.join(JOURNAL_FILE_NAME).exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn journal_rejects_mismatched_identity() {
+        let root = temporary_root("identity");
+
+        fs::create_dir_all(&root).unwrap();
+
+        let journal = ResumeJournal::new(0x1234_5678_9ABC_DEF0, 4).unwrap();
+
+        journal.save_atomic(&root).unwrap();
+
+        let fingerprint_error =
+            ResumeJournal::load_existing(&root, 0x1234_5678_9ABC_DEF1, 4).unwrap_err();
+
+        assert_eq!(fingerprint_error.kind(), io::ErrorKind::InvalidData);
+
+        assert!(
+            fingerprint_error
+                .to_string()
+                .contains("manifest fingerprint",)
+        );
+
+        let stream_error =
+            ResumeJournal::load_existing(&root, 0x1234_5678_9ABC_DEF0, 3).unwrap_err();
+
+        assert_eq!(stream_error.kind(), io::ErrorKind::InvalidData);
+
+        assert!(stream_error.to_string().contains("data streams"));
 
         fs::remove_dir_all(root).unwrap();
     }
