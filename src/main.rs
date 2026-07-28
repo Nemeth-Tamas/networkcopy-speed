@@ -1,6 +1,7 @@
 mod adaptive_compression;
 mod calibrated_transfer;
 mod compression_probe;
+mod console_progress;
 mod content_hash;
 mod control_plane;
 mod copy_bench;

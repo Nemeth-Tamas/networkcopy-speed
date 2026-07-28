@@ -7,6 +7,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
 use std::process;
+use std::sync::Once;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +24,9 @@ const CONTROL_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_PATH_UTF16_UNITS: usize = 1024 * 1024;
 const MAX_DATA_STREAMS: usize = 32;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+const ERROR_INVALID_FUNCTION: i32 = 1;
+
+static UNSUPPORTED_SOCKET_OPTION_WARNING: Once = Once::new();
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -368,10 +372,38 @@ fn connect_stream(address: SocketAddr) -> io::Result<TcpStream> {
 }
 
 pub(crate) fn configure_stream(stream: &TcpStream) -> io::Result<()> {
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
-    stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
+    apply_socket_setting(stream.set_nodelay(true), "TCP_NODELAY")?;
+
+    apply_socket_setting(stream.set_read_timeout(Some(SOCKET_TIMEOUT)), "SO_RCVTIMEO")?;
+
+    apply_socket_setting(
+        stream.set_write_timeout(Some(SOCKET_TIMEOUT)),
+        "SO_SNDTIMEO",
+    )?;
+
     Ok(())
+}
+
+fn apply_socket_setting(result: io::Result<()>, option: &str) -> io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+
+        Err(error) if error.raw_os_error() == Some(ERROR_INVALID_FUNCTION) => {
+            UNSUPPORTED_SOCKET_OPTION_WARNING
+                .call_once(|| {
+                    eprintln!(
+                        "warning: {option} is unsupported by this Windows network environment; continuing without unsupported socket tuning"
+                    );
+                });
+
+            Ok(())
+        }
+
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("failed to configure {option}: {error}"),
+        )),
+    }
 }
 
 pub(crate) fn create_session_id() -> u64 {
@@ -845,14 +877,27 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionRole, Handshake, PROTOCOL_VERSION, read_handshake, run,
-        validate_data_stream_count, write_handshake,
+        ConnectionRole, ERROR_INVALID_FUNCTION, Handshake, PROTOCOL_VERSION, apply_socket_setting,
+        read_handshake, run, validate_data_stream_count, write_handshake,
     };
     use std::env;
     use std::fs;
-    use std::io::Cursor;
+    use std::io::{self, Cursor};
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn unsupported_socket_setting_is_tolerated() {
+        let unsupported = io::Error::from_raw_os_error(ERROR_INVALID_FUNCTION);
+
+        assert!(apply_socket_setting(Err(unsupported), "SO_RCVTIMEO",).is_ok());
+
+        let real_failure = io::Error::from_raw_os_error(10022);
+
+        let error = apply_socket_setting(Err(real_failure), "SO_RCVTIMEO").unwrap_err();
+
+        assert!(error.to_string().contains("SO_RCVTIMEO",));
+    }
 
     #[test]
     fn handshake_round_trips() {

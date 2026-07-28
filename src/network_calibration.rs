@@ -1,3 +1,4 @@
+use crate::console_progress::ProgressCounter;
 use crate::control_plane;
 use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_second, format_bytes};
 use crate::multistream_copy;
@@ -166,6 +167,15 @@ pub fn send(
     total_bytes: u64,
     data_stream_count: usize,
 ) -> io::Result<NetworkCalibrationReport> {
+    send_one(receiver_address, total_bytes, data_stream_count, None)
+}
+
+fn send_one(
+    receiver_address: SocketAddr,
+    total_bytes: u64,
+    data_stream_count: usize,
+    progress: Option<ProgressCounter>,
+) -> io::Result<NetworkCalibrationReport> {
     validate_config(total_bytes, data_stream_count)?;
 
     let session_id = control_plane::create_session_id();
@@ -210,7 +220,9 @@ pub fn send(
 
             let payload = Arc::clone(&payload);
 
-            handles.push(scope.spawn(move || send_lane(stream, payload, bytes)));
+            let lane_progress = progress.clone();
+
+            handles.push(scope.spawn(move || send_lane(stream, payload, bytes, lane_progress)));
         }
 
         join_lane_threads(handles, "network calibration sender lane panicked")
@@ -242,30 +254,80 @@ pub fn send_matrix(
     receiver_address: SocketAddr,
     total_bytes: u64,
 ) -> io::Result<NetworkCalibrationMatrixReport> {
+    send_matrix_internal(receiver_address, total_bytes, None)
+}
+
+pub(crate) fn send_matrix_with_progress(
+    receiver_address: SocketAddr,
+    total_bytes: u64,
+    progress: ProgressCounter,
+) -> io::Result<NetworkCalibrationMatrixReport> {
+    prepare_matrix_progress(&progress, total_bytes)?;
+
+    send_matrix_internal(receiver_address, total_bytes, Some(progress))
+}
+
+fn send_matrix_internal(
+    receiver_address: SocketAddr,
+    total_bytes: u64,
+    progress: Option<ProgressCounter>,
+) -> io::Result<NetworkCalibrationMatrixReport> {
     let mut reports = Vec::with_capacity(MATRIX_STREAM_COUNTS.len());
 
     for data_stream_count in MATRIX_STREAM_COUNTS {
-        reports.push(send(receiver_address, total_bytes, data_stream_count)?);
+        if let Some(progress) = &progress {
+            progress.set_label(format!("Calibration send - {data_stream_count} streams"));
+        }
+
+        reports.push(send_one(
+            receiver_address,
+            total_bytes,
+            data_stream_count,
+            progress.clone(),
+        )?);
     }
 
     build_matrix_report(reports)
 }
 
 pub fn receive_once(listener: TcpListener) -> io::Result<NetworkCalibrationReport> {
-    receive_one(&listener)
+    receive_one(&listener, None)
 }
 
 pub fn receive_matrix(listener: TcpListener) -> io::Result<NetworkCalibrationMatrixReport> {
-    receive_matrix_on_listener(&listener)
+    receive_matrix_internal(&listener, None)
 }
 
 pub(crate) fn receive_matrix_on_listener(
     listener: &TcpListener,
 ) -> io::Result<NetworkCalibrationMatrixReport> {
+    receive_matrix_internal(listener, None)
+}
+
+pub(crate) fn receive_matrix_on_listener_with_progress(
+    listener: &TcpListener,
+    progress: ProgressCounter,
+) -> io::Result<NetworkCalibrationMatrixReport> {
+    progress.set_completed(0);
+    progress.set_total(0);
+
+    receive_matrix_internal(listener, Some(progress))
+}
+
+fn receive_matrix_internal(
+    listener: &TcpListener,
+    progress: Option<ProgressCounter>,
+) -> io::Result<NetworkCalibrationMatrixReport> {
     let mut reports = Vec::with_capacity(MATRIX_STREAM_COUNTS.len());
 
     for expected_stream_count in MATRIX_STREAM_COUNTS {
-        let report = receive_one(listener)?;
+        if let Some(progress) = &progress {
+            progress.set_label(format!(
+                "Calibration receive - {expected_stream_count} streams"
+            ));
+        }
+
+        let report = receive_one(listener, progress.clone())?;
 
         if report.data_stream_count != expected_stream_count {
             return Err(io::Error::new(
@@ -283,7 +345,10 @@ pub(crate) fn receive_matrix_on_listener(
     build_matrix_report(reports)
 }
 
-fn receive_one(listener: &TcpListener) -> io::Result<NetworkCalibrationReport> {
+fn receive_one(
+    listener: &TcpListener,
+    progress: Option<ProgressCounter>,
+) -> io::Result<NetworkCalibrationReport> {
     let (mut control_stream, _control_peer) = listener.accept()?;
 
     control_plane::configure_stream(&control_stream)?;
@@ -291,6 +356,12 @@ fn receive_one(listener: &TcpListener) -> io::Result<NetworkCalibrationReport> {
     let config = read_control_header(&mut control_stream)?;
 
     validate_config(config.total_bytes, config.data_stream_count)?;
+
+    if let Some(progress) = &progress {
+        if progress.total() == 0 {
+            prepare_matrix_progress(progress, config.total_bytes)?;
+        }
+    }
 
     let mut data_streams: Vec<Option<TcpStream>> = std::iter::repeat_with(|| None)
         .take(config.data_stream_count)
@@ -350,7 +421,9 @@ fn receive_one(listener: &TcpListener) -> io::Result<NetworkCalibrationReport> {
         for (stream_id, stream) in ordered_streams.into_iter().enumerate() {
             let bytes = lane_bytes(config.total_bytes, config.data_stream_count, stream_id)?;
 
-            handles.push(scope.spawn(move || receive_lane(stream, bytes)));
+            let lane_progress = progress.clone();
+
+            handles.push(scope.spawn(move || receive_lane(stream, bytes, lane_progress)));
         }
 
         join_lane_threads(handles, "network calibration receiver lane panicked")
@@ -420,6 +493,23 @@ fn report_megabytes_per_second(report: &NetworkCalibrationReport) -> f64 {
     decimal_megabytes_per_second(report.total_bytes, report.elapsed)
 }
 
+fn prepare_matrix_progress(progress: &ProgressCounter, bytes_per_run: u64) -> io::Result<()> {
+    let run_count = u64::try_from(MATRIX_STREAM_COUNTS.len())
+        .map_err(|_| io::Error::other("calibration matrix run count cannot be represented"))?;
+
+    let total_bytes = bytes_per_run.checked_mul(run_count).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "calibration matrix progress size overflowed",
+        )
+    })?;
+
+    progress.set_completed(0);
+    progress.set_total(total_bytes);
+
+    Ok(())
+}
+
 fn validate_config(total_bytes: u64, data_stream_count: usize) -> io::Result<()> {
     if total_bytes == 0 {
         return Err(io::Error::new(
@@ -483,7 +573,12 @@ fn build_payload_buffer() -> Vec<u8> {
     payload
 }
 
-fn send_lane(mut stream: TcpStream, payload: Arc<Vec<u8>>, total_bytes: u64) -> io::Result<u64> {
+fn send_lane(
+    mut stream: TcpStream,
+    payload: Arc<Vec<u8>>,
+    total_bytes: u64,
+    progress: Option<ProgressCounter>,
+) -> io::Result<u64> {
     let mut remaining = total_bytes;
 
     while remaining > 0 {
@@ -496,6 +591,10 @@ fn send_lane(mut stream: TcpStream, payload: Arc<Vec<u8>>, total_bytes: u64) -> 
 
         stream.write_all(&payload[..count])?;
 
+        if let Some(progress) = &progress {
+            progress.add(count as u64);
+        }
+
         remaining -= count as u64;
     }
 
@@ -504,7 +603,11 @@ fn send_lane(mut stream: TcpStream, payload: Arc<Vec<u8>>, total_bytes: u64) -> 
     Ok(total_bytes)
 }
 
-fn receive_lane(mut stream: TcpStream, total_bytes: u64) -> io::Result<u64> {
+fn receive_lane(
+    mut stream: TcpStream,
+    total_bytes: u64,
+    progress: Option<ProgressCounter>,
+) -> io::Result<u64> {
     let mut buffer = vec![0_u8; BUFFER_BYTES];
 
     let mut remaining = total_bytes;
@@ -518,6 +621,10 @@ fn receive_lane(mut stream: TcpStream, total_bytes: u64) -> io::Result<u64> {
         })?;
 
         stream.read_exact(&mut buffer[..count])?;
+
+        if let Some(progress) = &progress {
+            progress.add(count as u64);
+        }
 
         remaining -= count as u64;
     }
@@ -678,7 +785,12 @@ fn write_receiver_ready(writer: &mut impl Write) -> io::Result<()> {
 fn read_receiver_ready(reader: &mut impl Read) -> io::Result<()> {
     let mut message = [0_u8; 1];
 
-    reader.read_exact(&mut message)?;
+    reader.read_exact(&mut message).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("receiver disconnected before calibration became ready: {error}"),
+        )
+    })?;
 
     if message[0] != RECEIVER_READY {
         return Err(io::Error::new(

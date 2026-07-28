@@ -1,5 +1,6 @@
 use crate::adaptive_compression::{MAX_COMPRESSED_CHUNK_BYTES, PayloadDecoder, PayloadEncoder};
 use crate::compression_probe;
+use crate::console_progress::ProgressCounter;
 use crate::content_hash::{self, ContentHasher};
 use crate::control_plane::{self, ConnectionRole, Handshake, ManifestSummary};
 use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_second, format_bytes};
@@ -416,6 +417,7 @@ fn run_with_fault(
         memory_plan,
         memory_plan.loopback_bytes,
         Some(server),
+        None,
     )
 }
 
@@ -424,6 +426,38 @@ pub fn send(
     source_root: &Path,
     worker_count: usize,
     data_stream_count: usize,
+) -> io::Result<MultistreamCopyReport> {
+    send_configured(
+        receiver_address,
+        source_root,
+        worker_count,
+        data_stream_count,
+        None,
+    )
+}
+
+pub(crate) fn send_with_progress(
+    receiver_address: SocketAddr,
+    source_root: &Path,
+    worker_count: usize,
+    data_stream_count: usize,
+    progress: ProgressCounter,
+) -> io::Result<MultistreamCopyReport> {
+    send_configured(
+        receiver_address,
+        source_root,
+        worker_count,
+        data_stream_count,
+        Some(progress),
+    )
+}
+
+fn send_configured(
+    receiver_address: SocketAddr,
+    source_root: &Path,
+    worker_count: usize,
+    data_stream_count: usize,
+    progress: Option<ProgressCounter>,
 ) -> io::Result<MultistreamCopyReport> {
     manifest_scan::validate_worker_count(worker_count)?;
 
@@ -444,6 +478,7 @@ pub fn send(
         memory_plan,
         memory_plan.per_peer_bytes,
         None,
+        progress,
     )
 }
 
@@ -503,6 +538,7 @@ fn send_internal(
     memory_plan: transfer_memory::TransferMemoryPlan,
     process_buffer_bytes: u64,
     server: Option<thread::JoinHandle<io::Result<ReceiveReport>>>,
+    progress: Option<ProgressCounter>,
 ) -> io::Result<MultistreamCopyReport> {
     let total_started = Instant::now();
 
@@ -515,6 +551,14 @@ fn send_internal(
     let manifest = Arc::new(scan_result.manifest);
 
     let summary = control_plane::summarize_manifest(&manifest)?;
+
+    if let Some(progress) = &progress {
+        progress.set_label("Transfer send");
+
+        progress.set_completed(0);
+
+        progress.set_total(summary.total_file_bytes);
+    }
 
     let session_id = control_plane::create_session_id();
 
