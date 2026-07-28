@@ -189,6 +189,100 @@ pub(crate) fn receive(interface_index: u32) -> io::Result<()> {
     }
 }
 
+pub(crate) fn receive_all() -> io::Result<()> {
+    let interface_indices = direct_link::strict_candidate_indices()?;
+
+    let local_endpoints = interface_indices
+        .iter()
+        .copied()
+        .map(|interface_index| {
+            direct_address::link_local_endpoint(interface_index, DISCOVERY_PORT)
+                .map(|endpoint| (interface_index, endpoint))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    let bind_endpoint = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, DISCOVERY_PORT, 0, 0);
+
+    let socket = UdpSocket::bind(bind_endpoint)?;
+
+    socket.set_multicast_loop_v6(false)?;
+
+    for (interface_index, _) in &local_endpoints {
+        socket.join_multicast_v6(&DISCOVERY_GROUP, *interface_index)?;
+    }
+
+    println!("NetworkCopy Speed Edition automatic direct-link discovery receiver");
+
+    println!("  Candidate interfaces: {}", local_endpoints.len(),);
+
+    for (interface_index, endpoint) in &local_endpoints {
+        println!();
+
+        println!("  Listening interface: {}", interface_index,);
+
+        println!(
+            "  Local IPv6:          {}%{}",
+            endpoint.ip(),
+            interface_index,
+        );
+
+        println!(
+            "  Multicast group:     [{}%{}]:{}",
+            DISCOVERY_GROUP, interface_index, DISCOVERY_PORT,
+        );
+    }
+
+    println!();
+
+    println!("  Transfer port:       {}", DIRECT_TRANSFER_PORT,);
+
+    println!();
+    println!("Waiting for direct-link probes...");
+
+    let mut buffer = [0_u8; 256];
+
+    loop {
+        let (received, source) = socket.recv_from(&mut buffer)?;
+
+        let SocketAddr::V6(source) = source else {
+            continue;
+        };
+
+        let interface_index = source.scope_id();
+
+        if interface_index == 0 {
+            println!("  Ignored a link-local probe without an interface scope ID");
+
+            continue;
+        }
+
+        if !interface_indices.contains(&interface_index) {
+            continue;
+        }
+
+        let Ok(packet) = DiscoveryPacket::decode(&buffer[..received]) else {
+            continue;
+        };
+
+        if packet.kind != DiscoveryKind::Probe {
+            continue;
+        }
+
+        let Some(reply_target) = scoped_link_local(source, interface_index) else {
+            continue;
+        };
+
+        let offer = DiscoveryPacket::offer(packet.nonce, DIRECT_TRANSFER_PORT);
+
+        socket.send_to(&offer.encode(), reply_target)?;
+
+        println!(
+            "  Replied to {} through interface {}",
+            reply_target, interface_index,
+        );
+    }
+}
+
 pub(crate) fn discover(interface_index: u32) -> io::Result<SocketAddrV6> {
     discover_on_interface(interface_index, true)
 }

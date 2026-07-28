@@ -76,6 +76,8 @@ fn run() -> Result<(), Box<dyn Error>> {
 
         "direct-discovery-receive" => run_direct_discovery_receive(&mut arguments),
 
+        "direct-discovery-receive-auto" => run_direct_discovery_receive_auto(&mut arguments),
+
         "direct-discovery-send" => run_direct_discovery_send(&mut arguments),
 
         "direct-discovery-send-auto" => run_direct_discovery_send_auto(&mut arguments),
@@ -96,6 +98,24 @@ fn run() -> Result<(), Box<dyn Error>> {
         )
         .into()),
     }
+}
+
+fn run_direct_discovery_receive_auto(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy(),),
+        )
+        .into());
+    }
+
+    windows_setup::prepare_discovery_receiver(direct_discovery::DISCOVERY_PORT)?;
+
+    direct_discovery::receive_all()?;
+
+    Ok(())
 }
 
 fn run_direct_discovery_send_auto(
@@ -1078,6 +1098,7 @@ fn print_usage(program: &OsStr) {
     println!("  {program} direct-interfaces");
     println!("  {program} direct-address <interface-index>");
     println!("  {program} direct-discovery-receive <interface-index>");
+    println!("  {program} direct-discovery-receive-auto");
     println!("  {program} direct-discovery-send <interface-index>");
     println!("  {program} direct-discovery-send-auto");
     println!("  {program} receive-auto <bind-address> <destination-root>");
