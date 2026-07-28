@@ -242,16 +242,6 @@ pub fn run(
         MAX_COMPRESSED_CHUNK_BYTES as u64,
     )?;
 
-    if destination_root.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "destination must not already exist: {}",
-                destination_root.display()
-            ),
-        ));
-    }
-
     let total_started = Instant::now();
     let source_root = source_root.canonicalize()?;
 
@@ -434,16 +424,15 @@ fn run_server(
 
     let (manifest, summary, _) = control_plane::receive_manifest_entries(&mut control_stream)?;
 
-    prepare_destination(&destination_root, &manifest)?;
-
     let mut transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
 
-    let resume_journal = ResumeJournal::new(summary.fingerprint, data_stream_count)?;
-
-    resume_journal.save_atomic(&destination_root)?;
-
-    let resume_journal =
-        ResumeJournal::load_existing(&destination_root, summary.fingerprint, data_stream_count)?;
+    let resume_journal = prepare_destination(
+        &destination_root,
+        &manifest,
+        summary,
+        data_stream_count,
+        &transfer_plan,
+    )?;
 
     let receiver_ready = ReceiverReady {
         summary,
@@ -615,38 +604,234 @@ fn accept_session(
     Ok((control_stream, ordered_streams))
 }
 
-fn prepare_destination(destination_root: &Path, manifest: &[ManifestEntry]) -> io::Result<()> {
-    if destination_root.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("destination already exists: {}", destination_root.display()),
-        ));
+fn prepare_destination(
+    destination_root: &Path,
+    manifest: &[ManifestEntry],
+    summary: ManifestSummary,
+    data_stream_count: usize,
+    transfer_plan: &TransferPlan,
+) -> io::Result<ResumeJournal> {
+    if destination_root.try_exists()? {
+        return prepare_resume_destination(
+            destination_root,
+            manifest,
+            summary,
+            data_stream_count,
+            transfer_plan,
+        );
     }
 
     fs::create_dir_all(destination_root)?;
 
     for (file_id, entry) in manifest.iter().enumerate() {
-        if let Some(parent) = entry.relative_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(destination_root.join(parent))?;
+        create_destination_parent(destination_root, entry)?;
+
+        if entry.class != FileClass::Large {
+            continue;
         }
 
-        if entry.class == FileClass::Large {
-            let final_path = destination_root.join(&entry.relative_path);
+        let final_path = destination_root.join(&entry.relative_path);
 
-            let temporary_path = temporary_path(&final_path, file_id);
+        let temporary_path = temporary_path(&final_path, file_id);
 
-            let file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(temporary_path)?;
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(temporary_path)?;
 
-            file.set_len(entry.file_size)?;
+        file.set_len(entry.file_size)?;
+    }
+
+    let journal = ResumeJournal::new(summary.fingerprint, data_stream_count)?;
+
+    journal.save_atomic(destination_root)?;
+
+    ResumeJournal::load_existing(destination_root, summary.fingerprint, data_stream_count)
+}
+
+fn prepare_resume_destination(
+    destination_root: &Path,
+    manifest: &[ManifestEntry],
+    summary: ManifestSummary,
+    data_stream_count: usize,
+    transfer_plan: &TransferPlan,
+) -> io::Result<ResumeJournal> {
+    let root_metadata = fs::metadata(destination_root)?;
+
+    if !root_metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "resume destination is not a directory: {}",
+                destination_root.display()
+            ),
+        ));
+    }
+
+    let journal =
+        ResumeJournal::load_existing(destination_root, summary.fingerprint, data_stream_count)?;
+
+    let completed_stripes: BTreeSet<ResumeStripe> = journal.completed_stripes().collect();
+
+    validate_resume_offer(transfer_plan, &completed_stripes)?;
+
+    for (file_id, entry) in manifest.iter().enumerate() {
+        create_destination_parent(destination_root, entry)?;
+
+        let final_path = destination_root.join(&entry.relative_path);
+
+        let temporary_path = temporary_path(&final_path, file_id);
+
+        match entry.class {
+            FileClass::Large => {
+                prepare_resume_large_file(
+                    file_id,
+                    entry,
+                    &final_path,
+                    &temporary_path,
+                    transfer_plan,
+                    &completed_stripes,
+                )?;
+            }
+
+            FileClass::Medium | FileClass::Tiny => {
+                remove_file_if_present(&temporary_path)?;
+
+                remove_file_if_present(&final_path)?;
+            }
         }
     }
 
+    Ok(journal)
+}
+
+fn create_destination_parent(destination_root: &Path, entry: &ManifestEntry) -> io::Result<()> {
+    let Some(parent) = entry.relative_path.parent() else {
+        return Ok(());
+    };
+
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(destination_root.join(parent))
+}
+
+fn prepare_resume_large_file(
+    file_id: usize,
+    entry: &ManifestEntry,
+    final_path: &Path,
+    temporary_path: &Path,
+    transfer_plan: &TransferPlan,
+    completed_stripes: &BTreeSet<ResumeStripe>,
+) -> io::Result<()> {
+    let final_exists = final_path.try_exists()?;
+
+    let temporary_exists = temporary_path.try_exists()?;
+
+    match (final_exists, temporary_exists) {
+        (false, true) => {
+            validate_resume_file(temporary_path, entry.file_size, "partial large file")
+        }
+
+        (true, false) => {
+            if !all_file_stripes_completed(file_id, transfer_plan, completed_stripes)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "final large file exists but its resume journal is incomplete: {}",
+                        final_path.display()
+                    ),
+                ));
+            }
+
+            validate_resume_file(final_path, entry.file_size, "finalized large file")
+        }
+
+        (true, true) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "both final and temporary large files exist during resume: {}",
+                final_path.display()
+            ),
+        )),
+
+        (false, false) => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "resume journal exists but the large partial file is missing: {}",
+                temporary_path.display()
+            ),
+        )),
+    }
+}
+
+fn all_file_stripes_completed(
+    file_id: usize,
+    transfer_plan: &TransferPlan,
+    completed_stripes: &BTreeSet<ResumeStripe>,
+) -> io::Result<bool> {
+    let mut found_stripe = false;
+
+    for task in transfer_plan.lanes.iter().flatten() {
+        let TransferTask::Stripe {
+            file_id: task_file_id,
+            offset,
+            length,
+        } = task
+        else {
+            continue;
+        };
+
+        if *task_file_id != file_id {
+            continue;
+        }
+
+        found_stripe = true;
+
+        let stripe = ResumeStripe::new(*task_file_id, *offset, *length)?;
+
+        if !completed_stripes.contains(&stripe) {
+            return Ok(false);
+        }
+    }
+
+    Ok(found_stripe)
+}
+
+fn validate_resume_file(path: &Path, expected_size: u64, description: &str) -> io::Result<()> {
+    let metadata = fs::metadata(path)?;
+
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description} is not a regular file: {}", path.display()),
+        ));
+    }
+
+    let actual_size = metadata.len();
+
+    if actual_size != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{description} has {actual_size} bytes, expected {expected_size}: {}",
+                path.display()
+            ),
+        ));
+    }
+
     Ok(())
+}
+
+fn remove_file_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+
+        Err(error) => Err(error),
+    }
 }
 
 fn build_transfer_plan(
@@ -1630,20 +1815,41 @@ fn finalize_large_files(destination_root: &Path, manifest: &[ManifestEntry]) -> 
 
         let temporary_path = temporary_path(&final_path, file_id);
 
-        let actual_size = fs::metadata(&temporary_path)?.len();
+        let final_exists = final_path.try_exists()?;
 
-        if actual_size != entry.file_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "striped destination has {actual_size} bytes, expected {}: {}",
-                    entry.file_size,
-                    final_path.display()
-                ),
-            ));
+        let temporary_exists = temporary_path.try_exists()?;
+
+        match (final_exists, temporary_exists) {
+            (false, true) => {
+                validate_resume_file(&temporary_path, entry.file_size, "striped temporary file")?;
+
+                fs::rename(temporary_path, final_path)?;
+            }
+
+            (true, false) => {
+                validate_resume_file(&final_path, entry.file_size, "finalized striped file")?;
+            }
+
+            (true, true) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "both final and temporary striped files exist: {}",
+                        final_path.display()
+                    ),
+                ));
+            }
+
+            (false, false) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "striped temporary file is missing: {}",
+                        temporary_path.display()
+                    ),
+                ));
+            }
         }
-
-        fs::rename(temporary_path, final_path)?;
     }
 
     Ok(())
@@ -2118,16 +2324,16 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 mod tests {
     use super::{
         ReceiverReady, TINY_PACK_TARGET_BYTES, TransferTask, apply_resume_offer,
-        build_transfer_plan, copy_exact_hashed, read_receiver_ready, run, validate_resume_offer,
-        verify_content_digest, write_receiver_ready,
+        build_transfer_plan, copy_exact_hashed, read_receiver_ready, run, temporary_path,
+        validate_resume_offer, verify_content_digest, write_receiver_ready,
     };
-    use crate::control_plane::ManifestSummary;
-    use crate::manifest_scan::{FileClass, ManifestEntry};
-    use crate::resume_state::{JOURNAL_FILE_NAME, ResumeStripe};
+    use crate::control_plane::{self, ManifestSummary};
+    use crate::manifest_scan::{self, FileClass, ManifestEntry};
+    use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
     use std::collections::BTreeSet;
     use std::env;
     use std::fs;
-    use std::io::{self, Cursor};
+    use std::io::{self, Cursor, Write};
     use std::path::PathBuf;
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2380,6 +2586,136 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         assert!(error.to_string().contains("unplanned completed stripe",));
+    }
+
+    #[test]
+    fn loopback_session_resumes_verified_stripe() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let parent = env::temp_dir().join(format!(
+            "networkcopy-resume-loopback-{}-{unique}",
+            process::id()
+        ));
+
+        let source = parent.join("source");
+
+        let destination = parent.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        let mut large_contents = vec![0_u8; 64 * 1024 * 1024 + 137];
+
+        let mut state = 0x1234_5678_u32;
+
+        for byte in &mut large_contents {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+
+            *byte = state as u8;
+        }
+
+        fs::write(source.join("large.bin"), &large_contents).unwrap();
+
+        let medium_contents = vec![0xA5_u8; 300 * 1024];
+
+        fs::write(source.join("medium.bin"), &medium_contents).unwrap();
+
+        let scan = manifest_scan::run(&source, 2).unwrap();
+
+        let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+
+        let large_file_id = scan
+            .manifest
+            .iter()
+            .position(|entry| entry.relative_path == PathBuf::from("large.bin"))
+            .unwrap();
+
+        let transfer_plan = build_transfer_plan(&scan.manifest, 2).unwrap();
+
+        let (stripe_offset, stripe_length) = transfer_plan
+            .lanes
+            .iter()
+            .flatten()
+            .find_map(|task| {
+                let TransferTask::Stripe {
+                    file_id,
+                    offset,
+                    length,
+                } = task
+                else {
+                    return None;
+                };
+
+                if *file_id == large_file_id && *offset == 0 {
+                    Some((*offset, *length))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+
+        assert_eq!(stripe_offset, 0);
+
+        fs::create_dir_all(&destination).unwrap();
+
+        fs::write(destination.join("medium.bin"), b"stale previous copy").unwrap();
+
+        let large_final = destination.join("large.bin");
+
+        let large_temporary = temporary_path(&large_final, large_file_id);
+
+        let mut partial = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&large_temporary)
+            .unwrap();
+
+        partial.set_len(large_contents.len() as u64).unwrap();
+
+        partial
+            .write_all(&large_contents[..stripe_length as usize])
+            .unwrap();
+
+        partial.sync_all().unwrap();
+        drop(partial);
+
+        let mut journal = ResumeJournal::new(summary.fingerprint, 2).unwrap();
+
+        journal.mark_completed(
+            ResumeStripe::new(large_file_id, stripe_offset, stripe_length).unwrap(),
+        );
+
+        journal.save_atomic(&destination).unwrap();
+
+        let report = run(&source, &destination, 2, 2).unwrap();
+
+        assert_eq!(report.files_copied, 2);
+
+        assert_eq!(report.resumed_stripes, 1);
+
+        assert_eq!(report.resumed_bytes, stripe_length);
+
+        assert!(report.data_wire_bytes < report.bytes_copied);
+
+        assert_eq!(
+            fs::read(destination.join("large.bin",),).unwrap(),
+            large_contents
+        );
+
+        assert_eq!(
+            fs::read(destination.join("medium.bin",),).unwrap(),
+            medium_contents
+        );
+
+        assert!(!destination.join(JOURNAL_FILE_NAME).exists());
+
+        assert!(!large_temporary.exists());
+
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
