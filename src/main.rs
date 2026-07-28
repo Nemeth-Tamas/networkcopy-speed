@@ -10,6 +10,7 @@ mod direct_discovery;
 mod direct_link;
 mod direct_route;
 mod direct_tcp;
+mod direct_transfer;
 mod file_metadata;
 mod iocp_copy;
 mod iocp_file_probe;
@@ -88,6 +89,10 @@ fn run() -> Result<(), Box<dyn Error>> {
 
         "direct-tcp-send" => run_direct_tcp_send(&mut arguments),
 
+        "direct-receive" => run_direct_receive(&mut arguments),
+
+        "direct-send" => run_direct_send(&mut arguments),
+
         "version" | "--version" | "-V" => {
             println!("NetworkCopy Speed Edition {}", env!("CARGO_PKG_VERSION"));
 
@@ -104,6 +109,74 @@ fn run() -> Result<(), Box<dyn Error>> {
         )
         .into()),
     }
+}
+
+fn run_direct_receive(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let destination_root =
+        PathBuf::from(required_argument(arguments, "destination root directory")?);
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy(),),
+        )
+        .into());
+    }
+
+    let firewall_address = SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::UNSPECIFIED,
+        direct_address::DIRECT_TRANSFER_PORT,
+        0,
+        0,
+    ));
+
+    windows_setup::prepare_receiver(firewall_address)?;
+
+    windows_setup::prepare_discovery_receiver(direct_discovery::DISCOVERY_PORT)?;
+
+    let report = direct_transfer::receive_once(&destination_root)?;
+
+    report.print();
+
+    Ok(())
+}
+
+fn run_direct_send(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), Box<dyn Error>> {
+    let source_root = PathBuf::from(required_argument(arguments, "source root directory")?);
+
+    let worker_count = match arguments.next() {
+        Some(value) => parse_buffer_count(&value)?,
+
+        None => manifest_scan::default_worker_count(),
+    };
+
+    let calibration_mib = match arguments.next() {
+        Some(value) => parse_u64_count(&value, "calibration MiB")?,
+
+        None => calibrated_transfer::DEFAULT_CALIBRATION_MIB,
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy(),),
+        )
+        .into());
+    }
+
+    manifest_scan::validate_worker_count(worker_count)?;
+
+    let calibration_bytes = network_calibration::bytes_from_mib(calibration_mib)?;
+
+    println!("Direct-link calibration payload: {calibration_mib} MiB per matrix run");
+
+    let report = direct_transfer::send(&source_root, worker_count, calibration_bytes)?;
+
+    report.print();
+
+    Ok(())
 }
 
 fn run_direct_tcp_receive(
@@ -1152,6 +1225,8 @@ fn print_usage(program: &OsStr) {
     println!("  {program} direct-discovery-send-auto");
     println!("  {program} direct-tcp-receive");
     println!("  {program} direct-tcp-send");
+    println!("  {program} direct-receive <destination-root>");
+    println!("  {program} direct-send <source-root> [workers] [calibration-mib]");
     println!("  {program} receive-auto <bind-address> <destination-root>");
     println!("  {program} send-auto <receiver-address> <source-root> [workers] [calibration-mib]");
     println!("  {program} bench-network-matrix-receive <bind-address>");

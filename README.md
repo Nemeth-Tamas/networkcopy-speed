@@ -882,9 +882,9 @@ Planned after the first real-network release:
 * [x] Prefer IPv6 link-local addressing
 * [x] Handle IPv6 scope identifiers correctly
 * [ ] Fall back to direct-link IPv4
-* [ ] Bind every control and data socket to the selected interface
-* [ ] Validate the chosen TCP path
-* [ ] Calibrate the direct cable
+* [ ] Bind every control and data socket explicitly to the selected interface
+* [x] Validate the chosen TCP path
+* [ ] Run automatic calibration and folder transfer over the selected direct path
 * [ ] Recover cleanly if the link disappears
 
 The intended use case is a direct copper cable between two Windows computers, with no router or switch required.
