@@ -857,7 +857,7 @@ Planned work:
 * [x] Reach at least 85–90% of the measured path capacity
 * [x] Require elevation and automatically manage the Windows Firewall rule
 * [x] Live chunk-level console progress for automatic calibration and transfers
-* [ ] Standalone release binaries
+* [x] Standalone release binaries
 * [x] End-to-end two-machine acceptance test
 
 ## Milestone 9 — Direct Link Mode
