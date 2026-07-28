@@ -1312,7 +1312,7 @@ fn send_tiny_pack(
 
         validate_source_metadata(&file, &path, entry)?;
 
-        write_digest(writer, &digest)
+        write_digest(writer, &digest)?;
     }
 
     Ok(summary)
