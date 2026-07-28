@@ -16,9 +16,12 @@ const MESSAGE_FILE: u8 = 0x31;
 const MESSAGE_STREAM_END: u8 = 0x32;
 const MESSAGE_TRANSFER_ACK: u8 = 0x33;
 const MESSAGE_FILE_STRIPE: u8 = 0x34;
+const MESSAGE_TINY_PACK: u8 = 0x35;
 
 const NETWORK_BUFFER_BYTES: usize = 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+const TINY_PACK_TARGET_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_TINY_PACK_FILES: usize = 4096;
 
 pub const DEFAULT_DATA_STREAMS: usize = 4;
 
@@ -29,6 +32,9 @@ pub struct MultistreamCopyReport {
     pub files_copied: u64,
     pub bytes_copied: u64,
     pub manifest_wire_bytes: u64,
+    pub tiny_pack_count: u64,
+    pub tiny_files_packed: u64,
+    pub tiny_bytes_packed: u64,
     pub scan_elapsed: Duration,
     pub connection_elapsed: Duration,
     pub manifest_elapsed: Duration,
@@ -52,6 +58,15 @@ impl MultistreamCopyReport {
         println!(
             "  Manifest wire size:   {} bytes",
             format_bytes(self.manifest_wire_bytes)
+        );
+        println!(
+            "  Tiny packs:           {}",
+            format_bytes(self.tiny_pack_count)
+        );
+        println!(
+            "  Packed tiny files:    {} / {} bytes",
+            format_bytes(self.tiny_files_packed),
+            format_bytes(self.tiny_bytes_packed)
         );
         println!(
             "  Scan time:            {:.6} s",
@@ -93,10 +108,14 @@ struct LaneReport {
     bytes_copied: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum TransferTask {
     WholeFile {
         file_id: usize,
+    },
+    TinyPack {
+        file_ids: Vec<usize>,
+        total_bytes: u64,
     },
     Stripe {
         file_id: usize,
@@ -108,6 +127,19 @@ enum TransferTask {
 #[derive(Debug)]
 struct TransferPlan {
     lanes: Vec<Vec<TransferTask>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TransferPlanStats {
+    tiny_pack_count: u64,
+    tiny_files_packed: u64,
+    tiny_bytes_packed: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TinyPackSummary {
+    files: u64,
+    bytes: u64,
 }
 
 pub fn run(
@@ -200,6 +232,8 @@ pub fn run(
 
     let transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
 
+    let plan_stats = summarize_transfer_plan(&transfer_plan)?;
+
     let data_started = Instant::now();
     let source_root = Arc::new(source_root);
 
@@ -260,6 +294,9 @@ pub fn run(
         files_copied: transfer_ack.files_copied,
         bytes_copied: transfer_ack.bytes_copied,
         manifest_wire_bytes,
+        tiny_pack_count: plan_stats.tiny_pack_count,
+        tiny_files_packed: plan_stats.tiny_files_packed,
+        tiny_bytes_packed: plan_stats.tiny_bytes_packed,
         scan_elapsed,
         connection_elapsed,
         manifest_elapsed,
@@ -467,44 +504,47 @@ fn build_transfer_plan(
 
     let mut assigned_bytes = vec![0_u64; data_stream_count];
 
-    let mut whole_file_ids = Vec::new();
+    let mut medium_file_ids = Vec::new();
+    let mut tiny_file_ids = Vec::new();
 
     for (file_id, entry) in manifest.iter().enumerate() {
-        if entry.class != FileClass::Large {
-            whole_file_ids.push(file_id);
-            continue;
-        }
+        match entry.class {
+            FileClass::Large => {
+                for lane_id in 0..data_stream_count {
+                    let (offset, length) =
+                        striped_file::stripe_range(entry.file_size, lane_id, data_stream_count)?;
 
-        for lane_id in 0..data_stream_count {
-            let (offset, length) =
-                striped_file::stripe_range(entry.file_size, lane_id, data_stream_count)?;
+                    if length == 0 {
+                        continue;
+                    }
 
-            if length == 0 {
-                continue;
+                    lanes[lane_id].push(TransferTask::Stripe {
+                        file_id,
+                        offset,
+                        length,
+                    });
+
+                    assigned_bytes[lane_id] = assigned_bytes[lane_id]
+                        .checked_add(length)
+                        .ok_or_else(|| io::Error::other("striped lane size overflowed"))?;
+                }
             }
 
-            lanes[lane_id].push(TransferTask::Stripe {
-                file_id,
-                offset,
-                length,
-            });
+            FileClass::Medium => {
+                medium_file_ids.push(file_id);
+            }
 
-            assigned_bytes[lane_id] = assigned_bytes[lane_id]
-                .checked_add(length)
-                .ok_or_else(|| io::Error::other("striped lane size overflowed"))?;
+            FileClass::Tiny => {
+                tiny_file_ids.push(file_id);
+            }
         }
     }
 
-    whole_file_ids
+    medium_file_ids
         .sort_unstable_by(|left, right| manifest[*right].file_size.cmp(&manifest[*left].file_size));
 
-    for file_id in whole_file_ids {
-        let lane = assigned_bytes
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, bytes)| **bytes)
-            .map(|(lane, _)| lane)
-            .ok_or_else(|| io::Error::other("no TCP data lanes are available"))?;
+    for file_id in medium_file_ids {
+        let lane = least_loaded_lane(&lanes, &assigned_bytes)?;
 
         lanes[lane].push(TransferTask::WholeFile { file_id });
 
@@ -513,7 +553,115 @@ fn build_transfer_plan(
             .ok_or_else(|| io::Error::other("data-lane assignment size overflowed"))?;
     }
 
+    for (file_ids, total_bytes) in build_tiny_packs(manifest, tiny_file_ids)? {
+        let lane = least_loaded_lane(&lanes, &assigned_bytes)?;
+
+        lanes[lane].push(TransferTask::TinyPack {
+            file_ids,
+            total_bytes,
+        });
+
+        assigned_bytes[lane] = assigned_bytes[lane]
+            .checked_add(total_bytes)
+            .ok_or_else(|| io::Error::other("tiny-pack lane size overflowed"))?;
+    }
+
     Ok(TransferPlan { lanes })
+}
+
+fn least_loaded_lane(lanes: &[Vec<TransferTask>], assigned_bytes: &[u64]) -> io::Result<usize> {
+    assigned_bytes
+        .iter()
+        .enumerate()
+        .min_by_key(|(lane, bytes)| (**bytes, lanes[*lane].len()))
+        .map(|(lane, _)| lane)
+        .ok_or_else(|| io::Error::other("no TCP data lanes are available"))
+}
+
+fn build_tiny_packs(
+    manifest: &[ManifestEntry],
+    tiny_file_ids: Vec<usize>,
+) -> io::Result<Vec<(Vec<usize>, u64)>> {
+    let mut packs = Vec::new();
+    let mut current_file_ids = Vec::new();
+    let mut current_bytes = 0_u64;
+
+    for file_id in tiny_file_ids {
+        let entry = manifest.get(file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tiny-pack planner received an invalid file ID",
+            )
+        })?;
+
+        if entry.class != FileClass::Tiny {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tiny-pack planner received a non-tiny file",
+            ));
+        }
+
+        let candidate_bytes = current_bytes
+            .checked_add(entry.file_size)
+            .ok_or_else(|| io::Error::other("tiny-pack byte count overflowed"))?;
+
+        let exceeds_target =
+            !current_file_ids.is_empty() && candidate_bytes > TINY_PACK_TARGET_BYTES;
+
+        let exceeds_file_limit = current_file_ids.len() >= MAX_TINY_PACK_FILES;
+
+        if exceeds_target || exceeds_file_limit {
+            packs.push((std::mem::take(&mut current_file_ids), current_bytes));
+
+            current_bytes = 0;
+        }
+
+        current_bytes = current_bytes
+            .checked_add(entry.file_size)
+            .ok_or_else(|| io::Error::other("tiny-pack byte count overflowed"))?;
+
+        current_file_ids.push(file_id);
+    }
+
+    if !current_file_ids.is_empty() {
+        packs.push((current_file_ids, current_bytes));
+    }
+
+    Ok(packs)
+}
+
+fn summarize_transfer_plan(transfer_plan: &TransferPlan) -> io::Result<TransferPlanStats> {
+    let mut stats = TransferPlanStats::default();
+
+    for task in transfer_plan.lanes.iter().flatten() {
+        let TransferTask::TinyPack {
+            file_ids,
+            total_bytes,
+        } = task
+        else {
+            continue;
+        };
+
+        stats.tiny_pack_count = stats
+            .tiny_pack_count
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("tiny-pack count overflowed"))?;
+
+        stats.tiny_files_packed = stats
+            .tiny_files_packed
+            .checked_add(
+                u64::try_from(file_ids.len())
+                    .map_err(|_| io::Error::other("tiny-pack file count cannot be represented"))?,
+            )
+            .ok_or_else(|| io::Error::other("packed tiny-file count overflowed"))?;
+
+        stats.tiny_bytes_packed = stats
+            .tiny_bytes_packed
+            .checked_add(*total_bytes)
+            .ok_or_else(|| io::Error::other("packed tiny-file byte count overflowed"))?;
+    }
+
+    Ok(stats)
 }
 
 fn send_lane(
@@ -527,9 +675,11 @@ fn send_lane(
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     let mut report = LaneReport::default();
 
-    for &task in tasks {
+    for task in tasks {
         match task {
             TransferTask::WholeFile { file_id } => {
+                let file_id = *file_id;
+
                 let entry = manifest.get(file_id).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -539,15 +689,23 @@ fn send_lane(
 
                 send_whole_file(&mut writer, source_root, file_id, entry, &mut buffer)?;
 
-                report.files_copied = report
-                    .files_copied
-                    .checked_add(1)
-                    .ok_or_else(|| io::Error::other("sender file count overflowed"))?;
+                add_lane_counts(&mut report, 1, entry.file_size, "sender")?;
+            }
 
-                report.bytes_copied = report
-                    .bytes_copied
-                    .checked_add(entry.file_size)
-                    .ok_or_else(|| io::Error::other("sender byte count overflowed"))?;
+            TransferTask::TinyPack {
+                file_ids,
+                total_bytes,
+            } => {
+                let summary = send_tiny_pack(
+                    &mut writer,
+                    source_root,
+                    manifest,
+                    file_ids,
+                    *total_bytes,
+                    &mut buffer,
+                )?;
+
+                add_lane_counts(&mut report, summary.files, summary.bytes, "sender")?;
             }
 
             TransferTask::Stripe {
@@ -555,6 +713,10 @@ fn send_lane(
                 offset,
                 length,
             } => {
+                let file_id = *file_id;
+                let offset = *offset;
+                let length = *length;
+
                 let entry = manifest.get(file_id).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -572,17 +734,9 @@ fn send_lane(
                     &mut buffer,
                 )?;
 
-                if offset == 0 {
-                    report.files_copied = report
-                        .files_copied
-                        .checked_add(1)
-                        .ok_or_else(|| io::Error::other("sender file count overflowed"))?;
-                }
+                let completed_files = u64::from(offset == 0);
 
-                report.bytes_copied = report
-                    .bytes_copied
-                    .checked_add(length)
-                    .ok_or_else(|| io::Error::other("sender byte count overflowed"))?;
+                add_lane_counts(&mut report, completed_files, length, "sender")?;
             }
         }
     }
@@ -591,6 +745,135 @@ fn send_lane(
     writer.flush()?;
 
     Ok(report)
+}
+
+fn add_lane_counts(report: &mut LaneReport, files: u64, bytes: u64, side: &str) -> io::Result<()> {
+    report.files_copied = report
+        .files_copied
+        .checked_add(files)
+        .ok_or_else(|| io::Error::other(format!("{side} file count overflowed")))?;
+
+    report.bytes_copied = report
+        .bytes_copied
+        .checked_add(bytes)
+        .ok_or_else(|| io::Error::other(format!("{side} byte count overflowed")))?;
+
+    Ok(())
+}
+
+fn send_tiny_pack(
+    writer: &mut impl Write,
+    source_root: &Path,
+    manifest: &[ManifestEntry],
+    file_ids: &[usize],
+    expected_total_bytes: u64,
+    buffer: &mut [u8],
+) -> io::Result<TinyPackSummary> {
+    let summary = summarize_tiny_pack(manifest, file_ids)?;
+
+    if summary.bytes != expected_total_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tiny-pack plan byte count changed",
+        ));
+    }
+
+    write_u8(writer, MESSAGE_TINY_PACK)?;
+
+    write_u32(
+        writer,
+        u32::try_from(file_ids.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tiny pack contains too many files",
+            )
+        })?,
+    )?;
+
+    write_u64(writer, summary.bytes)?;
+
+    for &file_id in file_ids {
+        let entry = manifest.get(file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tiny pack contains an invalid file ID",
+            )
+        })?;
+
+        write_u64(
+            writer,
+            u64::try_from(file_id).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "tiny-pack file ID cannot be represented",
+                )
+            })?,
+        )?;
+
+        write_u64(writer, entry.file_size)?;
+    }
+
+    for &file_id in file_ids {
+        let entry = manifest.get(file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tiny pack contains an invalid file ID",
+            )
+        })?;
+
+        let path = source_root.join(&entry.relative_path);
+
+        let mut file = File::open(&path)?;
+
+        validate_source_size(&file, &path, entry)?;
+
+        copy_exact(&mut file, writer, entry.file_size, buffer)?;
+    }
+
+    Ok(summary)
+}
+
+fn summarize_tiny_pack(
+    manifest: &[ManifestEntry],
+    file_ids: &[usize],
+) -> io::Result<TinyPackSummary> {
+    if file_ids.is_empty() || file_ids.len() > MAX_TINY_PACK_FILES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "tiny pack must contain between 1 and {} files",
+                MAX_TINY_PACK_FILES
+            ),
+        ));
+    }
+
+    let mut bytes = 0_u64;
+
+    for &file_id in file_ids {
+        let entry = manifest.get(file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tiny pack contains an invalid file ID",
+            )
+        })?;
+
+        if entry.class != FileClass::Tiny {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tiny pack contains a non-tiny file",
+            ));
+        }
+
+        bytes = bytes
+            .checked_add(entry.file_size)
+            .ok_or_else(|| io::Error::other("tiny-pack byte count overflowed"))?;
+    }
+
+    Ok(TinyPackSummary {
+        files: u64::try_from(file_ids.len())
+            .map_err(|_| io::Error::other("tiny-pack file count cannot be represented"))?,
+        bytes,
+    })
 }
 
 fn send_whole_file(
@@ -688,9 +971,10 @@ fn receive_lane(
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
     let mut report = LaneReport::default();
 
-    for &task in tasks {
+    for task in tasks {
         match task {
             TransferTask::WholeFile { file_id } => {
+                let file_id = *file_id;
                 let message = read_u8(&mut reader)?;
 
                 if message != MESSAGE_FILE {
@@ -731,15 +1015,23 @@ fn receive_lane(
 
                 receive_file(&mut reader, destination_root, file_id, entry, &mut buffer)?;
 
-                report.files_copied = report
-                    .files_copied
-                    .checked_add(1)
-                    .ok_or_else(|| io::Error::other("receiver file count overflowed"))?;
+                add_lane_counts(&mut report, 1, entry.file_size, "receiver")?;
+            }
 
-                report.bytes_copied = report
-                    .bytes_copied
-                    .checked_add(entry.file_size)
-                    .ok_or_else(|| io::Error::other("receiver byte count overflowed"))?;
+            TransferTask::TinyPack {
+                file_ids,
+                total_bytes,
+            } => {
+                let summary = receive_tiny_pack(
+                    &mut reader,
+                    destination_root,
+                    manifest,
+                    file_ids,
+                    *total_bytes,
+                    &mut buffer,
+                )?;
+
+                add_lane_counts(&mut report, summary.files, summary.bytes, "receiver")?;
             }
 
             TransferTask::Stripe {
@@ -747,6 +1039,10 @@ fn receive_lane(
                 offset,
                 length,
             } => {
+                let file_id = *file_id;
+                let offset = *offset;
+                let length = *length;
+
                 let message = read_u8(&mut reader)?;
 
                 if message != MESSAGE_FILE_STRIPE {
@@ -792,17 +1088,9 @@ fn receive_lane(
                     &mut buffer,
                 )?;
 
-                if offset == 0 {
-                    report.files_copied = report
-                        .files_copied
-                        .checked_add(1)
-                        .ok_or_else(|| io::Error::other("receiver file count overflowed"))?;
-                }
+                let completed_files = u64::from(offset == 0);
 
-                report.bytes_copied = report
-                    .bytes_copied
-                    .checked_add(length)
-                    .ok_or_else(|| io::Error::other("receiver byte count overflowed"))?;
+                add_lane_counts(&mut report, completed_files, length, "receiver")?;
             }
         }
     }
@@ -817,6 +1105,101 @@ fn receive_lane(
     }
 
     Ok(report)
+}
+
+fn receive_tiny_pack(
+    reader: &mut impl Read,
+    destination_root: &Path,
+    manifest: &[ManifestEntry],
+    file_ids: &[usize],
+    expected_total_bytes: u64,
+    buffer: &mut [u8],
+) -> io::Result<TinyPackSummary> {
+    let message = read_u8(reader)?;
+
+    if message != MESSAGE_TINY_PACK {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected tiny-pack message, received 0x{message:02X}"),
+        ));
+    }
+
+    let announced_file_count = usize::try_from(read_u32(reader)?).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tiny-pack file count cannot be represented",
+        )
+    })?;
+
+    let announced_total_bytes = read_u64(reader)?;
+
+    let summary = summarize_tiny_pack(manifest, file_ids)?;
+
+    if summary.bytes != expected_total_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "receiver tiny-pack plan byte count changed",
+        ));
+    }
+
+    if announced_file_count != file_ids.len() || announced_total_bytes != summary.bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "tiny pack announced {announced_file_count} files and \
+                 {announced_total_bytes} bytes, expected {} files and {} bytes",
+                file_ids.len(),
+                summary.bytes
+            ),
+        ));
+    }
+
+    for &expected_file_id in file_ids {
+        let announced_file_id = read_file_id(reader)?;
+
+        let announced_size = read_u64(reader)?;
+
+        if announced_file_id != expected_file_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "tiny pack announced file ID {announced_file_id}, expected \
+                     {expected_file_id}"
+                ),
+            ));
+        }
+
+        let entry = manifest.get(expected_file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tiny pack referenced an unknown file",
+            )
+        })?;
+
+        if announced_size != entry.file_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "tiny file {expected_file_id} announced {announced_size} bytes, \
+                     expected {}",
+                    entry.file_size
+                ),
+            ));
+        }
+    }
+
+    for &file_id in file_ids {
+        let entry = manifest.get(file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tiny pack referenced an unknown file",
+            )
+        })?;
+
+        receive_file(reader, destination_root, file_id, entry, buffer)?;
+    }
+
+    Ok(summary)
 }
 
 fn receive_file_stripe(
@@ -1094,6 +1477,10 @@ fn write_u8(writer: &mut impl Write, value: u8) -> io::Result<()> {
     writer.write_all(&[value])
 }
 
+fn write_u32(writer: &mut impl Write, value: u32) -> io::Result<()> {
+    writer.write_all(&value.to_be_bytes())
+}
+
 fn write_u64(writer: &mut impl Write, value: u64) -> io::Result<()> {
     writer.write_all(&value.to_be_bytes())
 }
@@ -1102,6 +1489,12 @@ fn read_u8(reader: &mut impl Read) -> io::Result<u8> {
     let mut value = [0_u8; 1];
     reader.read_exact(&mut value)?;
     Ok(value[0])
+}
+
+fn read_u32(reader: &mut impl Read) -> io::Result<u32> {
+    let mut value = [0_u8; 4];
+    reader.read_exact(&mut value)?;
+    Ok(u32::from_be_bytes(value))
 }
 
 fn read_file_id(reader: &mut impl Read) -> io::Result<usize> {
@@ -1119,7 +1512,7 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TransferTask, build_transfer_plan, run};
+    use super::{TINY_PACK_TARGET_BYTES, TransferTask, build_transfer_plan, run};
     use crate::manifest_scan::{FileClass, ManifestEntry};
     use std::env;
     use std::fs;
@@ -1128,10 +1521,12 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn scheduler_stripes_large_files_between_all_lanes() {
+    fn scheduler_stripes_large_files_and_packs_tiny_files() {
         let manifest = vec![
             entry("large.bin", 1_000, FileClass::Large),
-            entry("small.bin", 20, FileClass::Tiny),
+            entry("medium.bin", 500_000, FileClass::Medium),
+            entry("tiny-a.bin", 10, FileClass::Tiny),
+            entry("tiny-b.bin", 20, FileClass::Tiny),
         ];
 
         let plan = build_transfer_plan(&manifest, 2).unwrap();
@@ -1141,21 +1536,35 @@ mod tests {
         let mut stripe_count = 0_usize;
         let mut stripe_bytes = 0_u64;
         let mut whole_file_count = 0_usize;
+        let mut tiny_pack_count = 0_usize;
+        let mut tiny_file_count = 0_usize;
 
         for lane in &plan.lanes {
             for task in lane {
-                match *task {
+                match task {
                     TransferTask::Stripe {
                         file_id, length, ..
                     } => {
-                        assert_eq!(file_id, 0);
+                        assert_eq!(*file_id, 0);
                         stripe_count += 1;
-                        stripe_bytes += length;
+                        stripe_bytes += *length;
                     }
 
                     TransferTask::WholeFile { file_id } => {
-                        assert_eq!(file_id, 1);
+                        assert_eq!(*file_id, 1);
                         whole_file_count += 1;
+                    }
+
+                    TransferTask::TinyPack {
+                        file_ids,
+                        total_bytes,
+                    } => {
+                        assert_eq!(file_ids.as_slice(), &[2, 3]);
+
+                        assert_eq!(*total_bytes, 30);
+
+                        tiny_pack_count += 1;
+                        tiny_file_count += file_ids.len();
                     }
                 }
             }
@@ -1164,6 +1573,46 @@ mod tests {
         assert_eq!(stripe_count, 2);
         assert_eq!(stripe_bytes, 1_000);
         assert_eq!(whole_file_count, 1);
+        assert_eq!(tiny_pack_count, 1);
+        assert_eq!(tiny_file_count, 2);
+    }
+
+    #[test]
+    fn tiny_packs_respect_the_payload_target() {
+        let tiny_file_size = TINY_PACK_TARGET_BYTES / 32;
+
+        let manifest: Vec<ManifestEntry> = (0..33)
+            .map(|index| {
+                entry(
+                    &format!("tiny-{index}.bin"),
+                    tiny_file_size,
+                    FileClass::Tiny,
+                )
+            })
+            .collect();
+
+        let plan = build_transfer_plan(&manifest, 2).unwrap();
+
+        let mut pack_payloads = Vec::new();
+        let mut packed_files = 0_usize;
+
+        for lane in &plan.lanes {
+            for task in lane {
+                if let TransferTask::TinyPack {
+                    file_ids,
+                    total_bytes,
+                } = task
+                {
+                    pack_payloads.push(*total_bytes);
+                    packed_files += file_ids.len();
+                }
+            }
+        }
+
+        pack_payloads.sort_unstable();
+
+        assert_eq!(packed_files, 33);
+        assert_eq!(pack_payloads, vec![tiny_file_size, TINY_PACK_TARGET_BYTES,]);
     }
 
     #[test]
