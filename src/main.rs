@@ -10,6 +10,7 @@ mod manifest_scan;
 mod multistream_copy;
 mod pipeline_bench;
 mod striped_file;
+mod transfer_memory;
 
 use std::env;
 use std::error::Error;

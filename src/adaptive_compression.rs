@@ -11,7 +11,7 @@ const DIGEST_BYTES: usize = 32;
 
 pub(crate) const COMPRESSION_CHUNK_BYTES: usize = 1024 * 1024;
 
-const MAX_COMPRESSED_CHUNK_BYTES: usize = COMPRESSION_CHUNK_BYTES * 2;
+pub(crate) const MAX_COMPRESSED_CHUNK_BYTES: usize = COMPRESSION_CHUNK_BYTES * 2;
 
 pub(crate) struct PayloadEncoder {
     compressor: zstd::bulk::Compressor<'static>,
@@ -161,7 +161,7 @@ impl PayloadDecoder {
 
         Ok(Self {
             decompressor,
-            compressed_buffer: Vec::new(),
+            compressed_buffer: Vec::with_capacity(MAX_COMPRESSED_CHUNK_BYTES),
         })
     }
 

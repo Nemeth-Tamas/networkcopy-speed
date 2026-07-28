@@ -1,10 +1,11 @@
-use crate::adaptive_compression::{PayloadDecoder, PayloadEncoder};
+use crate::adaptive_compression::{MAX_COMPRESSED_CHUNK_BYTES, PayloadDecoder, PayloadEncoder};
 use crate::compression_probe;
 use crate::content_hash::{self, ContentHasher};
 use crate::control_plane::{self, ConnectionRole, Handshake, ManifestSummary};
 use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_second, format_bytes};
 use crate::manifest_scan::{self, FileClass, ManifestEntry};
 use crate::striped_file;
+use crate::transfer_memory;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -37,6 +38,10 @@ pub struct MultistreamCopyReport {
     pub bytes_copied: u64,
     pub data_wire_bytes: u64,
     pub compressed_records: u64,
+    pub buffer_bytes_per_lane: u64,
+    pub buffer_bytes_per_peer: u64,
+    pub loopback_buffer_bytes: u64,
+    pub transfer_buffer_budget_bytes: u64,
     pub manifest_wire_bytes: u64,
     pub tiny_pack_count: u64,
     pub tiny_files_packed: u64,
@@ -72,6 +77,21 @@ impl MultistreamCopyReport {
         println!(
             "  Wire savings:         {:.2}%",
             wire_savings_percent(self.bytes_copied, self.data_wire_bytes,)
+        );
+        println!(
+            "  Buffers per lane:     {} bytes",
+            format_bytes(self.buffer_bytes_per_lane)
+        );
+
+        println!(
+            "  Buffers per peer:     {} bytes",
+            format_bytes(self.buffer_bytes_per_peer)
+        );
+
+        println!(
+            "  Loopback buffers:     {} / {} bytes",
+            format_bytes(self.loopback_buffer_bytes),
+            format_bytes(self.transfer_buffer_budget_bytes,)
         );
         println!(
             "  Manifest wire size:   {} bytes",
@@ -188,6 +208,13 @@ pub fn run(
 ) -> io::Result<MultistreamCopyReport> {
     manifest_scan::validate_worker_count(worker_count)?;
     control_plane::validate_data_stream_count(data_stream_count)?;
+
+    let memory_plan = transfer_memory::plan_loopback(
+        data_stream_count,
+        NETWORK_BUFFER_BYTES as u64,
+        COPY_BUFFER_BYTES as u64,
+        MAX_COMPRESSED_CHUNK_BYTES as u64,
+    )?;
 
     if destination_root.exists() {
         return Err(io::Error::new(
@@ -337,6 +364,15 @@ pub fn run(
         bytes_copied: transfer_ack.bytes_copied,
         data_wire_bytes: transfer_ack.data_wire_bytes,
         compressed_records: transfer_ack.compressed_records,
+
+        buffer_bytes_per_lane: memory_plan.per_lane_per_peer_bytes,
+
+        buffer_bytes_per_peer: memory_plan.per_peer_bytes,
+
+        loopback_buffer_bytes: memory_plan.loopback_bytes,
+
+        transfer_buffer_budget_bytes: memory_plan.budget_bytes,
+
         manifest_wire_bytes,
         tiny_pack_count: plan_stats.tiny_pack_count,
         tiny_files_packed: plan_stats.tiny_files_packed,
@@ -1970,6 +2006,13 @@ mod tests {
         let report = transfer_result.unwrap();
 
         assert_eq!(report.files_copied, 4);
+
+        assert!(report.loopback_buffer_bytes <= report.transfer_buffer_budget_bytes);
+
+        assert_eq!(
+            report.buffer_bytes_per_peer * 2,
+            report.loopback_buffer_bytes
+        );
 
         assert!(report.compressed_records > 0);
 
