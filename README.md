@@ -818,6 +818,7 @@ networkcopy-speed send <receiver-address> <source> [workers] [data-streams]
 
 Planned work:
 
+* [x] Derive session identity and stream count from the control connection
 * [ ] Separate sender and receiver CLI commands
 * [ ] Bind the receiver to a configurable interface and port
 * [ ] Connect sender data lanes to a remote machine

@@ -285,6 +285,12 @@ struct StripeDescriptor {
     length: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AcceptedSession {
+    session_id: u64,
+    data_stream_count: usize,
+}
+
 pub fn run(
     source_root: &Path,
     destination_root: &Path,
@@ -334,15 +340,7 @@ fn run_with_fault(
 
     let server = thread::Builder::new()
         .name("networkcopy-transfer-server".to_string())
-        .spawn(move || {
-            run_server(
-                listener,
-                session_id,
-                data_stream_count,
-                server_destination,
-                fault_injection,
-            )
-        })?;
+        .spawn(move || run_server(listener, server_destination, fault_injection))?;
 
     let connection_started = Instant::now();
 
@@ -498,13 +496,12 @@ fn run_with_fault(
 
 fn run_server(
     listener: TcpListener,
-    session_id: u64,
-    data_stream_count: usize,
     destination_root: PathBuf,
     fault_injection: Arc<TransferFault>,
 ) -> io::Result<TransferAck> {
-    let (mut control_stream, data_streams) =
-        accept_session(listener, session_id, data_stream_count)?;
+    let (mut control_stream, data_streams, accepted_session) = accept_session(listener)?;
+
+    let data_stream_count = accepted_session.data_stream_count;
 
     let (manifest, summary, _) = control_plane::receive_manifest_entries(&mut control_stream)?;
 
@@ -596,87 +593,95 @@ fn run_server(
 
 fn accept_session(
     listener: TcpListener,
-    session_id: u64,
-    data_stream_count: usize,
-) -> io::Result<(TcpStream, Vec<TcpStream>)> {
-    let expected_connections = data_stream_count
-        .checked_add(1)
-        .ok_or_else(|| io::Error::other("connection count overflowed"))?;
+) -> io::Result<(TcpStream, Vec<TcpStream>, AcceptedSession)> {
+    let (mut control_stream, _control_peer) = listener.accept()?;
 
-    let mut control_stream = None;
+    control_plane::configure_stream(&control_stream)?;
+
+    let control_handshake = control_plane::read_handshake(&mut control_stream)?;
+
+    if control_handshake.role != ConnectionRole::Control {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "first session connection must be the control connection",
+        ));
+    }
+
+    if control_handshake.stream_id != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "control stream used a nonzero ID",
+        ));
+    }
+
+    let data_stream_count = usize::try_from(control_handshake.stream_count).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "control stream count cannot be represented",
+        )
+    })?;
+
+    control_plane::validate_data_stream_count(data_stream_count)?;
+
+    let accepted_session = AcceptedSession {
+        session_id: control_handshake.session_id,
+
+        data_stream_count,
+    };
 
     let mut data_streams: Vec<Option<TcpStream>> = std::iter::repeat_with(|| None)
         .take(data_stream_count)
         .collect();
 
-    for _ in 0..expected_connections {
-        let (mut stream, _) = listener.accept()?;
+    for _ in 0..data_stream_count {
+        let (mut stream, _data_peer) = listener.accept()?;
+
         control_plane::configure_stream(&stream)?;
 
         let handshake = control_plane::read_handshake(&mut stream)?;
 
-        if handshake.session_id != session_id {
+        if handshake.role != ConnectionRole::Data {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "additional session connection must be a data connection",
+            ));
+        }
+
+        if handshake.session_id != accepted_session.session_id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "connection used an incorrect session ID",
             ));
         }
 
-        if handshake.stream_count != data_stream_count as u32 {
+        if handshake.stream_count != control_handshake.stream_count {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "connection used an incorrect stream count",
             ));
         }
 
-        match handshake.role {
-            ConnectionRole::Control => {
-                if handshake.stream_id != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "control stream used a nonzero ID",
-                    ));
-                }
+        let stream_id = usize::try_from(handshake.stream_id).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "data stream ID cannot be represented",
+            )
+        })?;
 
-                if control_stream.replace(stream).is_some() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "duplicate control connection",
-                    ));
-                }
-            }
+        let slot = data_streams.get_mut(stream_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "data stream ID is outside the negotiated range",
+            )
+        })?;
 
-            ConnectionRole::Data => {
-                let stream_id = usize::try_from(handshake.stream_id).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "data stream ID cannot be represented",
-                    )
-                })?;
-
-                let slot = data_streams.get_mut(stream_id).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "data stream ID is outside the negotiated range",
-                    )
-                })?;
-
-                if slot.replace(stream).is_some() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "duplicate data stream ID",
-                    ));
-                }
-            }
+        if slot.replace(stream).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "duplicate data stream ID",
+            ));
         }
     }
-
-    let control_stream = control_stream.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotConnected,
-            "control connection was not established",
-        )
-    })?;
 
     let mut ordered_streams = Vec::with_capacity(data_stream_count);
 
@@ -689,7 +694,7 @@ fn accept_session(
         })?);
     }
 
-    Ok((control_stream, ordered_streams))
+    Ok((control_stream, ordered_streams, accepted_session))
 }
 
 fn prepare_destination(
@@ -2446,10 +2451,10 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReceiverReady, TINY_PACK_TARGET_BYTES, TransferFault, TransferTask, apply_resume_offer,
-        build_transfer_plan, copy_exact_hashed, read_receiver_ready, run, run_with_fault,
-        temporary_path, validate_resume_offer, validate_source_metadata, verify_content_digest,
-        write_receiver_ready,
+        ReceiverReady, TINY_PACK_TARGET_BYTES, TransferFault, TransferTask, accept_session,
+        apply_resume_offer, build_transfer_plan, copy_exact_hashed, read_receiver_ready, run,
+        run_with_fault, temporary_path, validate_resume_offer, validate_source_metadata,
+        verify_content_digest, write_receiver_ready,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::file_metadata;
@@ -2459,10 +2464,12 @@ mod tests {
     use std::env;
     use std::fs::{self, File};
     use std::io::{self, Cursor, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::process;
     use std::sync::Arc;
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
 
@@ -2591,6 +2598,85 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 
         assert!(error.to_string().contains("BLAKE3 verification failed"));
+    }
+
+    #[test]
+    fn receiver_derives_session_from_control_handshake() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+
+        let address = listener.local_addr().unwrap();
+
+        let session_id = 0x1234_5678_9ABC_DEF0;
+
+        let receiver = thread::spawn(move || accept_session(listener));
+
+        let mut control_stream = TcpStream::connect(address).unwrap();
+
+        control_plane::configure_stream(&control_stream).unwrap();
+
+        control_plane::write_handshake(
+            &mut control_stream,
+            control_plane::Handshake {
+                role: control_plane::ConnectionRole::Control,
+
+                session_id,
+
+                stream_id: 0,
+
+                stream_count: 2,
+            },
+        )
+        .unwrap();
+
+        let mut data_stream_one = TcpStream::connect(address).unwrap();
+
+        control_plane::configure_stream(&data_stream_one).unwrap();
+
+        control_plane::write_handshake(
+            &mut data_stream_one,
+            control_plane::Handshake {
+                role: control_plane::ConnectionRole::Data,
+
+                session_id,
+
+                stream_id: 1,
+
+                stream_count: 2,
+            },
+        )
+        .unwrap();
+
+        let mut data_stream_zero = TcpStream::connect(address).unwrap();
+
+        control_plane::configure_stream(&data_stream_zero).unwrap();
+
+        control_plane::write_handshake(
+            &mut data_stream_zero,
+            control_plane::Handshake {
+                role: control_plane::ConnectionRole::Data,
+
+                session_id,
+
+                stream_id: 0,
+
+                stream_count: 2,
+            },
+        )
+        .unwrap();
+
+        let (accepted_control, accepted_data, accepted_session) = receiver.join().unwrap().unwrap();
+
+        assert_eq!(accepted_session.session_id, session_id);
+
+        assert_eq!(accepted_session.data_stream_count, 2);
+
+        assert_eq!(accepted_data.len(), 2);
+
+        drop(accepted_control);
+        drop(accepted_data);
+        drop(control_stream);
+        drop(data_stream_zero);
+        drop(data_stream_one);
     }
 
     #[test]
