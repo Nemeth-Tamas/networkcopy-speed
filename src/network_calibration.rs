@@ -298,12 +298,6 @@ pub fn receive_matrix(listener: TcpListener) -> io::Result<NetworkCalibrationMat
     receive_matrix_internal(&listener, None)
 }
 
-pub(crate) fn receive_matrix_on_listener(
-    listener: &TcpListener,
-) -> io::Result<NetworkCalibrationMatrixReport> {
-    receive_matrix_internal(listener, None)
-}
-
 pub(crate) fn receive_matrix_on_listener_with_progress(
     listener: &TcpListener,
     progress: ProgressCounter,
@@ -357,10 +351,10 @@ fn receive_one(
 
     validate_config(config.total_bytes, config.data_stream_count)?;
 
-    if let Some(progress) = &progress {
-        if progress.total() == 0 {
-            prepare_matrix_progress(progress, config.total_bytes)?;
-        }
+    if let Some(progress) = &progress
+        && progress.total() == 0
+    {
+        prepare_matrix_progress(progress, config.total_bytes)?;
     }
 
     let mut data_streams: Vec<Option<TcpStream>> = std::iter::repeat_with(|| None)

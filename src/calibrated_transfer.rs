@@ -1,3 +1,4 @@
+use crate::console_progress::ConsoleProgress;
 use crate::copy_bench::{decimal_megabytes_per_second, format_bytes};
 use crate::multistream_copy::{self, MultistreamCopyReport, ReceiveReport};
 use crate::network_calibration::{self, NetworkCalibrationMatrixReport, NetworkCalibrationReport};
@@ -100,18 +101,35 @@ pub fn send(
     worker_count: usize,
     calibration_bytes: u64,
 ) -> io::Result<CalibratedSendReport> {
-    let calibration = network_calibration::send_matrix(receiver_address, calibration_bytes)?;
+    let calibration_progress = ConsoleProgress::start("Connecting calibration", 0)?;
+
+    let calibration = network_calibration::send_matrix_with_progress(
+        receiver_address,
+        calibration_bytes,
+        calibration_progress.counter(),
+    )?;
+
+    calibration_progress.finish()?;
+
+    println!();
 
     let data_stream_count = calibration.recommended.data_stream_count;
 
     let calibrated_report = calibration.recommended;
 
-    let transfer = multistream_copy::send(
+    let transfer_progress = ConsoleProgress::start("Scanning source", 0)?;
+
+    let transfer = multistream_copy::send_with_progress(
         receiver_address,
         source_root,
         worker_count,
         data_stream_count,
+        transfer_progress.counter(),
     )?;
+
+    transfer_progress.finish()?;
+
+    println!();
 
     let calibrated_megabytes_per_second = report_megabytes_per_second(&calibrated_report);
 
@@ -138,9 +156,28 @@ pub fn receive_once(
     listener: TcpListener,
     destination_root: &Path,
 ) -> io::Result<CalibratedReceiveReport> {
-    let calibration = network_calibration::receive_matrix_on_listener(&listener)?;
+    let calibration_progress = ConsoleProgress::start("Waiting for calibration", 0)?;
 
-    let transfer = multistream_copy::receive_on_listener(&listener, destination_root)?;
+    let calibration = network_calibration::receive_matrix_on_listener_with_progress(
+        &listener,
+        calibration_progress.counter(),
+    )?;
+
+    calibration_progress.finish()?;
+
+    println!();
+
+    let transfer_progress = ConsoleProgress::start("Waiting for transfer", 0)?;
+
+    let transfer = multistream_copy::receive_on_listener_with_progress(
+        &listener,
+        destination_root,
+        transfer_progress.counter(),
+    )?;
+
+    transfer_progress.finish()?;
+
+    println!();
 
     if !calibration
         .reports

@@ -6,7 +6,7 @@ use crate::control_plane::{self, ConnectionRole, Handshake, ManifestSummary};
 use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_second, format_bytes};
 use crate::file_metadata;
 use crate::manifest_scan::{self, FileClass, ManifestEntry};
-use crate::resume_state::{ResumeJournal, ResumeStripe};
+use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
 use crate::striped_file;
 use crate::transfer_memory;
 use std::collections::BTreeSet;
@@ -407,7 +407,7 @@ fn run_with_fault(
 
     let server = thread::Builder::new()
         .name("networkcopy-transfer-server".to_string())
-        .spawn(move || run_server(&listener, server_destination, fault_injection))?;
+        .spawn(move || run_server(&listener, server_destination, fault_injection, None))?;
 
     send_internal(
         address,
@@ -415,7 +415,6 @@ fn run_with_fault(
         worker_count,
         data_stream_count,
         memory_plan,
-        memory_plan.loopback_bytes,
         Some(server),
         None,
     )
@@ -476,7 +475,6 @@ fn send_configured(
         worker_count,
         data_stream_count,
         memory_plan,
-        memory_plan.per_peer_bytes,
         None,
         progress,
     )
@@ -536,11 +534,16 @@ fn send_internal(
     worker_count: usize,
     data_stream_count: usize,
     memory_plan: transfer_memory::TransferMemoryPlan,
-    process_buffer_bytes: u64,
     server: Option<thread::JoinHandle<io::Result<ReceiveReport>>>,
     progress: Option<ProgressCounter>,
 ) -> io::Result<MultistreamCopyReport> {
     let total_started = Instant::now();
+
+    let process_buffer_bytes = if server.is_some() {
+        memory_plan.loopback_bytes
+    } else {
+        memory_plan.per_peer_bytes
+    };
 
     let source_root = source_root.canonicalize()?;
 
@@ -617,6 +620,10 @@ fn send_internal(
     let resume_application =
         apply_resume_offer(&mut transfer_plan, &receiver_ready.completed_stripes)?;
 
+    if let Some(progress) = &progress {
+        progress.set_completed(resume_application.logical_report.bytes_copied);
+    }
+
     let plan_stats = summarize_transfer_plan(&transfer_plan)?;
 
     let data_started = Instant::now();
@@ -627,13 +634,22 @@ fn send_internal(
 
         for (stream, tasks) in data_streams.into_iter().zip(transfer_plan.lanes) {
             let lane_root = Arc::clone(&source_root);
+
             let lane_manifest = Arc::clone(&manifest);
+
+            let lane_progress = progress.clone();
 
             handles.push(
                 thread::Builder::new()
                     .name("networkcopy-data-sender".to_string())
                     .spawn_scoped(scope, move || {
-                        send_lane(stream, lane_root.as_path(), &lane_manifest, &tasks)
+                        send_lane(
+                            stream,
+                            lane_root.as_path(),
+                            &lane_manifest,
+                            &tasks,
+                            lane_progress,
+                        )
                     })?,
             );
         }
@@ -728,10 +744,27 @@ pub(crate) fn receive_on_listener(
     listener: &TcpListener,
     destination_root: &Path,
 ) -> io::Result<ReceiveReport> {
+    receive_on_listener_internal(listener, destination_root, None)
+}
+
+pub(crate) fn receive_on_listener_with_progress(
+    listener: &TcpListener,
+    destination_root: &Path,
+    progress: ProgressCounter,
+) -> io::Result<ReceiveReport> {
+    receive_on_listener_internal(listener, destination_root, Some(progress))
+}
+
+fn receive_on_listener_internal(
+    listener: &TcpListener,
+    destination_root: &Path,
+    progress: Option<ProgressCounter>,
+) -> io::Result<ReceiveReport> {
     run_server(
         listener,
         destination_root.to_path_buf(),
         Arc::new(TransferFault::disabled()),
+        progress,
     )
 }
 
@@ -739,6 +772,7 @@ fn run_server(
     listener: &TcpListener,
     destination_root: PathBuf,
     fault_injection: Arc<TransferFault>,
+    progress: Option<ProgressCounter>,
 ) -> io::Result<ReceiveReport> {
     let (mut control_stream, data_streams, accepted_session) = accept_session(listener)?;
 
@@ -747,6 +781,14 @@ fn run_server(
     let data_stream_count = accepted_session.data_stream_count;
 
     let (manifest, summary, _) = control_plane::receive_manifest_entries(&mut control_stream)?;
+
+    if let Some(progress) = &progress {
+        progress.set_label("Transfer receive");
+
+        progress.set_completed(0);
+
+        progress.set_total(summary.total_file_bytes);
+    }
 
     let mut transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
 
@@ -767,6 +809,10 @@ fn run_server(
     let resume_application =
         apply_resume_offer(&mut transfer_plan, &receiver_ready.completed_stripes)?;
 
+    if let Some(progress) = &progress {
+        progress.set_completed(resume_application.logical_report.bytes_copied);
+    }
+
     write_receiver_ready(&mut control_stream, &receiver_ready)?;
 
     let resume_journal = Arc::new(Mutex::new(resume_journal));
@@ -780,9 +826,14 @@ fn run_server(
 
         for (stream, tasks) in data_streams.into_iter().zip(transfer_plan.lanes) {
             let lane_manifest = Arc::clone(&manifest);
+
             let lane_destination = Arc::clone(&destination_root);
+
             let lane_resume_journal = Arc::clone(&resume_journal);
+
             let lane_fault_injection = Arc::clone(&fault_injection);
+
+            let lane_progress = progress.clone();
 
             handles.push(
                 thread::Builder::new()
@@ -795,6 +846,7 @@ fn run_server(
                             &tasks,
                             &lane_resume_journal,
                             lane_fault_injection.as_ref(),
+                            lane_progress,
                         )
                     })?,
             );
@@ -966,17 +1018,54 @@ fn prepare_destination(
     transfer_plan: &TransferPlan,
 ) -> io::Result<ResumeJournal> {
     if destination_root.try_exists()? {
-        return prepare_resume_destination(
-            destination_root,
-            manifest,
-            summary,
-            data_stream_count,
-            transfer_plan,
-        );
+        let root_metadata = fs::metadata(destination_root)?;
+
+        if !root_metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "destination is not a directory: {}",
+                    destination_root.display()
+                ),
+            ));
+        }
+
+        let journal_path = destination_root.join(JOURNAL_FILE_NAME);
+
+        if journal_path.try_exists()? {
+            return prepare_resume_destination(
+                destination_root,
+                manifest,
+                summary,
+                data_stream_count,
+                transfer_plan,
+            );
+        }
+
+        let mut entries = fs::read_dir(destination_root)?;
+
+        if entries.next().transpose()?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "destination directory is not empty and contains no NetworkCopy resume journal: {}",
+                    destination_root.display()
+                ),
+            ));
+        }
+    } else {
+        fs::create_dir_all(destination_root)?;
     }
 
-    fs::create_dir_all(destination_root)?;
+    prepare_fresh_destination(destination_root, manifest, summary, data_stream_count)
+}
 
+fn prepare_fresh_destination(
+    destination_root: &Path,
+    manifest: &[ManifestEntry],
+    summary: ManifestSummary,
+    data_stream_count: usize,
+) -> io::Result<ResumeJournal> {
     for (file_id, entry) in manifest.iter().enumerate() {
         create_destination_parent(destination_root, entry)?;
 
@@ -1465,6 +1554,7 @@ fn send_lane(
     source_root: &Path,
     manifest: &[ManifestEntry],
     tasks: &[TransferTask],
+    progress: Option<ProgressCounter>,
 ) -> io::Result<LaneReport> {
     let buffered = BufWriter::with_capacity(NETWORK_BUFFER_BYTES, stream);
 
@@ -1554,6 +1644,8 @@ fn send_lane(
                 add_compressed_record(&mut report, compressed)?;
             }
         }
+
+        add_progress(&progress, transfer_task_bytes(task, manifest)?);
     }
 
     write_u8(&mut writer, MESSAGE_STREAM_END)?;
@@ -1563,6 +1655,30 @@ fn send_lane(
     report.data_wire_bytes = writer.bytes_written();
 
     Ok(report)
+}
+
+fn transfer_task_bytes(task: &TransferTask, manifest: &[ManifestEntry]) -> io::Result<u64> {
+    match task {
+        TransferTask::WholeFile { file_id } => manifest
+            .get(*file_id)
+            .map(|entry| entry.file_size)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "transfer task referenced an invalid file ID",
+                )
+            }),
+
+        TransferTask::TinyPack { total_bytes, .. } => Ok(*total_bytes),
+
+        TransferTask::Stripe { length, .. } => Ok(*length),
+    }
+}
+
+fn add_progress(progress: &Option<ProgressCounter>, bytes: u64) {
+    if let Some(progress) = progress {
+        progress.add(bytes);
+    }
 }
 
 fn add_lane_counts(report: &mut LaneReport, files: u64, bytes: u64, side: &str) -> io::Result<()> {
@@ -1841,6 +1957,7 @@ fn receive_lane(
     tasks: &[TransferTask],
     resume_journal: &Mutex<ResumeJournal>,
     fault_injection: &TransferFault,
+    progress: Option<ProgressCounter>,
 ) -> io::Result<LaneReport> {
     let buffered = BufReader::with_capacity(NETWORK_BUFFER_BYTES, stream);
 
@@ -1991,6 +2108,8 @@ fn receive_lane(
         if checkpoint_completed_stripe(task, destination_root, resume_journal)? {
             fault_injection.after_checkpointed_stripe()?;
         }
+
+        add_progress(&progress, transfer_task_bytes(task, manifest)?);
     }
 
     let final_message = read_u8(&mut reader)?;
@@ -2470,7 +2589,12 @@ fn write_receiver_ready(writer: &mut impl Write, ready: &ReceiverReady) -> io::R
 }
 
 fn read_receiver_ready(reader: &mut impl Read) -> io::Result<ReceiverReady> {
-    let message = read_u8(reader)?;
+    let message = read_u8(reader).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("receiver disconnected before the file transfer became ready: {error}"),
+        )
+    })?;
 
     if message != MESSAGE_RECEIVER_READY {
         return Err(io::Error::new(
@@ -3205,6 +3329,8 @@ mod tests {
         let destination = parent.join("destination");
 
         fs::create_dir_all(&source).unwrap();
+
+        fs::create_dir_all(&destination).unwrap();
 
         fs::write(source.join("small.txt"), b"separate sender and receiver").unwrap();
 
