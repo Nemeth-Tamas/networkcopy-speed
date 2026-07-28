@@ -41,6 +41,8 @@ pub struct MultistreamCopyReport {
     pub bytes_copied: u64,
     pub data_wire_bytes: u64,
     pub compressed_records: u64,
+    pub resumed_stripes: u64,
+    pub resumed_bytes: u64,
     pub buffer_bytes_per_lane: u64,
     pub buffer_bytes_per_peer: u64,
     pub loopback_buffer_bytes: u64,
@@ -76,6 +78,15 @@ impl MultistreamCopyReport {
         println!(
             "  Compressed records:   {}",
             format_bytes(self.compressed_records)
+        );
+        println!(
+            "  Resumed stripes:      {}",
+            format_bytes(self.resumed_stripes)
+        );
+
+        println!(
+            "  Resumed data:         {} bytes",
+            format_bytes(self.resumed_bytes)
         );
         println!(
             "  Wire savings:         {:.2}%",
@@ -166,6 +177,12 @@ struct LaneReport {
     bytes_copied: u64,
     data_wire_bytes: u64,
     compressed_records: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ResumeApplication {
+    logical_report: LaneReport,
+    stripe_count: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -304,9 +321,10 @@ pub fn run(
         ));
     }
 
-    let transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
+    let mut transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
 
-    validate_resume_offer(&transfer_plan, &receiver_ready.completed_stripes)?;
+    let resume_application =
+        apply_resume_offer(&mut transfer_plan, &receiver_ready.completed_stripes)?;
 
     let plan_stats = summarize_transfer_plan(&transfer_plan)?;
 
@@ -332,7 +350,12 @@ pub fn run(
         join_lane_threads(handles)
     })?;
 
-    let sender_report = merge_lane_reports(sender_reports)?;
+    let transferred_sender_report = merge_lane_reports(sender_reports)?;
+
+    let sender_report = merge_lane_reports(vec![
+        resume_application.logical_report,
+        transferred_sender_report,
+    ])?;
 
     let transfer_ack = read_transfer_ack(&mut control_stream)?;
 
@@ -376,6 +399,10 @@ pub fn run(
         data_wire_bytes: transfer_ack.data_wire_bytes,
         compressed_records: transfer_ack.compressed_records,
 
+        resumed_stripes: resume_application.stripe_count,
+
+        resumed_bytes: resume_application.logical_report.bytes_copied,
+
         buffer_bytes_per_lane: memory_plan.per_lane_per_peer_bytes,
 
         buffer_bytes_per_peer: memory_plan.per_peer_bytes,
@@ -409,7 +436,7 @@ fn run_server(
 
     prepare_destination(&destination_root, &manifest)?;
 
-    let transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
+    let mut transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
 
     let resume_journal = ResumeJournal::new(summary.fingerprint, data_stream_count)?;
 
@@ -423,6 +450,9 @@ fn run_server(
 
         completed_stripes: resume_journal.completed_stripes().collect(),
     };
+
+    let resume_application =
+        apply_resume_offer(&mut transfer_plan, &receiver_ready.completed_stripes)?;
 
     write_receiver_ready(&mut control_stream, &receiver_ready)?;
 
@@ -458,7 +488,9 @@ fn run_server(
         join_lane_threads(handles)
     })?;
 
-    let report = merge_lane_reports(lane_reports)?;
+    let transferred_report = merge_lane_reports(lane_reports)?;
+
+    let report = merge_lane_reports(vec![resume_application.logical_report, transferred_report])?;
 
     finalize_large_files(destination_root.as_path(), &manifest)?;
 
@@ -824,6 +856,69 @@ fn validate_resume_offer(
     }
 
     Ok(())
+}
+
+fn apply_resume_offer(
+    transfer_plan: &mut TransferPlan,
+    offered: &BTreeSet<ResumeStripe>,
+) -> io::Result<ResumeApplication> {
+    validate_resume_offer(transfer_plan, offered)?;
+
+    let mut application = ResumeApplication::default();
+
+    for lane in &mut transfer_plan.lanes {
+        let mut remaining_tasks = Vec::with_capacity(lane.len());
+
+        for task in lane.drain(..) {
+            let completed = match &task {
+                TransferTask::Stripe {
+                    file_id,
+                    offset,
+                    length,
+                } => {
+                    let stripe = ResumeStripe::new(*file_id, *offset, *length)?;
+
+                    if !offered.contains(&stripe) {
+                        false
+                    } else {
+                        add_lane_counts(
+                            &mut application.logical_report,
+                            u64::from(*offset == 0),
+                            *length,
+                            "resumed",
+                        )?;
+
+                        application.stripe_count = application
+                            .stripe_count
+                            .checked_add(1)
+                            .ok_or_else(|| io::Error::other("resumed stripe count overflowed"))?;
+
+                        true
+                    }
+                }
+
+                TransferTask::WholeFile { .. } | TransferTask::TinyPack { .. } => false,
+            };
+
+            if !completed {
+                remaining_tasks.push(task);
+            }
+        }
+
+        *lane = remaining_tasks;
+    }
+
+    let expected_stripe_count = u64::try_from(offered.len())
+        .map_err(|_| io::Error::other("resume offer stripe count cannot be represented"))?;
+
+    if application.stripe_count != expected_stripe_count {
+        return Err(io::Error::other(format!(
+            "applied {} resumed stripes, expected {expected_stripe_count}",
+            application.stripe_count
+        )));
+    }
+
+    Ok(application)
 }
 
 fn send_lane(
@@ -2022,9 +2117,9 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReceiverReady, TINY_PACK_TARGET_BYTES, TransferTask, build_transfer_plan,
-        copy_exact_hashed, read_receiver_ready, run, validate_resume_offer, verify_content_digest,
-        write_receiver_ready,
+        ReceiverReady, TINY_PACK_TARGET_BYTES, TransferTask, apply_resume_offer,
+        build_transfer_plan, copy_exact_hashed, read_receiver_ready, run, validate_resume_offer,
+        verify_content_digest, write_receiver_ready,
     };
     use crate::control_plane::ManifestSummary;
     use crate::manifest_scan::{FileClass, ManifestEntry};
@@ -2162,6 +2257,84 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 
         assert!(error.to_string().contains("BLAKE3 verification failed"));
+    }
+
+    #[test]
+    fn resume_offer_removes_completed_stripe() {
+        let manifest = vec![
+            entry("large.bin", 1_000, FileClass::Large),
+            entry("medium.bin", 300, FileClass::Medium),
+        ];
+
+        let mut transfer_plan = build_transfer_plan(&manifest, 2).unwrap();
+
+        let completed_stripe = ResumeStripe::new(0, 0, 500).unwrap();
+
+        let offered = BTreeSet::from([completed_stripe]);
+
+        let application = apply_resume_offer(&mut transfer_plan, &offered).unwrap();
+
+        assert_eq!(application.stripe_count, 1);
+
+        assert_eq!(application.logical_report.files_copied, 1);
+
+        assert_eq!(application.logical_report.bytes_copied, 500);
+
+        assert_eq!(application.logical_report.data_wire_bytes, 0);
+
+        assert!(!transfer_plan.lanes.iter().flatten().any(|task| {
+            matches!(
+                task,
+                TransferTask::Stripe {
+                    file_id: 0,
+                    offset: 0,
+                    length: 500,
+                }
+            )
+        }));
+
+        assert!(transfer_plan.lanes.iter().flatten().any(|task| {
+            matches!(
+                task,
+                TransferTask::Stripe {
+                    file_id: 0,
+                    offset: 500,
+                    length: 500,
+                }
+            )
+        }));
+
+        assert!(
+            transfer_plan
+                .lanes
+                .iter()
+                .flatten()
+                .any(|task| { matches!(task, TransferTask::WholeFile { file_id: 1 }) })
+        );
+    }
+
+    #[test]
+    fn empty_resume_offer_preserves_tasks() {
+        let manifest = vec![
+            entry("large.bin", 1_000, FileClass::Large),
+            entry("medium.bin", 300, FileClass::Medium),
+        ];
+
+        let mut transfer_plan = build_transfer_plan(&manifest, 2).unwrap();
+
+        let task_count_before = transfer_plan.lanes.iter().map(Vec::len).sum::<usize>();
+
+        let application = apply_resume_offer(&mut transfer_plan, &BTreeSet::new()).unwrap();
+
+        let task_count_after = transfer_plan.lanes.iter().map(Vec::len).sum::<usize>();
+
+        assert_eq!(task_count_after, task_count_before);
+
+        assert_eq!(application.stripe_count, 0);
+
+        assert_eq!(application.logical_report.files_copied, 0);
+
+        assert_eq!(application.logical_report.bytes_copied, 0);
     }
 
     #[test]
