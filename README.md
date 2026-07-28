@@ -840,7 +840,14 @@ Firewall inbound rule for the selected TCP port. The rule is restricted to:
 The rule is recreated whenever a receiver command starts, so changing the
 executable location or listening port requires no manual firewall maintenance.
 
-Planned work:
+### Release binary
+
+NetworkCopy Speed Edition v1.0 is distributed as one self-contained Windows
+executable:
+
+```text
+networkcopy-speed.exe
+```
 
 * [x] Derive session identity and stream count from the control connection
 * [x] Separate sender and receiver CLI commands
@@ -857,7 +864,7 @@ Planned work:
 * [x] Reach at least 85–90% of the measured path capacity
 * [x] Require elevation and automatically manage the Windows Firewall rule
 * [x] Live chunk-level console progress for automatic calibration and transfers
-* [x] Standalone release binaries
+* [x] Standalone self-contained release executable
 * [x] End-to-end two-machine acceptance test
 
 ## Milestone 9 — Direct Link Mode

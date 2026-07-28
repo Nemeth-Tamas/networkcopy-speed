@@ -66,6 +66,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         "probe-control" => run_control_plane_probe(&mut arguments),
         "bench-multistream-copy" => run_multistream_copy_bench(&mut arguments),
         "bench-striped-file" => run_striped_file_bench(&mut arguments),
+
+        "version" | "--version" | "-V" => {
+            println!("NetworkCopy Speed Edition {}", env!("CARGO_PKG_VERSION"));
+
+            Ok(())
+        }
+
         "help" | "--help" | "-h" => {
             print_usage(&program);
             Ok(())
@@ -915,8 +922,8 @@ fn print_usage(program: &OsStr) {
     println!("NetworkCopy Speed Edition");
     println!();
     println!("Usage:");
+    println!("  {program} --version");
     println!("  {program} receive-auto <bind-address> <destination-root>");
-
     println!("  {program} send-auto <receiver-address> <source-root> [workers] [calibration-mib]");
     println!("  {program} bench-network-matrix-receive <bind-address>");
     println!("  {program} bench-network-matrix-send <receiver-address> [total-mib]");
