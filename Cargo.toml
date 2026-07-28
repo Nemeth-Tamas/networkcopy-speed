@@ -1,7 +1,11 @@
 [package]
 name = "networkcopy-speed"
-version = "1.1.0"
+version = "1.2.0-dev"
 edition = "2024"
+
+[features]
+default = []
+default-language-en = []
 
 [dependencies]
 windows-sys = { version = "0.61.2", features = [
@@ -17,6 +21,11 @@ windows-sys = { version = "0.61.2", features = [
 blake3 = "1.8.5"
 zstd = "0.13.3"
 socket2 = "0.6.1"
+eframe = { version = "0.35.0", default-features = false, features = [
+    "default_fonts",
+    "glow",
+] }
+rfd = "0.17.2"
 
 [profile.release]
 opt-level = 3

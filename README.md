@@ -895,13 +895,25 @@ The intended use case is a direct copper cable between two Windows computers, wi
 The first GUI will remain deliberately small and will call the same transfer
 engine as the CLI.
 
-Planned implementation:
+Implementation progress:
 
-* `egui` / `eframe` native Windows application
-* separate `networkcopy-gui` binary
-* shared transfer engine exposed through a library crate
-* background worker thread with progress events
-* no separate or duplicated networking implementation
+* [x] `egui` / `eframe` native Windows application shell
+* [x] separate `networkcopy-gui` binary
+* [x] Hungarian-first interface with English compiled into the executable
+* [x] runtime Hungarian / English language switching
+* [x] native source and destination folder pickers
+* [ ] shared transfer engine exposed through a library facade
+* [ ] background worker thread with progress events
+* [ ] working Send, Receive, and Cancel actions
+* [ ] no separate or duplicated networking implementation
+
+Language and release policy:
+
+* development builds start in Hungarian
+* both Hungarian and English are included in every GUI executable
+* `networkcopy-speed-hu.exe` starts in Hungarian
+* `networkcopy-speed-en.exe` starts in English
+* users can switch language inside either executable
 
 Planned interface:
 
