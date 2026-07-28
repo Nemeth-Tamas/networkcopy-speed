@@ -9,6 +9,7 @@ mod iocp_probe;
 mod manifest_scan;
 mod multistream_copy;
 mod pipeline_bench;
+mod resume_state;
 mod striped_file;
 mod transfer_memory;
 

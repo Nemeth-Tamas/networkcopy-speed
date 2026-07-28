@@ -4,6 +4,7 @@ use crate::content_hash::{self, ContentHasher};
 use crate::control_plane::{self, ConnectionRole, Handshake, ManifestSummary};
 use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_second, format_bytes};
 use crate::manifest_scan::{self, FileClass, ManifestEntry};
+use crate::resume_state::{ResumeJournal, ResumeStripe};
 use crate::striped_file;
 use crate::transfer_memory;
 use std::ffi::OsString;
@@ -11,7 +12,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -402,7 +403,14 @@ fn run_server(
 
     let transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
 
+    let mut resume_journal = ResumeJournal::new(summary.fingerprint, data_stream_count)?;
+
+    resume_journal.save_atomic(&destination_root)?;
+
+    let resume_journal = Arc::new(Mutex::new(resume_journal));
+
     let manifest = Arc::new(manifest);
+
     let destination_root = Arc::new(destination_root);
 
     let lane_reports = thread::scope(|scope| -> io::Result<Vec<LaneReport>> {
@@ -411,12 +419,19 @@ fn run_server(
         for (stream, tasks) in data_streams.into_iter().zip(transfer_plan.lanes) {
             let lane_manifest = Arc::clone(&manifest);
             let lane_destination = Arc::clone(&destination_root);
+            let lane_resume_journal = Arc::clone(&resume_journal);
 
             handles.push(
                 thread::Builder::new()
                     .name("networkcopy-data-receiver".to_string())
                     .spawn_scoped(scope, move || {
-                        receive_lane(stream, lane_destination.as_path(), &lane_manifest, &tasks)
+                        receive_lane(
+                            stream,
+                            lane_destination.as_path(),
+                            &lane_manifest,
+                            &tasks,
+                            &lane_resume_journal,
+                        )
                     })?,
             );
         }
@@ -443,6 +458,11 @@ fn run_server(
     }
 
     write_transfer_ack(&mut control_stream, ack)?;
+
+    drop(resume_journal);
+
+    ResumeJournal::remove(destination_root.as_path())?;
+
     Ok(ack)
 }
 
@@ -1095,6 +1115,7 @@ fn receive_lane(
     destination_root: &Path,
     manifest: &[ManifestEntry],
     tasks: &[TransferTask],
+    resume_journal: &Mutex<ResumeJournal>,
 ) -> io::Result<LaneReport> {
     let buffered = BufReader::with_capacity(NETWORK_BUFFER_BYTES, stream);
 
@@ -1241,6 +1262,8 @@ fn receive_lane(
                 add_compressed_record(&mut report, compressed)?;
             }
         }
+
+        checkpoint_completed_stripe(task, destination_root, resume_journal)?;
     }
 
     let final_message = read_u8(&mut reader)?;
@@ -1255,6 +1278,33 @@ fn receive_lane(
     report.data_wire_bytes = reader.bytes_read();
 
     Ok(report)
+}
+
+fn checkpoint_completed_stripe(
+    task: &TransferTask,
+    destination_root: &Path,
+    resume_journal: &Mutex<ResumeJournal>,
+) -> io::Result<()> {
+    let TransferTask::Stripe {
+        file_id,
+        offset,
+        length,
+    } = task
+    else {
+        return Ok(());
+    };
+
+    let stripe = ResumeStripe::new(*file_id, *offset, *length)?;
+
+    let mut journal = resume_journal
+        .lock()
+        .map_err(|_| io::Error::other("resume journal lock poisoned"))?;
+
+    if journal.mark_completed(stripe) {
+        journal.save_atomic(destination_root)?;
+    }
+
+    Ok(())
 }
 
 fn receive_tiny_pack(
@@ -1383,7 +1433,11 @@ fn receive_file_stripe(
         entry.relative_path.display()
     );
 
-    decoder.receive_positional(reader, &file, offset, length, buffer, &context)
+    let compressed = decoder.receive_positional(reader, &file, offset, length, buffer, &context)?;
+
+    file.sync_all()?;
+
+    Ok(compressed)
 }
 
 fn validate_stripe(entry: &ManifestEntry, offset: u64, length: u64) -> io::Result<()> {
@@ -1839,6 +1893,7 @@ mod tests {
         verify_content_digest,
     };
     use crate::manifest_scan::{FileClass, ManifestEntry};
+    use crate::resume_state::JOURNAL_FILE_NAME;
     use std::env;
     use std::fs;
     use std::io::Cursor;
@@ -2006,6 +2061,8 @@ mod tests {
         let report = transfer_result.unwrap();
 
         assert_eq!(report.files_copied, 4);
+
+        assert!(!destination.join(JOURNAL_FILE_NAME).exists());
 
         assert!(report.loopback_buffer_bytes <= report.transfer_buffer_budget_bytes);
 

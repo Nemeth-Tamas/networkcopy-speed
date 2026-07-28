@@ -330,6 +330,13 @@ pub fn run(root: &Path, worker_count: usize) -> io::Result<ScanResult> {
         manifest.extend(worker_result.manifest);
     }
 
+    manifest.sort_unstable_by(|left, right| {
+        left.relative_path
+            .as_os_str()
+            .encode_wide()
+            .cmp(right.relative_path.as_os_str().encode_wide())
+    });
+
     let report = build_report(
         &manifest,
         worker_count,
@@ -583,5 +590,47 @@ mod tests {
 
         assert!(paths.contains(&PathBuf::from("root.txt")));
         assert!(paths.contains(&PathBuf::from("alpha").join("beta").join("nested.bin")));
+    }
+
+    #[test]
+    fn manifest_entries_have_deterministic_order() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let root = env::temp_dir().join(format!(
+            "networkcopy-manifest-order-{}-{unique}",
+            process::id()
+        ));
+
+        fs::create_dir_all(&root).unwrap();
+
+        fs::write(root.join("zeta.txt"), b"zeta").unwrap();
+
+        fs::write(root.join("árvíz.txt"), b"unicode").unwrap();
+
+        fs::write(root.join("alpha.txt"), b"alpha").unwrap();
+
+        let scan_result = run(&root, 4);
+        let cleanup_result = fs::remove_dir_all(&root);
+
+        let result = scan_result.unwrap();
+        cleanup_result.unwrap();
+
+        let paths: Vec<PathBuf> = result
+            .manifest
+            .into_iter()
+            .map(|entry| entry.relative_path)
+            .collect();
+
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("alpha.txt"),
+                PathBuf::from("zeta.txt"),
+                PathBuf::from("árvíz.txt"),
+            ]
+        );
     }
 }
