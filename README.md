@@ -877,13 +877,13 @@ Planned after the first real-network release:
 * [x] Discover peers through interface-scoped IPv6 multicast
 * [x] Probe every strict Ethernet candidate concurrently
 * [x] Listen for discovery on every strict Ethernet candidate
-* [ ] Reject interfaces with an IPv4 or IPv6 default route
-* [ ] Reject Wi-Fi, VPN, Hyper-V, and WSL routes
-* [ ] Prefer IPv6 link-local addressing
-* [ ] Handle IPv6 scope identifiers correctly
+* [x] Reject interfaces with an IPv4 or IPv6 default route
+* [x] Reject Wi-Fi, VPN, Hyper-V, and WSL routes
+* [x] Prefer IPv6 link-local addressing
+* [x] Handle IPv6 scope identifiers correctly
 * [ ] Fall back to direct-link IPv4
 * [ ] Bind every control and data socket to the selected interface
-* [ ] Validate the chosen path
+* [ ] Validate the chosen TCP path
 * [ ] Calibrate the direct cable
 * [ ] Recover cleanly if the link disappears
 

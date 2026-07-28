@@ -9,6 +9,7 @@ mod direct_address;
 mod direct_discovery;
 mod direct_link;
 mod direct_route;
+mod direct_tcp;
 mod file_metadata;
 mod iocp_copy;
 mod iocp_file_probe;
@@ -26,7 +27,7 @@ use std::env;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener};
 use std::path::PathBuf;
 
 fn main() {
@@ -83,6 +84,10 @@ fn run() -> Result<(), Box<dyn Error>> {
 
         "direct-discovery-send-auto" => run_direct_discovery_send_auto(&mut arguments),
 
+        "direct-tcp-receive" => run_direct_tcp_receive(&mut arguments),
+
+        "direct-tcp-send" => run_direct_tcp_send(&mut arguments),
+
         "version" | "--version" | "-V" => {
             println!("NetworkCopy Speed Edition {}", env!("CARGO_PKG_VERSION"));
 
@@ -99,6 +104,49 @@ fn run() -> Result<(), Box<dyn Error>> {
         )
         .into()),
     }
+}
+
+fn run_direct_tcp_receive(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy(),),
+        )
+        .into());
+    }
+
+    let firewall_address = SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::UNSPECIFIED,
+        direct_address::DIRECT_TRANSFER_PORT,
+        0,
+        0,
+    ));
+
+    windows_setup::prepare_receiver(firewall_address)?;
+
+    windows_setup::prepare_discovery_receiver(direct_discovery::DISCOVERY_PORT)?;
+
+    direct_tcp::receive_once()?;
+
+    Ok(())
+}
+
+fn run_direct_tcp_send(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy(),),
+        )
+        .into());
+    }
+
+    direct_tcp::send_once()?;
+
+    Ok(())
 }
 
 fn run_direct_discovery_receive_auto(
@@ -1102,6 +1150,8 @@ fn print_usage(program: &OsStr) {
     println!("  {program} direct-discovery-receive-auto");
     println!("  {program} direct-discovery-send <interface-index>");
     println!("  {program} direct-discovery-send-auto");
+    println!("  {program} direct-tcp-receive");
+    println!("  {program} direct-tcp-send");
     println!("  {program} receive-auto <bind-address> <destination-root>");
     println!("  {program} send-auto <receiver-address> <source-root> [workers] [calibration-mib]");
     println!("  {program} bench-network-matrix-receive <bind-address>");

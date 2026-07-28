@@ -206,6 +206,14 @@ fn automatic_direct_candidates() -> io::Result<direct_route::RouteCandidates> {
 }
 
 pub(crate) fn receive_all() -> io::Result<()> {
+    receive_automatically(false).map(|_| ())
+}
+
+pub(crate) fn receive_one() -> io::Result<u32> {
+    receive_automatically(true)
+}
+
+fn receive_automatically(stop_after_first: bool) -> io::Result<u32> {
     let candidates = automatic_direct_candidates()?;
 
     let interface_indices = candidates.direct;
@@ -304,6 +312,10 @@ pub(crate) fn receive_all() -> io::Result<()> {
             "  Replied to {} through interface {}",
             reply_target, interface_index,
         );
+
+        if stop_after_first {
+            return Ok(interface_index);
+        }
     }
 }
 
@@ -417,6 +429,22 @@ pub(crate) fn discover_all() -> io::Result<Vec<DiscoveredPath>> {
     }
 
     Ok(discovered)
+}
+
+pub(crate) fn discover_one() -> io::Result<DiscoveredPath> {
+    let mut paths = discover_all()?;
+
+    if paths.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!(
+                "automatic direct-link connection requires exactly one discovered path, but {} paths replied",
+                paths.len(),
+            ),
+        ));
+    }
+
+    Ok(paths.remove(0))
 }
 
 fn discover_on_interface(interface_index: u32, verbose: bool) -> io::Result<SocketAddrV6> {
