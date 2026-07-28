@@ -189,6 +189,23 @@ pub(crate) fn print_inventory() -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn strict_candidate_indices() -> io::Result<Vec<u32>> {
+    let interface_indices = enumerate_interfaces()?
+        .into_iter()
+        .filter(|interface| interface.eligibility == DirectLinkEligibility::Eligible)
+        .map(|interface| interface.interface_index)
+        .collect::<Vec<_>>();
+
+    if interface_indices.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no strict connected physical Ethernet interface was found",
+        ));
+    }
+
+    Ok(interface_indices)
+}
+
 fn enumerate_interfaces() -> io::Result<Vec<DirectLinkInterface>> {
     let mut raw_table = ptr::null_mut();
 

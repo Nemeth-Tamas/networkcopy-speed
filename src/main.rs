@@ -78,6 +78,8 @@ fn run() -> Result<(), Box<dyn Error>> {
 
         "direct-discovery-send" => run_direct_discovery_send(&mut arguments),
 
+        "direct-discovery-send-auto" => run_direct_discovery_send_auto(&mut arguments),
+
         "version" | "--version" | "-V" => {
             println!("NetworkCopy Speed Edition {}", env!("CARGO_PKG_VERSION"));
 
@@ -94,6 +96,22 @@ fn run() -> Result<(), Box<dyn Error>> {
         )
         .into()),
     }
+}
+
+fn run_direct_discovery_send_auto(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy(),),
+        )
+        .into());
+    }
+
+    direct_discovery::discover_all()?;
+
+    Ok(())
 }
 
 fn run_direct_discovery_receive(
@@ -1061,6 +1079,7 @@ fn print_usage(program: &OsStr) {
     println!("  {program} direct-address <interface-index>");
     println!("  {program} direct-discovery-receive <interface-index>");
     println!("  {program} direct-discovery-send <interface-index>");
+    println!("  {program} direct-discovery-send-auto");
     println!("  {program} receive-auto <bind-address> <destination-root>");
     println!("  {program} send-auto <receiver-address> <source-root> [workers] [calibration-mib]");
     println!("  {program} bench-network-matrix-receive <bind-address>");

@@ -874,7 +874,8 @@ Planned after the first real-network release:
 * [x] Enumerate and classify physical Ethernet interfaces
 * [x] Remove NDIS filter interfaces from candidate enumeration
 * [x] Resolve scoped IPv6 link-local addresses by interface index
-* [ ] Discover peers through interface-scoped IPv6 multicast
+* [x] Discover peers through interface-scoped IPv6 multicast
+* [ ] Probe every strict Ethernet candidate concurrently
 * [ ] Reject Wi-Fi, VPN, Hyper-V, and WSL routes
 * [ ] Prefer IPv6 link-local addressing
 * [ ] Handle IPv6 scope identifiers correctly
