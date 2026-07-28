@@ -33,6 +33,9 @@ const TINY_PACK_TARGET_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_TINY_PACK_FILES: usize = 4096;
 const CONTENT_DIGEST_BYTES: usize = 32;
 const MAX_RESUME_OFFER_STRIPES: u32 = 1_000_000;
+const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub const DEFAULT_DATA_STREAMS: usize = 4;
 
@@ -444,6 +447,54 @@ pub fn send(
     )
 }
 
+fn connect_with_retry(receiver_address: SocketAddr) -> io::Result<TcpStream> {
+    connect_with_retry_config(receiver_address, CONNECT_RETRY_TIMEOUT, CONNECT_RETRY_DELAY)
+}
+
+fn connect_with_retry_config(
+    receiver_address: SocketAddr,
+    timeout: Duration,
+    retry_delay: Duration,
+) -> io::Result<TcpStream> {
+    if timeout.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "connection retry timeout must not be zero",
+        ));
+    }
+
+    if retry_delay.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "connection retry delay must not be zero",
+        ));
+    }
+
+    let started = Instant::now();
+
+    loop {
+        match TcpStream::connect(receiver_address) {
+            Ok(stream) => {
+                return Ok(stream);
+            }
+
+            Err(_) if started.elapsed() < timeout => {
+                thread::sleep(retry_delay);
+            }
+
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to connect to {receiver_address} within {:.1} seconds: {error}",
+                        timeout.as_secs_f64()
+                    ),
+                ));
+            }
+        }
+    }
+}
+
 fn send_internal(
     receiver_address: SocketAddr,
     source_root: &Path,
@@ -469,9 +520,7 @@ fn send_internal(
 
     let connection_started = Instant::now();
 
-    let connection_started = Instant::now();
-
-    let mut control_stream = TcpStream::connect(receiver_address)?;
+    let mut control_stream = connect_with_retry(receiver_address)?;
     control_plane::configure_stream(&control_stream)?;
 
     control_plane::write_handshake(
@@ -487,7 +536,7 @@ fn send_internal(
     let mut data_streams = Vec::with_capacity(data_stream_count);
 
     for stream_id in 0..data_stream_count {
-        let mut stream = TcpStream::connect(receiver_address)?;
+        let mut stream = connect_with_retry(receiver_address)?;
         control_plane::configure_stream(&stream)?;
 
         control_plane::write_handshake(
@@ -2613,9 +2662,10 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 mod tests {
     use super::{
         ReceiverReady, TINY_PACK_TARGET_BYTES, TransferFault, TransferTask, accept_session,
-        apply_resume_offer, build_transfer_plan, copy_exact_hashed, read_receiver_ready,
-        receive_once, run, run_with_fault, send, temporary_path, validate_resume_offer,
-        validate_source_metadata, verify_content_digest, write_receiver_ready,
+        apply_resume_offer, build_transfer_plan, connect_with_retry_config, copy_exact_hashed,
+        read_receiver_ready, receive_once, run, run_with_fault, send, temporary_path,
+        validate_resume_offer, validate_source_metadata, verify_content_digest,
+        write_receiver_ready,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::file_metadata;
@@ -2631,7 +2681,7 @@ mod tests {
     use std::process;
     use std::sync::Arc;
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
 
     #[test]
@@ -2838,6 +2888,37 @@ mod tests {
         drop(control_stream);
         drop(data_stream_zero);
         drop(data_stream_one);
+    }
+
+    #[test]
+    fn sender_retries_until_receiver_starts() {
+        let reserved_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+
+        let address = reserved_listener.local_addr().unwrap();
+
+        drop(reserved_listener);
+
+        let receiver = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+
+            let listener = TcpListener::bind(address).unwrap();
+
+            listener.accept().unwrap().0
+        });
+
+        let started = Instant::now();
+
+        let sender =
+            connect_with_retry_config(address, Duration::from_secs(2), Duration::from_millis(20))
+                .unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(100));
+
+        drop(sender);
+
+        let accepted = receiver.join().unwrap();
+
+        drop(accepted);
     }
 
     #[test]
