@@ -1,3 +1,4 @@
+mod content_hash;
 mod control_plane;
 mod copy_bench;
 mod iocp_copy;
@@ -34,6 +35,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     match command.to_string_lossy().as_ref() {
         "bench-copy" => run_bench_copy(&mut arguments),
+        "bench-hash" => run_hash_bench(&mut arguments),
         "bench-pipeline" => run_bench_pipeline(&mut arguments),
         "probe-iocp" => run_iocp_probe(&mut arguments),
         "probe-overlapped-read" => run_overlapped_read_probe(&mut arguments),
@@ -52,6 +54,33 @@ fn run() -> Result<(), Box<dyn Error>> {
         )
         .into()),
     }
+}
+
+fn run_hash_bench(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), Box<dyn Error>> {
+    let source = PathBuf::from(required_argument(arguments, "source path")?);
+
+    let buffer_mib = match arguments.next() {
+        Some(value) => parse_buffer_mib(&value)?,
+        None => content_hash::DEFAULT_BUFFER_MIB,
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    println!("NetworkCopy Speed Edition BLAKE3 benchmark");
+    println!("  Source: {}", source.display());
+    println!("  Buffer: {buffer_mib} MiB");
+    println!();
+
+    let report = content_hash::run(&source, buffer_mib)?;
+
+    report.print();
+    Ok(())
 }
 
 fn run_bench_copy(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), Box<dyn Error>> {
@@ -418,6 +447,7 @@ fn print_usage(program: &OsStr) {
     println!();
     println!("Usage:");
     println!("  {program} bench-copy <source> <destination> [buffer-mib]");
+    println!("  {program} bench-hash <source> [buffer-mib]");
     println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
     println!("  {program} probe-iocp");
     println!("  {program} probe-overlapped-read <source> [read-mib]");
