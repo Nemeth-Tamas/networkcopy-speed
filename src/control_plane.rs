@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PROTOCOL_MAGIC: [u8; 4] = *b"NCS4";
-const PROTOCOL_VERSION: u16 = 2;
+const PROTOCOL_VERSION: u16 = 3;
 
 const ROLE_CONTROL: u8 = 1;
 const ROLE_DATA: u8 = 2;
@@ -870,7 +870,7 @@ mod tests {
         let actual = read_handshake(&mut cursor).unwrap();
 
         assert_eq!(actual, expected);
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     #[test]

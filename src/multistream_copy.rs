@@ -1,3 +1,5 @@
+use crate::adaptive_compression::{PayloadDecoder, PayloadEncoder};
+use crate::compression_probe;
 use crate::content_hash::{self, ContentHasher};
 use crate::control_plane::{self, ConnectionRole, Handshake, ManifestSummary};
 use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_second, format_bytes};
@@ -33,6 +35,8 @@ pub struct MultistreamCopyReport {
     pub data_stream_count: usize,
     pub files_copied: u64,
     pub bytes_copied: u64,
+    pub data_wire_bytes: u64,
+    pub compressed_records: u64,
     pub manifest_wire_bytes: u64,
     pub tiny_pack_count: u64,
     pub tiny_files_packed: u64,
@@ -56,6 +60,18 @@ impl MultistreamCopyReport {
         println!(
             "  Data copied:          {} bytes",
             format_bytes(self.bytes_copied)
+        );
+        println!(
+            "  Data wire size:       {} bytes",
+            format_bytes(self.data_wire_bytes)
+        );
+        println!(
+            "  Compressed records:   {}",
+            format_bytes(self.compressed_records)
+        );
+        println!(
+            "  Wire savings:         {:.2}%",
+            wire_savings_percent(self.bytes_copied, self.data_wire_bytes,)
         );
         println!(
             "  Manifest wire size:   {} bytes",
@@ -99,16 +115,28 @@ impl MultistreamCopyReport {
     }
 }
 
+fn wire_savings_percent(logical_bytes: u64, wire_bytes: u64) -> f64 {
+    if logical_bytes == 0 {
+        return 0.0;
+    }
+
+    100.0 - wire_bytes as f64 / logical_bytes as f64 * 100.0
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TransferAck {
     files_copied: u64,
     bytes_copied: u64,
+    data_wire_bytes: u64,
+    compressed_records: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct LaneReport {
     files_copied: u64,
     bytes_copied: u64,
+    data_wire_bytes: u64,
+    compressed_records: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -143,6 +171,13 @@ struct TransferPlanStats {
 struct TinyPackSummary {
     files: u64,
     bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StripeDescriptor {
+    file_id: usize,
+    offset: u64,
+    length: u64,
 }
 
 pub fn run(
@@ -287,8 +322,12 @@ pub fn run(
 
     if sender_report.files_copied != transfer_ack.files_copied
         || sender_report.bytes_copied != transfer_ack.bytes_copied
+        || sender_report.data_wire_bytes != transfer_ack.data_wire_bytes
+        || sender_report.compressed_records != transfer_ack.compressed_records
     {
-        return Err(io::Error::other("sender and receiver byte counts differ"));
+        return Err(io::Error::other(
+            "sender and receiver transfer reports differ",
+        ));
     }
 
     Ok(MultistreamCopyReport {
@@ -296,6 +335,8 @@ pub fn run(
         data_stream_count,
         files_copied: transfer_ack.files_copied,
         bytes_copied: transfer_ack.bytes_copied,
+        data_wire_bytes: transfer_ack.data_wire_bytes,
+        compressed_records: transfer_ack.compressed_records,
         manifest_wire_bytes,
         tiny_pack_count: plan_stats.tiny_pack_count,
         tiny_files_packed: plan_stats.tiny_files_packed,
@@ -354,6 +395,8 @@ fn run_server(
     let ack = TransferAck {
         files_copied: report.files_copied,
         bytes_copied: report.bytes_copied,
+        data_wire_bytes: report.data_wire_bytes,
+        compressed_records: report.compressed_records,
     };
 
     if ack.files_copied != summary.entries || ack.bytes_copied != summary.total_file_bytes {
@@ -673,9 +716,14 @@ fn send_lane(
     manifest: &[ManifestEntry],
     tasks: &[TransferTask],
 ) -> io::Result<LaneReport> {
-    let mut writer = BufWriter::with_capacity(NETWORK_BUFFER_BYTES, stream);
+    let buffered = BufWriter::with_capacity(NETWORK_BUFFER_BYTES, stream);
+
+    let mut writer = CountingWriter::new(buffered);
 
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+
+    let mut encoder = PayloadEncoder::new(compression_probe::DEFAULT_LEVEL)?;
+
     let mut report = LaneReport::default();
 
     for task in tasks {
@@ -690,9 +738,18 @@ fn send_lane(
                     )
                 })?;
 
-                send_whole_file(&mut writer, source_root, file_id, entry, &mut buffer)?;
+                let compressed = send_whole_file(
+                    &mut writer,
+                    source_root,
+                    file_id,
+                    entry,
+                    &mut buffer,
+                    &mut encoder,
+                )?;
 
                 add_lane_counts(&mut report, 1, entry.file_size, "sender")?;
+
+                add_compressed_record(&mut report, compressed)?;
             }
 
             TransferTask::TinyPack {
@@ -727,25 +784,33 @@ fn send_lane(
                     )
                 })?;
 
-                send_file_stripe(
+                let compressed = send_file_stripe(
                     &mut writer,
                     source_root,
-                    file_id,
                     entry,
-                    offset,
-                    length,
+                    StripeDescriptor {
+                        file_id,
+                        offset,
+                        length,
+                    },
                     &mut buffer,
+                    &mut encoder,
                 )?;
 
                 let completed_files = u64::from(offset == 0);
 
                 add_lane_counts(&mut report, completed_files, length, "sender")?;
+
+                add_compressed_record(&mut report, compressed)?;
             }
         }
     }
 
     write_u8(&mut writer, MESSAGE_STREAM_END)?;
+
     writer.flush()?;
+
+    report.data_wire_bytes = writer.bytes_written();
 
     Ok(report)
 }
@@ -760,6 +825,19 @@ fn add_lane_counts(report: &mut LaneReport, files: u64, bytes: u64, side: &str) 
         .bytes_copied
         .checked_add(bytes)
         .ok_or_else(|| io::Error::other(format!("{side} byte count overflowed")))?;
+
+    Ok(())
+}
+
+fn add_compressed_record(report: &mut LaneReport, compressed: bool) -> io::Result<()> {
+    if !compressed {
+        return Ok(());
+    }
+
+    report.compressed_records = report
+        .compressed_records
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("compressed record count overflowed"))?;
 
     Ok(())
 }
@@ -887,7 +965,8 @@ fn send_whole_file(
     file_id: usize,
     entry: &ManifestEntry,
     buffer: &mut [u8],
-) -> io::Result<()> {
+    encoder: &mut PayloadEncoder,
+) -> io::Result<bool> {
     write_u8(writer, MESSAGE_FILE)?;
 
     write_u64(
@@ -900,24 +979,35 @@ fn send_whole_file(
     write_u64(writer, entry.file_size)?;
 
     let path = source_root.join(&entry.relative_path);
+
     let mut file = File::open(&path)?;
 
     validate_source_size(&file, &path, entry)?;
 
-    let digest = copy_exact_hashed(&mut file, writer, entry.file_size, buffer)?;
+    let decision = compression_probe::decide_file_range(
+        &file,
+        0,
+        entry.file_size,
+        compression_probe::DEFAULT_LEVEL,
+    )?;
 
-    write_digest(writer, &digest)
+    encoder.send_sequential(writer, &mut file, entry.file_size, buffer, decision)
 }
 
 fn send_file_stripe(
     writer: &mut impl Write,
     source_root: &Path,
-    file_id: usize,
     entry: &ManifestEntry,
-    offset: u64,
-    length: u64,
+    stripe: StripeDescriptor,
     buffer: &mut [u8],
-) -> io::Result<()> {
+    encoder: &mut PayloadEncoder,
+) -> io::Result<bool> {
+    let StripeDescriptor {
+        file_id,
+        offset,
+        length,
+    } = stripe;
+
     validate_stripe(entry, offset, length)?;
 
     write_u8(writer, MESSAGE_FILE_STRIPE)?;
@@ -936,41 +1026,19 @@ fn send_file_stripe(
     write_u64(writer, length)?;
 
     let path = source_root.join(&entry.relative_path);
+
     let file = File::open(&path)?;
 
     validate_source_size(&file, &path, entry)?;
 
-    let mut transferred = 0_u64;
-    let mut hasher = ContentHasher::new();
+    let decision = compression_probe::decide_file_range(
+        &file,
+        offset,
+        length,
+        compression_probe::DEFAULT_LEVEL,
+    )?;
 
-    while transferred < length {
-        let requested = (length - transferred).min(buffer.len() as u64) as usize;
-
-        let read_offset = offset
-            .checked_add(transferred)
-            .ok_or_else(|| io::Error::other("stripe read offset overflowed"))?;
-
-        let read = striped_file::read_at_retry(&file, &mut buffer[..requested], read_offset)?;
-
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "source stripe ended with {} bytes remaining",
-                    length - transferred
-                ),
-            ));
-        }
-
-        writer.write_all(&buffer[..read])?;
-        hasher.update(&buffer[..read]);
-
-        transferred = transferred
-            .checked_add(read as u64)
-            .ok_or_else(|| io::Error::other("stripe send byte count overflowed"))?;
-    }
-
-    write_digest(writer, &hasher.finalize())
+    encoder.send_positional(writer, &file, offset, length, buffer, decision)
 }
 
 fn validate_source_size(file: &File, path: &Path, entry: &ManifestEntry) -> io::Result<()> {
@@ -992,15 +1060,21 @@ fn receive_lane(
     manifest: &[ManifestEntry],
     tasks: &[TransferTask],
 ) -> io::Result<LaneReport> {
-    let mut reader = BufReader::with_capacity(NETWORK_BUFFER_BYTES, stream);
+    let buffered = BufReader::with_capacity(NETWORK_BUFFER_BYTES, stream);
+
+    let mut reader = CountingReader::new(buffered);
 
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
+
+    let mut decoder = PayloadDecoder::new()?;
+
     let mut report = LaneReport::default();
 
     for task in tasks {
         match task {
             TransferTask::WholeFile { file_id } => {
                 let file_id = *file_id;
+
                 let message = read_u8(&mut reader)?;
 
                 if message != MESSAGE_FILE {
@@ -1032,16 +1106,24 @@ fn receive_lane(
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "file {file_id} announced {announced_size} bytes but manifest \
-                             expects {}",
+                            "file {file_id} announced {announced_size} bytes but manifest expects {}",
                             entry.file_size
                         ),
                     ));
                 }
 
-                receive_file(&mut reader, destination_root, file_id, entry, &mut buffer)?;
+                let compressed = receive_file(
+                    &mut reader,
+                    destination_root,
+                    file_id,
+                    entry,
+                    &mut buffer,
+                    &mut decoder,
+                )?;
 
                 add_lane_counts(&mut report, 1, entry.file_size, "receiver")?;
+
+                add_compressed_record(&mut report, compressed)?;
             }
 
             TransferTask::TinyPack {
@@ -1091,8 +1173,7 @@ fn receive_lane(
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "received stripe ({announced_file_id}, {announced_offset}, \
-                             {announced_length}), expected ({file_id}, {offset}, {length})"
+                            "received stripe ({announced_file_id}, {announced_offset}, {announced_length}), expected ({file_id}, {offset}, {length})"
                         ),
                     ));
                 }
@@ -1104,19 +1185,24 @@ fn receive_lane(
                     )
                 })?;
 
-                receive_file_stripe(
+                let compressed = receive_file_stripe(
                     &mut reader,
                     destination_root,
-                    file_id,
                     entry,
-                    offset,
-                    length,
+                    StripeDescriptor {
+                        file_id,
+                        offset,
+                        length,
+                    },
                     &mut buffer,
+                    &mut decoder,
                 )?;
 
                 let completed_files = u64::from(offset == 0);
 
                 add_lane_counts(&mut report, completed_files, length, "receiver")?;
+
+                add_compressed_record(&mut report, compressed)?;
             }
         }
     }
@@ -1129,6 +1215,8 @@ fn receive_lane(
             format!("expected stream-end message, received 0x{final_message:02X}"),
         ));
     }
+
+    report.data_wire_bytes = reader.bytes_read();
 
     Ok(report)
 }
@@ -1222,7 +1310,7 @@ fn receive_tiny_pack(
             )
         })?;
 
-        receive_file(reader, destination_root, file_id, entry, buffer)?;
+        receive_raw_file(reader, destination_root, file_id, entry, buffer)?;
     }
 
     Ok(summary)
@@ -1231,12 +1319,17 @@ fn receive_tiny_pack(
 fn receive_file_stripe(
     reader: &mut impl Read,
     destination_root: &Path,
-    file_id: usize,
     entry: &ManifestEntry,
-    offset: u64,
-    length: u64,
+    stripe: StripeDescriptor,
     buffer: &mut [u8],
-) -> io::Result<()> {
+    decoder: &mut PayloadDecoder,
+) -> io::Result<bool> {
+    let StripeDescriptor {
+        file_id,
+        offset,
+        length,
+    } = stripe;
+
     validate_stripe(entry, offset, length)?;
 
     let final_path = destination_root.join(&entry.relative_path);
@@ -1244,40 +1337,6 @@ fn receive_file_stripe(
     let temporary_path = temporary_path(&final_path, file_id);
 
     let file = OpenOptions::new().write(true).open(temporary_path)?;
-
-    let mut transferred = 0_u64;
-    let mut hasher = ContentHasher::new();
-
-    while transferred < length {
-        let requested = (length - transferred).min(buffer.len() as u64) as usize;
-
-        let read = reader.read(&mut buffer[..requested])?;
-
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "stripe payload ended with {} bytes remaining",
-                    length - transferred
-                ),
-            ));
-        }
-
-        let write_offset = offset
-            .checked_add(transferred)
-            .ok_or_else(|| io::Error::other("stripe write offset overflowed"))?;
-
-        striped_file::write_all_at(&file, &buffer[..read], write_offset)?;
-
-        hasher.update(&buffer[..read]);
-
-        transferred = transferred
-            .checked_add(read as u64)
-            .ok_or_else(|| io::Error::other("stripe receive byte count overflowed"))?;
-    }
-
-    let actual_digest = hasher.finalize();
-    let expected_digest = read_digest(reader)?;
 
     let stripe_end = offset
         .checked_add(length)
@@ -1288,7 +1347,7 @@ fn receive_file_stripe(
         entry.relative_path.display()
     );
 
-    verify_content_digest(&context, &actual_digest, &expected_digest)
+    decoder.receive_positional(reader, &file, offset, length, buffer, &context)
 }
 
 fn validate_stripe(entry: &ManifestEntry, offset: u64, length: u64) -> io::Result<()> {
@@ -1345,7 +1404,7 @@ fn finalize_large_files(destination_root: &Path, manifest: &[ManifestEntry]) -> 
     Ok(())
 }
 
-fn receive_file(
+fn receive_raw_file(
     reader: &mut impl Read,
     destination_root: &Path,
     file_id: usize,
@@ -1377,12 +1436,63 @@ fn receive_file(
 
     if let Err(error) = transfer_result {
         drop(file);
+
         let _ = fs::remove_file(&temporary_path);
+
         return Err(error);
     }
 
     drop(file);
+
     fs::rename(temporary_path, final_path)
+}
+
+fn receive_file(
+    reader: &mut impl Read,
+    destination_root: &Path,
+    file_id: usize,
+    entry: &ManifestEntry,
+    buffer: &mut [u8],
+    decoder: &mut PayloadDecoder,
+) -> io::Result<bool> {
+    let final_path = destination_root.join(&entry.relative_path);
+
+    let temporary_path = temporary_path(&final_path, file_id);
+
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary_path)?;
+
+    file.set_len(entry.file_size)?;
+
+    let context = format!("file {file_id} ({})", entry.relative_path.display());
+
+    let transfer_result = (|| -> io::Result<bool> {
+        let compressed =
+            decoder.receive_sequential(reader, &mut file, entry.file_size, buffer, &context)?;
+
+        file.flush()?;
+        Ok(compressed)
+    })();
+
+    let compressed = match transfer_result {
+        Ok(compressed) => compressed,
+
+        Err(error) => {
+            drop(file);
+
+            let _ = fs::remove_file(&temporary_path);
+
+            return Err(error);
+        }
+    };
+
+    drop(file);
+
+    fs::rename(temporary_path, final_path)?;
+
+    Ok(compressed)
 }
 
 fn temporary_path(final_path: &Path, file_id: usize) -> PathBuf {
@@ -1468,6 +1578,16 @@ fn merge_lane_reports(reports: Vec<LaneReport>) -> io::Result<LaneReport> {
             .bytes_copied
             .checked_add(report.bytes_copied)
             .ok_or_else(|| io::Error::other("merged byte count overflowed"))?;
+
+        merged.data_wire_bytes = merged
+            .data_wire_bytes
+            .checked_add(report.data_wire_bytes)
+            .ok_or_else(|| io::Error::other("merged wire-byte count overflowed"))?;
+
+        merged.compressed_records = merged
+            .compressed_records
+            .checked_add(report.compressed_records)
+            .ok_or_else(|| io::Error::other("merged compressed-record count overflowed"))?;
     }
 
     Ok(merged)
@@ -1503,8 +1623,15 @@ fn read_receiver_ready(reader: &mut impl Read) -> io::Result<ManifestSummary> {
 
 fn write_transfer_ack(writer: &mut impl Write, ack: TransferAck) -> io::Result<()> {
     write_u8(writer, MESSAGE_TRANSFER_ACK)?;
+
     write_u64(writer, ack.files_copied)?;
+
     write_u64(writer, ack.bytes_copied)?;
+
+    write_u64(writer, ack.data_wire_bytes)?;
+
+    write_u64(writer, ack.compressed_records)?;
+
     writer.flush()
 }
 
@@ -1514,17 +1641,93 @@ fn read_transfer_ack(reader: &mut impl Read) -> io::Result<TransferAck> {
     if message != MESSAGE_TRANSFER_ACK {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "expected transfer acknowledgement, received \
-                 0x{message:02X}"
-            ),
+            format!("expected transfer acknowledgement, received 0x{message:02X}"),
         ));
     }
 
     Ok(TransferAck {
         files_copied: read_u64(reader)?,
+
         bytes_copied: read_u64(reader)?,
+
+        data_wire_bytes: read_u64(reader)?,
+
+        compressed_records: read_u64(reader)?,
     })
+}
+
+#[derive(Debug)]
+struct CountingWriter<W> {
+    inner: W,
+    bytes_written: u64,
+}
+
+impl<W> CountingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            bytes_written: 0,
+        }
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buffer)?;
+
+        self.bytes_written = self
+            .bytes_written
+            .checked_add(
+                u64::try_from(written)
+                    .map_err(|_| io::Error::other("wire write length cannot be represented"))?,
+            )
+            .ok_or_else(|| io::Error::other("data wire-byte count overflowed"))?;
+
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[derive(Debug)]
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: u64,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+        }
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+
+        self.bytes_read = self
+            .bytes_read
+            .checked_add(
+                u64::try_from(read)
+                    .map_err(|_| io::Error::other("wire read length cannot be represented"))?,
+            )
+            .ok_or_else(|| io::Error::other("data wire read count overflowed"))?;
+
+        Ok(read)
+    }
 }
 
 fn write_digest(writer: &mut impl Write, digest: &[u8; CONTENT_DIGEST_BYTES]) -> io::Result<()> {
@@ -1767,6 +1970,10 @@ mod tests {
         let report = transfer_result.unwrap();
 
         assert_eq!(report.files_copied, 4);
+
+        assert!(report.compressed_records > 0);
+
+        assert!(report.data_wire_bytes < report.bytes_copied);
 
         assert_eq!(
             fs::read(source.join("empty.bin")).unwrap(),

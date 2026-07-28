@@ -1,3 +1,4 @@
+mod adaptive_compression;
 mod compression_probe;
 mod content_hash;
 mod control_plane;

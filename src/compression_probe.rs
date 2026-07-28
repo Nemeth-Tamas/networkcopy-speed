@@ -1,6 +1,6 @@
 use crate::copy_bench::{decimal_megabytes_per_second, format_bytes};
 use std::fs::File;
-use std::io;
+use std::io::{self, Seek, SeekFrom};
 use std::os::windows::fs::FileExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -110,27 +110,8 @@ pub fn run(source: &Path, level: i32) -> io::Result<CompressionProbeReport> {
     let ranges = sample_ranges(file_bytes);
 
     let compression_started = Instant::now();
-    let mut sampled_bytes = 0_u64;
-    let mut compressed_bytes = 0_u64;
 
-    for (offset, length) in &ranges {
-        let mut sample = vec![0_u8; *length];
-
-        read_exact_at(&file, &mut sample, *offset)?;
-
-        let compressed = zstd::bulk::compress(&sample, level).map_err(|error| {
-            io::Error::other(format!("Zstandard sample compression failed: {error}"))
-        })?;
-
-        sampled_bytes = sampled_bytes
-            .checked_add(*length as u64)
-            .ok_or_else(|| io::Error::other("sampled byte count overflowed"))?;
-
-        compressed_bytes = compressed_bytes
-            .checked_add(compressed.len() as u64)
-            .ok_or_else(|| io::Error::other("compressed sample byte count overflowed"))?;
-    }
-
+    let (sampled_bytes, compressed_bytes) = measure_ranges(&file, 0, &ranges, level)?;
     let compression_elapsed = compression_started.elapsed();
 
     let ratio_percent = compression_ratio_percent(sampled_bytes, compressed_bytes);
@@ -155,6 +136,91 @@ pub fn run(source: &Path, level: i32) -> io::Result<CompressionProbeReport> {
         compression_elapsed,
         total_elapsed: total_started.elapsed(),
     })
+}
+
+pub(crate) fn decide_file_range(
+    file: &File,
+    offset: u64,
+    length: u64,
+    level: i32,
+) -> io::Result<CompressionDecision> {
+    validate_level(level)?;
+
+    let end = offset.checked_add(length).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "compression range overflowed")
+    })?;
+
+    let file_length = file.metadata()?.len();
+
+    if end > file_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("compression range {offset}..{end} exceeds file length {file_length}"),
+        ));
+    }
+
+    let ranges = sample_ranges(length);
+
+    let original_position = {
+        let mut cursor = file;
+        cursor.stream_position()?
+    };
+
+    let measurement = measure_ranges(file, offset, &ranges, level);
+
+    {
+        let mut cursor = file;
+
+        cursor.seek(SeekFrom::Start(original_position))?;
+    }
+
+    let (sampled_bytes, compressed_bytes) = measurement?;
+
+    Ok(choose_decision(sampled_bytes, compressed_bytes))
+}
+
+fn measure_ranges(
+    file: &File,
+    base_offset: u64,
+    ranges: &[(u64, usize)],
+    level: i32,
+) -> io::Result<(u64, u64)> {
+    let mut compressor = zstd::bulk::Compressor::new(level).map_err(|error| {
+        io::Error::other(format!("failed to create Zstandard compressor: {error}"))
+    })?;
+
+    let mut sampled_bytes = 0_u64;
+    let mut compressed_bytes = 0_u64;
+
+    for (relative_offset, length) in ranges {
+        let absolute_offset = base_offset
+            .checked_add(*relative_offset)
+            .ok_or_else(|| io::Error::other("compression sample offset overflowed"))?;
+
+        let mut sample = vec![0_u8; *length];
+
+        read_exact_at(file, &mut sample, absolute_offset)?;
+
+        let compressed = compressor.compress(&sample).map_err(|error| {
+            io::Error::other(format!("Zstandard sample compression failed: {error}"))
+        })?;
+
+        sampled_bytes = sampled_bytes
+            .checked_add(
+                u64::try_from(*length)
+                    .map_err(|_| io::Error::other("sample length cannot be represented"))?,
+            )
+            .ok_or_else(|| io::Error::other("sampled byte count overflowed"))?;
+
+        compressed_bytes =
+            compressed_bytes
+                .checked_add(u64::try_from(compressed.len()).map_err(|_| {
+                    io::Error::other("compressed sample length cannot be represented")
+                })?)
+                .ok_or_else(|| io::Error::other("compressed sample byte count overflowed"))?;
+    }
+
+    Ok((sampled_bytes, compressed_bytes))
 }
 
 fn sample_ranges(file_bytes: u64) -> Vec<(u64, usize)> {
