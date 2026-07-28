@@ -881,11 +881,12 @@ Planned after the first real-network release:
 * [x] Reject Wi-Fi, VPN, Hyper-V, and WSL routes
 * [x] Prefer IPv6 link-local addressing
 * [x] Handle IPv6 scope identifiers correctly
+* [ ] Resolve IPv4 APIPA addresses by interface index
 * [ ] Fall back to direct-link IPv4
-* [ ] Bind every control and data socket explicitly to the selected interface
+* [x] Bind every control and data socket explicitly to the selected interface
 * [x] Validate the chosen TCP path
 * [x] Run automatic calibration and folder transfer over the selected direct path
-* [ ] Recover cleanly if the link disappears
+* [x] Recover cleanly if the link disappears
 
 The intended use case is a direct copper cable between two Windows computers, with no router or switch required.
 

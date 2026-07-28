@@ -359,7 +359,7 @@ fn run_direct_address(
         .into());
     }
 
-    direct_address::print_link_local(interface_index)?;
+    direct_address::print_addresses(interface_index)?;
 
     Ok(())
 }
