@@ -826,6 +826,20 @@ Sender:
 networkcopy-speed send-auto <receiver-address> <source> [workers] [calibration-mib]
 ```
 
+### Windows Firewall
+
+All receiver commands must run from an elevated terminal.
+
+Before binding the listener, NetworkCopy automatically refreshes a Windows
+Firewall inbound rule for the selected TCP port. The rule is restricted to:
+
+* the currently running `networkcopy-speed.exe`
+* the selected TCP port
+* remote systems on the local subnet
+
+The rule is recreated whenever a receiver command starts, so changing the
+executable location or listening port requires no manual firewall maintenance.
+
 Planned work:
 
 * [x] Derive session identity and stream count from the control connection
@@ -841,7 +855,7 @@ Planned work:
 * [ ] Measure a real two-machine path with automatic calibrated transfer
 * [ ] Tune socket buffers and in-flight data where real-path measurements justify it
 * [ ] Target at least 85–90% of the measured path capacity
-* [ ] Firewall guidance
+* [x] Require elevation and automatically manage the Windows Firewall rule
 * [ ] Standalone release binaries
 * [ ] End-to-end two-machine acceptance test
 

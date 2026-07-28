@@ -15,6 +15,7 @@ mod pipeline_bench;
 mod resume_state;
 mod striped_file;
 mod transfer_memory;
+mod windows_setup;
 
 use std::env;
 use std::error::Error;
@@ -419,6 +420,8 @@ fn run_network_matrix_receive(
         .into());
     }
 
+    windows_setup::prepare_receiver(bind_address)?;
+
     let listener = TcpListener::bind(bind_address)?;
 
     println!("NetworkCopy Speed Edition raw TCP path matrix receiver");
@@ -506,6 +509,8 @@ fn run_network_bench_receive(
         )
         .into());
     }
+
+    windows_setup::prepare_receiver(bind_address)?;
 
     let listener = TcpListener::bind(bind_address)?;
 
@@ -603,6 +608,8 @@ fn run_receive_auto(arguments: &mut impl Iterator<Item = OsString>) -> Result<()
         .into());
     }
 
+    windows_setup::prepare_receiver(bind_address)?;
+
     let listener = TcpListener::bind(bind_address)?;
 
     println!("NetworkCopy Speed Edition automatic calibrated receiver");
@@ -696,6 +703,8 @@ fn run_receive(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), Box
         )
         .into());
     }
+
+    windows_setup::prepare_receiver(bind_address)?;
 
     let listener = TcpListener::bind(bind_address)?;
 
