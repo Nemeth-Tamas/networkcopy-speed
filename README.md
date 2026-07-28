@@ -810,7 +810,7 @@ Planned command shape:
 
 ```text
 Receiver:
-networkcopy-speed receive <bind-address> <destination> [data-streams]
+networkcopy-speed receive <bind-address> <destination>
 
 Sender:
 networkcopy-speed send <receiver-address> <source> [workers] [data-streams]
@@ -819,10 +819,10 @@ networkcopy-speed send <receiver-address> <source> [workers] [data-streams]
 Planned work:
 
 * [x] Derive session identity and stream count from the control connection
-* [ ] Separate sender and receiver CLI commands
-* [ ] Bind the receiver to a configurable interface and port
-* [ ] Connect sender data lanes to a remote machine
-* [ ] Preserve the current protocol and transfer planner
+* [x] Separate sender and receiver CLI commands
+* [x] Bind the receiver to a configurable interface and port
+* [x] Connect sender data lanes to a remote machine
+* [x] Preserve the current protocol and transfer planner
 * [ ] Real-network raw TCP calibration
 * [ ] Test 1, 2, 4, and 8 streams
 * [ ] Tune socket buffers and in-flight data

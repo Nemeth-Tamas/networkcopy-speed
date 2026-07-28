@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,7 +48,7 @@ pub struct MultistreamCopyReport {
     pub resumed_bytes: u64,
     pub buffer_bytes_per_lane: u64,
     pub buffer_bytes_per_peer: u64,
-    pub loopback_buffer_bytes: u64,
+    pub process_buffer_bytes: u64,
     pub transfer_buffer_budget_bytes: u64,
     pub manifest_wire_bytes: u64,
     pub tiny_pack_count: u64,
@@ -106,8 +106,8 @@ impl MultistreamCopyReport {
         );
 
         println!(
-            "  Loopback buffers:     {} / {} bytes",
-            format_bytes(self.loopback_buffer_bytes),
+            "  Process buffers:      {} / {} bytes",
+            format_bytes(self.process_buffer_bytes,),
             format_bytes(self.transfer_buffer_budget_bytes,)
         );
         println!(
@@ -148,6 +148,77 @@ impl MultistreamCopyReport {
             "  Payload throughput:   {:.2} MB/s ({:.2} MiB/s)",
             decimal_megabytes_per_second(self.bytes_copied, self.data_elapsed,),
             binary_mebibytes_per_second(self.bytes_copied, self.data_elapsed,)
+        );
+    }
+}
+
+#[derive(Debug)]
+pub struct ReceiveReport {
+    pub session_id: u64,
+    pub data_stream_count: usize,
+    pub files_received: u64,
+    pub bytes_received: u64,
+    pub data_wire_bytes: u64,
+    pub compressed_records: u64,
+    pub resumed_stripes: u64,
+    pub resumed_bytes: u64,
+    pub elapsed: Duration,
+}
+
+impl ReceiveReport {
+    pub fn print(&self) {
+        println!("NetworkCopy receive session complete");
+
+        println!("  Session ID:           {:016X}", self.session_id);
+
+        println!("  TCP data streams:     {}", self.data_stream_count);
+
+        println!(
+            "  Files received:       {}",
+            format_bytes(self.files_received,)
+        );
+
+        println!(
+            "  Data received:        {} bytes",
+            format_bytes(self.bytes_received,)
+        );
+
+        println!(
+            "  Data wire size:       {} bytes",
+            format_bytes(self.data_wire_bytes,)
+        );
+
+        println!(
+            "  Compressed records:   {}",
+            format_bytes(self.compressed_records,)
+        );
+
+        println!(
+            "  Resumed stripes:      {}",
+            format_bytes(self.resumed_stripes,)
+        );
+
+        println!(
+            "  Resumed data:         {} bytes",
+            format_bytes(self.resumed_bytes,)
+        );
+
+        println!(
+            "  Wire savings:         {:.2}%",
+            wire_savings_percent(self.bytes_received, self.data_wire_bytes,)
+        );
+
+        println!("  Integrity:            BLAKE3 verified");
+
+        println!(
+            "  Session time:         {:.6} s",
+            self.elapsed.as_secs_f64()
+        );
+
+        println!(
+            "  Payload throughput:   {:.2} MB/s ({:.2} MiB/s)",
+            decimal_megabytes_per_second(self.bytes_received, self.elapsed,),
+            binary_mebibytes_per_second(self.bytes_received, self.elapsed,)
         );
     }
 }
@@ -314,6 +385,7 @@ fn run_with_fault(
     fault_injection: Arc<TransferFault>,
 ) -> io::Result<MultistreamCopyReport> {
     manifest_scan::validate_worker_count(worker_count)?;
+
     control_plane::validate_data_stream_count(data_stream_count)?;
 
     let memory_plan = transfer_memory::plan_loopback(
@@ -323,18 +395,9 @@ fn run_with_fault(
         MAX_COMPRESSED_CHUNK_BYTES as u64,
     )?;
 
-    let total_started = Instant::now();
-    let source_root = source_root.canonicalize()?;
-
-    let scan_result = manifest_scan::run(&source_root, worker_count)?;
-
-    let scan_elapsed = scan_result.report.elapsed;
-    let manifest = Arc::new(scan_result.manifest);
-    let summary = control_plane::summarize_manifest(&manifest)?;
-
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
+
     let address = listener.local_addr()?;
-    let session_id = control_plane::create_session_id();
 
     let server_destination = destination_root.to_path_buf();
 
@@ -342,9 +405,73 @@ fn run_with_fault(
         .name("networkcopy-transfer-server".to_string())
         .spawn(move || run_server(listener, server_destination, fault_injection))?;
 
+    send_internal(
+        address,
+        source_root,
+        worker_count,
+        data_stream_count,
+        memory_plan,
+        memory_plan.loopback_bytes,
+        Some(server),
+    )
+}
+
+pub fn send(
+    receiver_address: SocketAddr,
+    source_root: &Path,
+    worker_count: usize,
+    data_stream_count: usize,
+) -> io::Result<MultistreamCopyReport> {
+    manifest_scan::validate_worker_count(worker_count)?;
+
+    control_plane::validate_data_stream_count(data_stream_count)?;
+
+    let memory_plan = transfer_memory::plan_loopback(
+        data_stream_count,
+        NETWORK_BUFFER_BYTES as u64,
+        COPY_BUFFER_BYTES as u64,
+        MAX_COMPRESSED_CHUNK_BYTES as u64,
+    )?;
+
+    send_internal(
+        receiver_address,
+        source_root,
+        worker_count,
+        data_stream_count,
+        memory_plan,
+        memory_plan.per_peer_bytes,
+        None,
+    )
+}
+
+fn send_internal(
+    receiver_address: SocketAddr,
+    source_root: &Path,
+    worker_count: usize,
+    data_stream_count: usize,
+    memory_plan: transfer_memory::TransferMemoryPlan,
+    process_buffer_bytes: u64,
+    server: Option<thread::JoinHandle<io::Result<ReceiveReport>>>,
+) -> io::Result<MultistreamCopyReport> {
+    let total_started = Instant::now();
+
+    let source_root = source_root.canonicalize()?;
+
+    let scan_result = manifest_scan::run(&source_root, worker_count)?;
+
+    let scan_elapsed = scan_result.report.elapsed;
+
+    let manifest = Arc::new(scan_result.manifest);
+
+    let summary = control_plane::summarize_manifest(&manifest)?;
+
+    let session_id = control_plane::create_session_id();
+
     let connection_started = Instant::now();
 
-    let mut control_stream = TcpStream::connect(address)?;
+    let connection_started = Instant::now();
+
+    let mut control_stream = TcpStream::connect(receiver_address)?;
     control_plane::configure_stream(&control_stream)?;
 
     control_plane::write_handshake(
@@ -360,7 +487,7 @@ fn run_with_fault(
     let mut data_streams = Vec::with_capacity(data_stream_count);
 
     for stream_id in 0..data_stream_count {
-        let mut stream = TcpStream::connect(address)?;
+        let mut stream = TcpStream::connect(receiver_address)?;
         control_plane::configure_stream(&stream)?;
 
         control_plane::write_handshake(
@@ -434,14 +561,20 @@ fn run_with_fault(
 
     drop(control_stream);
 
-    let server_ack = server
-        .join()
-        .map_err(|_| io::Error::other("multistream receiver thread panicked"))??;
+    if let Some(server) = server {
+        let receiver_report = server
+            .join()
+            .map_err(|_| io::Error::other("multistream receiver thread panicked"))??;
 
-    if transfer_ack != server_ack {
-        return Err(io::Error::other(
-            "client and server transfer acknowledgements differ",
-        ));
+        if transfer_ack.files_copied != receiver_report.files_received
+            || transfer_ack.bytes_copied != receiver_report.bytes_received
+            || transfer_ack.data_wire_bytes != receiver_report.data_wire_bytes
+            || transfer_ack.compressed_records != receiver_report.compressed_records
+        {
+            return Err(io::Error::other(
+                "client and server transfer reports differ",
+            ));
+        }
     }
 
     if transfer_ack.files_copied != summary.entries
@@ -478,7 +611,7 @@ fn run_with_fault(
 
         buffer_bytes_per_peer: memory_plan.per_peer_bytes,
 
-        loopback_buffer_bytes: memory_plan.loopback_bytes,
+        process_buffer_bytes,
 
         transfer_buffer_budget_bytes: memory_plan.budget_bytes,
 
@@ -494,12 +627,22 @@ fn run_with_fault(
     })
 }
 
+pub fn receive_once(listener: TcpListener, destination_root: &Path) -> io::Result<ReceiveReport> {
+    run_server(
+        listener,
+        destination_root.to_path_buf(),
+        Arc::new(TransferFault::disabled()),
+    )
+}
+
 fn run_server(
     listener: TcpListener,
     destination_root: PathBuf,
     fault_injection: Arc<TransferFault>,
-) -> io::Result<TransferAck> {
+) -> io::Result<ReceiveReport> {
     let (mut control_stream, data_streams, accepted_session) = accept_session(listener)?;
+
+    let session_started = Instant::now();
 
     let data_stream_count = accepted_session.data_stream_count;
 
@@ -588,7 +731,25 @@ fn run_server(
 
     ResumeJournal::remove(destination_root.as_path())?;
 
-    Ok(ack)
+    Ok(ReceiveReport {
+        session_id: accepted_session.session_id,
+
+        data_stream_count,
+
+        files_received: ack.files_copied,
+
+        bytes_received: ack.bytes_copied,
+
+        data_wire_bytes: ack.data_wire_bytes,
+
+        compressed_records: ack.compressed_records,
+
+        resumed_stripes: resume_application.stripe_count,
+
+        resumed_bytes: resume_application.logical_report.bytes_copied,
+
+        elapsed: session_started.elapsed(),
+    })
 }
 
 fn accept_session(
@@ -2452,9 +2613,9 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 mod tests {
     use super::{
         ReceiverReady, TINY_PACK_TARGET_BYTES, TransferFault, TransferTask, accept_session,
-        apply_resume_offer, build_transfer_plan, copy_exact_hashed, read_receiver_ready, run,
-        run_with_fault, temporary_path, validate_resume_offer, validate_source_metadata,
-        verify_content_digest, write_receiver_ready,
+        apply_resume_offer, build_transfer_plan, copy_exact_hashed, read_receiver_ready,
+        receive_once, run, run_with_fault, send, temporary_path, validate_resume_offer,
+        validate_source_metadata, verify_content_digest, write_receiver_ready,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::file_metadata;
@@ -2898,6 +3059,69 @@ mod tests {
     }
 
     #[test]
+    fn separate_sender_and_receiver_copy_directory() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let parent =
+            env::temp_dir().join(format!("networkcopy-separated-{}-{unique}", process::id()));
+
+        let source = parent.join("source");
+
+        let destination = parent.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        fs::write(source.join("small.txt"), b"separate sender and receiver").unwrap();
+
+        let medium_contents = vec![0xA5_u8; 300 * 1024];
+
+        fs::write(source.join("medium.bin"), &medium_contents).unwrap();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+
+        let receiver_address = listener.local_addr().unwrap();
+
+        let receiver_destination = destination.clone();
+
+        let receiver = thread::spawn(move || receive_once(listener, &receiver_destination));
+
+        let sender_report = send(receiver_address, &source, 2, 2).unwrap();
+
+        let receiver_report = receiver.join().unwrap().unwrap();
+
+        assert_eq!(sender_report.files_copied, 2);
+
+        assert_eq!(receiver_report.files_received, 2);
+
+        assert_eq!(sender_report.bytes_copied, receiver_report.bytes_received);
+
+        assert_eq!(
+            sender_report.data_wire_bytes,
+            receiver_report.data_wire_bytes
+        );
+
+        assert_eq!(
+            sender_report.process_buffer_bytes,
+            sender_report.buffer_bytes_per_peer
+        );
+
+        assert_eq!(
+            fs::read(destination.join("small.txt",),).unwrap(),
+            b"separate sender and receiver"
+        );
+
+        assert_eq!(
+            fs::read(destination.join("medium.bin",),).unwrap(),
+            medium_contents
+        );
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
     fn loopback_session_resumes_after_injected_failure() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3123,11 +3347,11 @@ mod tests {
 
         assert!(!destination.join(JOURNAL_FILE_NAME).exists());
 
-        assert!(report.loopback_buffer_bytes <= report.transfer_buffer_budget_bytes);
+        assert!(report.process_buffer_bytes <= report.transfer_buffer_budget_bytes);
 
         assert_eq!(
             report.buffer_bytes_per_peer * 2,
-            report.loopback_buffer_bytes
+            report.process_buffer_bytes
         );
 
         assert!(report.compressed_records > 0);

@@ -18,6 +18,7 @@ use std::env;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 
 fn main() {
@@ -39,6 +40,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     match command.to_string_lossy().as_ref() {
+        "send" => run_send(&mut arguments),
+        "receive" => run_receive(&mut arguments),
         "bench-copy" => run_bench_copy(&mut arguments),
         "bench-hash" => run_hash_bench(&mut arguments),
         "probe-compression" => run_compression_probe(&mut arguments),
@@ -346,6 +349,100 @@ fn run_control_plane_probe(
     Ok(())
 }
 
+fn run_send(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), Box<dyn Error>> {
+    let receiver_address = parse_socket_address(
+        &required_argument(arguments, "receiver address")?,
+        "receiver address",
+    )?;
+
+    let source_root = PathBuf::from(required_argument(arguments, "source root directory")?);
+
+    let worker_count = match arguments.next() {
+        Some(value) => parse_buffer_count(&value)?,
+
+        None => manifest_scan::default_worker_count(),
+    };
+
+    let data_stream_count = match arguments.next() {
+        Some(value) => parse_buffer_count(&value)?,
+
+        None => multistream_copy::DEFAULT_DATA_STREAMS,
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    manifest_scan::validate_worker_count(worker_count)?;
+
+    control_plane::validate_data_stream_count(data_stream_count)?;
+
+    println!("NetworkCopy Speed Edition sender");
+
+    println!("  Receiver:     {receiver_address}");
+
+    println!("  Source:       {}", source_root.display());
+
+    println!("  Scan workers: {worker_count}");
+
+    println!("  Data streams: {data_stream_count}");
+
+    println!();
+
+    let report = multistream_copy::send(
+        receiver_address,
+        &source_root,
+        worker_count,
+        data_stream_count,
+    )?;
+
+    report.print();
+
+    Ok(())
+}
+
+fn run_receive(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), Box<dyn Error>> {
+    let bind_address = parse_socket_address(
+        &required_argument(arguments, "bind address")?,
+        "bind address",
+    )?;
+
+    let destination_root =
+        PathBuf::from(required_argument(arguments, "destination root directory")?);
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    let listener = TcpListener::bind(bind_address)?;
+
+    let local_address = listener.local_addr()?;
+
+    println!("NetworkCopy Speed Edition receiver");
+
+    println!("  Listening:    {local_address}");
+
+    println!("  Destination:  {}", destination_root.display());
+
+    println!("  Mode:         one transfer, then exit");
+
+    println!();
+
+    let report = multistream_copy::receive_once(listener, &destination_root)?;
+
+    report.print();
+
+    Ok(())
+}
+
 fn run_multistream_copy_bench(
     arguments: &mut impl Iterator<Item = OsString>,
 ) -> Result<(), Box<dyn Error>> {
@@ -429,6 +526,22 @@ fn run_striped_file_bench(
     Ok(())
 }
 
+fn parse_socket_address(value: &OsStr, description: &str) -> io::Result<SocketAddr> {
+    let value = value.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} must contain valid Unicode"),
+        )
+    })?;
+
+    value.parse::<SocketAddr>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {description} {value:?}: {error}"),
+        )
+    })
+}
+
 fn required_argument(
     arguments: &mut impl Iterator<Item = OsString>,
     description: &str,
@@ -501,6 +614,8 @@ fn print_usage(program: &OsStr) {
     println!("NetworkCopy Speed Edition");
     println!();
     println!("Usage:");
+    println!("  {program} receive <bind-address> <destination-root>");
+    println!("  {program} send <receiver-address> <source-root> [workers] [data-streams]");
     println!("  {program} bench-copy <source> <destination> [buffer-mib]");
     println!("  {program} bench-hash <source> [buffer-mib]");
     println!("  {program} probe-compression <source> [zstd-level]");
