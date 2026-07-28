@@ -882,7 +882,7 @@ Planned after the first real-network release:
 * [x] Prefer IPv6 link-local addressing
 * [x] Handle IPv6 scope identifiers correctly
 * [x] Resolve IPv4 APIPA addresses by interface index
-* [ ] Fall back to direct-link IPv4
+* [x] Fall back to direct-link IPv4
 * [x] Bind every control and data socket explicitly to the selected interface
 * [x] Validate the chosen TCP path
 * [x] Run automatic calibration and folder transfer over the selected direct path
