@@ -265,7 +265,7 @@ pub(crate) fn receive_matrix_on_listener(
     let mut reports = Vec::with_capacity(MATRIX_STREAM_COUNTS.len());
 
     for expected_stream_count in MATRIX_STREAM_COUNTS {
-        let report = receive_one(&listener)?;
+        let report = receive_one(listener)?;
 
         if report.data_stream_count != expected_stream_count {
             return Err(io::Error::new(
