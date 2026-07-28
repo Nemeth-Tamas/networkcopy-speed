@@ -406,7 +406,7 @@ fn run_with_fault(
 
     let server = thread::Builder::new()
         .name("networkcopy-transfer-server".to_string())
-        .spawn(move || run_server(listener, server_destination, fault_injection))?;
+        .spawn(move || run_server(&listener, server_destination, fault_injection))?;
 
     send_internal(
         address,
@@ -677,6 +677,13 @@ fn send_internal(
 }
 
 pub fn receive_once(listener: TcpListener, destination_root: &Path) -> io::Result<ReceiveReport> {
+    receive_on_listener(&listener, destination_root)
+}
+
+pub(crate) fn receive_on_listener(
+    listener: &TcpListener,
+    destination_root: &Path,
+) -> io::Result<ReceiveReport> {
     run_server(
         listener,
         destination_root.to_path_buf(),
@@ -685,7 +692,7 @@ pub fn receive_once(listener: TcpListener, destination_root: &Path) -> io::Resul
 }
 
 fn run_server(
-    listener: TcpListener,
+    listener: &TcpListener,
     destination_root: PathBuf,
     fault_injection: Arc<TransferFault>,
 ) -> io::Result<ReceiveReport> {
@@ -802,7 +809,7 @@ fn run_server(
 }
 
 fn accept_session(
-    listener: TcpListener,
+    listener: &TcpListener,
 ) -> io::Result<(TcpStream, Vec<TcpStream>, AcceptedSession)> {
     let (mut control_stream, _control_peer) = listener.accept()?;
 
@@ -2819,7 +2826,7 @@ mod tests {
 
         let session_id = 0x1234_5678_9ABC_DEF0;
 
-        let receiver = thread::spawn(move || accept_session(listener));
+        let receiver = thread::spawn(move || accept_session(&listener));
 
         let mut control_stream = TcpStream::connect(address).unwrap();
 

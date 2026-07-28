@@ -816,6 +816,16 @@ Sender:
 networkcopy-speed send <receiver-address> <source> [workers] [data-streams]
 ```
 
+Automatic calibrated mode:
+
+```text
+Receiver:
+networkcopy-speed receive-auto <bind-address> <destination>
+
+Sender:
+networkcopy-speed send-auto <receiver-address> <source> [workers] [calibration-mib]
+```
+
 Planned work:
 
 * [x] Derive session identity and stream count from the control connection
@@ -826,9 +836,10 @@ Planned work:
 * [x] Raw TCP memory calibration commands
 * [x] Automatic 1, 2, 4, and 8-stream path matrix
 * [x] Recommend the smallest stream count within 90% of the best result
-* [ ] Measure a real two-machine path with the calibration matrix
-* [ ] Tune socket buffers and in-flight data
-* [ ] Compare engine throughput against measured TCP ceiling
+* [x] Automatic calibrated transfer using the recommended stream count
+* [x] Compare application-wire throughput against the calibrated TCP ceiling
+* [ ] Measure a real two-machine path with automatic calibrated transfer
+* [ ] Tune socket buffers and in-flight data where real-path measurements justify it
 * [ ] Target at least 85–90% of the measured path capacity
 * [ ] Firewall guidance
 * [ ] Standalone release binaries

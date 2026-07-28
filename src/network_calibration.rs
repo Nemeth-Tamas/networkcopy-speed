@@ -256,6 +256,12 @@ pub fn receive_once(listener: TcpListener) -> io::Result<NetworkCalibrationRepor
 }
 
 pub fn receive_matrix(listener: TcpListener) -> io::Result<NetworkCalibrationMatrixReport> {
+    receive_matrix_on_listener(&listener)
+}
+
+pub(crate) fn receive_matrix_on_listener(
+    listener: &TcpListener,
+) -> io::Result<NetworkCalibrationMatrixReport> {
     let mut reports = Vec::with_capacity(MATRIX_STREAM_COUNTS.len());
 
     for expected_stream_count in MATRIX_STREAM_COUNTS {

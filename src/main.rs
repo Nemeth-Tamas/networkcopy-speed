@@ -1,4 +1,5 @@
 mod adaptive_compression;
+mod calibrated_transfer;
 mod compression_probe;
 mod content_hash;
 mod control_plane;
@@ -45,7 +46,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         "bench-network-matrix-receive" => run_network_matrix_receive(&mut arguments),
         "bench-network-send" => run_network_bench_send(&mut arguments),
         "bench-network-receive" => run_network_bench_receive(&mut arguments),
+        "send-auto" => run_send_auto(&mut arguments),
+
+        "receive-auto" => run_receive_auto(&mut arguments),
+
         "send" => run_send(&mut arguments),
+
         "receive" => run_receive(&mut arguments),
         "bench-copy" => run_bench_copy(&mut arguments),
         "bench-hash" => run_hash_bench(&mut arguments),
@@ -520,6 +526,104 @@ fn run_network_bench_receive(
     Ok(())
 }
 
+fn run_send_auto(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), Box<dyn Error>> {
+    let receiver_address = parse_socket_address(
+        &required_argument(arguments, "receiver address")?,
+        "receiver address",
+    )?;
+
+    let source_root = PathBuf::from(required_argument(arguments, "source root directory")?);
+
+    let worker_count = match arguments.next() {
+        Some(value) => parse_buffer_count(&value)?,
+
+        None => manifest_scan::default_worker_count(),
+    };
+
+    let calibration_mib = match arguments.next() {
+        Some(value) => parse_u64_count(&value, "calibration MiB")?,
+
+        None => calibrated_transfer::DEFAULT_CALIBRATION_MIB,
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    manifest_scan::validate_worker_count(worker_count)?;
+
+    let calibration_bytes = network_calibration::bytes_from_mib(calibration_mib)?;
+
+    println!("NetworkCopy Speed Edition automatic calibrated sender");
+
+    println!("  Receiver:       {receiver_address}");
+
+    println!("  Source:         {}", source_root.display());
+
+    println!("  Scan workers:   {worker_count}");
+
+    println!("  Calibration:    {calibration_mib} MiB per matrix run");
+
+    println!("  Stream tests:   1, 2, 4, 8");
+
+    println!("  Selection:      smallest count within 90% of best");
+
+    println!();
+
+    let report = calibrated_transfer::send(
+        receiver_address,
+        &source_root,
+        worker_count,
+        calibration_bytes,
+    )?;
+
+    report.print();
+
+    Ok(())
+}
+
+fn run_receive_auto(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), Box<dyn Error>> {
+    let bind_address = parse_socket_address(
+        &required_argument(arguments, "bind address")?,
+        "bind address",
+    )?;
+
+    let destination_root =
+        PathBuf::from(required_argument(arguments, "destination root directory")?);
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    let listener = TcpListener::bind(bind_address)?;
+
+    println!("NetworkCopy Speed Edition automatic calibrated receiver");
+
+    println!("  Listening:      {}", listener.local_addr()?);
+
+    println!("  Destination:    {}", destination_root.display());
+
+    println!("  Sequence:       matrix, then one transfer");
+
+    println!("  Stream tests:   1, 2, 4, 8");
+
+    println!();
+
+    let report = calibrated_transfer::receive_once(listener, &destination_root)?;
+
+    report.print();
+
+    Ok(())
+}
+
 fn run_send(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), Box<dyn Error>> {
     let receiver_address = parse_socket_address(
         &required_argument(arguments, "receiver address")?,
@@ -801,6 +905,9 @@ fn print_usage(program: &OsStr) {
     println!("NetworkCopy Speed Edition");
     println!();
     println!("Usage:");
+    println!("  {program} receive-auto <bind-address> <destination-root>");
+
+    println!("  {program} send-auto <receiver-address> <source-root> [workers] [calibration-mib]");
     println!("  {program} bench-network-matrix-receive <bind-address>");
     println!("  {program} bench-network-matrix-send <receiver-address> [total-mib]");
     println!("  {program} bench-network-receive <bind-address>");
