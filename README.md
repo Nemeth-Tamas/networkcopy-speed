@@ -789,7 +789,7 @@ This is exactly why the future two-machine mode will calibrate stream counts ins
 * [x] Actual application-wire accounting
 * [x] Hard 4 GiB transfer-buffer ceiling
 
-## Milestone 7 — Resume and filesystem behavior
+## Milestone 7 — Resume and filesystem correctness
 
 * [x] Durable resume journal
 * [x] Atomic journal replacement
@@ -798,13 +798,9 @@ This is exactly why the future two-machine mode will calibrate stream counts ins
 * [x] Resume-stripe control negotiation
 * [x] Transfer-plan filtering
 * [x] Reopen interrupted destinations
-* [ ] Automated process-interruption test
-* [ ] Metadata restoration
-* [ ] Sparse-file range preservation
-* [ ] Medium-file chunk resume
-* [ ] Tiny-pack resume
-* [ ] Source snapshot consistency checks
-* [ ] Delta transfer
+* [ ] Restore last-write timestamps and safe Windows attributes
+* [ ] Reject source files changed after manifest scanning
+* [ ] Automated interruption and resume acceptance test
 
 ## Milestone 8 — Real two-machine mode
 
@@ -850,6 +846,63 @@ Planned after the first real-network release:
 * [ ] Recover cleanly if the link disappears
 
 The intended use case is a direct copper cable between two Windows computers, with no router or switch required.
+
+## Milestone 10 — v1.2 simple desktop GUI
+
+The first GUI will remain deliberately small and will call the same transfer
+engine as the CLI.
+
+Planned implementation:
+
+* `egui` / `eframe` native Windows application
+* separate `networkcopy-gui` binary
+* shared transfer engine exposed through a library crate
+* background worker thread with progress events
+* no separate or duplicated networking implementation
+
+Planned interface:
+
+* Send and Receive tabs
+* source and destination folder pickers
+* receiver address or local bind address
+* scanner-worker selector
+* data-stream selector
+* Start and Cancel buttons
+* overall progress bar
+* current file and phase
+* logical throughput
+* application-wire throughput
+* compression savings
+* resumed stripe and byte counts
+* compact scrolling event log
+* final success or failure summary
+
+Explicit v1.2 non-goals:
+
+* no system service
+* no tray application
+* no account system
+* no transfer history database
+* no remote filesystem browser
+* no theme editor
+* no drag-and-drop protocol changes
+* no separate GUI-only transfer engine
+
+The GUI should make the production CLI easier to operate, not replace or fork
+the core engine.
+
+## Later advanced transfer work
+
+These features remain planned, but are not required before the first real
+two-machine release:
+
+* sparse-file allocation preservation
+* medium-file chunk resume
+* tiny-pack resume
+* alternate data stream handling
+* ACL and ownership preservation
+* delta transfer
+* authenticated and encrypted sessions
 
 ---
 
