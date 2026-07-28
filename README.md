@@ -902,7 +902,9 @@ Implementation progress:
 * [x] Hungarian-first interface with English compiled into the executable
 * [x] runtime Hungarian / English language switching
 * [x] native source and destination folder pickers
-* [ ] shared transfer engine exposed through a library facade
+* [x] shared transfer engine exposed through a library facade
+* [x] common Direct Link and manual IP-address transfer requests
+* [x] GUI-facing loopback round-trip coverage
 * [ ] background worker thread with progress events
 * [ ] working Send, Receive, and Cancel actions
 * [ ] no separate or duplicated networking implementation
