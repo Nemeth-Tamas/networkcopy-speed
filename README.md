@@ -881,7 +881,7 @@ Planned after the first real-network release:
 * [x] Reject Wi-Fi, VPN, Hyper-V, and WSL routes
 * [x] Prefer IPv6 link-local addressing
 * [x] Handle IPv6 scope identifiers correctly
-* [ ] Resolve IPv4 APIPA addresses by interface index
+* [x] Resolve IPv4 APIPA addresses by interface index
 * [ ] Fall back to direct-link IPv4
 * [x] Bind every control and data socket explicitly to the selected interface
 * [x] Validate the chosen TCP path

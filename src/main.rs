@@ -7,6 +7,7 @@ mod control_plane;
 mod copy_bench;
 mod direct_address;
 mod direct_discovery;
+mod direct_discovery_v4;
 mod direct_link;
 mod direct_route;
 mod direct_tcp;

@@ -1,21 +1,19 @@
 use crate::calibrated_transfer::{self, CalibratedReceiveReport, CalibratedSendReport};
-use crate::direct_address::{self, DIRECT_TRANSFER_PORT};
 use crate::direct_discovery;
+use crate::tcp_connect;
 use std::io;
-use std::net::{SocketAddr, TcpListener};
+use std::net::TcpListener;
 use std::path::Path;
 
 pub(crate) fn receive_once(destination_root: &Path) -> io::Result<CalibratedReceiveReport> {
-    let interface_index = direct_discovery::receive_one()?;
+    let path = direct_discovery::receive_one()?;
 
-    let bind_endpoint = direct_address::link_local_endpoint(interface_index, DIRECT_TRANSFER_PORT)?;
-
-    let listener = TcpListener::bind(bind_endpoint)?;
+    let listener = TcpListener::bind(path.local_endpoint)?;
 
     println!();
     println!("NetworkCopy Speed Edition direct-link receiver");
 
-    println!("  Local interface: {}", interface_index,);
+    println!("  Local interface: {}", path.interface_index,);
 
     println!("  Listening:       {}", listener.local_addr()?,);
 
@@ -35,9 +33,11 @@ pub(crate) fn send(
 ) -> io::Result<CalibratedSendReport> {
     let path = direct_discovery::discover_one()?;
 
-    let local_address = direct_address::link_local_endpoint(path.interface_index, 0)?;
+    let local_address = path.local_endpoint;
 
-    let receiver_address = SocketAddr::V6(path.endpoint);
+    let receiver_address = path.endpoint;
+
+    let _binding = tcp_connect::begin_direct_binding(local_address.ip())?;
 
     println!();
     println!("NetworkCopy Speed Edition direct-link sender");

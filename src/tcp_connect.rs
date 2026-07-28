@@ -2,8 +2,54 @@ use crate::direct_address;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpStream};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+static DIRECT_BINDING: OnceLock<Mutex<Option<IpAddr>>> = OnceLock::new();
+
+pub(crate) struct DirectBindingGuard;
+
+impl Drop for DirectBindingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut binding) = binding_slot().lock() {
+            *binding = None;
+        }
+    }
+}
+
+pub(crate) fn begin_direct_binding(address: IpAddr) -> io::Result<DirectBindingGuard> {
+    let mut binding = lock_binding()?;
+
+    if binding.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "a direct-link source binding is already active",
+        ));
+    }
+
+    *binding = Some(address);
+
+    Ok(DirectBindingGuard)
+}
+
+fn binding_slot() -> &'static Mutex<Option<IpAddr>> {
+    DIRECT_BINDING.get_or_init(|| Mutex::new(None))
+}
+
+fn lock_binding() -> io::Result<MutexGuard<'static, Option<IpAddr>>> {
+    binding_slot()
+        .lock()
+        .map_err(|_| io::Error::other("direct-link source binding lock was poisoned"))
+}
+
+fn configured_binding() -> io::Result<Option<IpAddr>> {
+    Ok(*lock_binding()?)
+}
 
 pub(crate) fn connect(receiver_address: SocketAddr) -> io::Result<TcpStream> {
+    if let Some(address) = configured_binding()? {
+        return connect_bound(SocketAddr::new(address, 0), receiver_address);
+    }
+
     let Some(local_address) = local_bind_address(receiver_address)? else {
         return TcpStream::connect(receiver_address);
     };

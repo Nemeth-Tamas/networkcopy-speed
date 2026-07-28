@@ -1,6 +1,8 @@
 use crate::direct_address::{self, DIRECT_TRANSFER_PORT};
+use crate::direct_discovery_v4;
 use crate::direct_link;
 use crate::direct_route;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::process;
@@ -16,29 +18,38 @@ const DISCOVERY_PACKET_BYTES: usize = 20;
 const DISCOVERY_ATTEMPTS: usize = 6;
 const DISCOVERY_REPLY_TIMEOUT: Duration = Duration::from_millis(500);
 
+const DISCOVERY_POLL_TIMEOUT: Duration = Duration::from_millis(100);
+
 const DISCOVERY_GROUP: Ipv6Addr = Ipv6Addr::new(0xFF12, 0, 0, 0, 0, 0, 0x4E43, 0x5350);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DiscoveredPath {
     pub(crate) interface_index: u32,
-    pub(crate) endpoint: SocketAddrV6,
+    pub(crate) local_endpoint: SocketAddr,
+    pub(crate) endpoint: SocketAddr,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DiscoveryKind {
+pub(crate) struct ReceivedPath {
+    pub(crate) interface_index: u32,
+    pub(crate) local_endpoint: SocketAddr,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DiscoveryKind {
     Probe = 1,
     Offer = 2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DiscoveryPacket {
-    kind: DiscoveryKind,
-    nonce: u64,
-    transfer_port: u16,
+pub(crate) struct DiscoveryPacket {
+    pub(crate) kind: DiscoveryKind,
+    pub(crate) nonce: u64,
+    pub(crate) transfer_port: u16,
 }
 
 impl DiscoveryPacket {
-    fn probe(nonce: u64) -> Self {
+    pub(crate) fn probe(nonce: u64) -> Self {
         Self {
             kind: DiscoveryKind::Probe,
             nonce,
@@ -46,7 +57,7 @@ impl DiscoveryPacket {
         }
     }
 
-    fn offer(nonce: u64, transfer_port: u16) -> Self {
+    pub(crate) fn offer(nonce: u64, transfer_port: u16) -> Self {
         Self {
             kind: DiscoveryKind::Offer,
             nonce,
@@ -54,7 +65,7 @@ impl DiscoveryPacket {
         }
     }
 
-    fn encode(self) -> [u8; DISCOVERY_PACKET_BYTES] {
+    pub(crate) fn encode(self) -> [u8; DISCOVERY_PACKET_BYTES] {
         let mut bytes = [0_u8; DISCOVERY_PACKET_BYTES];
 
         bytes[..4].copy_from_slice(&DISCOVERY_MAGIC);
@@ -69,7 +80,7 @@ impl DiscoveryPacket {
         bytes
     }
 
-    fn decode(bytes: &[u8]) -> io::Result<Self> {
+    pub(crate) fn decode(bytes: &[u8]) -> io::Result<Self> {
         if bytes.len() != DISCOVERY_PACKET_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -209,39 +220,67 @@ pub(crate) fn receive_all() -> io::Result<()> {
     receive_automatically(false).map(|_| ())
 }
 
-pub(crate) fn receive_one() -> io::Result<u32> {
+pub(crate) fn receive_one() -> io::Result<ReceivedPath> {
     receive_automatically(true)
 }
 
-fn receive_automatically(stop_after_first: bool) -> io::Result<u32> {
+fn receive_automatically(stop_after_first: bool) -> io::Result<ReceivedPath> {
     let candidates = automatic_direct_candidates()?;
 
     let interface_indices = candidates.direct;
 
     let routed_interface_indices = candidates.routed;
 
-    let local_endpoints = interface_indices
-        .iter()
-        .copied()
-        .map(|interface_index| {
-            direct_address::link_local_endpoint(interface_index, DISCOVERY_PORT)
-                .map(|endpoint| (interface_index, endpoint))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
+    let mut local_endpoints = Vec::new();
 
-    let bind_endpoint = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, DISCOVERY_PORT, 0, 0);
+    for interface_index in &interface_indices {
+        match direct_address::link_local_endpoint(*interface_index, DISCOVERY_PORT) {
+            Ok(endpoint) => {
+                local_endpoints.push((*interface_index, endpoint));
+            }
 
-    let socket = UdpSocket::bind(bind_endpoint)?;
+            Err(error) if error.kind() == io::ErrorKind::AddrNotAvailable => {}
 
-    socket.set_multicast_loop_v6(false)?;
-
-    for (interface_index, _) in &local_endpoints {
-        socket.join_multicast_v6(&DISCOVERY_GROUP, *interface_index)?;
+            Err(error) => {
+                return Err(error);
+            }
+        }
     }
+
+    let (ipv4_receiver, ipv4_warning) = match direct_discovery_v4::receiver(&interface_indices) {
+        Ok(receiver) => (receiver, None),
+
+        Err(error) if !local_endpoints.is_empty() => (None, Some(error.to_string())),
+
+        Err(error) => {
+            return Err(error);
+        }
+    };
+
+    if local_endpoints.is_empty() && ipv4_receiver.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no direct candidate has a usable IPv6 link-local or IPv4 APIPA address",
+        ));
+    }
+
+    let ipv6_socket = if local_endpoints.is_empty() {
+        None
+    } else {
+        let socket = bind_ipv6_receiver()?;
+
+        socket.set_multicast_loop_v6(false)?;
+
+        for (interface_index, _) in &local_endpoints {
+            socket.join_multicast_v6(&DISCOVERY_GROUP, *interface_index)?;
+        }
+
+        Some(socket)
+    };
 
     println!("NetworkCopy Speed Edition automatic direct-link discovery receiver");
 
-    println!("  Direct candidates:    {}", local_endpoints.len(),);
+    println!("  Direct candidates:    {}", interface_indices.len(),);
 
     for interface_index in &routed_interface_indices {
         println!("  Rejected routed:      {}", interface_index,);
@@ -253,74 +292,177 @@ fn receive_automatically(stop_after_first: bool) -> io::Result<u32> {
         println!("  Listening interface: {}", interface_index,);
 
         println!(
-            "  Local IPv6:          {}%{}",
+            "  IPv6 link-local:     {}%{}",
             endpoint.ip(),
             interface_index,
         );
 
         println!(
-            "  Multicast group:     [{}%{}]:{}",
+            "  IPv6 multicast:     [{}%{}]:{}",
             DISCOVERY_GROUP, interface_index, DISCOVERY_PORT,
         );
     }
 
+    if let Some(receiver) = &ipv4_receiver {
+        println!();
+
+        println!("  IPv4 fallback:       {}", receiver.local_endpoint(),);
+    }
+
+    if let Some(warning) = ipv4_warning {
+        println!();
+
+        println!("  IPv4 fallback unavailable: {}", warning,);
+    }
+
     println!();
 
-    println!("  Transfer port:       {}", DIRECT_TRANSFER_PORT,);
+    println!(
+        "  Transfer port:       {}",
+        direct_address::DIRECT_TRANSFER_PORT,
+    );
 
     println!();
     println!("Waiting for direct-link probes...");
 
-    let mut buffer = [0_u8; 256];
-
     loop {
-        let (received, source) = socket.recv_from(&mut buffer)?;
-
-        let SocketAddr::V6(source) = source else {
-            continue;
-        };
-
-        let interface_index = source.scope_id();
-
-        if interface_index == 0 {
-            println!("  Ignored a link-local probe without an interface scope ID");
-
-            continue;
+        if let Some(socket) = &ipv6_socket
+            && let Some(path) = receive_ipv6_probe(socket, &interface_indices)?
+            && stop_after_first
+        {
+            return Ok(path);
         }
 
-        if !interface_indices.contains(&interface_index) {
-            continue;
-        }
+        if let Some(receiver) = &ipv4_receiver
+            && let Some(path) = receiver.poll()?
+        {
+            let path = ReceivedPath {
+                interface_index: path.interface_index,
 
-        let Ok(packet) = DiscoveryPacket::decode(&buffer[..received]) else {
-            continue;
-        };
+                local_endpoint: SocketAddr::V4(path.local_endpoint),
+            };
 
-        if packet.kind != DiscoveryKind::Probe {
-            continue;
-        }
-
-        let Some(reply_target) = scoped_link_local(source, interface_index) else {
-            continue;
-        };
-
-        let offer = DiscoveryPacket::offer(packet.nonce, DIRECT_TRANSFER_PORT);
-
-        socket.send_to(&offer.encode(), reply_target)?;
-
-        println!(
-            "  Replied to {} through interface {}",
-            reply_target, interface_index,
-        );
-
-        if stop_after_first {
-            return Ok(interface_index);
+            if stop_after_first {
+                return Ok(path);
+            }
         }
     }
 }
 
-pub(crate) fn discover(interface_index: u32) -> io::Result<SocketAddrV6> {
-    discover_on_interface(interface_index, true)
+fn bind_ipv6_receiver() -> io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+
+    socket.set_only_v6(true)?;
+
+    let bind_endpoint = SocketAddr::V6(SocketAddrV6::new(
+        Ipv6Addr::UNSPECIFIED,
+        DISCOVERY_PORT,
+        0,
+        0,
+    ));
+
+    socket.bind(&bind_endpoint.into())?;
+
+    let socket: UdpSocket = socket.into();
+
+    socket.set_read_timeout(Some(DISCOVERY_POLL_TIMEOUT))?;
+
+    Ok(socket)
+}
+
+fn receive_ipv6_probe(
+    socket: &UdpSocket,
+    interface_indices: &[u32],
+) -> io::Result<Option<ReceivedPath>> {
+    let mut buffer = [0_u8; 256];
+
+    let (received, source) = match socket.recv_from(&mut buffer) {
+        Ok(value) => value,
+
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Ok(None);
+        }
+
+        Err(error) => {
+            return Err(error);
+        }
+    };
+
+    let SocketAddr::V6(source) = source else {
+        return Ok(None);
+    };
+
+    let interface_index = source.scope_id();
+
+    if interface_index == 0 || !interface_indices.contains(&interface_index) {
+        return Ok(None);
+    }
+
+    let Ok(packet) = DiscoveryPacket::decode(&buffer[..received]) else {
+        return Ok(None);
+    };
+
+    if packet.kind != DiscoveryKind::Probe {
+        return Ok(None);
+    }
+
+    let Some(reply_target) = scoped_link_local(source, interface_index) else {
+        return Ok(None);
+    };
+
+    let offer = DiscoveryPacket::offer(packet.nonce, direct_address::DIRECT_TRANSFER_PORT);
+
+    socket.send_to(&offer.encode(), reply_target)?;
+
+    println!(
+        "  Replied to {} through interface {} using IPv6",
+        reply_target, interface_index,
+    );
+
+    let local_endpoint =
+        direct_address::link_local_endpoint(interface_index, direct_address::DIRECT_TRANSFER_PORT)?;
+
+    Ok(Some(ReceivedPath {
+        interface_index,
+        local_endpoint: SocketAddr::V6(local_endpoint),
+    }))
+}
+
+pub(crate) fn discover(interface_index: u32) -> io::Result<SocketAddr> {
+    match discover_on_interface(interface_index, true) {
+        Ok(path) => Ok(path.endpoint),
+
+        Err(ipv6_error) => {
+            println!();
+
+            println!("IPv6 discovery failed: {}", ipv6_error,);
+
+            println!("Trying IPv4 APIPA fallback...");
+
+            direct_discovery_v4::discover_on_interface(
+                interface_index,
+                true,
+            )
+            .map(|path| {
+                SocketAddr::V4(
+                    path.endpoint,
+                )
+            })
+            .map_err(|ipv4_error| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "IPv6 discovery failed: {ipv6_error}; IPv4 discovery failed: {ipv4_error}",
+                    ),
+                )
+            })
+        }
+    }
 }
 
 pub(crate) fn discover_all() -> io::Result<Vec<DiscoveredPath>> {
@@ -344,61 +486,31 @@ pub(crate) fn discover_all() -> io::Result<Vec<DiscoveredPath>> {
 
     println!();
 
-    let (mut discovered, failures) = thread::scope(|scope| {
-        let handles = interface_indices
-            .iter()
-            .copied()
-            .map(|interface_index| {
-                (
-                    interface_index,
-                    scope.spawn(move || discover_on_interface(interface_index, false)),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let mut discovered = Vec::new();
-        let mut failures = Vec::new();
-
-        for (interface_index, handle) in handles {
-            match handle.join() {
-                Ok(Ok(endpoint)) => {
-                    discovered.push(DiscoveredPath {
-                        interface_index,
-                        endpoint,
-                    });
-                }
-
-                Ok(Err(error)) => {
-                    failures.push(format!("interface {interface_index}: {error}"));
-                }
-
-                Err(_) => {
-                    failures.push(format!(
-                        "interface {interface_index}: discovery thread panicked"
-                    ));
-                }
-            }
-        }
-
-        (discovered, failures)
-    });
-
-    discovered.sort_by_key(|path| path.interface_index);
+    let (mut discovered, mut failures) = discover_ipv6_paths(&interface_indices);
 
     if discovered.is_empty() {
-        let details = if failures.is_empty() {
-            "no candidate returned a diagnostic".to_string()
-        } else {
-            failures.join("; ")
-        };
+        let ipv6_details = failure_details(&failures);
 
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "no NetworkCopy receiver was discovered through any strict Ethernet interface: {details}"
-            ),
-        ));
+        println!("No IPv6 receiver replied; trying IPv4 APIPA fallback...");
+
+        let (ipv4_discovered, ipv4_failures) = discover_ipv4_paths(&interface_indices);
+
+        discovered = ipv4_discovered;
+
+        failures = ipv4_failures;
+
+        if discovered.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "IPv6 discovery failed: {ipv6_details}; IPv4 discovery failed: {}",
+                    failure_details(&failures,),
+                ),
+            ));
+        }
     }
+
+    discovered.sort_by_key(|path| (path.interface_index, path.endpoint.is_ipv4()));
 
     println!(
         "Direct-link receiver path{} discovered",
@@ -411,16 +523,22 @@ pub(crate) fn discover_all() -> io::Result<Vec<DiscoveredPath>> {
         println!("  Local interface: {}", path.interface_index,);
 
         println!(
-            "  Peer IPv6:       {}%{}",
-            path.endpoint.ip(),
-            path.interface_index,
+            "  Protocol:        {}",
+            if path.endpoint.is_ipv6() {
+                "IPv6 link-local"
+            } else {
+                "IPv4 APIPA"
+            },
         );
 
-        println!("  TCP endpoint:    {}", path.endpoint,);
+        println!("  Local binding:   {}", path.local_endpoint,);
+
+        println!("  Peer endpoint:   {}", path.endpoint,);
     }
 
     if !failures.is_empty() {
         println!();
+
         println!("Interfaces without a valid reply:");
 
         for failure in failures {
@@ -429,6 +547,100 @@ pub(crate) fn discover_all() -> io::Result<Vec<DiscoveredPath>> {
     }
 
     Ok(discovered)
+}
+
+fn discover_ipv6_paths(interface_indices: &[u32]) -> (Vec<DiscoveredPath>, Vec<String>) {
+    thread::scope(|scope| {
+        let handles = interface_indices
+            .iter()
+            .copied()
+            .map(|interface_index| {
+                (
+                    interface_index,
+                    scope.spawn(move || discover_on_interface(interface_index, false)),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut discovered = Vec::new();
+
+        let mut failures = Vec::new();
+
+        for (interface_index, handle) in handles {
+            match handle.join() {
+                Ok(Ok(path)) => {
+                    discovered.push(path);
+                }
+
+                Ok(Err(error)) => {
+                    failures.push(format!("interface {interface_index}: {error}",));
+                }
+
+                Err(_) => {
+                    failures.push(format!(
+                        "interface {interface_index}: IPv6 discovery thread panicked",
+                    ));
+                }
+            }
+        }
+
+        (discovered, failures)
+    })
+}
+
+fn discover_ipv4_paths(interface_indices: &[u32]) -> (Vec<DiscoveredPath>, Vec<String>) {
+    thread::scope(|scope| {
+        let handles = interface_indices
+            .iter()
+            .copied()
+            .map(|interface_index| {
+                (
+                    interface_index,
+                    scope.spawn(move || {
+                        direct_discovery_v4::discover_on_interface(interface_index, false)
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut discovered = Vec::new();
+
+        let mut failures = Vec::new();
+
+        for (interface_index, handle) in handles {
+            match handle.join() {
+                Ok(Ok(path)) => {
+                    discovered.push(DiscoveredPath {
+                        interface_index: path.interface_index,
+
+                        local_endpoint: SocketAddr::V4(path.local_endpoint),
+
+                        endpoint: SocketAddr::V4(path.endpoint),
+                    });
+                }
+
+                Ok(Err(error)) => {
+                    failures.push(format!("interface {interface_index}: {error}",));
+                }
+
+                Err(_) => {
+                    failures.push(format!(
+                        "interface {interface_index}: IPv4 discovery thread panicked",
+                    ));
+                }
+            }
+        }
+
+        (discovered, failures)
+    })
+}
+
+fn failure_details(failures: &[String]) -> String {
+    if failures.is_empty() {
+        "no candidate returned a diagnostic".to_string()
+    } else {
+        failures.join("; ")
+    }
 }
 
 pub(crate) fn discover_one() -> io::Result<DiscoveredPath> {
@@ -447,7 +659,7 @@ pub(crate) fn discover_one() -> io::Result<DiscoveredPath> {
     Ok(paths.remove(0))
 }
 
-fn discover_on_interface(interface_index: u32, verbose: bool) -> io::Result<SocketAddrV6> {
+fn discover_on_interface(interface_index: u32, verbose: bool) -> io::Result<DiscoveredPath> {
     let local_endpoint = direct_address::link_local_endpoint(interface_index, 0)?;
 
     let socket = UdpSocket::bind(local_endpoint)?;
@@ -516,6 +728,7 @@ fn discover_on_interface(interface_index: u32, verbose: bool) -> io::Result<Sock
 
                     if verbose {
                         println!();
+
                         println!("Direct-link receiver discovered");
 
                         println!("  Peer IPv6:      {}%{}", endpoint.ip(), interface_index,);
@@ -525,7 +738,13 @@ fn discover_on_interface(interface_index: u32, verbose: bool) -> io::Result<Sock
                         println!("  Local interface: {}", interface_index,);
                     }
 
-                    return Ok(endpoint);
+                    return Ok(DiscoveredPath {
+                        interface_index,
+
+                        local_endpoint: SocketAddr::V6(local_endpoint),
+
+                        endpoint: SocketAddr::V6(endpoint),
+                    });
                 }
 
                 Err(error)
@@ -546,7 +765,7 @@ fn discover_on_interface(interface_index: u32, verbose: bool) -> io::Result<Sock
 
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
-        format!("no NetworkCopy receiver replied through interface {interface_index}"),
+        format!("no NetworkCopy receiver replied through interface {interface_index}",),
     ))
 }
 
@@ -564,7 +783,7 @@ fn is_link_local(address: Ipv6Addr) -> bool {
     address.segments()[0] & 0xFFC0 == 0xFE80
 }
 
-fn create_nonce() -> io::Result<u64> {
+pub(crate) fn create_nonce() -> io::Result<u64> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| {

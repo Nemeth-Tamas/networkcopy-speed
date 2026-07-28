@@ -1,24 +1,22 @@
-use crate::direct_address::{self, DIRECT_TRANSFER_PORT};
 use crate::direct_discovery;
 use crate::multistream_copy;
+use crate::tcp_connect;
 use std::io::{self, Read, Write};
-use std::net::{Ipv6Addr, SocketAddr, TcpListener};
+use std::net::{IpAddr, SocketAddr, TcpListener};
 
 const PROBE_MAGIC: [u8; 8] = *b"NCTP1REQ";
 
 const ACK_MAGIC: [u8; 8] = *b"NCTP1ACK";
 
 pub(crate) fn receive_once() -> io::Result<()> {
-    let interface_index = direct_discovery::receive_one()?;
+    let path = direct_discovery::receive_one()?;
 
-    let bind_endpoint = direct_address::link_local_endpoint(interface_index, DIRECT_TRANSFER_PORT)?;
-
-    let listener = TcpListener::bind(bind_endpoint)?;
+    let listener = TcpListener::bind(path.local_endpoint)?;
 
     println!();
     println!("Direct-link TCP receiver ready");
 
-    println!("  Local interface: {}", interface_index,);
+    println!("  Local interface: {}", path.interface_index,);
 
     println!("  Listening:       {}", listener.local_addr()?,);
 
@@ -31,7 +29,7 @@ pub(crate) fn receive_once() -> io::Result<()> {
 
     let actual_local = stream.local_addr()?;
 
-    validate_local_address(actual_local, *bind_endpoint.ip())?;
+    validate_local_address(actual_local, path.local_endpoint.ip())?;
 
     let mut request = [0_u8; PROBE_MAGIC.len()];
 
@@ -51,7 +49,7 @@ pub(crate) fn receive_once() -> io::Result<()> {
     println!();
     println!("Direct-link TCP path validated");
 
-    println!("  Local interface: {}", interface_index,);
+    println!("  Local interface: {}", path.interface_index,);
 
     println!("  Local endpoint:  {}", actual_local,);
 
@@ -63,9 +61,11 @@ pub(crate) fn receive_once() -> io::Result<()> {
 pub(crate) fn send_once() -> io::Result<()> {
     let path = direct_discovery::discover_one()?;
 
-    let expected_local = direct_address::link_local_endpoint(path.interface_index, 0)?;
+    let expected_local = path.local_endpoint;
 
-    let receiver_address = SocketAddr::V6(path.endpoint);
+    let receiver_address = path.endpoint;
+
+    let _binding = tcp_connect::begin_direct_binding(expected_local.ip())?;
 
     let mut stream = multistream_copy::connect_with_retry(receiver_address)?;
 
@@ -73,7 +73,7 @@ pub(crate) fn send_once() -> io::Result<()> {
 
     let actual_local = stream.local_addr()?;
 
-    validate_local_address(actual_local, *expected_local.ip())?;
+    validate_local_address(actual_local, expected_local.ip())?;
 
     stream.write_all(&PROBE_MAGIC)?;
 
@@ -102,15 +102,8 @@ pub(crate) fn send_once() -> io::Result<()> {
     Ok(())
 }
 
-fn validate_local_address(actual: SocketAddr, expected_ip: Ipv6Addr) -> io::Result<()> {
-    let SocketAddr::V6(actual) = actual else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("direct-link socket used an IPv4 local address: {actual}"),
-        ));
-    };
-
-    if actual.ip() != &expected_ip {
+fn validate_local_address(actual: SocketAddr, expected_ip: IpAddr) -> io::Result<()> {
+    if actual.ip() != expected_ip {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -127,7 +120,7 @@ fn validate_local_address(actual: SocketAddr, expected_ip: Ipv6Addr) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::validate_local_address;
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
     #[test]
     fn matching_ipv6_local_address_is_valid() {
@@ -135,7 +128,7 @@ mod tests {
 
         let actual = SocketAddr::V6(SocketAddrV6::new(expected, 7337, 0, 10));
 
-        validate_local_address(actual, expected).unwrap();
+        validate_local_address(actual, IpAddr::V6(expected)).unwrap();
     }
 
     #[test]
@@ -147,17 +140,18 @@ mod tests {
             10,
         ));
 
-        let error = validate_local_address(actual, "fe80::1234".parse().unwrap()).unwrap_err();
+        let error =
+            validate_local_address(actual, IpAddr::V6("fe80::1234".parse().unwrap())).unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData,);
     }
 
     #[test]
-    fn ipv4_local_address_is_rejected() {
-        let actual = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7337));
+    fn matching_ipv4_local_address_is_valid() {
+        let expected = Ipv4Addr::new(169, 254, 132, 227);
 
-        let error = validate_local_address(actual, Ipv6Addr::LOCALHOST).unwrap_err();
+        let actual = SocketAddr::V4(SocketAddrV4::new(expected, 7337));
 
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData,);
+        validate_local_address(actual, IpAddr::V4(expected)).unwrap();
     }
 }
