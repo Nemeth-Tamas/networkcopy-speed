@@ -8,6 +8,7 @@ mod copy_bench;
 mod direct_address;
 mod direct_discovery;
 mod direct_link;
+mod direct_route;
 mod file_metadata;
 mod iocp_copy;
 mod iocp_file_probe;

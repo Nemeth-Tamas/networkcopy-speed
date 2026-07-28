@@ -1,5 +1,6 @@
 use crate::direct_address::{self, DIRECT_TRANSFER_PORT};
 use crate::direct_link;
+use crate::direct_route;
 use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::process;
@@ -189,8 +190,27 @@ pub(crate) fn receive(interface_index: u32) -> io::Result<()> {
     }
 }
 
+fn automatic_direct_candidates() -> io::Result<direct_route::RouteCandidates> {
+    let strict_candidates = direct_link::strict_candidate_indices()?;
+
+    let candidates = direct_route::classify_candidates(&strict_candidates)?;
+
+    if candidates.direct.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no dedicated Ethernet interface without a default route was found",
+        ));
+    }
+
+    Ok(candidates)
+}
+
 pub(crate) fn receive_all() -> io::Result<()> {
-    let interface_indices = direct_link::strict_candidate_indices()?;
+    let candidates = automatic_direct_candidates()?;
+
+    let interface_indices = candidates.direct;
+
+    let routed_interface_indices = candidates.routed;
 
     let local_endpoints = interface_indices
         .iter()
@@ -213,7 +233,11 @@ pub(crate) fn receive_all() -> io::Result<()> {
 
     println!("NetworkCopy Speed Edition automatic direct-link discovery receiver");
 
-    println!("  Candidate interfaces: {}", local_endpoints.len(),);
+    println!("  Direct candidates:    {}", local_endpoints.len(),);
+
+    for interface_index in &routed_interface_indices {
+        println!("  Rejected routed:      {}", interface_index,);
+    }
 
     for (interface_index, endpoint) in &local_endpoints {
         println!();
@@ -288,11 +312,19 @@ pub(crate) fn discover(interface_index: u32) -> io::Result<SocketAddrV6> {
 }
 
 pub(crate) fn discover_all() -> io::Result<Vec<DiscoveredPath>> {
-    let interface_indices = direct_link::strict_candidate_indices()?;
+    let candidates = automatic_direct_candidates()?;
+
+    let interface_indices = candidates.direct;
+
+    let routed_interface_indices = candidates.routed;
 
     println!("NetworkCopy Speed Edition automatic direct-link discovery");
 
-    println!("  Candidate interfaces: {}", interface_indices.len(),);
+    println!("  Direct candidates:    {}", interface_indices.len(),);
+
+    for interface_index in &routed_interface_indices {
+        println!("  Rejected routed:      {}", interface_index,);
+    }
 
     for interface_index in &interface_indices {
         println!("  Probing interface:    {}", interface_index,);

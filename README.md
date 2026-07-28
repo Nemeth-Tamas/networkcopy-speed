@@ -876,7 +876,8 @@ Planned after the first real-network release:
 * [x] Resolve scoped IPv6 link-local addresses by interface index
 * [x] Discover peers through interface-scoped IPv6 multicast
 * [x] Probe every strict Ethernet candidate concurrently
-* [ ] Listen for discovery on every strict Ethernet candidate
+* [x] Listen for discovery on every strict Ethernet candidate
+* [ ] Reject interfaces with an IPv4 or IPv6 default route
 * [ ] Reject Wi-Fi, VPN, Hyper-V, and WSL routes
 * [ ] Prefer IPv6 link-local addressing
 * [ ] Handle IPv6 scope identifiers correctly
