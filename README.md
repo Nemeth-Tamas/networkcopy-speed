@@ -905,9 +905,13 @@ Implementation progress:
 * [x] shared transfer engine exposed through a library facade
 * [x] common Direct Link and manual IP-address transfer requests
 * [x] GUI-facing loopback round-trip coverage
-* [ ] background worker thread with progress events
-* [ ] working Send, Receive, and Cancel actions
-* [ ] no separate or duplicated networking implementation
+* [x] background worker thread
+* [x] working Send and Receive actions
+* [x] Direct Link and manual IP-address mode selectors
+* [x] in-window success and failure summaries
+* [ ] live progress events
+* [ ] cooperative Cancel action
+* [x] no separate or duplicated networking implementation
 
 Language and release policy:
 

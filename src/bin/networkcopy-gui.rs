@@ -4,7 +4,15 @@
 )]
 
 use eframe::egui;
+use networkcopy_speed::gui_transfer::{
+    GuiConnectionMode, GuiTransferRequest, GuiTransferSummary, run_gui_transfer,
+};
 use rfd::FileDialog;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
+use std::time::Duration;
 
 const APP_NAME: &str = "NetworkCopy Speed Edition";
 
@@ -61,6 +69,12 @@ enum TransferMode {
     Receive,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionChoice {
+    Direct,
+    Address,
+}
+
 #[derive(Clone, Copy)]
 struct Text {
     subtitle: &'static str,
@@ -68,6 +82,11 @@ struct Text {
     send: &'static str,
     receive: &'static str,
     direct_mode: &'static str,
+    direct_connection: &'static str,
+    ip_connection: &'static str,
+    receiver_address: &'static str,
+    bind_address: &'static str,
+    address_hint: &'static str,
     send_description: &'static str,
     receive_description: &'static str,
     source_folder: &'static str,
@@ -81,6 +100,20 @@ struct Text {
     calibration_mib: &'static str,
     start: &'static str,
     cancel: &'static str,
+    running: &'static str,
+    completed: &'static str,
+    failed: &'static str,
+    files: &'static str,
+    logical_data: &'static str,
+    speed: &'static str,
+    wire_savings: &'static str,
+    streams: &'static str,
+    elapsed: &'static str,
+    missing_source: &'static str,
+    missing_destination: &'static str,
+    invalid_address: &'static str,
+    worker_start_failed: &'static str,
+    worker_disconnected: &'static str,
     development_status: &'static str,
     engine_pending: &'static str,
 }
@@ -95,11 +128,21 @@ impl Text {
 
         receive: "Fogadás",
 
-        direct_mode: "Automatikus közvetlen kapcsolat",
+        direct_mode: "Kapcsolat és átvitel",
 
-        send_description: "Válassza ki a küldendő mappát. A program automatikusan megkeresi a másik számítógépet, megméri a kapcsolat sebességét, majd elindítja a másolást.",
+        direct_connection: "Közvetlen kábel",
 
-        receive_description: "Válassza ki a célmappát, majd indítsa el a fogadást. A program automatikusan beállítja a Windows tűzfalat és megvárja a küldő számítógépet.",
+        ip_connection: "IP-cím",
+
+        receiver_address: "Fogadó címe",
+
+        bind_address: "Helyi figyelési cím",
+
+        address_hint: "például 127.0.0.1:7337",
+
+        send_description: "Válassza ki a küldendő mappát. Közvetlen módban a program automatikusan megkeresi a másik számítógépet; IP-cím módban a megadott címhez csatlakozik.",
+
+        receive_description: "Válassza ki a célmappát. Közvetlen módban a program megvárja az automatikusan felderített küldőt; IP-cím módban a megadott helyi címen figyel.",
 
         source_folder: "Forrásmappa",
 
@@ -123,9 +166,37 @@ impl Text {
 
         cancel: "Megszakítás",
 
+        running: "Az átvitel folyamatban…",
+
+        completed: "Az átvitel sikeresen befejeződött",
+
+        failed: "Az átvitel sikertelen",
+
+        files: "Fájlok",
+
+        logical_data: "Adatmennyiség",
+
+        speed: "Sebesség",
+
+        wire_savings: "Hálózati megtakarítás",
+
+        streams: "TCP szálak",
+
+        elapsed: "Idő",
+
+        missing_source: "Nincs kiválasztva forrásmappa",
+
+        missing_destination: "Nincs kiválasztva célmappa",
+
+        invalid_address: "Érvénytelen IP-cím vagy port",
+
+        worker_start_failed: "Nem sikerült elindítani az átviteli háttérfolyamatot",
+
+        worker_disconnected: "Az átviteli háttérfolyamat válasz nélkül leállt",
+
         development_status: "v1.2 fejlesztői felület",
 
-        engine_pending: "A mappaválasztás és a nyelvváltás már működik. A másolómotor bekötése a következő lépés.",
+        engine_pending: "Az Indítás gomb már valódi átvitelt végez. A részletes élő folyamatjelzés és a megszakítás holnap érkezik.",
     };
 
     const ENGLISH: Self = Self {
@@ -137,11 +208,21 @@ impl Text {
 
         receive: "Receive",
 
-        direct_mode: "Automatic direct connection",
+        direct_mode: "Connection and transfer",
 
-        send_description: "Choose the folder to send. NetworkCopy will automatically find the other computer, measure the connection speed, and start the transfer.",
+        direct_connection: "Direct cable",
 
-        receive_description: "Choose the destination folder and start receiving. NetworkCopy will configure Windows Firewall automatically and wait for the sending computer.",
+        ip_connection: "IP address",
+
+        receiver_address: "Receiver address",
+
+        bind_address: "Local listening address",
+
+        address_hint: "for example 127.0.0.1:7337",
+
+        send_description: "Choose the folder to send. In Direct mode, NetworkCopy automatically discovers the other computer; in IP-address mode, it connects to the specified address.",
+
+        receive_description: "Choose the destination folder. In Direct mode, NetworkCopy waits for an automatically discovered sender; in IP-address mode, it listens on the specified local address.",
 
         source_folder: "Source folder",
 
@@ -165,19 +246,53 @@ impl Text {
 
         cancel: "Cancel",
 
+        running: "Transfer in progress…",
+
+        completed: "Transfer completed successfully",
+
+        failed: "Transfer failed",
+
+        files: "Files",
+
+        logical_data: "Logical data",
+
+        speed: "Speed",
+
+        wire_savings: "Network savings",
+
+        streams: "TCP streams",
+
+        elapsed: "Time",
+
+        missing_source: "No source folder has been selected",
+
+        missing_destination: "No destination folder has been selected",
+
+        invalid_address: "Invalid IP address or port",
+
+        worker_start_failed: "Failed to start the transfer worker",
+
+        worker_disconnected: "The transfer worker stopped without returning a result",
+
         development_status: "v1.2 development interface",
 
-        engine_pending: "Folder selection and language switching are ready. Connecting the transfer engine is the next step.",
+        engine_pending: "The Start button now performs a real transfer. Detailed live progress and cancellation arrive tomorrow.",
     };
 }
 
 struct NetworkCopyGui {
     language: Language,
     mode: TransferMode,
+    connection: ConnectionChoice,
     source_folder: String,
     destination_folder: String,
+    receiver_address: String,
+    bind_address: String,
     scanner_workers: usize,
     calibration_mib: u64,
+    transfer_receiver: Option<Receiver<Result<GuiTransferSummary, String>>>,
+    last_summary: Option<GuiTransferSummary>,
+    last_error: Option<String>,
 }
 
 impl NetworkCopyGui {
@@ -187,12 +302,24 @@ impl NetworkCopyGui {
 
             mode: TransferMode::Send,
 
+            connection: ConnectionChoice::Direct,
+
             source_folder: String::new(),
 
             destination_folder: String::new(),
 
+            receiver_address: "127.0.0.1:7337".to_string(),
+
+            bind_address: "127.0.0.1:7337".to_string(),
+
             scanner_workers: 4,
             calibration_mib: 64,
+
+            transfer_receiver: None,
+
+            last_summary: None,
+
+            last_error: None,
         }
     }
 
@@ -202,6 +329,41 @@ impl NetworkCopyGui {
 
             ui.selectable_value(&mut self.mode, TransferMode::Receive, text.receive);
         });
+    }
+
+    fn connection_selector(&mut self, ui: &mut egui::Ui, text: Text) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.connection,
+                ConnectionChoice::Direct,
+                text.direct_connection,
+            );
+
+            ui.selectable_value(
+                &mut self.connection,
+                ConnectionChoice::Address,
+                text.ip_connection,
+            );
+        });
+
+        if self.connection != ConnectionChoice::Address {
+            return;
+        }
+
+        ui.add_space(8.0);
+
+        let (label, address) = match self.mode {
+            TransferMode::Send => (text.receiver_address, &mut self.receiver_address),
+
+            TransferMode::Receive => (text.bind_address, &mut self.bind_address),
+        };
+
+        ui.label(label);
+
+        ui.add_sized(
+            [ui.available_width(), 28.0],
+            egui::TextEdit::singleline(address).hint_text(text.address_hint),
+        );
     }
 
     fn send_panel(&mut self, ui: &mut egui::Ui, text: Text) {
@@ -253,17 +415,220 @@ impl NetworkCopyGui {
         );
     }
 
+    fn transfer_request(&self, text: Text) -> Result<GuiTransferRequest, String> {
+        let connection = match self.connection {
+            ConnectionChoice::Direct => GuiConnectionMode::Direct,
+
+            ConnectionChoice::Address => {
+                let value = match self.mode {
+                    TransferMode::Send => self.receiver_address.trim(),
+
+                    TransferMode::Receive => self.bind_address.trim(),
+                };
+
+                let address = value
+                    .parse::<SocketAddr>()
+                    .map_err(|error| format!("{}: {error}", text.invalid_address,))?;
+
+                GuiConnectionMode::Address(address)
+            }
+        };
+
+        match self.mode {
+            TransferMode::Send => {
+                let source = self.source_folder.trim();
+
+                if source.is_empty() {
+                    return Err(text.missing_source.to_string());
+                }
+
+                Ok(GuiTransferRequest::Send {
+                    connection,
+
+                    source_root: PathBuf::from(source),
+
+                    worker_count: self.scanner_workers,
+
+                    calibration_mib: self.calibration_mib,
+                })
+            }
+
+            TransferMode::Receive => {
+                let destination = self.destination_folder.trim();
+
+                if destination.is_empty() {
+                    return Err(text.missing_destination.to_string());
+                }
+
+                Ok(GuiTransferRequest::Receive {
+                    connection,
+
+                    destination_root: PathBuf::from(destination),
+                })
+            }
+        }
+    }
+
+    fn start_transfer(&mut self, text: Text) {
+        if self.transfer_receiver.is_some() {
+            return;
+        }
+
+        let request = match self.transfer_request(text) {
+            Ok(request) => request,
+
+            Err(error) => {
+                self.last_summary = None;
+
+                self.last_error = Some(error);
+
+                return;
+            }
+        };
+
+        let (sender, receiver) = mpsc::channel();
+
+        let worker = thread::Builder::new()
+            .name("networkcopy-gui-transfer".to_string())
+            .spawn(move || {
+                let result = run_gui_transfer(request).map_err(|error| error.to_string());
+
+                let _ = sender.send(result);
+            });
+
+        match worker {
+            Ok(_worker) => {
+                self.transfer_receiver = Some(receiver);
+
+                self.last_summary = None;
+
+                self.last_error = None;
+            }
+
+            Err(error) => {
+                self.last_summary = None;
+
+                self.last_error = Some(format!("{}: {error}", text.worker_start_failed,));
+            }
+        }
+    }
+
+    fn poll_transfer(&mut self, context: &egui::Context, text: Text) {
+        let Some(receiver) = self.transfer_receiver.as_ref() else {
+            return;
+        };
+
+        let outcome = match receiver.try_recv() {
+            Ok(result) => Some(result),
+
+            Err(TryRecvError::Empty) => {
+                context.request_repaint_after(Duration::from_millis(100));
+
+                None
+            }
+
+            Err(TryRecvError::Disconnected) => Some(Err(text.worker_disconnected.to_string())),
+        };
+
+        let Some(outcome) = outcome else {
+            return;
+        };
+
+        self.transfer_receiver = None;
+
+        match outcome {
+            Ok(summary) => {
+                self.last_summary = Some(summary);
+
+                self.last_error = None;
+            }
+
+            Err(error) => {
+                self.last_summary = None;
+
+                self.last_error = Some(error);
+            }
+        }
+    }
+
+    fn summary_panel(&self, ui: &mut egui::Ui, text: Text) {
+        let Some(summary) = &self.last_summary else {
+            return;
+        };
+
+        ui.group(|ui| {
+            ui.heading(text.completed);
+
+            ui.add_space(6.0);
+
+            egui::Grid::new("transfer_summary")
+                .num_columns(2)
+                .spacing([24.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label(text.files);
+
+                    ui.label(summary.files.to_string());
+
+                    ui.end_row();
+
+                    ui.label(text.logical_data);
+
+                    ui.label(format_bytes(summary.logical_bytes));
+
+                    ui.end_row();
+
+                    ui.label(text.speed);
+
+                    ui.label(format!("{:.2} MB/s", summary.logical_megabytes_per_second,));
+
+                    ui.end_row();
+
+                    ui.label(text.wire_savings);
+
+                    ui.label(format!("{:.2}%", summary.wire_savings_percent,));
+
+                    ui.end_row();
+
+                    ui.label(text.streams);
+
+                    ui.label(summary.data_stream_count.to_string());
+
+                    ui.end_row();
+
+                    ui.label(text.elapsed);
+
+                    ui.label(format!("{:.2} s", summary.elapsed.as_secs_f64(),));
+
+                    ui.end_row();
+                });
+        });
+    }
+
     fn action_buttons(&mut self, ui: &mut egui::Ui, text: Text) {
+        let running = self.transfer_receiver.is_some();
+
         ui.horizontal(|ui| {
-            ui.add_enabled(
-                false,
+            let start = ui.add_enabled(
+                !running,
                 egui::Button::new(text.start).min_size(egui::vec2(120.0, 34.0)),
             );
+
+            if start.clicked() {
+                self.start_transfer(text);
+
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            }
 
             ui.add_enabled(
                 false,
                 egui::Button::new(text.cancel).min_size(egui::vec2(120.0, 34.0)),
             );
+
+            if running {
+                ui.spinner();
+
+                ui.label(text.running);
+            }
         });
     }
 }
@@ -271,6 +636,8 @@ impl NetworkCopyGui {
 impl eframe::App for NetworkCopyGui {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let text = self.language.text();
+
+        self.poll_transfer(ui.ctx(), text);
 
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -302,6 +669,12 @@ impl eframe::App for NetworkCopyGui {
 
                 ui.add_space(6.0);
 
+                self.connection_selector(ui, text);
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+
                 match self.mode {
                     TransferMode::Send => {
                         self.send_panel(ui, text);
@@ -321,9 +694,19 @@ impl eframe::App for NetworkCopyGui {
             ui.separator();
             ui.add_space(10.0);
 
-            ui.label(egui::RichText::new(text.development_status).strong());
+            if let Some(error) = &self.last_error {
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new(text.failed).strong());
 
-            ui.label(text.engine_pending);
+                    ui.label(error);
+                });
+            } else if self.last_summary.is_some() {
+                self.summary_panel(ui, text);
+            } else {
+                ui.label(egui::RichText::new(text.development_status).strong());
+
+                ui.label(text.engine_pending);
+            }
         });
     }
 }
@@ -358,6 +741,26 @@ fn folder_picker(
             *value = path.display().to_string();
         }
     });
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+
+    const MIB: f64 = 1024.0 * KIB;
+
+    const GIB: f64 = 1024.0 * MIB;
+
+    let bytes = bytes as f64;
+
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB,)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes / MIB,)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes / KIB,)
+    } else {
+        format!("{bytes:.0} B",)
+    }
 }
 
 #[cfg(test)]
