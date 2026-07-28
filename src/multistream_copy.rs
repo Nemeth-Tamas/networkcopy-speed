@@ -15,6 +15,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -187,6 +188,62 @@ struct ResumeApplication {
     stripe_count: u64,
 }
 
+#[derive(Debug)]
+struct TransferFault {
+    fail_after_checkpointed_stripes: Option<u64>,
+
+    checkpointed_stripes: AtomicU64,
+}
+
+impl TransferFault {
+    fn disabled() -> Self {
+        Self {
+            fail_after_checkpointed_stripes: None,
+
+            checkpointed_stripes: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_after_checkpointed_stripes(stripe_count: u64) -> io::Result<Self> {
+        if stripe_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fault injection stripe count must not be zero",
+            ));
+        }
+
+        Ok(Self {
+            fail_after_checkpointed_stripes: Some(stripe_count),
+
+            checkpointed_stripes: AtomicU64::new(0),
+        })
+    }
+
+    fn after_checkpointed_stripe(&self) -> io::Result<()> {
+        let Some(failure_limit) = self.fail_after_checkpointed_stripes else {
+            return Ok(());
+        };
+
+        let completed = self
+            .checkpointed_stripes
+            .fetch_add(1, Ordering::SeqCst)
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("fault-injection stripe count overflowed"))?;
+
+        if completed < failure_limit {
+            return Ok(());
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!(
+                "fault injection stopped the receiver after {completed} checkpointed stripe(s)"
+            ),
+        ))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TransferTask {
     WholeFile {
@@ -234,6 +291,22 @@ pub fn run(
     worker_count: usize,
     data_stream_count: usize,
 ) -> io::Result<MultistreamCopyReport> {
+    run_with_fault(
+        source_root,
+        destination_root,
+        worker_count,
+        data_stream_count,
+        Arc::new(TransferFault::disabled()),
+    )
+}
+
+fn run_with_fault(
+    source_root: &Path,
+    destination_root: &Path,
+    worker_count: usize,
+    data_stream_count: usize,
+    fault_injection: Arc<TransferFault>,
+) -> io::Result<MultistreamCopyReport> {
     manifest_scan::validate_worker_count(worker_count)?;
     control_plane::validate_data_stream_count(data_stream_count)?;
 
@@ -261,7 +334,15 @@ pub fn run(
 
     let server = thread::Builder::new()
         .name("networkcopy-transfer-server".to_string())
-        .spawn(move || run_server(listener, session_id, data_stream_count, server_destination))?;
+        .spawn(move || {
+            run_server(
+                listener,
+                session_id,
+                data_stream_count,
+                server_destination,
+                fault_injection,
+            )
+        })?;
 
     let connection_started = Instant::now();
 
@@ -420,6 +501,7 @@ fn run_server(
     session_id: u64,
     data_stream_count: usize,
     destination_root: PathBuf,
+    fault_injection: Arc<TransferFault>,
 ) -> io::Result<TransferAck> {
     let (mut control_stream, data_streams) =
         accept_session(listener, session_id, data_stream_count)?;
@@ -460,6 +542,7 @@ fn run_server(
             let lane_manifest = Arc::clone(&manifest);
             let lane_destination = Arc::clone(&destination_root);
             let lane_resume_journal = Arc::clone(&resume_journal);
+            let lane_fault_injection = Arc::clone(&fault_injection);
 
             handles.push(
                 thread::Builder::new()
@@ -471,6 +554,7 @@ fn run_server(
                             &lane_manifest,
                             &tasks,
                             &lane_resume_journal,
+                            lane_fault_injection.as_ref(),
                         )
                     })?,
             );
@@ -1490,6 +1574,7 @@ fn receive_lane(
     manifest: &[ManifestEntry],
     tasks: &[TransferTask],
     resume_journal: &Mutex<ResumeJournal>,
+    fault_injection: &TransferFault,
 ) -> io::Result<LaneReport> {
     let buffered = BufReader::with_capacity(NETWORK_BUFFER_BYTES, stream);
 
@@ -1637,7 +1722,9 @@ fn receive_lane(
             }
         }
 
-        checkpoint_completed_stripe(task, destination_root, resume_journal)?;
+        if checkpoint_completed_stripe(task, destination_root, resume_journal)? {
+            fault_injection.after_checkpointed_stripe()?;
+        }
     }
 
     let final_message = read_u8(&mut reader)?;
@@ -1658,14 +1745,14 @@ fn checkpoint_completed_stripe(
     task: &TransferTask,
     destination_root: &Path,
     resume_journal: &Mutex<ResumeJournal>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     let TransferTask::Stripe {
         file_id,
         offset,
         length,
     } = task
     else {
-        return Ok(());
+        return Ok(false);
     };
 
     let stripe = ResumeStripe::new(*file_id, *offset, *length)?;
@@ -1674,11 +1761,13 @@ fn checkpoint_completed_stripe(
         .lock()
         .map_err(|_| io::Error::other("resume journal lock poisoned"))?;
 
-    if journal.mark_completed(stripe) {
+    let newly_completed = journal.mark_completed(stripe);
+
+    if newly_completed {
         journal.save_atomic(destination_root)?;
     }
 
-    Ok(())
+    Ok(newly_completed)
 }
 
 fn receive_tiny_pack(
@@ -2357,9 +2446,9 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReceiverReady, TINY_PACK_TARGET_BYTES, TransferTask, apply_resume_offer,
-        build_transfer_plan, copy_exact_hashed, read_receiver_ready, run, temporary_path,
-        validate_resume_offer, validate_source_metadata, verify_content_digest,
+        ReceiverReady, TINY_PACK_TARGET_BYTES, TransferFault, TransferTask, apply_resume_offer,
+        build_transfer_plan, copy_exact_hashed, read_receiver_ready, run, run_with_fault,
+        temporary_path, validate_resume_offer, validate_source_metadata, verify_content_digest,
         write_receiver_ready,
     };
     use crate::control_plane::{self, ManifestSummary};
@@ -2373,6 +2462,7 @@ mod tests {
     use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::process;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
 
@@ -2719,6 +2809,58 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         assert!(error.to_string().contains("unplanned completed stripe",));
+    }
+
+    #[test]
+    fn loopback_session_resumes_after_injected_failure() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let parent = env::temp_dir().join(format!(
+            "networkcopy-interruption-{}-{unique}",
+            process::id()
+        ));
+
+        let source = parent.join("source");
+
+        let destination = parent.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        let large_contents = vec![0x5A_u8; 64 * 1024 * 1024 + 137];
+
+        fs::write(source.join("large.bin"), &large_contents).unwrap();
+
+        let fault_injection = Arc::new(TransferFault::fail_after_checkpointed_stripes(1).unwrap());
+
+        let interrupted = run_with_fault(&source, &destination, 2, 1, fault_injection);
+
+        assert!(interrupted.is_err());
+
+        assert!(destination.join(JOURNAL_FILE_NAME).exists());
+
+        assert!(!destination.join("large.bin").exists());
+
+        let report = run(&source, &destination, 2, 1).unwrap();
+
+        assert_eq!(report.files_copied, 1);
+
+        assert_eq!(report.resumed_stripes, 1);
+
+        assert_eq!(report.resumed_bytes, large_contents.len() as u64);
+
+        assert!(report.data_wire_bytes < report.bytes_copied);
+
+        assert_eq!(
+            fs::read(destination.join("large.bin",),).unwrap(),
+            large_contents
+        );
+
+        assert!(!destination.join(JOURNAL_FILE_NAME).exists());
+
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
