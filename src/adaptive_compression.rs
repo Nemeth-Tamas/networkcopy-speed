@@ -1,8 +1,10 @@
 use crate::compression_probe::{self, CompressionDecision};
+use crate::console_progress::ProgressCounter;
 use crate::content_hash::{self, ContentHasher};
 use crate::striped_file;
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::ops::Range;
 
 const MODE_RAW: u8 = 0;
 const MODE_ZSTD: u8 = 1;
@@ -32,33 +34,49 @@ impl PayloadEncoder {
         })
     }
 
-    pub(crate) fn send_sequential(
+    pub(crate) fn send_sequential_with_progress(
         &mut self,
         writer: &mut impl Write,
         reader: &mut impl Read,
         byte_count: u64,
         raw_buffer: &mut [u8],
         decision: CompressionDecision,
-    ) -> io::Result<bool> {
-        self.send_payload(writer, byte_count, raw_buffer, decision, |chunk, _| {
-            reader.read_exact(chunk)
-        })
-    }
-
-    pub(crate) fn send_positional(
-        &mut self,
-        writer: &mut impl Write,
-        file: &File,
-        offset: u64,
-        byte_count: u64,
-        raw_buffer: &mut [u8],
-        decision: CompressionDecision,
+        progress: Option<&ProgressCounter>,
     ) -> io::Result<bool> {
         self.send_payload(
             writer,
             byte_count,
             raw_buffer,
             decision,
+            progress,
+            |chunk, _| reader.read_exact(chunk),
+        )
+    }
+
+    pub(crate) fn send_positional_with_progress(
+        &mut self,
+        writer: &mut impl Write,
+        file: &File,
+        range: Range<u64>,
+        raw_buffer: &mut [u8],
+        decision: CompressionDecision,
+        progress: Option<&ProgressCounter>,
+    ) -> io::Result<bool> {
+        let byte_count = range.end.checked_sub(range.start).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "positional send range ends before it starts",
+            )
+        })?;
+
+        let offset = range.start;
+
+        self.send_payload(
+            writer,
+            byte_count,
+            raw_buffer,
+            decision,
+            progress,
             |chunk, transferred| {
                 let read_offset = offset
                     .checked_add(transferred)
@@ -75,6 +93,7 @@ impl PayloadEncoder {
         byte_count: u64,
         raw_buffer: &mut [u8],
         decision: CompressionDecision,
+        progress: Option<&ProgressCounter>,
         mut fill_chunk: F,
     ) -> io::Result<bool>
     where
@@ -134,11 +153,16 @@ impl PayloadEncoder {
                 }
             }
 
+            let requested_bytes = u64::try_from(requested)
+                .map_err(|_| io::Error::other("compression chunk length cannot be represented"))?;
+
             transferred = transferred
-                .checked_add(u64::try_from(requested).map_err(|_| {
-                    io::Error::other("compression chunk length cannot be represented")
-                })?)
+                .checked_add(requested_bytes)
                 .ok_or_else(|| io::Error::other("compressed send byte count overflowed"))?;
+
+            if let Some(progress) = progress {
+                progress.add(requested_bytes);
+            }
         }
 
         writer.write_all(&hasher.finalize())?;
@@ -165,33 +189,49 @@ impl PayloadDecoder {
         })
     }
 
-    pub(crate) fn receive_sequential(
+    pub(crate) fn receive_sequential_with_progress(
         &mut self,
         reader: &mut impl Read,
         writer: &mut impl Write,
         byte_count: u64,
         raw_buffer: &mut [u8],
         context: &str,
-    ) -> io::Result<bool> {
-        self.receive_payload(reader, byte_count, raw_buffer, context, |chunk, _| {
-            writer.write_all(chunk)
-        })
-    }
-
-    pub(crate) fn receive_positional(
-        &mut self,
-        reader: &mut impl Read,
-        file: &File,
-        offset: u64,
-        byte_count: u64,
-        raw_buffer: &mut [u8],
-        context: &str,
+        progress: Option<&ProgressCounter>,
     ) -> io::Result<bool> {
         self.receive_payload(
             reader,
             byte_count,
             raw_buffer,
             context,
+            progress,
+            |chunk, _| writer.write_all(chunk),
+        )
+    }
+
+    pub(crate) fn receive_positional_with_progress(
+        &mut self,
+        reader: &mut impl Read,
+        file: &File,
+        range: Range<u64>,
+        raw_buffer: &mut [u8],
+        context: &str,
+        progress: Option<&ProgressCounter>,
+    ) -> io::Result<bool> {
+        let byte_count = range.end.checked_sub(range.start).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "positional receive range ends before it starts",
+            )
+        })?;
+
+        let offset = range.start;
+
+        self.receive_payload(
+            reader,
+            byte_count,
+            raw_buffer,
+            context,
+            progress,
             |chunk, transferred| {
                 let write_offset = offset
                     .checked_add(transferred)
@@ -208,6 +248,7 @@ impl PayloadDecoder {
         byte_count: u64,
         raw_buffer: &mut [u8],
         context: &str,
+        progress: Option<&ProgressCounter>,
         mut write_chunk: F,
     ) -> io::Result<bool>
     where
@@ -238,11 +279,17 @@ impl PayloadDecoder {
 
                     write_chunk(chunk, transferred)?;
 
+                    let requested_bytes = u64::try_from(requested).map_err(|_| {
+                        io::Error::other("raw payload length cannot be represented")
+                    })?;
+
                     transferred = transferred
-                        .checked_add(u64::try_from(requested).map_err(|_| {
-                            io::Error::other("raw payload length cannot be represented")
-                        })?)
+                        .checked_add(requested_bytes)
                         .ok_or_else(|| io::Error::other("raw receive byte count overflowed"))?;
+
+                    if let Some(progress) = progress {
+                        progress.add(requested_bytes);
+                    }
                 }
 
                 CompressionDecision::Compress => {
@@ -312,13 +359,17 @@ impl PayloadDecoder {
 
                     write_chunk(chunk, transferred)?;
 
-                    transferred = transferred
-                        .checked_add(u64::try_from(raw_length).map_err(|_| {
-                            io::Error::other("decompressed payload length cannot be represented")
-                        })?)
-                        .ok_or_else(|| {
-                            io::Error::other("decompressed receive byte count overflowed")
-                        })?;
+                    let raw_length_bytes = u64::try_from(raw_length).map_err(|_| {
+                        io::Error::other("decompressed payload length cannot be represented")
+                    })?;
+
+                    transferred = transferred.checked_add(raw_length_bytes).ok_or_else(|| {
+                        io::Error::other("decompressed receive byte count overflowed")
+                    })?;
+
+                    if let Some(progress) = progress {
+                        progress.add(raw_length_bytes);
+                    }
                 }
             }
         }
@@ -432,12 +483,13 @@ mod tests {
         let mut encode_buffer = vec![0_u8; COMPRESSION_CHUNK_BYTES];
 
         let compressed = encoder
-            .send_sequential(
+            .send_sequential_with_progress(
                 &mut wire,
                 &mut source,
                 contents.len() as u64,
                 &mut encode_buffer,
                 CompressionDecision::Compress,
+                None,
             )
             .unwrap();
 
@@ -453,12 +505,13 @@ mod tests {
         let mut decode_buffer = vec![0_u8; COMPRESSION_CHUNK_BYTES];
 
         let received_compressed = decoder
-            .receive_sequential(
+            .receive_sequential_with_progress(
                 &mut wire_reader,
                 &mut destination,
                 contents.len() as u64,
                 &mut decode_buffer,
                 "compressed test payload",
+                None,
             )
             .unwrap();
 
@@ -478,12 +531,13 @@ mod tests {
         let mut encode_buffer = vec![0_u8; 64 * 1024];
 
         let compressed = encoder
-            .send_sequential(
+            .send_sequential_with_progress(
                 &mut wire,
                 &mut source,
                 contents.len() as u64,
                 &mut encode_buffer,
                 CompressionDecision::SendRaw,
+                None,
             )
             .unwrap();
 
@@ -497,12 +551,13 @@ mod tests {
         let mut decode_buffer = vec![0_u8; 64 * 1024];
 
         let received_compressed = decoder
-            .receive_sequential(
+            .receive_sequential_with_progress(
                 &mut wire_reader,
                 &mut destination,
                 contents.len() as u64,
                 &mut decode_buffer,
                 "raw test payload",
+                None,
             )
             .unwrap();
 

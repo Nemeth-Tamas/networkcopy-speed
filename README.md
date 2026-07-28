@@ -856,7 +856,7 @@ Planned work:
 * [x] Validate current socket buffering and in-flight data on a real path
 * [x] Reach at least 85–90% of the measured path capacity
 * [x] Require elevation and automatically manage the Windows Firewall rule
-* [x] Live console progress for automatic calibration and transfers
+* [x] Live chunk-level console progress for automatic calibration and transfers
 * [ ] Standalone release binaries
 * [x] End-to-end two-machine acceptance test
 

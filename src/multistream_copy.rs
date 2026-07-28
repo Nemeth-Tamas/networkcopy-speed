@@ -1585,6 +1585,7 @@ fn send_lane(
                     entry,
                     &mut buffer,
                     &mut encoder,
+                    progress.as_ref(),
                 )?;
 
                 add_lane_counts(&mut report, 1, entry.file_size, "sender")?;
@@ -1635,6 +1636,7 @@ fn send_lane(
                     },
                     &mut buffer,
                     &mut encoder,
+                    progress.as_ref(),
                 )?;
 
                 let completed_files = u64::from(offset == 0);
@@ -1645,7 +1647,9 @@ fn send_lane(
             }
         }
 
-        add_progress(&progress, transfer_task_bytes(task, manifest)?);
+        if let TransferTask::TinyPack { total_bytes, .. } = task {
+            add_progress(&progress, *total_bytes);
+        }
     }
 
     write_u8(&mut writer, MESSAGE_STREAM_END)?;
@@ -1655,24 +1659,6 @@ fn send_lane(
     report.data_wire_bytes = writer.bytes_written();
 
     Ok(report)
-}
-
-fn transfer_task_bytes(task: &TransferTask, manifest: &[ManifestEntry]) -> io::Result<u64> {
-    match task {
-        TransferTask::WholeFile { file_id } => manifest
-            .get(*file_id)
-            .map(|entry| entry.file_size)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "transfer task referenced an invalid file ID",
-                )
-            }),
-
-        TransferTask::TinyPack { total_bytes, .. } => Ok(*total_bytes),
-
-        TransferTask::Stripe { length, .. } => Ok(*length),
-    }
 }
 
 fn add_progress(progress: &Option<ProgressCounter>, bytes: u64) {
@@ -1834,6 +1820,7 @@ fn send_whole_file(
     entry: &ManifestEntry,
     buffer: &mut [u8],
     encoder: &mut PayloadEncoder,
+    progress: Option<&ProgressCounter>,
 ) -> io::Result<bool> {
     write_u8(writer, MESSAGE_FILE)?;
 
@@ -1859,8 +1846,14 @@ fn send_whole_file(
         compression_probe::DEFAULT_LEVEL,
     )?;
 
-    let compressed =
-        encoder.send_sequential(writer, &mut file, entry.file_size, buffer, decision)?;
+    let compressed = encoder.send_sequential_with_progress(
+        writer,
+        &mut file,
+        entry.file_size,
+        buffer,
+        decision,
+        progress,
+    )?;
 
     validate_source_metadata(&file, &path, entry)?;
 
@@ -1874,6 +1867,7 @@ fn send_file_stripe(
     stripe: StripeDescriptor,
     buffer: &mut [u8],
     encoder: &mut PayloadEncoder,
+    progress: Option<&ProgressCounter>,
 ) -> io::Result<bool> {
     let StripeDescriptor {
         file_id,
@@ -1911,7 +1905,18 @@ fn send_file_stripe(
         compression_probe::DEFAULT_LEVEL,
     )?;
 
-    let compressed = encoder.send_positional(writer, &file, offset, length, buffer, decision)?;
+    let stripe_end = offset
+        .checked_add(length)
+        .ok_or_else(|| io::Error::other("stripe description overflowed"))?;
+
+    let compressed = encoder.send_positional_with_progress(
+        writer,
+        &file,
+        offset..stripe_end,
+        buffer,
+        decision,
+        progress,
+    )?;
 
     validate_source_metadata(&file, &path, entry)?;
 
@@ -2018,6 +2023,7 @@ fn receive_lane(
                     entry,
                     &mut buffer,
                     &mut decoder,
+                    progress.as_ref(),
                 )?;
 
                 add_lane_counts(&mut report, 1, entry.file_size, "receiver")?;
@@ -2095,6 +2101,7 @@ fn receive_lane(
                     },
                     &mut buffer,
                     &mut decoder,
+                    progress.as_ref(),
                 )?;
 
                 let completed_files = u64::from(offset == 0);
@@ -2109,7 +2116,9 @@ fn receive_lane(
             fault_injection.after_checkpointed_stripe()?;
         }
 
-        add_progress(&progress, transfer_task_bytes(task, manifest)?);
+        if let TransferTask::TinyPack { total_bytes, .. } = task {
+            add_progress(&progress, *total_bytes);
+        }
     }
 
     let final_message = read_u8(&mut reader)?;
@@ -2257,6 +2266,7 @@ fn receive_file_stripe(
     stripe: StripeDescriptor,
     buffer: &mut [u8],
     decoder: &mut PayloadDecoder,
+    progress: Option<&ProgressCounter>,
 ) -> io::Result<bool> {
     let StripeDescriptor {
         file_id,
@@ -2281,7 +2291,14 @@ fn receive_file_stripe(
         entry.relative_path.display()
     );
 
-    let compressed = decoder.receive_positional(reader, &file, offset, length, buffer, &context)?;
+    let compressed = decoder.receive_positional_with_progress(
+        reader,
+        &file,
+        offset..stripe_end,
+        buffer,
+        &context,
+        progress,
+    )?;
 
     file.sync_all()?;
 
@@ -2413,6 +2430,7 @@ fn receive_file(
     entry: &ManifestEntry,
     buffer: &mut [u8],
     decoder: &mut PayloadDecoder,
+    progress: Option<&ProgressCounter>,
 ) -> io::Result<bool> {
     let final_path = destination_root.join(&entry.relative_path);
 
@@ -2428,8 +2446,14 @@ fn receive_file(
     let context = format!("file {file_id} ({})", entry.relative_path.display());
 
     let transfer_result = (|| -> io::Result<bool> {
-        let compressed =
-            decoder.receive_sequential(reader, &mut file, entry.file_size, buffer, &context)?;
+        let compressed = decoder.receive_sequential_with_progress(
+            reader,
+            &mut file,
+            entry.file_size,
+            buffer,
+            &context,
+            progress,
+        )?;
 
         file.flush()?;
         Ok(compressed)
