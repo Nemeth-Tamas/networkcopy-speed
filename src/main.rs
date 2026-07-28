@@ -6,6 +6,7 @@ mod content_hash;
 mod control_plane;
 mod copy_bench;
 mod direct_address;
+mod direct_discovery;
 mod direct_link;
 mod file_metadata;
 mod iocp_copy;
@@ -73,6 +74,10 @@ fn run() -> Result<(), Box<dyn Error>> {
 
         "direct-address" => run_direct_address(&mut arguments),
 
+        "direct-discovery-receive" => run_direct_discovery_receive(&mut arguments),
+
+        "direct-discovery-send" => run_direct_discovery_send(&mut arguments),
+
         "version" | "--version" | "-V" => {
             println!("NetworkCopy Speed Edition {}", env!("CARGO_PKG_VERSION"));
 
@@ -89,6 +94,78 @@ fn run() -> Result<(), Box<dyn Error>> {
         )
         .into()),
     }
+}
+
+fn run_direct_discovery_receive(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let value = required_argument(arguments, "interface index")?;
+
+    let parsed = parse_u64_count(&value, "interface index")?;
+
+    let interface_index = u32::try_from(parsed).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface index is larger than u32",
+        )
+    })?;
+
+    if interface_index == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface index must not be zero",
+        )
+        .into());
+    }
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy(),),
+        )
+        .into());
+    }
+
+    windows_setup::prepare_discovery_receiver(direct_discovery::DISCOVERY_PORT)?;
+
+    direct_discovery::receive(interface_index)?;
+
+    Ok(())
+}
+
+fn run_direct_discovery_send(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let value = required_argument(arguments, "interface index")?;
+
+    let parsed = parse_u64_count(&value, "interface index")?;
+
+    let interface_index = u32::try_from(parsed).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface index is larger than u32",
+        )
+    })?;
+
+    if interface_index == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface index must not be zero",
+        )
+        .into());
+    }
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy(),),
+        )
+        .into());
+    }
+
+    direct_discovery::discover(interface_index)?;
+
+    Ok(())
 }
 
 fn run_direct_address(
@@ -982,6 +1059,8 @@ fn print_usage(program: &OsStr) {
     println!("  {program} --version");
     println!("  {program} direct-interfaces");
     println!("  {program} direct-address <interface-index>");
+    println!("  {program} direct-discovery-receive <interface-index>");
+    println!("  {program} direct-discovery-send <interface-index>");
     println!("  {program} receive-auto <bind-address> <destination-root>");
     println!("  {program} send-auto <receiver-address> <source-root> [workers] [calibration-mib]");
     println!("  {program} bench-network-matrix-receive <bind-address>");

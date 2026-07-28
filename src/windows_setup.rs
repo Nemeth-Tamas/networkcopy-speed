@@ -14,10 +14,18 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 
 const FIREWALL_RULE_PREFIX: &str = "NetworkCopy Speed Edition TCP";
 
+const DISCOVERY_FIREWALL_RULE_PREFIX: &str = "NetworkCopy Speed Edition UDP Discovery";
+
 pub fn prepare_receiver(bind_address: SocketAddr) -> io::Result<()> {
     require_administrator()?;
 
     ensure_firewall_rule(bind_address.port())
+}
+
+pub(crate) fn prepare_discovery_receiver(port: u16) -> io::Result<()> {
+    require_administrator()?;
+
+    ensure_discovery_firewall_rule(port)
 }
 
 fn require_administrator() -> io::Result<()> {
@@ -118,6 +126,45 @@ fn ensure_firewall_rule(port: u16) -> io::Result<()> {
     Ok(())
 }
 
+fn ensure_discovery_firewall_rule(port: u16) -> io::Result<()> {
+    let executable = env::current_exe()?;
+
+    let rule_name = discovery_firewall_rule_name(port);
+
+    remove_existing_rule(&rule_name)?;
+
+    let output = Command::new("netsh")
+        .args(["advfirewall", "firewall", "add", "rule"])
+        .args(discovery_firewall_rule_arguments(
+            &rule_name,
+            &executable,
+            port,
+        ))
+        .output()?;
+
+    if !output.status.success() {
+        return Err(command_failure(
+            "creating the Windows discovery firewall rule",
+            &output.stdout,
+            &output.stderr,
+        ));
+    }
+
+    println!("Windows Firewall discovery rule ready");
+
+    println!("  Rule:          {rule_name}");
+
+    println!("  Program:       {}", executable.display(),);
+
+    println!("  Inbound UDP:   {port}");
+
+    println!("  Remote scope:  local subnet");
+
+    println!();
+
+    Ok(())
+}
+
 fn remove_existing_rule(rule_name: &str) -> io::Result<()> {
     let output = Command::new("netsh")
         .args(["advfirewall", "firewall", "delete", "rule"])
@@ -137,6 +184,10 @@ fn firewall_rule_name(port: u16) -> String {
     format!("{FIREWALL_RULE_PREFIX} {port}")
 }
 
+fn discovery_firewall_rule_name(port: u16) -> String {
+    format!("{DISCOVERY_FIREWALL_RULE_PREFIX} {port}")
+}
+
 fn firewall_rule_arguments(rule_name: &str, executable: &Path, port: u16) -> Vec<OsString> {
     let mut program = OsString::from("program=");
 
@@ -148,6 +199,28 @@ fn firewall_rule_arguments(rule_name: &str, executable: &Path, port: u16) -> Vec
         OsString::from("action=allow"),
         OsString::from("protocol=TCP"),
         OsString::from(format!("localport={port}")),
+        program,
+        OsString::from("profile=any"),
+        OsString::from("remoteip=localsubnet"),
+        OsString::from("enable=yes"),
+    ]
+}
+
+fn discovery_firewall_rule_arguments(
+    rule_name: &str,
+    executable: &Path,
+    port: u16,
+) -> Vec<OsString> {
+    let mut program = OsString::from("program=");
+
+    program.push(executable.as_os_str());
+
+    vec![
+        OsString::from(format!("name={rule_name}",)),
+        OsString::from("dir=in"),
+        OsString::from("action=allow"),
+        OsString::from("protocol=UDP"),
+        OsString::from(format!("localport={port}",)),
         program,
         OsString::from("profile=any"),
         OsString::from("remoteip=localsubnet"),
@@ -173,7 +246,10 @@ fn command_failure(action: &str, stdout: &[u8], stderr: &[u8]) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{firewall_rule_arguments, firewall_rule_name};
+    use super::{
+        discovery_firewall_rule_arguments, discovery_firewall_rule_name, firewall_rule_arguments,
+        firewall_rule_name,
+    };
     use std::path::Path;
 
     #[test]
@@ -206,5 +282,29 @@ mod tests {
                 argument.starts_with("program=C:\\Program Files\\NetworkCopy")
             },)
         );
+    }
+
+    #[test]
+    fn discovery_firewall_rule_is_udp_and_scoped() {
+        let rule_name = discovery_firewall_rule_name(7336);
+
+        assert_eq!(rule_name, "NetworkCopy Speed Edition UDP Discovery 7336",);
+
+        let arguments = discovery_firewall_rule_arguments(
+            &rule_name,
+            Path::new(r"C:\Program Files\NetworkCopy\networkcopy-speed.exe"),
+            7336,
+        );
+
+        let rendered: Vec<String> = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(rendered.contains(&"localport=7336".to_string(),),);
+
+        assert!(rendered.contains(&"protocol=UDP".to_string(),),);
+
+        assert!(rendered.contains(&"remoteip=localsubnet".to_string(),),);
     }
 }
