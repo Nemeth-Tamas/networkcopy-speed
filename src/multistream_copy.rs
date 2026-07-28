@@ -3,6 +3,7 @@ use crate::compression_probe;
 use crate::content_hash::{self, ContentHasher};
 use crate::control_plane::{self, ConnectionRole, Handshake, ManifestSummary};
 use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_second, format_bytes};
+use crate::file_metadata;
 use crate::manifest_scan::{self, FileClass, ManifestEntry};
 use crate::resume_state::{ResumeJournal, ResumeStripe};
 use crate::striped_file;
@@ -482,6 +483,8 @@ fn run_server(
     let report = merge_lane_reports(vec![resume_application.logical_report, transferred_report])?;
 
     finalize_large_files(destination_root.as_path(), &manifest)?;
+
+    file_metadata::restore_manifest_files(destination_root.as_path(), &manifest)?;
 
     let ack = TransferAck {
         files_copied: report.files_copied,
@@ -2328,15 +2331,18 @@ mod tests {
         validate_resume_offer, verify_content_digest, write_receiver_ready,
     };
     use crate::control_plane::{self, ManifestSummary};
+    use crate::file_metadata;
     use crate::manifest_scan::{self, FileClass, ManifestEntry};
     use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
     use std::collections::BTreeSet;
     use std::env;
     use std::fs;
     use std::io::{self, Cursor, Write};
+    use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
 
     #[test]
     fn scheduler_stripes_large_files_and_packs_tiny_files() {
@@ -2737,6 +2743,14 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         fs::write(source.join("empty.bin"), []).unwrap();
         fs::write(source.join("small.txt"), b"NetworkCopy Speed Edition").unwrap();
+        let small_last_write_time = 132_537_600_123_456_789;
+
+        file_metadata::restore_file(
+            &source.join("small.txt"),
+            small_last_write_time,
+            FILE_ATTRIBUTE_HIDDEN,
+        )
+        .unwrap();
 
         fs::write(nested.join("medium.bin"), vec![0xA5_u8; 300 * 1024]).unwrap();
 
@@ -2773,6 +2787,18 @@ mod tests {
         assert_eq!(
             fs::read(source.join("small.txt")).unwrap(),
             fs::read(destination.join("small.txt")).unwrap()
+        );
+
+        let copied_small_metadata = fs::metadata(destination.join("small.txt")).unwrap();
+
+        assert_eq!(
+            copied_small_metadata.last_write_time(),
+            small_last_write_time
+        );
+
+        assert_ne!(
+            copied_small_metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN,
+            0
         );
 
         assert_eq!(

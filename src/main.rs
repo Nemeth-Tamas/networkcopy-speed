@@ -3,6 +3,7 @@ mod compression_probe;
 mod content_hash;
 mod control_plane;
 mod copy_bench;
+mod file_metadata;
 mod iocp_copy;
 mod iocp_file_probe;
 mod iocp_probe;
