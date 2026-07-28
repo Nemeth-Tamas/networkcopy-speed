@@ -13,6 +13,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1305,11 +1306,13 @@ fn send_tiny_pack(
 
         let mut file = File::open(&path)?;
 
-        validate_source_size(&file, &path, entry)?;
+        validate_source_metadata(&file, &path, entry)?;
 
         let digest = copy_exact_hashed(&mut file, writer, entry.file_size, buffer)?;
 
-        write_digest(writer, &digest)?;
+        validate_source_metadata(&file, &path, entry)?;
+
+        write_digest(writer, &digest)
     }
 
     Ok(summary)
@@ -1381,7 +1384,7 @@ fn send_whole_file(
 
     let mut file = File::open(&path)?;
 
-    validate_source_size(&file, &path, entry)?;
+    validate_source_metadata(&file, &path, entry)?;
 
     let decision = compression_probe::decide_file_range(
         &file,
@@ -1390,7 +1393,12 @@ fn send_whole_file(
         compression_probe::DEFAULT_LEVEL,
     )?;
 
-    encoder.send_sequential(writer, &mut file, entry.file_size, buffer, decision)
+    let compressed =
+        encoder.send_sequential(writer, &mut file, entry.file_size, buffer, decision)?;
+
+    validate_source_metadata(&file, &path, entry)?;
+
+    Ok(compressed)
 }
 
 fn send_file_stripe(
@@ -1428,7 +1436,7 @@ fn send_file_stripe(
 
     let file = File::open(&path)?;
 
-    validate_source_size(&file, &path, entry)?;
+    validate_source_metadata(&file, &path, entry)?;
 
     let decision = compression_probe::decide_file_range(
         &file,
@@ -1437,16 +1445,39 @@ fn send_file_stripe(
         compression_probe::DEFAULT_LEVEL,
     )?;
 
-    encoder.send_positional(writer, &file, offset, length, buffer, decision)
+    let compressed = encoder.send_positional(writer, &file, offset, length, buffer, decision)?;
+
+    validate_source_metadata(&file, &path, entry)?;
+
+    Ok(compressed)
 }
 
-fn validate_source_size(file: &File, path: &Path, entry: &ManifestEntry) -> io::Result<()> {
-    let current_size = file.metadata()?.len();
+fn validate_source_metadata(file: &File, path: &Path, entry: &ManifestEntry) -> io::Result<()> {
+    let metadata = file.metadata()?;
+
+    let current_size = metadata.len();
 
     if current_size != entry.file_size {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("source changed after scanning: {}", path.display()),
+            format!(
+                "source size changed after scanning: expected {} bytes, found {current_size}: {}",
+                entry.file_size,
+                path.display()
+            ),
+        ));
+    }
+
+    let current_last_write_time = metadata.last_write_time();
+
+    if current_last_write_time != entry.last_write_time {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "source last-write time changed after scanning: expected {}, found {current_last_write_time}: {}",
+                entry.last_write_time,
+                path.display()
+            ),
         ));
     }
 
@@ -2328,7 +2359,8 @@ mod tests {
     use super::{
         ReceiverReady, TINY_PACK_TARGET_BYTES, TransferTask, apply_resume_offer,
         build_transfer_plan, copy_exact_hashed, read_receiver_ready, run, temporary_path,
-        validate_resume_offer, verify_content_digest, write_receiver_ready,
+        validate_resume_offer, validate_source_metadata, verify_content_digest,
+        write_receiver_ready,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::file_metadata;
@@ -2336,7 +2368,7 @@ mod tests {
     use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
     use std::collections::BTreeSet;
     use std::env;
-    use std::fs;
+    use std::fs::{self, File};
     use std::io::{self, Cursor, Write};
     use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
@@ -2469,6 +2501,101 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 
         assert!(error.to_string().contains("BLAKE3 verification failed"));
+    }
+
+    #[test]
+    fn source_metadata_rejects_size_change() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let path = env::temp_dir().join(format!(
+            "networkcopy-source-size-{}-{unique}.bin",
+            process::id()
+        ));
+
+        fs::write(&path, b"original").unwrap();
+
+        let metadata = fs::metadata(&path).unwrap();
+
+        let entry = ManifestEntry {
+            relative_path: PathBuf::from("source.bin"),
+
+            file_size: metadata.len(),
+
+            last_write_time: metadata.last_write_time(),
+
+            file_attributes: metadata.file_attributes(),
+
+            class: FileClass::Tiny,
+        };
+
+        fs::write(&path, b"changed-length").unwrap();
+
+        let file = File::open(&path).unwrap();
+
+        let error = validate_source_metadata(&file, &path, &entry).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        assert!(
+            error
+                .to_string()
+                .contains("source size changed after scanning",)
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn source_metadata_rejects_timestamp_change() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let path = env::temp_dir().join(format!(
+            "networkcopy-source-time-{}-{unique}.bin",
+            process::id()
+        ));
+
+        fs::write(&path, b"unchanged-size").unwrap();
+
+        let metadata = fs::metadata(&path).unwrap();
+
+        let entry = ManifestEntry {
+            relative_path: PathBuf::from("source.bin"),
+
+            file_size: metadata.len(),
+
+            last_write_time: metadata.last_write_time(),
+
+            file_attributes: metadata.file_attributes(),
+
+            class: FileClass::Tiny,
+        };
+
+        file_metadata::restore_file(
+            &path,
+            entry.last_write_time.checked_add(10_000_000).unwrap(),
+            entry.file_attributes,
+        )
+        .unwrap();
+
+        let file = File::open(&path).unwrap();
+
+        let error = validate_source_metadata(&file, &path, &entry).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        assert!(
+            error
+                .to_string()
+                .contains("source last-write time changed after scanning",)
+        );
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

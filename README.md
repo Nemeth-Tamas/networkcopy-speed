@@ -798,8 +798,8 @@ This is exactly why the future two-machine mode will calibrate stream counts ins
 * [x] Resume-stripe control negotiation
 * [x] Transfer-plan filtering
 * [x] Reopen interrupted destinations
-* [ ] Restore last-write timestamps and safe Windows attributes
-* [ ] Reject source files changed after manifest scanning
+* [x] Restore last-write timestamps and safe Windows attributes
+* [x] Reject source files changed after manifest scanning
 * [ ] Automated interruption and resume acceptance test
 
 ## Milestone 8 — Real two-machine mode
