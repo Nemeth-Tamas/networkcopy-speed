@@ -852,12 +852,13 @@ Planned work:
 * [x] Recommend the smallest stream count within 90% of the best result
 * [x] Automatic calibrated transfer using the recommended stream count
 * [x] Compare application-wire throughput against the calibrated TCP ceiling
-* [ ] Measure a real two-machine path with automatic calibrated transfer
-* [ ] Tune socket buffers and in-flight data where real-path measurements justify it
-* [ ] Target at least 85–90% of the measured path capacity
+* [x] Measure a real two-machine path with automatic calibrated transfer
+* [x] Validate current socket buffering and in-flight data on a real path
+* [x] Reach at least 85–90% of the measured path capacity
 * [x] Require elevation and automatically manage the Windows Firewall rule
+* [x] Live console progress for automatic calibration and transfers
 * [ ] Standalone release binaries
-* [ ] End-to-end two-machine acceptance test
+* [x] End-to-end two-machine acceptance test
 
 ## Milestone 9 — Direct Link Mode
 

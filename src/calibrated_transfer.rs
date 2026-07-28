@@ -115,7 +115,7 @@ pub fn send(
 
     let data_stream_count = calibration.recommended.data_stream_count;
 
-    let calibrated_report = calibration.recommended;
+    let calibrated_report = calibration.best;
 
     let transfer_progress = ConsoleProgress::start("Scanning source", 0)?;
 

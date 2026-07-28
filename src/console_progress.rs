@@ -4,8 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-const BAR_WIDTH: usize = 28;
-const DISPLAY_WIDTH: usize = 120;
+const BAR_WIDTH: usize = 20;
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -168,8 +167,10 @@ impl Drop for ConsoleProgress {
 fn display_loop(counter: ProgressCounter) -> io::Result<()> {
     let started = Instant::now();
 
+    let mut previous_width = 0_usize;
+
     loop {
-        render_progress(&counter, started.elapsed())?;
+        render_progress(&counter, started.elapsed(), &mut previous_width)?;
 
         if counter.is_finished() {
             break;
@@ -185,16 +186,28 @@ fn display_loop(counter: ProgressCounter) -> io::Result<()> {
     stdout.flush()
 }
 
-fn render_progress(counter: &ProgressCounter, elapsed: Duration) -> io::Result<()> {
+fn render_progress(
+    counter: &ProgressCounter,
+    elapsed: Duration,
+    previous_width: &mut usize,
+) -> io::Result<()> {
     let snapshot = counter.snapshot();
 
     let line = format_progress_line(&snapshot, elapsed);
 
+    let current_width = line.chars().count();
+
+    let clear_width = previous_width.saturating_sub(current_width);
+
     let mut stdout = io::stdout().lock();
 
-    write!(stdout, "\r{line:<width$}", width = DISPLAY_WIDTH,)?;
+    write!(stdout, "\r{line}{}", " ".repeat(clear_width,),)?;
 
-    stdout.flush()
+    stdout.flush()?;
+
+    *previous_width = current_width;
+
+    Ok(())
 }
 
 fn format_progress_line(snapshot: &ProgressSnapshot, elapsed: Duration) -> String {
@@ -206,7 +219,7 @@ fn format_progress_line(snapshot: &ProgressSnapshot, elapsed: Duration) -> Strin
 
     if snapshot.total == 0 {
         return format!(
-            "{:<29} [waiting]  {}  {:>8.2} MB/s",
+            "{:<24} [waiting]  {}  {:>8.2} MB/s",
             snapshot.label,
             format_amount(snapshot.completed,),
             megabytes_per_second,
@@ -226,7 +239,7 @@ fn format_progress_line(snapshot: &ProgressSnapshot, elapsed: Duration) -> Strin
     );
 
     format!(
-        "{:<29} [{}] {:>6.2}%  {} / {}  {:>8.2} MB/s",
+        "{:<24} [{}] {:>6.2}%  {} / {}  {:>8.2} MB/s",
         snapshot.label,
         bar,
         fraction * 100.0,
@@ -280,5 +293,7 @@ mod tests {
         assert!(line.contains("1.00 MiB / 2.00 MiB",));
 
         assert!(line.contains("Transfer send",));
+
+        assert!(line.chars().count() < 100);
     }
 }
