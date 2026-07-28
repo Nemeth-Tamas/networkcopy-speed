@@ -447,7 +447,7 @@ pub fn send(
     )
 }
 
-fn connect_with_retry(receiver_address: SocketAddr) -> io::Result<TcpStream> {
+pub(crate) fn connect_with_retry(receiver_address: SocketAddr) -> io::Result<TcpStream> {
     connect_with_retry_config(receiver_address, CONNECT_RETRY_TIMEOUT, CONNECT_RETRY_DELAY)
 }
 

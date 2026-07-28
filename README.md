@@ -823,7 +823,8 @@ Planned work:
 * [x] Bind the receiver to a configurable interface and port
 * [x] Connect sender data lanes to a remote machine
 * [x] Preserve the current protocol and transfer planner
-* [ ] Real-network raw TCP calibration
+* [x] Real-network raw TCP calibration
+* [ ] Measure a real network path with the calibration commands
 * [ ] Test 1, 2, 4, and 8 streams
 * [ ] Tune socket buffers and in-flight data
 * [ ] Compare engine throughput against measured TCP ceiling

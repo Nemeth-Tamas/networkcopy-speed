@@ -9,6 +9,7 @@ mod iocp_file_probe;
 mod iocp_probe;
 mod manifest_scan;
 mod multistream_copy;
+mod network_calibration;
 mod pipeline_bench;
 mod resume_state;
 mod striped_file;
@@ -40,6 +41,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     match command.to_string_lossy().as_ref() {
+        "bench-network-send" => run_network_bench_send(&mut arguments),
+        "bench-network-receive" => run_network_bench_receive(&mut arguments),
         "send" => run_send(&mut arguments),
         "receive" => run_receive(&mut arguments),
         "bench-copy" => run_bench_copy(&mut arguments),
@@ -349,6 +352,92 @@ fn run_control_plane_probe(
     Ok(())
 }
 
+fn run_network_bench_send(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let receiver_address = parse_socket_address(
+        &required_argument(arguments, "receiver address")?,
+        "receiver address",
+    )?;
+
+    let total_mib = match arguments.next() {
+        Some(value) => parse_u64_count(&value, "total MiB")?,
+
+        None => network_calibration::DEFAULT_TOTAL_MIB,
+    };
+
+    let data_stream_count = match arguments.next() {
+        Some(value) => parse_buffer_count(&value)?,
+
+        None => network_calibration::DEFAULT_DATA_STREAMS,
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    let total_bytes = network_calibration::bytes_from_mib(total_mib)?;
+
+    control_plane::validate_data_stream_count(data_stream_count)?;
+
+    println!("NetworkCopy Speed Edition raw TCP sender");
+
+    println!("  Receiver:     {receiver_address}");
+
+    println!("  Payload:      {total_mib} MiB");
+
+    println!("  Data streams: {data_stream_count}");
+
+    println!("  Source:       generated memory buffers");
+
+    println!();
+
+    let report = network_calibration::send(receiver_address, total_bytes, data_stream_count)?;
+
+    report.print("send");
+
+    Ok(())
+}
+
+fn run_network_bench_receive(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let bind_address = parse_socket_address(
+        &required_argument(arguments, "bind address")?,
+        "bind address",
+    )?;
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    let listener = TcpListener::bind(bind_address)?;
+
+    println!("NetworkCopy Speed Edition raw TCP receiver");
+
+    println!("  Listening:    {}", listener.local_addr()?);
+
+    println!("  Destination:  discarded memory buffers");
+
+    println!("  Mode:         one calibration, then exit");
+
+    println!();
+
+    let report = network_calibration::receive_once(listener)?;
+
+    report.print("receive");
+
+    Ok(())
+}
+
 fn run_send(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), Box<dyn Error>> {
     let receiver_address = parse_socket_address(
         &required_argument(arguments, "receiver address")?,
@@ -592,6 +681,22 @@ fn parse_buffer_mib(value: &OsStr) -> io::Result<usize> {
     Ok(buffer_mib)
 }
 
+fn parse_u64_count(value: &OsStr, description: &str) -> io::Result<u64> {
+    let value = value.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} must contain valid Unicode digits"),
+        )
+    })?;
+
+    value.parse::<u64>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid {description} {value:?}: {error}"),
+        )
+    })
+}
+
 fn parse_buffer_count(value: &OsStr) -> io::Result<usize> {
     let value = value.to_str().ok_or_else(|| {
         io::Error::new(
@@ -614,6 +719,8 @@ fn print_usage(program: &OsStr) {
     println!("NetworkCopy Speed Edition");
     println!();
     println!("Usage:");
+    println!("  {program} bench-network-receive <bind-address>");
+    println!("  {program} bench-network-send <receiver-address> [total-mib] [data-streams]");
     println!("  {program} receive <bind-address> <destination-root>");
     println!("  {program} send <receiver-address> <source-root> [workers] [data-streams]");
     println!("  {program} bench-copy <source> <destination> [buffer-mib]");
