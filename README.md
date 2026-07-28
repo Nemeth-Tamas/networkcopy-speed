@@ -823,9 +823,10 @@ Planned work:
 * [x] Bind the receiver to a configurable interface and port
 * [x] Connect sender data lanes to a remote machine
 * [x] Preserve the current protocol and transfer planner
-* [x] Real-network raw TCP calibration
-* [ ] Measure a real network path with the calibration commands
-* [ ] Test 1, 2, 4, and 8 streams
+* [x] Raw TCP memory calibration commands
+* [x] Automatic 1, 2, 4, and 8-stream path matrix
+* [x] Recommend the smallest stream count within 90% of the best result
+* [ ] Measure a real two-machine path with the calibration matrix
 * [ ] Tune socket buffers and in-flight data
 * [ ] Compare engine throughput against measured TCP ceiling
 * [ ] Target at least 85–90% of the measured path capacity

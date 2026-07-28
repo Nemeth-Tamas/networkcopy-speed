@@ -41,6 +41,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     match command.to_string_lossy().as_ref() {
+        "bench-network-matrix-send" => run_network_matrix_send(&mut arguments),
+        "bench-network-matrix-receive" => run_network_matrix_receive(&mut arguments),
         "bench-network-send" => run_network_bench_send(&mut arguments),
         "bench-network-receive" => run_network_bench_receive(&mut arguments),
         "send" => run_send(&mut arguments),
@@ -348,6 +350,86 @@ fn run_control_plane_probe(
     let report = control_plane::run(&root, worker_count, data_stream_count)?;
 
     report.print();
+
+    Ok(())
+}
+
+fn run_network_matrix_send(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let receiver_address = parse_socket_address(
+        &required_argument(arguments, "receiver address")?,
+        "receiver address",
+    )?;
+
+    let total_mib = match arguments.next() {
+        Some(value) => parse_u64_count(&value, "total MiB")?,
+
+        None => network_calibration::DEFAULT_TOTAL_MIB,
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    let total_bytes = network_calibration::bytes_from_mib(total_mib)?;
+
+    println!("NetworkCopy Speed Edition raw TCP path matrix sender");
+
+    println!("  Receiver:     {receiver_address}");
+
+    println!("  Payload/run:  {total_mib} MiB");
+
+    println!("  Stream tests: 1, 2, 4, 8");
+
+    println!("  Source:       generated memory buffers");
+
+    println!();
+
+    let report = network_calibration::send_matrix(receiver_address, total_bytes)?;
+
+    report.print("send");
+
+    Ok(())
+}
+
+fn run_network_matrix_receive(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let bind_address = parse_socket_address(
+        &required_argument(arguments, "bind address")?,
+        "bind address",
+    )?;
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    let listener = TcpListener::bind(bind_address)?;
+
+    println!("NetworkCopy Speed Edition raw TCP path matrix receiver");
+
+    println!("  Listening:    {}", listener.local_addr()?);
+
+    println!("  Stream tests: 1, 2, 4, 8");
+
+    println!("  Destination:  discarded memory buffers");
+
+    println!("  Mode:         four calibrations, then exit");
+
+    println!();
+
+    let report = network_calibration::receive_matrix(listener)?;
+
+    report.print("receive");
 
     Ok(())
 }
@@ -719,6 +801,8 @@ fn print_usage(program: &OsStr) {
     println!("NetworkCopy Speed Edition");
     println!();
     println!("Usage:");
+    println!("  {program} bench-network-matrix-receive <bind-address>");
+    println!("  {program} bench-network-matrix-send <receiver-address> [total-mib]");
     println!("  {program} bench-network-receive <bind-address>");
     println!("  {program} bench-network-send <receiver-address> [total-mib] [data-streams]");
     println!("  {program} receive <bind-address> <destination-root>");

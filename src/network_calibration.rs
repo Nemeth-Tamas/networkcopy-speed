@@ -19,6 +19,8 @@ const MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 pub const DEFAULT_TOTAL_MIB: u64 = 1024;
 pub const DEFAULT_DATA_STREAMS: usize = 1;
 pub const BUFFER_BYTES: usize = 1024 * 1024;
+const MATRIX_STREAM_COUNTS: [usize; 4] = [1, 2, 4, 8];
+const MATRIX_RECOMMENDATION_FRACTION: f64 = 0.90;
 
 #[derive(Clone, Copy, Debug)]
 pub struct NetworkCalibrationReport {
@@ -64,6 +66,65 @@ impl NetworkCalibrationReport {
         println!(
             "  Link throughput:      {:.3} Gbit/s",
             gigabits_per_second(self.total_bytes, self.elapsed,)
+        );
+    }
+}
+
+#[derive(Debug)]
+pub struct NetworkCalibrationMatrixReport {
+    pub reports: Vec<NetworkCalibrationReport>,
+
+    pub best: NetworkCalibrationReport,
+
+    pub recommended: NetworkCalibrationReport,
+
+    pub recommended_percent_of_best: f64,
+}
+
+impl NetworkCalibrationMatrixReport {
+    pub fn print(&self, direction: &str) {
+        println!("Raw TCP path matrix {direction} complete");
+
+        println!(
+            "  Selection policy: smallest lane count reaching {:.0}% of the best result",
+            MATRIX_RECOMMENDATION_FRACTION * 100.0
+        );
+
+        println!();
+
+        println!("  Streams        MB/s        MiB/s      Gbit/s");
+
+        for report in &self.reports {
+            println!(
+                "  {:>7}  {:>10.2}  {:>11.2}  {:>10.3}",
+                report.data_stream_count,
+                decimal_megabytes_per_second(report.total_bytes, report.elapsed,),
+                binary_mebibytes_per_second(report.total_bytes, report.elapsed,),
+                gigabits_per_second(report.total_bytes, report.elapsed,)
+            );
+        }
+
+        println!();
+
+        println!(
+            "  Best result:          {} streams at {:.2} MB/s",
+            self.best.data_stream_count,
+            decimal_megabytes_per_second(self.best.total_bytes, self.best.elapsed,)
+        );
+
+        println!(
+            "  Recommended streams: {}",
+            self.recommended.data_stream_count
+        );
+
+        println!(
+            "  Recommended speed:   {:.2} MB/s",
+            decimal_megabytes_per_second(self.recommended.total_bytes, self.recommended.elapsed,)
+        );
+
+        println!(
+            "  Percent of best:      {:.2}%",
+            self.recommended_percent_of_best
         );
     }
 }
@@ -177,7 +238,46 @@ pub fn send(
     build_report(data_stream_count, total_bytes, elapsed)
 }
 
+pub fn send_matrix(
+    receiver_address: SocketAddr,
+    total_bytes: u64,
+) -> io::Result<NetworkCalibrationMatrixReport> {
+    let mut reports = Vec::with_capacity(MATRIX_STREAM_COUNTS.len());
+
+    for data_stream_count in MATRIX_STREAM_COUNTS {
+        reports.push(send(receiver_address, total_bytes, data_stream_count)?);
+    }
+
+    build_matrix_report(reports)
+}
+
 pub fn receive_once(listener: TcpListener) -> io::Result<NetworkCalibrationReport> {
+    receive_one(&listener)
+}
+
+pub fn receive_matrix(listener: TcpListener) -> io::Result<NetworkCalibrationMatrixReport> {
+    let mut reports = Vec::with_capacity(MATRIX_STREAM_COUNTS.len());
+
+    for expected_stream_count in MATRIX_STREAM_COUNTS {
+        let report = receive_one(&listener)?;
+
+        if report.data_stream_count != expected_stream_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "network calibration matrix expected {expected_stream_count} streams, received {}",
+                    report.data_stream_count
+                ),
+            ));
+        }
+
+        reports.push(report);
+    }
+
+    build_matrix_report(reports)
+}
+
+fn receive_one(listener: &TcpListener) -> io::Result<NetworkCalibrationReport> {
     let (mut control_stream, _control_peer) = listener.accept()?;
 
     control_plane::configure_stream(&control_stream)?;
@@ -265,6 +365,53 @@ pub fn receive_once(listener: TcpListener) -> io::Result<NetworkCalibrationRepor
     write_ack(&mut control_stream, received_bytes)?;
 
     build_report(config.data_stream_count, received_bytes, elapsed)
+}
+
+fn build_matrix_report(
+    reports: Vec<NetworkCalibrationReport>,
+) -> io::Result<NetworkCalibrationMatrixReport> {
+    let best = reports
+        .iter()
+        .copied()
+        .max_by(|left, right| {
+            report_megabytes_per_second(left).total_cmp(&report_megabytes_per_second(right))
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "network calibration matrix contained no reports",
+            )
+        })?;
+
+    let best_megabytes_per_second = report_megabytes_per_second(&best);
+
+    let recommendation_threshold = best_megabytes_per_second * MATRIX_RECOMMENDATION_FRACTION;
+
+    let recommended = reports
+        .iter()
+        .copied()
+        .filter(|report| report_megabytes_per_second(report) >= recommendation_threshold)
+        .min_by_key(|report| report.data_stream_count)
+        .ok_or_else(|| {
+            io::Error::other("network calibration matrix could not select a recommendation")
+        })?;
+
+    let recommended_percent_of_best = if best_megabytes_per_second == 0.0 {
+        0.0
+    } else {
+        report_megabytes_per_second(&recommended) / best_megabytes_per_second * 100.0
+    };
+
+    Ok(NetworkCalibrationMatrixReport {
+        reports,
+        best,
+        recommended,
+        recommended_percent_of_best,
+    })
+}
+
+fn report_megabytes_per_second(report: &NetworkCalibrationReport) -> f64 {
+    decimal_megabytes_per_second(report.total_bytes, report.elapsed)
 }
 
 fn validate_config(total_bytes: u64, data_stream_count: usize) -> io::Result<()> {
@@ -648,9 +795,13 @@ fn gigabits_per_second(bytes: u64, elapsed: Duration) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{lane_bytes, receive_once, send};
+    use super::{
+        MATRIX_STREAM_COUNTS, NetworkCalibrationReport, build_matrix_report, lane_bytes,
+        receive_matrix, receive_once, send, send_matrix,
+    };
     use std::net::TcpListener;
     use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn lane_ranges_cover_total_bytes() {
@@ -659,6 +810,34 @@ mod tests {
         assert_eq!(lane_bytes(10, 3, 1).unwrap(), 3);
 
         assert_eq!(lane_bytes(10, 3, 2).unwrap(), 3);
+    }
+
+    #[test]
+    fn matrix_recommends_smallest_near_best_count() {
+        let report = |data_stream_count, milliseconds| NetworkCalibrationReport {
+            data_stream_count,
+            total_bytes: 100 * 1024 * 1024,
+
+            buffer_bytes_per_lane: 1024 * 1024,
+
+            process_buffer_bytes: data_stream_count as u64 * 1024 * 1024,
+
+            elapsed: Duration::from_millis(milliseconds),
+        };
+
+        let matrix = build_matrix_report(vec![
+            report(1, 200),
+            report(2, 120),
+            report(4, 55),
+            report(8, 50),
+        ])
+        .unwrap();
+
+        assert_eq!(matrix.best.data_stream_count, 8);
+
+        assert_eq!(matrix.recommended.data_stream_count, 4);
+
+        assert!(matrix.recommended_percent_of_best >= 90.0);
     }
 
     #[test]
@@ -682,5 +861,48 @@ mod tests {
         assert_eq!(sender_report.data_stream_count, 2);
 
         assert_eq!(receiver_report.data_stream_count, 2);
+    }
+
+    #[test]
+    fn loopback_matrix_round_trips() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+
+        let address = listener.local_addr().unwrap();
+
+        let receiver = thread::spawn(move || receive_matrix(listener));
+
+        let total_bytes = 8 * 1024 * 1024 + 137;
+
+        let sender_matrix = send_matrix(address, total_bytes).unwrap();
+
+        let receiver_matrix = receiver.join().unwrap().unwrap();
+
+        assert_eq!(sender_matrix.reports.len(), MATRIX_STREAM_COUNTS.len());
+
+        assert_eq!(receiver_matrix.reports.len(), MATRIX_STREAM_COUNTS.len());
+
+        let sender_counts: Vec<usize> = sender_matrix
+            .reports
+            .iter()
+            .map(|report| report.data_stream_count)
+            .collect();
+
+        let receiver_counts: Vec<usize> = receiver_matrix
+            .reports
+            .iter()
+            .map(|report| report.data_stream_count)
+            .collect();
+
+        assert_eq!(sender_counts, MATRIX_STREAM_COUNTS);
+
+        assert_eq!(receiver_counts, MATRIX_STREAM_COUNTS);
+
+        for report in sender_matrix.reports {
+            assert_eq!(report.total_bytes, total_bytes);
+        }
+
+        for report in receiver_matrix.reports {
+            assert_eq!(report.total_bytes, total_bytes);
+        }
     }
 }
