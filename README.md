@@ -871,7 +871,7 @@ networkcopy-speed.exe
 
 Planned after the first real-network release:
 
-* [ ] Detect physical Ethernet interfaces
+* [x] Enumerate and classify physical Ethernet interfaces
 * [ ] Reject Wi-Fi, VPN, Hyper-V, and WSL routes
 * [ ] Prefer IPv6 link-local addressing
 * [ ] Handle IPv6 scope identifiers correctly
