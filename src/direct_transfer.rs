@@ -11,13 +11,6 @@ pub(crate) fn receive_once(destination_root: &Path) -> io::Result<CalibratedRece
     receive_configured(destination_root, None, DestinationMode::Fresh)
 }
 
-pub(crate) fn receive_once_with_progress(
-    destination_root: &Path,
-    progress: ProgressCounter,
-) -> io::Result<CalibratedReceiveReport> {
-    receive_configured(destination_root, Some(progress), DestinationMode::Fresh)
-}
-
 pub(crate) fn receive_once_with_progress_and_mode(
     destination_root: &Path,
     progress: ProgressCounter,

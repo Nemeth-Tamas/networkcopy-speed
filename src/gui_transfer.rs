@@ -185,7 +185,7 @@ pub fn run_gui_transfer_with_control(
             update_existing,
         } => {
             let destination_mode = if update_existing {
-                DestinationMode::UpdateFast
+                DestinationMode::UpdateVerified
             } else {
                 DestinationMode::Fresh
             };

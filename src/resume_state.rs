@@ -125,6 +125,16 @@ impl ResumeJournal {
         self.completed_stripes.iter().copied()
     }
 
+    pub(crate) fn remove_completed_files(&mut self, file_ids: &BTreeSet<usize>) -> bool {
+        let previous_count = self.completed_stripes.len();
+
+        self.completed_stripes.retain(|stripe| {
+            usize::try_from(stripe.file_id).map_or(true, |file_id| !file_ids.contains(&file_id))
+        });
+
+        self.completed_stripes.len() != previous_count
+    }
+
     pub(crate) fn save_atomic(&self, destination_root: &Path) -> io::Result<()> {
         let destination_root = destination_root.canonicalize()?;
 

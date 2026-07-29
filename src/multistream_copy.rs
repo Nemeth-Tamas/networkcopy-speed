@@ -12,8 +12,9 @@ use crate::striped_file;
 use crate::tcp_connect;
 use crate::tiny_pack_codec::{self, TinyPackEncoding};
 use crate::transfer_memory;
+use crate::update_verification::{self, FILE_DIGEST_BYTES, FileDigest};
 use crate::windows_file_replace;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -30,7 +31,9 @@ const MESSAGE_FILE: u8 = 0x31;
 const MESSAGE_STREAM_END: u8 = 0x32;
 const MESSAGE_TRANSFER_ACK: u8 = 0x33;
 const MESSAGE_FILE_STRIPE: u8 = 0x34;
+const MESSAGE_UPDATE_VERIFY_REQUEST: u8 = 0x35;
 const MESSAGE_TINY_PACK_V2: u8 = 0x36;
+const MESSAGE_UPDATE_VERIFY_RESPONSE: u8 = 0x37;
 
 const NETWORK_BUFFER_BYTES: usize = 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
@@ -56,6 +59,7 @@ pub const DEFAULT_DATA_STREAMS: usize = 4;
 pub(crate) enum DestinationMode {
     Fresh,
     UpdateFast,
+    UpdateVerified,
 }
 
 #[derive(Debug)]
@@ -711,7 +715,46 @@ fn send_internal(
 
     let manifest_wire_bytes = control_plane::send_manifest(&mut control_stream, &manifest)?;
 
-    let receiver_ready = read_receiver_ready(&mut control_stream)?;
+    let preparation_message = read_u8(&mut control_stream).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("receiver disconnected while preparing the transfer: {error}"),
+        )
+    })?;
+
+    let receiver_ready = if preparation_message == MESSAGE_UPDATE_VERIFY_REQUEST {
+        let destination_digests = read_update_verification_request(&mut control_stream)?;
+
+        let candidate_file_ids: BTreeSet<usize> = destination_digests.keys().copied().collect();
+
+        validate_unchanged_offer(&manifest, &candidate_file_ids)?;
+
+        if let Some(progress) = &progress {
+            progress.check_cancelled()?;
+            progress.set_label("Verifying source files");
+            progress.set_completed(0);
+            progress.set_total(0);
+        }
+
+        let source_digests =
+            update_verification::hash_candidates(&source_root, &manifest, &candidate_file_ids)?;
+
+        let matching_file_ids =
+            update_verification::matching_candidates(&destination_digests, &source_digests)?;
+
+        write_update_verification_response(&mut control_stream, &matching_file_ids)?;
+
+        if let Some(progress) = &progress {
+            progress.check_cancelled()?;
+            progress.set_label("Transfer send");
+            progress.set_completed(0);
+            progress.set_total(summary.total_file_bytes);
+        }
+
+        read_receiver_ready(&mut control_stream)?
+    } else {
+        read_receiver_ready_after_message(&mut control_stream, preparation_message)?
+    };
 
     let manifest_elapsed = manifest_started.elapsed();
 
@@ -966,6 +1009,17 @@ fn run_server_with_mode(
 
     let mut transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
 
+    let verified_unchanged_file_ids = if destination_mode == DestinationMode::UpdateVerified {
+        Some(negotiate_verified_unchanged_files(
+            &mut control_stream,
+            &destination_root,
+            &manifest,
+            progress.as_ref(),
+        )?)
+    } else {
+        None
+    };
+
     let PreparedDestination {
         journal: resume_journal,
         unchanged_file_ids,
@@ -976,6 +1030,7 @@ fn run_server_with_mode(
         data_stream_count,
         &transfer_plan,
         destination_mode,
+        verified_unchanged_file_ids.as_ref(),
     )?;
 
     let completed_stripes = resume_journal
@@ -1282,6 +1337,56 @@ fn accept_session(
     Ok((control_stream, ordered_streams, accepted_session))
 }
 
+fn negotiate_verified_unchanged_files(
+    control_stream: &mut TcpStream,
+    destination_root: &Path,
+    manifest: &[ManifestEntry],
+    progress: Option<&ProgressCounter>,
+) -> io::Result<BTreeSet<usize>> {
+    if !destination_root.try_exists()? {
+        return Ok(BTreeSet::new());
+    }
+
+    let inventory = destination_inventory::compare_fast(destination_root, manifest)?;
+
+    validate_update_inventory(destination_root, &inventory)?;
+
+    let candidate_file_ids = inventory.unchanged_file_ids;
+
+    if candidate_file_ids.is_empty() {
+        return Ok(candidate_file_ids);
+    }
+
+    if let Some(progress) = progress {
+        progress.check_cancelled()?;
+        progress.set_label("Verifying destination files");
+        progress.set_completed(0);
+        progress.set_total(0);
+    }
+
+    let destination_digests =
+        update_verification::hash_candidates(destination_root, manifest, &candidate_file_ids)?;
+
+    write_update_verification_request(control_stream, &destination_digests)?;
+
+    let matching_file_ids = read_update_verification_response(control_stream)?;
+
+    if !matching_file_ids.is_subset(&candidate_file_ids) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sender verified a file that was not offered as a candidate",
+        ));
+    }
+
+    if let Some(progress) = progress {
+        progress.check_cancelled()?;
+        progress.set_label("Transfer receive");
+        progress.set_completed(0);
+    }
+
+    Ok(matching_file_ids)
+}
+
 fn prepare_destination(
     destination_root: &Path,
     manifest: &[ManifestEntry],
@@ -1289,6 +1394,7 @@ fn prepare_destination(
     data_stream_count: usize,
     transfer_plan: &TransferPlan,
     destination_mode: DestinationMode,
+    verified_unchanged_file_ids: Option<&BTreeSet<usize>>,
 ) -> io::Result<PreparedDestination> {
     if destination_root.try_exists()? {
         let root_metadata = fs::metadata(destination_root)?;
@@ -1306,14 +1412,15 @@ fn prepare_destination(
         let journal_path = destination_root.join(JOURNAL_FILE_NAME);
 
         if journal_path.try_exists()? {
-            let unchanged_file_ids = if destination_mode == DestinationMode::UpdateFast {
+            let (unchanged_file_ids, reset_file_ids) = if destination_mode == DestinationMode::Fresh
+            {
+                (BTreeSet::new(), BTreeSet::new())
+            } else {
                 let inventory = destination_inventory::compare_fast(destination_root, manifest)?;
 
                 validate_update_inventory(destination_root, &inventory)?;
 
-                inventory.unchanged_file_ids
-            } else {
-                BTreeSet::new()
+                select_update_file_sets(destination_mode, &inventory, verified_unchanged_file_ids)?
             };
 
             let journal = prepare_resume_destination(
@@ -1323,7 +1430,8 @@ fn prepare_destination(
                 data_stream_count,
                 transfer_plan,
                 &unchanged_file_ids,
-                destination_mode == DestinationMode::UpdateFast,
+                &reset_file_ids,
+                destination_mode != DestinationMode::Fresh,
             )?;
 
             return Ok(PreparedDestination {
@@ -1354,7 +1462,8 @@ fn prepare_destination(
 
             validate_update_inventory(destination_root, &inventory)?;
 
-            let unchanged_file_ids = inventory.unchanged_file_ids;
+            let (unchanged_file_ids, _reset_file_ids) =
+                select_update_file_sets(destination_mode, &inventory, verified_unchanged_file_ids)?;
 
             let journal = prepare_update_destination(
                 destination_root,
@@ -1381,6 +1490,42 @@ fn prepare_destination(
 
         unchanged_file_ids: BTreeSet::new(),
     })
+}
+
+fn select_update_file_sets(
+    destination_mode: DestinationMode,
+    inventory: &destination_inventory::DestinationInventory,
+    verified_unchanged_file_ids: Option<&BTreeSet<usize>>,
+) -> io::Result<(BTreeSet<usize>, BTreeSet<usize>)> {
+    match destination_mode {
+        DestinationMode::Fresh => Ok((BTreeSet::new(), BTreeSet::new())),
+
+        DestinationMode::UpdateFast => Ok((inventory.unchanged_file_ids.clone(), BTreeSet::new())),
+
+        DestinationMode::UpdateVerified => {
+            let verified = verified_unchanged_file_ids.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "verified update mode did not negotiate unchanged files",
+                )
+            })?;
+
+            if !verified.is_subset(&inventory.unchanged_file_ids) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "verified unchanged set is not a subset of the current destination inventory",
+                ));
+            }
+
+            let reset_file_ids = inventory
+                .unchanged_file_ids
+                .difference(verified)
+                .copied()
+                .collect();
+
+            Ok((verified.clone(), reset_file_ids))
+        }
+    }
 }
 
 fn validate_update_inventory(
@@ -1479,6 +1624,7 @@ fn prepare_resume_destination(
     data_stream_count: usize,
     transfer_plan: &TransferPlan,
     unchanged_file_ids: &BTreeSet<usize>,
+    reset_file_ids: &BTreeSet<usize>,
     preserve_existing_final: bool,
 ) -> io::Result<ResumeJournal> {
     let root_metadata = fs::metadata(destination_root)?;
@@ -1493,8 +1639,12 @@ fn prepare_resume_destination(
         ));
     }
 
-    let journal =
+    let mut journal =
         ResumeJournal::load_existing(destination_root, summary.fingerprint, data_stream_count)?;
+
+    if journal.remove_completed_files(reset_file_ids) {
+        journal.save_atomic(destination_root)?;
+    }
 
     let completed_stripes: BTreeSet<ResumeStripe> = journal.completed_stripes().collect();
 
@@ -1521,6 +1671,7 @@ fn prepare_resume_destination(
                     &temporary_path,
                     transfer_plan,
                     &completed_stripes,
+                    reset_file_ids.contains(&file_id),
                     preserve_existing_final,
                 )?;
             }
@@ -1557,6 +1708,7 @@ fn prepare_resume_large_file(
     temporary_path: &Path,
     transfer_plan: &TransferPlan,
     completed_stripes: &BTreeSet<ResumeStripe>,
+    reset_completed_stripes: bool,
     preserve_existing_final: bool,
 ) -> io::Result<()> {
     let final_exists = final_path.try_exists()?;
@@ -1566,6 +1718,15 @@ fn prepare_resume_large_file(
     match (final_exists, temporary_exists) {
         (false, true) => {
             validate_resume_file(temporary_path, entry.file_size, "partial large file")
+        }
+
+        (true, false) if preserve_existing_final && reset_completed_stripes => {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(temporary_path)?;
+
+            file.set_len(entry.file_size)
         }
 
         (true, false) => {
@@ -3347,6 +3508,142 @@ fn validate_tiny_pack_plan(report: &LaneReport, expected: TransferPlanStats) -> 
     Ok(())
 }
 
+fn write_update_verification_request(
+    writer: &mut impl Write,
+    digests: &BTreeMap<usize, FileDigest>,
+) -> io::Result<()> {
+    let count = u32::try_from(digests.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "verification request contains too many files",
+        )
+    })?;
+
+    if count > MAX_UNCHANGED_OFFER_FILES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "verification request exceeds the supported file limit",
+        ));
+    }
+
+    write_u8(writer, MESSAGE_UPDATE_VERIFY_REQUEST)?;
+
+    write_u32(writer, count)?;
+
+    for (&file_id, digest) in digests {
+        write_u64(
+            writer,
+            u64::try_from(file_id).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "verification file ID cannot be represented",
+                )
+            })?,
+        )?;
+
+        writer.write_all(digest)?;
+    }
+
+    writer.flush()
+}
+
+fn read_update_verification_request(
+    reader: &mut impl Read,
+) -> io::Result<BTreeMap<usize, FileDigest>> {
+    let count = read_u32(reader)?;
+
+    if count > MAX_UNCHANGED_OFFER_FILES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "verification request exceeds the supported file limit",
+        ));
+    }
+
+    let mut digests = BTreeMap::new();
+
+    for _ in 0..count {
+        let file_id = read_file_id(reader)?;
+
+        let mut digest = [0_u8; FILE_DIGEST_BYTES];
+
+        reader.read_exact(&mut digest)?;
+
+        if digests.insert(file_id, digest).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "verification request contains a duplicate file ID",
+            ));
+        }
+    }
+
+    Ok(digests)
+}
+
+fn write_update_verification_response(
+    writer: &mut impl Write,
+    matching_file_ids: &BTreeSet<usize>,
+) -> io::Result<()> {
+    let count = u32::try_from(matching_file_ids.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "verification response contains too many files",
+        )
+    })?;
+
+    write_u8(writer, MESSAGE_UPDATE_VERIFY_RESPONSE)?;
+
+    write_u32(writer, count)?;
+
+    for &file_id in matching_file_ids {
+        write_u64(
+            writer,
+            u64::try_from(file_id).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "verified file ID cannot be represented",
+                )
+            })?,
+        )?;
+    }
+
+    writer.flush()
+}
+
+fn read_update_verification_response(reader: &mut impl Read) -> io::Result<BTreeSet<usize>> {
+    let message = read_u8(reader)?;
+
+    if message != MESSAGE_UPDATE_VERIFY_RESPONSE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected update-verification response, received 0x{message:02X}"),
+        ));
+    }
+
+    let count = read_u32(reader)?;
+
+    if count > MAX_UNCHANGED_OFFER_FILES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "verification response exceeds the supported file limit",
+        ));
+    }
+
+    let mut matching_file_ids = BTreeSet::new();
+
+    for _ in 0..count {
+        let file_id = read_file_id(reader)?;
+
+        if !matching_file_ids.insert(file_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "verification response contains a duplicate file ID",
+            ));
+        }
+    }
+
+    Ok(matching_file_ids)
+}
+
 fn write_receiver_ready(writer: &mut impl Write, ready: &ReceiverReady) -> io::Result<()> {
     let stripe_count = u32::try_from(ready.completed_stripes.len()).map_err(|_| {
         io::Error::new(
@@ -3421,13 +3718,17 @@ fn read_receiver_ready(reader: &mut impl Read) -> io::Result<ReceiverReady> {
         )
     })?;
 
+    read_receiver_ready_after_message(reader, message)
+}
+
+fn read_receiver_ready_after_message(
+    reader: &mut impl Read,
+    message: u8,
+) -> io::Result<ReceiverReady> {
     if message != MESSAGE_RECEIVER_READY {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "expected receiver-ready message, received \
-                 0x{message:02X}"
-            ),
+            format!("expected receiver-ready message, received 0x{message:02X}"),
         ));
     }
 
@@ -4677,6 +4978,7 @@ mod tests {
             2,
             &transfer_plan,
             DestinationMode::UpdateFast,
+            None,
         )
         .unwrap();
 
