@@ -52,7 +52,7 @@ The GUI includes:
 Implementation order:
 
 - [x] single-file fixed-block deduplication control benchmark;
-- [ ] repeatable overwrite, insertion, deletion, and append corpus;
+- [x] repeatable overwrite, insertion, deletion, and append corpus;
 - [ ] content-defined chunk boundary prototype;
 - [ ] fixed-block versus content-defined chunk-size matrix;
 - [ ] receiver basis-file chunk index;
@@ -64,6 +64,12 @@ The first benchmark intentionally uses fixed boundaries from byte zero. It
 measures both same-position reuse and blocks found elsewhere in the basis file.
 This provides the control result that content-defined chunking must beat,
 particularly after insertions or deletions shift subsequent content.
+
+The deterministic mutation harness creates exact-copy, overwrite, aligned
+insertion, unaligned insertion, unaligned deletion, and append candidates. It
+runs the fixed-block benchmark at 4, 16, 64, and 256 KiB so future
+content-defined chunking implementations can be evaluated against identical
+inputs.
 
 ## v1.4 highlights
 
