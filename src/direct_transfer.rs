@@ -31,7 +31,11 @@ fn receive_configured(
         progress.check_cancelled()?;
     }
 
-    let path = direct_discovery::receive_one()?;
+    let path = match &progress {
+        Some(progress) => direct_discovery::receive_one_with_progress(progress)?,
+
+        None => direct_discovery::receive_one()?,
+    };
 
     if let Some(progress) = &progress {
         progress.check_cancelled()?;
@@ -94,7 +98,11 @@ fn send_configured(
         progress.check_cancelled()?;
     }
 
-    let path = direct_discovery::discover_one()?;
+    let path = match &progress {
+        Some(progress) => direct_discovery::discover_one_with_progress(progress)?,
+
+        None => direct_discovery::discover_one()?,
+    };
 
     if let Some(progress) = &progress {
         progress.check_cancelled()?;

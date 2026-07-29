@@ -919,7 +919,7 @@ Implementation progress:
 * [x] automatic UAC elevation when starting Receive
 * [x] elevated receiver restores and starts its saved request automatically
 * [x] sender operation remains unelevated
-* [ ] immediate Cancel while waiting in Direct Link discovery
+* [x] immediate Cancel while waiting in Direct Link discovery
 * [x] no separate or duplicated networking implementation
 
 Language and release policy:

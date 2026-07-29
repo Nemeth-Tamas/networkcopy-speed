@@ -1,9 +1,10 @@
+use crate::console_progress::ProgressCounter;
 use crate::direct_address::{self, DIRECT_TRANSFER_PORT};
 use crate::direct_discovery::{DISCOVERY_PORT, DiscoveryKind, DiscoveryPacket};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DISCOVERY_GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 78, 67);
 
@@ -150,6 +151,16 @@ pub(crate) fn discover_on_interface(
     interface_index: u32,
     verbose: bool,
 ) -> io::Result<Ipv4DiscoveredPath> {
+    discover_on_interface_with_progress(interface_index, verbose, None)
+}
+
+pub(crate) fn discover_on_interface_with_progress(
+    interface_index: u32,
+    verbose: bool,
+    progress: Option<&ProgressCounter>,
+) -> io::Result<Ipv4DiscoveredPath> {
+    check_cancelled(progress)?;
+
     let local_endpoint = direct_address::apipa_endpoint(interface_index, 0)?;
 
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -166,7 +177,7 @@ pub(crate) fn discover_on_interface(
 
     let socket: UdpSocket = socket.into();
 
-    socket.set_read_timeout(Some(DISCOVERY_REPLY_TIMEOUT))?;
+    socket.set_read_timeout(Some(DISCOVERY_POLL_TIMEOUT))?;
 
     let multicast_endpoint = SocketAddrV4::new(DISCOVERY_GROUP, DISCOVERY_PORT);
 
@@ -191,13 +202,23 @@ pub(crate) fn discover_on_interface(
     }
 
     for attempt in 1..=DISCOVERY_ATTEMPTS {
+        check_cancelled(progress)?;
+
         socket.send_to(&encoded_probe, multicast_endpoint)?;
 
         if verbose {
             println!("  Probe {attempt}/{DISCOVERY_ATTEMPTS} sent");
         }
 
+        let deadline = Instant::now() + DISCOVERY_REPLY_TIMEOUT;
+
         loop {
+            check_cancelled(progress)?;
+
+            if Instant::now() >= deadline {
+                break;
+            }
+
             match socket.recv_from(&mut buffer) {
                 Ok((received, source)) => {
                     let SocketAddr::V4(source) = source else {
@@ -246,7 +267,7 @@ pub(crate) fn discover_on_interface(
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) =>
                 {
-                    break;
+                    continue;
                 }
 
                 Err(error) => {
@@ -260,6 +281,14 @@ pub(crate) fn discover_on_interface(
         io::ErrorKind::TimedOut,
         format!("no NetworkCopy IPv4 receiver replied through interface {interface_index}",),
     ))
+}
+
+fn check_cancelled(progress: Option<&ProgressCounter>) -> io::Result<()> {
+    if let Some(progress) = progress {
+        progress.check_cancelled()?;
+    }
+
+    Ok(())
 }
 
 fn is_apipa(address: Ipv4Addr) -> bool {

@@ -1,3 +1,4 @@
+use crate::console_progress::ProgressCounter;
 use crate::direct_address::{self, DIRECT_TRANSFER_PORT};
 use crate::direct_discovery_v4;
 use crate::direct_link;
@@ -7,7 +8,7 @@ use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, UdpSocket};
 use std::process;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const DISCOVERY_PORT: u16 = 7336;
 
@@ -217,14 +218,23 @@ fn automatic_direct_candidates() -> io::Result<direct_route::RouteCandidates> {
 }
 
 pub(crate) fn receive_all() -> io::Result<()> {
-    receive_automatically(false).map(|_| ())
+    receive_automatically(false, None).map(|_| ())
 }
 
 pub(crate) fn receive_one() -> io::Result<ReceivedPath> {
-    receive_automatically(true)
+    receive_automatically(true, None)
 }
 
-fn receive_automatically(stop_after_first: bool) -> io::Result<ReceivedPath> {
+pub(crate) fn receive_one_with_progress(progress: &ProgressCounter) -> io::Result<ReceivedPath> {
+    receive_automatically(true, Some(progress))
+}
+
+fn receive_automatically(
+    stop_after_first: bool,
+    progress: Option<&ProgressCounter>,
+) -> io::Result<ReceivedPath> {
+    check_cancelled(progress)?;
+
     let candidates = automatic_direct_candidates()?;
 
     let interface_indices = candidates.direct;
@@ -326,12 +336,16 @@ fn receive_automatically(stop_after_first: bool) -> io::Result<ReceivedPath> {
     println!("Waiting for direct-link probes...");
 
     loop {
+        check_cancelled(progress)?;
+
         if let Some(socket) = &ipv6_socket
             && let Some(path) = receive_ipv6_probe(socket, &interface_indices)?
             && stop_after_first
         {
             return Ok(path);
         }
+
+        check_cancelled(progress)?;
 
         if let Some(receiver) = &ipv4_receiver
             && let Some(path) = receiver.poll()?
@@ -466,6 +480,12 @@ pub(crate) fn discover(interface_index: u32) -> io::Result<SocketAddr> {
 }
 
 pub(crate) fn discover_all() -> io::Result<Vec<DiscoveredPath>> {
+    discover_all_configured(None)
+}
+
+fn discover_all_configured(progress: Option<&ProgressCounter>) -> io::Result<Vec<DiscoveredPath>> {
+    check_cancelled(progress)?;
+
     let candidates = automatic_direct_candidates()?;
 
     let interface_indices = candidates.direct;
@@ -486,14 +506,18 @@ pub(crate) fn discover_all() -> io::Result<Vec<DiscoveredPath>> {
 
     println!();
 
-    let (mut discovered, mut failures) = discover_ipv6_paths(&interface_indices);
+    let (mut discovered, mut failures) = discover_ipv6_paths(&interface_indices, progress);
+
+    check_cancelled(progress)?;
 
     if discovered.is_empty() {
         let ipv6_details = failure_details(&failures);
 
         println!("No IPv6 receiver replied; trying IPv4 APIPA fallback...");
 
-        let (ipv4_discovered, ipv4_failures) = discover_ipv4_paths(&interface_indices);
+        let (ipv4_discovered, ipv4_failures) = discover_ipv4_paths(&interface_indices, progress);
+
+        check_cancelled(progress)?;
 
         discovered = ipv4_discovered;
 
@@ -549,7 +573,10 @@ pub(crate) fn discover_all() -> io::Result<Vec<DiscoveredPath>> {
     Ok(discovered)
 }
 
-fn discover_ipv6_paths(interface_indices: &[u32]) -> (Vec<DiscoveredPath>, Vec<String>) {
+fn discover_ipv6_paths(
+    interface_indices: &[u32],
+    progress: Option<&ProgressCounter>,
+) -> (Vec<DiscoveredPath>, Vec<String>) {
     thread::scope(|scope| {
         let handles = interface_indices
             .iter()
@@ -557,7 +584,9 @@ fn discover_ipv6_paths(interface_indices: &[u32]) -> (Vec<DiscoveredPath>, Vec<S
             .map(|interface_index| {
                 (
                     interface_index,
-                    scope.spawn(move || discover_on_interface(interface_index, false)),
+                    scope.spawn(move || {
+                        discover_on_interface_with_progress(interface_index, false, progress)
+                    }),
                 )
             })
             .collect::<Vec<_>>();
@@ -588,7 +617,10 @@ fn discover_ipv6_paths(interface_indices: &[u32]) -> (Vec<DiscoveredPath>, Vec<S
     })
 }
 
-fn discover_ipv4_paths(interface_indices: &[u32]) -> (Vec<DiscoveredPath>, Vec<String>) {
+fn discover_ipv4_paths(
+    interface_indices: &[u32],
+    progress: Option<&ProgressCounter>,
+) -> (Vec<DiscoveredPath>, Vec<String>) {
     thread::scope(|scope| {
         let handles = interface_indices
             .iter()
@@ -597,7 +629,11 @@ fn discover_ipv4_paths(interface_indices: &[u32]) -> (Vec<DiscoveredPath>, Vec<S
                 (
                     interface_index,
                     scope.spawn(move || {
-                        direct_discovery_v4::discover_on_interface(interface_index, false)
+                        direct_discovery_v4::discover_on_interface_with_progress(
+                            interface_index,
+                            false,
+                            progress,
+                        )
                     }),
                 )
             })
@@ -644,7 +680,17 @@ fn failure_details(failures: &[String]) -> String {
 }
 
 pub(crate) fn discover_one() -> io::Result<DiscoveredPath> {
-    let mut paths = discover_all()?;
+    discover_one_configured(None)
+}
+
+pub(crate) fn discover_one_with_progress(progress: &ProgressCounter) -> io::Result<DiscoveredPath> {
+    discover_one_configured(Some(progress))
+}
+
+fn discover_one_configured(progress: Option<&ProgressCounter>) -> io::Result<DiscoveredPath> {
+    let mut paths = discover_all_configured(progress)?;
+
+    check_cancelled(progress)?;
 
     if paths.len() != 1 {
         return Err(io::Error::new(
@@ -660,13 +706,23 @@ pub(crate) fn discover_one() -> io::Result<DiscoveredPath> {
 }
 
 fn discover_on_interface(interface_index: u32, verbose: bool) -> io::Result<DiscoveredPath> {
+    discover_on_interface_with_progress(interface_index, verbose, None)
+}
+
+fn discover_on_interface_with_progress(
+    interface_index: u32,
+    verbose: bool,
+    progress: Option<&ProgressCounter>,
+) -> io::Result<DiscoveredPath> {
+    check_cancelled(progress)?;
+
     let local_endpoint = direct_address::link_local_endpoint(interface_index, 0)?;
 
     let socket = UdpSocket::bind(local_endpoint)?;
 
     socket.set_multicast_loop_v6(false)?;
 
-    socket.set_read_timeout(Some(DISCOVERY_REPLY_TIMEOUT))?;
+    socket.set_read_timeout(Some(DISCOVERY_POLL_TIMEOUT))?;
 
     let multicast_endpoint = SocketAddrV6::new(DISCOVERY_GROUP, DISCOVERY_PORT, 0, interface_index);
 
@@ -695,13 +751,23 @@ fn discover_on_interface(interface_index: u32, verbose: bool) -> io::Result<Disc
     }
 
     for attempt in 1..=DISCOVERY_ATTEMPTS {
+        check_cancelled(progress)?;
+
         socket.send_to(&encoded_probe, multicast_endpoint)?;
 
         if verbose {
             println!("  Probe {attempt}/{DISCOVERY_ATTEMPTS} sent");
         }
 
+        let deadline = Instant::now() + DISCOVERY_REPLY_TIMEOUT;
+
         loop {
+            check_cancelled(progress)?;
+
+            if Instant::now() >= deadline {
+                break;
+            }
+
             match socket.recv_from(&mut buffer) {
                 Ok((received, source)) => {
                     let SocketAddr::V6(source) = source else {
@@ -753,7 +819,7 @@ fn discover_on_interface(interface_index: u32, verbose: bool) -> io::Result<Disc
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                     ) =>
                 {
-                    break;
+                    continue;
                 }
 
                 Err(error) => {
@@ -767,6 +833,14 @@ fn discover_on_interface(interface_index: u32, verbose: bool) -> io::Result<Disc
         io::ErrorKind::TimedOut,
         format!("no NetworkCopy receiver replied through interface {interface_index}",),
     ))
+}
+
+fn check_cancelled(progress: Option<&ProgressCounter>) -> io::Result<()> {
+    if let Some(progress) = progress {
+        progress.check_cancelled()?;
+    }
+
+    Ok(())
 }
 
 fn scoped_link_local(mut address: SocketAddrV6, interface_index: u32) -> Option<SocketAddrV6> {
@@ -795,7 +869,8 @@ pub(crate) fn create_nonce() -> io::Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DISCOVERY_PACKET_BYTES, DiscoveryKind, DiscoveryPacket};
+    use super::{DISCOVERY_PACKET_BYTES, DiscoveryKind, DiscoveryPacket, check_cancelled};
+    use crate::console_progress::ProgressCounter;
 
     #[test]
     fn probe_packet_round_trips() {
@@ -844,5 +919,16 @@ mod tests {
         let error = DiscoveryPacket::decode(&encoded).unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData,);
+    }
+
+    #[test]
+    fn cancelled_discovery_returns_interrupted() {
+        let progress = ProgressCounter::new("test discovery", 0);
+
+        progress.cancel();
+
+        let error = check_cancelled(Some(&progress)).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted,);
     }
 }
