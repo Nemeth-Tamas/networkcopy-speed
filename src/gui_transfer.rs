@@ -134,6 +134,8 @@ pub struct GuiTransferSummary {
 
     pub data_stream_count: usize,
 
+    pub tiny_materialization_workers: usize,
+
     pub elapsed: Duration,
 
     pub logical_megabytes_per_second: f64,
@@ -340,6 +342,8 @@ fn send_summary(report: CalibratedSendReport) -> GuiTransferSummary {
 
         data_stream_count: transfer.data_stream_count,
 
+        tiny_materialization_workers: transfer.tiny_materialization_workers,
+
         elapsed: transfer.data_elapsed,
 
         logical_megabytes_per_second,
@@ -390,6 +394,8 @@ fn receive_summary(report: CalibratedReceiveReport) -> GuiTransferSummary {
         skipped_bytes: transfer.skipped_bytes,
 
         data_stream_count: transfer.data_stream_count,
+
+        tiny_materialization_workers: transfer.tiny_materialization_workers,
 
         elapsed: transfer.elapsed,
 

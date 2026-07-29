@@ -13,6 +13,20 @@ const MAX_MATERIALIZATION_WORKERS: usize = 2;
 const QUEUED_JOBS_PER_WORKER: usize = 64;
 const WAIT_INTERVAL: Duration = Duration::from_millis(50);
 
+pub(crate) fn validate_worker_count(worker_count: usize) -> io::Result<()> {
+    if !(1..=MAX_MATERIALIZATION_WORKERS).contains(&worker_count) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "tiny-file materialization workers must be between 1 and \
+                 {MAX_MATERIALIZATION_WORKERS}",
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 pub(crate) struct TinyFileMaterializer {
     handle: TinyFileMaterializerHandle,
     workers: Vec<JoinHandle<io::Result<()>>>,
@@ -114,15 +128,7 @@ impl TinyFileMaterializer {
         progress: Option<ProgressCounter>,
         worker_count: usize,
     ) -> io::Result<Self> {
-        if !(1..=MAX_MATERIALIZATION_WORKERS).contains(&worker_count) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "tiny-file materialization workers must be between 1 and \
-                     {MAX_MATERIALIZATION_WORKERS}",
-                ),
-            ));
-        }
+        validate_worker_count(worker_count)?;
 
         let queue_capacity = worker_count
             .checked_mul(QUEUED_JOBS_PER_WORKER)

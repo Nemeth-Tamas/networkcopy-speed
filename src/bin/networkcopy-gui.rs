@@ -223,6 +223,7 @@ struct Text {
     tiny_pack_data: &'static str,
     tiny_pack_savings: &'static str,
     streams: &'static str,
+    tiny_write_workers: &'static str,
     elapsed: &'static str,
     missing_source: &'static str,
     missing_destination: &'static str,
@@ -357,6 +358,8 @@ impl Text {
         tiny_pack_savings: "Aprófájl-megtakarítás",
 
         streams: "TCP szálak",
+
+        tiny_write_workers: "Aprófájl-író szálak",
 
         elapsed: "Idő",
 
@@ -507,6 +510,8 @@ impl Text {
         tiny_pack_savings: "Tiny-pack savings",
 
         streams: "TCP streams",
+
+        tiny_write_workers: "Tiny write workers",
 
         elapsed: "Time",
 
@@ -1273,6 +1278,12 @@ impl NetworkCopyGui {
                         ui.label(text.packed_tiny_files);
 
                         ui.strong(summary.tiny_files_packed.to_string());
+
+                        ui.end_row();
+
+                        ui.label(text.tiny_write_workers);
+
+                        ui.strong(summary.tiny_materialization_workers.to_string());
 
                         ui.end_row();
 

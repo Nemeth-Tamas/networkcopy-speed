@@ -66,6 +66,10 @@ materialization pool. The pool is bounded globally across all TCP lanes,
 preserves per-file BLAKE3 verification and atomic replacement, and falls back
 to one worker on single-core systems.
 
+Protocol v6 returns the receiver's selected tiny-file materialization worker
+count in the final transfer acknowledgement, so CLI and GUI summaries on both
+peers report the actual bounded pool width.
+
 ## v1.3 highlights
 
 v1.3 includes:

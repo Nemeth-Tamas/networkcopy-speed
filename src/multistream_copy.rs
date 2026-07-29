@@ -66,6 +66,7 @@ pub(crate) enum DestinationMode {
 pub struct MultistreamCopyReport {
     pub worker_count: usize,
     pub data_stream_count: usize,
+    pub tiny_materialization_workers: usize,
     pub files_copied: u64,
     pub bytes_copied: u64,
     pub data_wire_bytes: u64,
@@ -97,6 +98,10 @@ impl MultistreamCopyReport {
         println!("Multistream TCP folder copy complete");
         println!("  Scanner workers:      {}", self.worker_count);
         println!("  TCP data streams:     {}", self.data_stream_count);
+        println!(
+            "  Tiny write workers:   {}",
+            self.tiny_materialization_workers,
+        );
         println!(
             "  Files copied:         {}",
             format_bytes(self.files_copied)
@@ -326,6 +331,7 @@ struct TransferAck {
     bytes_copied: u64,
     data_wire_bytes: u64,
     compressed_records: u64,
+    tiny_materialization_workers: u32,
     tiny_pack_count: u64,
     compressed_tiny_pack_count: u64,
     raw_tiny_pack_count: u64,
@@ -839,6 +845,24 @@ fn send_internal(
 
     let transfer_ack = read_transfer_ack(&mut control_stream)?;
 
+    let tiny_materialization_workers = usize::try_from(transfer_ack.tiny_materialization_workers)
+        .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "receiver tiny-write worker count cannot be represented",
+        )
+    })?;
+
+    tiny_file_pool::validate_worker_count(tiny_materialization_workers).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "receiver reported an invalid tiny-write worker count: \
+                 {error}",
+            ),
+        )
+    })?;
+
     let data_elapsed = data_started.elapsed();
 
     drop(control_stream);
@@ -852,6 +876,7 @@ fn send_internal(
             || transfer_ack.bytes_copied != receiver_report.bytes_received
             || transfer_ack.data_wire_bytes != receiver_report.data_wire_bytes
             || transfer_ack.compressed_records != receiver_report.compressed_records
+            || tiny_materialization_workers != receiver_report.tiny_materialization_workers
             || transfer_ack.tiny_pack_count != receiver_report.tiny_pack_count
             || transfer_ack.compressed_tiny_pack_count != receiver_report.compressed_tiny_pack_count
             || transfer_ack.raw_tiny_pack_count != receiver_report.raw_tiny_pack_count
@@ -892,6 +917,7 @@ fn send_internal(
     Ok(MultistreamCopyReport {
         worker_count,
         data_stream_count,
+        tiny_materialization_workers,
         files_copied: transfer_ack.files_copied,
         bytes_copied: transfer_ack.bytes_copied,
         data_wire_bytes: transfer_ack.data_wire_bytes,
@@ -1158,6 +1184,9 @@ fn run_server_with_mode(
         bytes_copied: report.bytes_copied,
         data_wire_bytes: report.data_wire_bytes,
         compressed_records: report.compressed_records,
+        tiny_materialization_workers: u32::try_from(tiny_materialization_workers).map_err(
+            |_| io::Error::other("tiny-file materialization worker count cannot be represented"),
+        )?,
         tiny_pack_count: report.tiny_pack_count,
         compressed_tiny_pack_count: report.compressed_tiny_pack_count,
         raw_tiny_pack_count: report.raw_tiny_pack_count,
@@ -3894,6 +3923,8 @@ fn write_transfer_ack(writer: &mut impl Write, ack: TransferAck) -> io::Result<(
 
     write_u64(writer, ack.compressed_records)?;
 
+    write_u32(writer, ack.tiny_materialization_workers)?;
+
     write_u64(writer, ack.tiny_pack_count)?;
 
     write_u64(writer, ack.compressed_tiny_pack_count)?;
@@ -3927,6 +3958,8 @@ fn read_transfer_ack(reader: &mut impl Read) -> io::Result<TransferAck> {
         data_wire_bytes: read_u64(reader)?,
 
         compressed_records: read_u64(reader)?,
+
+        tiny_materialization_workers: read_u32(reader)?,
 
         tiny_pack_count: read_u64(reader)?,
 
@@ -4085,11 +4118,12 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DestinationMode, ReceiverReady, TINY_PACK_TARGET_BYTES, TransferFault, TransferTask,
-        accept_session, apply_resume_offer, build_transfer_plan, connect_with_retry_config,
-        prepare_destination, read_receiver_ready, receive_once, run, run_with_fault, send,
-        temporary_path, tiny_pack_record_wire_bytes, validate_resume_offer,
-        validate_source_metadata, verify_content_digest, write_receiver_ready,
+        DestinationMode, ReceiverReady, TINY_PACK_TARGET_BYTES, TransferAck, TransferFault,
+        TransferTask, accept_session, apply_resume_offer, build_transfer_plan,
+        connect_with_retry_config, prepare_destination, read_receiver_ready, read_transfer_ack,
+        receive_once, run, run_with_fault, send, temporary_path, tiny_pack_record_wire_bytes,
+        validate_resume_offer, validate_source_metadata, verify_content_digest,
+        write_receiver_ready, write_transfer_ack,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::file_metadata;
@@ -5073,5 +5107,30 @@ mod tests {
         drop(prepared);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transfer_ack_round_trips_tiny_write_workers() {
+        let expected = TransferAck {
+            files_copied: 10_000,
+            bytes_copied: 1_920_000,
+            data_wire_bytes: 1_430_000,
+            compressed_records: 2,
+            tiny_materialization_workers: 2,
+            tiny_pack_count: 3,
+            compressed_tiny_pack_count: 2,
+            raw_tiny_pack_count: 1,
+            tiny_files_packed: 10_000,
+            tiny_bytes_packed: 1_920_000,
+            tiny_pack_wire_bytes: 1_430_000,
+        };
+
+        let mut bytes = Vec::new();
+
+        write_transfer_ack(&mut bytes, expected).unwrap();
+
+        let actual = read_transfer_ack(&mut Cursor::new(bytes)).unwrap();
+
+        assert_eq!(actual, expected);
     }
 }
