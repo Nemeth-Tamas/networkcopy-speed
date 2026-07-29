@@ -16,20 +16,20 @@ not require a router, switch, DHCP server, or manually assigned IP addresses.
 
 The repository currently contains:
 
-- the released v1.1 command-line transfer engine;
-- the v1.2 desktop GUI under active development;
+- the v1.3 command-line transfer engine;
+- the v1.3 desktop GUI;
 - one shared networking and transfer implementation used by both front ends.
 
 ## Current status
 
-Current development version:
+Current release:
 
 ```text
-1.3.0-dev
+1.3.0
 ```
 
-v1.2 is the current stable release. v1.3 is focused on smarter transfers,
-lower network usage, and efficient updates to existing destinations.
+v1.3 is the current stable release. It adds smarter transfers, lower network
+usage, and efficient verified updates to existing destinations.
 
 The GUI includes:
 
@@ -46,9 +46,9 @@ The GUI includes:
 - automatic administrator elevation when Receive requires firewall setup;
 - success, cancellation, and failure summaries.
 
-## v1.3 roadmap
+## v1.3 highlights
 
-Current v1.3 work:
+v1.3 includes:
 
 - [x] adaptive compression of complete tiny-file packs;
 - [x] exact compressed/raw pack and pack-wire telemetry;
@@ -318,7 +318,7 @@ cargo build `
 
 ## Release naming
 
-The v1.2 release assets will be executable-only:
+The v1.3 release assets are executable-only:
 
 ```text
 networkcopy-speed-hu.exe
