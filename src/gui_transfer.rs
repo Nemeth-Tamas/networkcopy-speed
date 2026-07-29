@@ -91,6 +91,27 @@ impl Default for GuiTransferControl {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuiTransferDiagnostic {
+    AllFilesSkipped,
+    TinyFileHeavy,
+    CompressionEffective,
+    CompressionBypassed,
+    Balanced,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DiagnosticInput {
+    files: u64,
+    logical_bytes: u64,
+    wire_bytes: u64,
+    compressed_records: u64,
+    skipped_files: u64,
+    skipped_bytes: u64,
+    tiny_files_packed: u64,
+    raw_tiny_pack_count: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct GuiTransferSummary {
     pub direction: GuiTransferDirection,
@@ -134,6 +155,56 @@ pub struct GuiTransferSummary {
     pub tiny_pack_wire_bytes: u64,
 
     pub tiny_pack_wire_savings_percent: f64,
+}
+
+impl GuiTransferSummary {
+    pub fn diagnostic(&self) -> GuiTransferDiagnostic {
+        diagnose_transfer(DiagnosticInput {
+            files: self.files,
+
+            logical_bytes: self.logical_bytes,
+
+            wire_bytes: self.wire_bytes,
+
+            compressed_records: self.compressed_records,
+
+            skipped_files: self.skipped_files,
+
+            skipped_bytes: self.skipped_bytes,
+
+            tiny_files_packed: self.tiny_files_packed,
+
+            raw_tiny_pack_count: self.raw_tiny_pack_count,
+        })
+    }
+}
+
+fn diagnose_transfer(input: DiagnosticInput) -> GuiTransferDiagnostic {
+    let transferred_files = input.files.saturating_sub(input.skipped_files);
+
+    let transferred_bytes = input.logical_bytes.saturating_sub(input.skipped_bytes);
+
+    if transferred_files == 0 || transferred_bytes == 0 {
+        return GuiTransferDiagnostic::AllFilesSkipped;
+    }
+
+    let average_file_bytes = transferred_bytes / transferred_files;
+
+    if input.tiny_files_packed >= 1_000 && average_file_bytes <= 64 * 1024 {
+        return GuiTransferDiagnostic::TinyFileHeavy;
+    }
+
+    let wire_savings_percent = 100.0 - input.wire_bytes as f64 / transferred_bytes as f64 * 100.0;
+
+    if input.compressed_records > 0 && wire_savings_percent >= 5.0 {
+        return GuiTransferDiagnostic::CompressionEffective;
+    }
+
+    if input.raw_tiny_pack_count > 0 && input.compressed_records == 0 {
+        return GuiTransferDiagnostic::CompressionBypassed;
+    }
+
+    GuiTransferDiagnostic::Balanced
 }
 
 pub fn run_gui_transfer(request: GuiTransferRequest) -> io::Result<GuiTransferSummary> {
@@ -380,10 +451,102 @@ fn signed_wire_savings_percent(logical_bytes: u64, wire_bytes: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        GuiConnectionMode, GuiTransferControl, GuiTransferDirection, GuiTransferRequest,
-        run_gui_transfer,
+        DiagnosticInput, GuiConnectionMode, GuiTransferControl, GuiTransferDiagnostic,
+        GuiTransferDirection, GuiTransferRequest, diagnose_transfer, run_gui_transfer,
     };
     use std::env;
+
+    #[test]
+    fn diagnostic_detects_fully_skipped_transfer() {
+        assert_eq!(
+            diagnose_transfer(DiagnosticInput {
+                files: 10_000,
+                logical_bytes: 2_000_000,
+
+                wire_bytes: 0,
+
+                compressed_records: 0,
+
+                skipped_files: 10_000,
+
+                skipped_bytes: 2_000_000,
+
+                tiny_files_packed: 0,
+
+                raw_tiny_pack_count: 0,
+            }),
+            GuiTransferDiagnostic::AllFilesSkipped,
+        );
+    }
+
+    #[test]
+    fn diagnostic_detects_tiny_file_overhead() {
+        assert_eq!(
+            diagnose_transfer(DiagnosticInput {
+                files: 5_000,
+                logical_bytes: 960_000,
+
+                wire_bytes: 1_200_000,
+
+                compressed_records: 0,
+
+                skipped_files: 0,
+
+                skipped_bytes: 0,
+
+                tiny_files_packed: 5_000,
+
+                raw_tiny_pack_count: 2,
+            }),
+            GuiTransferDiagnostic::TinyFileHeavy,
+        );
+    }
+
+    #[test]
+    fn diagnostic_detects_effective_compression() {
+        assert_eq!(
+            diagnose_transfer(DiagnosticInput {
+                files: 4,
+                logical_bytes: 100_000_000,
+
+                wire_bytes: 25_000_000,
+
+                compressed_records: 4,
+
+                skipped_files: 0,
+
+                skipped_bytes: 0,
+
+                tiny_files_packed: 0,
+
+                raw_tiny_pack_count: 0,
+            }),
+            GuiTransferDiagnostic::CompressionEffective,
+        );
+    }
+
+    #[test]
+    fn diagnostic_detects_raw_compression_fallback() {
+        assert_eq!(
+            diagnose_transfer(DiagnosticInput {
+                files: 20,
+                logical_bytes: 20_000_000,
+
+                wire_bytes: 20_100_000,
+
+                compressed_records: 0,
+
+                skipped_files: 0,
+
+                skipped_bytes: 0,
+
+                tiny_files_packed: 20,
+
+                raw_tiny_pack_count: 1,
+            }),
+            GuiTransferDiagnostic::CompressionBypassed,
+        );
+    }
     use std::fs;
     use std::net::{SocketAddr, TcpListener};
     use std::process;

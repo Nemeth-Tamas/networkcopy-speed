@@ -67,8 +67,14 @@ Current v1.3 work:
 - [x] verified update mode enabled by default;
 - [x] wire protocol v5 with explicit cross-version rejection;
 - [x] safe reset of stale resumed stripes after verification mismatch;
-- [ ] automatic Zstandard strategy calibration;
-- [ ] clearer skipped-data and bottleneck diagnostics.
+- [x] automatic per-record Zstandard/raw strategy selection;
+- [x] compression-strategy reporting and conservative workload diagnostics;
+
+NetworkCopy probes each transferable record before encoding it. Compressible
+files, stripes, and tiny-file packs use Zstandard; incompressible payloads
+automatically fall back to raw transfer. The GUI reports whether a completed
+session was dominated by skipped files, tiny-file overhead, useful
+compression, raw fallback, or showed no clear single limiter.
 
 Shared Zstandard dictionaries will be benchmarked after v1.3.
 

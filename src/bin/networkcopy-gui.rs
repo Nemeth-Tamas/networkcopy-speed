@@ -6,8 +6,8 @@
 use eframe::egui;
 use networkcopy_speed::gui_session;
 use networkcopy_speed::gui_transfer::{
-    GuiConnectionMode, GuiTransferControl, GuiTransferProgress, GuiTransferRequest,
-    GuiTransferSummary, run_gui_transfer_with_control,
+    GuiConnectionMode, GuiTransferControl, GuiTransferDiagnostic, GuiTransferProgress,
+    GuiTransferRequest, GuiTransferSummary, run_gui_transfer_with_control,
 };
 use networkcopy_speed::windows_elevation;
 use rfd::FileDialog;
@@ -232,6 +232,14 @@ struct Text {
     elevation_failed: &'static str,
     development_status: &'static str,
     engine_pending: &'static str,
+    compression_strategy: &'static str,
+    compression_strategy_adaptive: &'static str,
+    transfer_diagnostic: &'static str,
+    diagnostic_all_skipped: &'static str,
+    diagnostic_tiny_files: &'static str,
+    diagnostic_compression_effective: &'static str,
+    diagnostic_compression_bypassed: &'static str,
+    diagnostic_balanced: &'static str,
 }
 
 impl Text {
@@ -367,6 +375,22 @@ impl Text {
         development_status: "Készen áll az átvitelre",
 
         engine_pending: "Válassza ki a kapcsolatot és a mappát, majd indítsa el az átvitelt. A félbemaradt műveletek később folytathatók.",
+
+        compression_strategy: "Tömörítési stratégia",
+
+        compression_strategy_adaptive: "Automatikus, rekordonkénti próba",
+
+        transfer_diagnostic: "Átviteli diagnosztika",
+
+        diagnostic_all_skipped: "Nincs átküldendő adat; minden fájl már naprakész volt.",
+
+        diagnostic_tiny_files: "Valószínű korlát: sok apró fájl kezelési költsége.",
+
+        diagnostic_compression_effective: "A tömörítés érdemben csökkentette a hálózati forgalmat.",
+
+        diagnostic_compression_bypassed: "Az adat nagyrészt nem tömöríthető; a nyers átvitel volt célszerűbb.",
+
+        diagnostic_balanced: "Az átviteli adatok alapján nem látszik egyetlen domináns korlát.",
     };
 
     const ENGLISH: Self = Self {
@@ -501,6 +525,22 @@ impl Text {
         development_status: "Ready to transfer",
 
         engine_pending: "Choose the connection and folder, then start the transfer. Interrupted operations can be resumed later.",
+
+        compression_strategy: "Compression strategy",
+
+        compression_strategy_adaptive: "Automatic per-record probing",
+
+        transfer_diagnostic: "Transfer diagnostic",
+
+        diagnostic_all_skipped: "No payload was required; every file was already current.",
+
+        diagnostic_tiny_files: "Likely limiter: per-file overhead from a large number of tiny files.",
+
+        diagnostic_compression_effective: "Compression meaningfully reduced network traffic.",
+
+        diagnostic_compression_bypassed: "The data was mostly incompressible, so raw transfer was the better choice.",
+
+        diagnostic_balanced: "No single dominant limiter is visible from the transfer telemetry.",
     };
 }
 
@@ -1180,6 +1220,34 @@ impl NetworkCopyGui {
                     ui.label(text.wire_savings);
 
                     ui.strong(format!("{:.2}%", summary.wire_savings_percent,));
+
+                    ui.end_row();
+
+                    ui.label(text.compression_strategy);
+
+                    ui.strong(text.compression_strategy_adaptive);
+
+                    ui.end_row();
+
+                    ui.label(text.transfer_diagnostic);
+
+                    let diagnostic = match summary.diagnostic() {
+                        GuiTransferDiagnostic::AllFilesSkipped => text.diagnostic_all_skipped,
+
+                        GuiTransferDiagnostic::TinyFileHeavy => text.diagnostic_tiny_files,
+
+                        GuiTransferDiagnostic::CompressionEffective => {
+                            text.diagnostic_compression_effective
+                        }
+
+                        GuiTransferDiagnostic::CompressionBypassed => {
+                            text.diagnostic_compression_bypassed
+                        }
+
+                        GuiTransferDiagnostic::Balanced => text.diagnostic_balanced,
+                    };
+
+                    ui.strong(diagnostic);
 
                     ui.end_row();
 

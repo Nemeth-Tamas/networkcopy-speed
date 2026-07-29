@@ -108,6 +108,7 @@ impl MultistreamCopyReport {
             "  Data wire size:       {} bytes",
             format_bytes(self.data_wire_bytes)
         );
+        println!("  Compression strategy: adaptive per-record probing");
         println!(
             "  Compressed records:   {}",
             format_bytes(self.compressed_records)
@@ -241,6 +242,7 @@ impl ReceiveReport {
             format_bytes(self.data_wire_bytes,)
         );
 
+        println!("  Compression strategy: adaptive per-record probing");
         println!(
             "  Compressed records:   {}",
             format_bytes(self.compressed_records,)
