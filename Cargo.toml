@@ -37,3 +37,7 @@ strip = "symbols"
 [build-dependencies]
 winresource = "0.1.31"
 
+[patch.crates-io]
+winit = { path = "vendor/winit" }
+
+
