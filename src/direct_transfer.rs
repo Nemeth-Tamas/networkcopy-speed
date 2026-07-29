@@ -1,25 +1,35 @@
 use crate::calibrated_transfer::{self, CalibratedReceiveReport, CalibratedSendReport};
 use crate::console_progress::ProgressCounter;
 use crate::direct_discovery;
+use crate::multistream_copy::DestinationMode;
 use crate::tcp_connect;
 use std::io;
 use std::net::TcpListener;
 use std::path::Path;
 
 pub(crate) fn receive_once(destination_root: &Path) -> io::Result<CalibratedReceiveReport> {
-    receive_configured(destination_root, None)
+    receive_configured(destination_root, None, DestinationMode::Fresh)
 }
 
 pub(crate) fn receive_once_with_progress(
     destination_root: &Path,
     progress: ProgressCounter,
 ) -> io::Result<CalibratedReceiveReport> {
-    receive_configured(destination_root, Some(progress))
+    receive_configured(destination_root, Some(progress), DestinationMode::Fresh)
+}
+
+pub(crate) fn receive_once_with_progress_and_mode(
+    destination_root: &Path,
+    progress: ProgressCounter,
+    destination_mode: DestinationMode,
+) -> io::Result<CalibratedReceiveReport> {
+    receive_configured(destination_root, Some(progress), destination_mode)
 }
 
 fn receive_configured(
     destination_root: &Path,
     progress: Option<ProgressCounter>,
+    destination_mode: DestinationMode,
 ) -> io::Result<CalibratedReceiveReport> {
     if let Some(progress) = &progress {
         progress.set_label("Waiting for direct sender");
@@ -57,11 +67,22 @@ fn receive_configured(
     println!();
 
     match progress {
-        Some(progress) => {
-            calibrated_transfer::receive_once_with_progress(listener, destination_root, progress)
-        }
+        Some(progress) => calibrated_transfer::receive_once_with_progress_and_mode(
+            listener,
+            destination_root,
+            progress,
+            destination_mode,
+        ),
 
-        None => calibrated_transfer::receive_once(listener, destination_root),
+        None => {
+            if destination_mode != DestinationMode::Fresh {
+                return Err(io::Error::other(
+                    "update mode requires progress-aware receiver execution",
+                ));
+            }
+
+            calibrated_transfer::receive_once(listener, destination_root)
+        }
     }
 }
 

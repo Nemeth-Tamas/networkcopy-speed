@@ -60,7 +60,8 @@ Current v1.3 work:
 - [x] safe update-mode destination preparation;
 - [x] old-file preservation until replacement data is verified;
 - [x] atomic Windows replacement of completed files;
-- [ ] GUI and session controls for update-existing destination mode;
+- [x] GUI and session controls for update-existing destination mode;
+- [x] unchanged-file and skipped-byte telemetry;
 - [ ] fast and BLAKE3-verified unchanged-file detection;
 - [ ] automatic Zstandard strategy calibration;
 - [ ] clearer skipped-data and bottleneck diagnostics.

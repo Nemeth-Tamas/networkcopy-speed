@@ -4,6 +4,7 @@ use crate::direct_address::DIRECT_TRANSFER_PORT;
 use crate::direct_discovery;
 use crate::direct_transfer;
 use crate::manifest_scan;
+use crate::multistream_copy::DestinationMode;
 use crate::network_calibration;
 use crate::windows_setup;
 use std::io;
@@ -33,6 +34,8 @@ pub enum GuiTransferRequest {
         connection: GuiConnectionMode,
 
         destination_root: PathBuf,
+
+        update_existing: bool,
     },
 }
 
@@ -103,6 +106,10 @@ pub struct GuiTransferSummary {
     pub resumed_stripes: u64,
 
     pub resumed_bytes: u64,
+
+    pub skipped_files: u64,
+
+    pub skipped_bytes: u64,
 
     pub data_stream_count: usize,
 
@@ -175,14 +182,22 @@ pub fn run_gui_transfer_with_control(
         GuiTransferRequest::Receive {
             connection,
             destination_root,
+            update_existing,
         } => {
+            let destination_mode = if update_existing {
+                DestinationMode::UpdateFast
+            } else {
+                DestinationMode::Fresh
+            };
+
             let report = match connection {
                 GuiConnectionMode::Direct => {
                     prepare_direct_receiver()?;
 
-                    direct_transfer::receive_once_with_progress(
+                    direct_transfer::receive_once_with_progress_and_mode(
                         &destination_root,
                         control.progress.clone(),
+                        destination_mode,
                     )?
                 }
 
@@ -191,10 +206,11 @@ pub fn run_gui_transfer_with_control(
 
                     let listener = TcpListener::bind(bind_address)?;
 
-                    calibrated_transfer::receive_once_with_progress(
+                    calibrated_transfer::receive_once_with_progress_and_mode(
                         listener,
                         &destination_root,
                         control.progress.clone(),
+                        destination_mode,
                     )?
                 }
             };
@@ -247,6 +263,10 @@ fn send_summary(report: CalibratedSendReport) -> GuiTransferSummary {
 
         resumed_bytes: transfer.resumed_bytes,
 
+        skipped_files: transfer.skipped_files,
+
+        skipped_bytes: transfer.skipped_bytes,
+
         data_stream_count: transfer.data_stream_count,
 
         elapsed: transfer.data_elapsed,
@@ -293,6 +313,10 @@ fn receive_summary(report: CalibratedReceiveReport) -> GuiTransferSummary {
         resumed_stripes: transfer.resumed_stripes,
 
         resumed_bytes: transfer.resumed_bytes,
+
+        skipped_files: transfer.skipped_files,
+
+        skipped_bytes: transfer.skipped_bytes,
 
         data_stream_count: transfer.data_stream_count,
 
@@ -361,7 +385,7 @@ mod tests {
     };
     use std::env;
     use std::fs;
-    use std::net::TcpListener;
+    use std::net::{SocketAddr, TcpListener};
     use std::process;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -398,6 +422,8 @@ mod tests {
                 connection: GuiConnectionMode::Address(address),
 
                 destination_root: receiver_destination,
+
+                update_existing: false,
             })
         });
 
@@ -477,5 +503,117 @@ mod tests {
         let after = control.progress();
 
         assert!(after.cancel_requested,);
+    }
+
+    #[test]
+    fn gui_update_transfer_skips_unchanged_files_and_replaces_changed_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let parent =
+            env::temp_dir().join(format!("networkcopy-gui-update-{}-{unique}", process::id(),));
+
+        let source = parent.join("source");
+        let destination = parent.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        fs::write(
+            source.join("unchanged.txt"),
+            b"this file stays exactly the same",
+        )
+        .unwrap();
+
+        fs::write(source.join("changed.txt"), b"original contents").unwrap();
+
+        let first_address = available_address();
+
+        let first_destination = destination.clone();
+
+        let first_receiver = thread::spawn(move || {
+            run_gui_transfer(GuiTransferRequest::Receive {
+                connection: GuiConnectionMode::Address(first_address),
+
+                destination_root: first_destination,
+
+                update_existing: false,
+            })
+        });
+
+        let _first_sender = run_gui_transfer(GuiTransferRequest::Send {
+            connection: GuiConnectionMode::Address(first_address),
+
+            source_root: source.clone(),
+
+            worker_count: 2,
+
+            calibration_mib: 1,
+        })
+        .unwrap();
+
+        let _first_receiver = first_receiver.join().unwrap().unwrap();
+
+        let unchanged_bytes = fs::metadata(source.join("unchanged.txt")).unwrap().len();
+
+        fs::write(
+            source.join("changed.txt"),
+            b"replacement contents are different",
+        )
+        .unwrap();
+
+        let second_address = available_address();
+
+        let second_destination = destination.clone();
+
+        let second_receiver = thread::spawn(move || {
+            run_gui_transfer(GuiTransferRequest::Receive {
+                connection: GuiConnectionMode::Address(second_address),
+
+                destination_root: second_destination,
+
+                update_existing: true,
+            })
+        });
+
+        let sender_summary = run_gui_transfer(GuiTransferRequest::Send {
+            connection: GuiConnectionMode::Address(second_address),
+
+            source_root: source,
+
+            worker_count: 2,
+
+            calibration_mib: 1,
+        })
+        .unwrap();
+
+        let receiver_summary = second_receiver.join().unwrap().unwrap();
+
+        assert_eq!(sender_summary.skipped_files, 1,);
+
+        assert_eq!(sender_summary.skipped_bytes, unchanged_bytes,);
+
+        assert_eq!(receiver_summary.skipped_files, 1,);
+
+        assert_eq!(receiver_summary.skipped_bytes, unchanged_bytes,);
+
+        assert_eq!(
+            fs::read(destination.join("unchanged.txt")).unwrap(),
+            b"this file stays exactly the same",
+        );
+
+        assert_eq!(
+            fs::read(destination.join("changed.txt")).unwrap(),
+            b"replacement contents are different",
+        );
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    fn available_address() -> SocketAddr {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+
+        listener.local_addr().unwrap()
     }
 }

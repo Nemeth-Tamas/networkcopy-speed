@@ -1,6 +1,6 @@
 use crate::console_progress::{ConsoleProgress, ProgressCounter};
 use crate::copy_bench::{decimal_megabytes_per_second, format_bytes};
-use crate::multistream_copy::{self, MultistreamCopyReport, ReceiveReport};
+use crate::multistream_copy::{self, DestinationMode, MultistreamCopyReport, ReceiveReport};
 use crate::network_calibration::{self, NetworkCalibrationMatrixReport, NetworkCalibrationReport};
 use std::io;
 use std::net::{SocketAddr, TcpListener};
@@ -272,6 +272,20 @@ pub(crate) fn receive_once_with_progress(
     destination_root: &Path,
     progress: ProgressCounter,
 ) -> io::Result<CalibratedReceiveReport> {
+    receive_once_with_progress_and_mode(
+        listener,
+        destination_root,
+        progress,
+        DestinationMode::Fresh,
+    )
+}
+
+pub(crate) fn receive_once_with_progress_and_mode(
+    listener: TcpListener,
+    destination_root: &Path,
+    progress: ProgressCounter,
+    destination_mode: DestinationMode,
+) -> io::Result<CalibratedReceiveReport> {
     progress.set_label("Waiting for calibration");
 
     progress.set_completed(0);
@@ -289,10 +303,11 @@ pub(crate) fn receive_once_with_progress(
 
     progress.set_total(0);
 
-    let transfer = multistream_copy::receive_on_listener_with_progress(
+    let transfer = multistream_copy::receive_on_listener_with_progress_and_mode(
         &listener,
         destination_root,
         progress.clone(),
+        destination_mode,
     )?;
 
     progress.check_cancelled()?;

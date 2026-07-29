@@ -255,25 +255,35 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
 }
 
 fn encode_request(request: &GuiTransferRequest) -> io::Result<String> {
-    let (direction, connection, path, worker_count, calibration_mib) = match request {
-        GuiTransferRequest::Send {
-            connection,
-            source_root,
-            worker_count,
-            calibration_mib,
-        } => (
-            "send",
-            *connection,
-            source_root.as_path(),
-            *worker_count,
-            *calibration_mib,
-        ),
+    let (direction, connection, path, worker_count, calibration_mib, update_existing) =
+        match request {
+            GuiTransferRequest::Send {
+                connection,
+                source_root,
+                worker_count,
+                calibration_mib,
+            } => (
+                "send",
+                *connection,
+                source_root.as_path(),
+                *worker_count,
+                *calibration_mib,
+                false,
+            ),
 
-        GuiTransferRequest::Receive {
-            connection,
-            destination_root,
-        } => ("receive", *connection, destination_root.as_path(), 0, 0),
-    };
+            GuiTransferRequest::Receive {
+                connection,
+                destination_root,
+                update_existing,
+            } => (
+                "receive",
+                *connection,
+                destination_root.as_path(),
+                0,
+                0,
+                *update_existing,
+            ),
+        };
 
     let (connection_name, address) = match connection {
         GuiConnectionMode::Direct => ("direct", String::new()),
@@ -288,7 +298,8 @@ fn encode_request(request: &GuiTransferRequest) -> io::Result<String> {
              address={address}\n\
              path_utf16={}\n\
              worker_count={worker_count}\n\
-             calibration_mib={calibration_mib}\n",
+             calibration_mib={calibration_mib}\n\
+             update_existing={update_existing}\n",
         encode_path(path,),
     ))
 }
@@ -336,6 +347,16 @@ fn decode_request(contents: &str) -> io::Result<GuiTransferRequest> {
 
     let path = decode_path(required_field(&fields, "path_utf16")?)?;
 
+    let update_existing = match fields.get("update_existing") {
+        Some(value) => value.parse::<bool>().map_err(|error| {
+            invalid_data(format!(
+                "invalid GUI session field 'update_existing': {error}",
+            ))
+        })?,
+
+        None => false,
+    };
+
     match direction {
         "send" => {
             let worker_count = parse_field::<usize>(&fields, "worker_count")?;
@@ -361,6 +382,7 @@ fn decode_request(contents: &str) -> io::Result<GuiTransferRequest> {
         "receive" => Ok(GuiTransferRequest::Receive {
             connection,
             destination_root: path,
+            update_existing,
         }),
 
         _ => Err(invalid_data("unknown GUI session direction")),
@@ -454,6 +476,8 @@ mod tests {
             connection: GuiConnectionMode::Address(address),
 
             destination_root: PathBuf::from(r"C:\NetworkCopy Received"),
+
+            update_existing: true,
         };
 
         let encoded = encode_request(&request).unwrap();
@@ -461,6 +485,21 @@ mod tests {
         let decoded = decode_request(&encoded).unwrap();
 
         assert_eq!(decoded, request,);
+
+        let legacy = encoded.replace("update_existing=true\n", "");
+
+        let legacy_decoded = decode_request(&legacy).unwrap();
+
+        assert_eq!(
+            legacy_decoded,
+            GuiTransferRequest::Receive {
+                connection: GuiConnectionMode::Address(address),
+
+                destination_root: PathBuf::from(r"C:\NetworkCopy Received"),
+
+                update_existing: false,
+            },
+        );
     }
 
     #[test]

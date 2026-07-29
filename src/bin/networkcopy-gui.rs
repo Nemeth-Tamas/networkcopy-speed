@@ -182,6 +182,8 @@ struct Text {
     destination_folder: &'static str,
     source_hint: &'static str,
     destination_hint: &'static str,
+    update_existing: &'static str,
+    update_existing_hint: &'static str,
     browse: &'static str,
     choose_source: &'static str,
     choose_destination: &'static str,
@@ -198,6 +200,9 @@ struct Text {
     resume_direction: &'static str,
     resume_folder: &'static str,
     resume_connection: &'static str,
+    resume_update_mode: &'static str,
+    enabled: &'static str,
+    disabled: &'static str,
     resume_continue: &'static str,
     resume_discard: &'static str,
     session_save_failed: &'static str,
@@ -206,6 +211,8 @@ struct Text {
     completed: &'static str,
     failed: &'static str,
     files: &'static str,
+    skipped_files: &'static str,
+    skipped_data: &'static str,
     logical_data: &'static str,
     speed: &'static str,
     wire_savings: &'static str,
@@ -261,6 +268,10 @@ impl Text {
 
         destination_hint: "Válassza ki a fogadási mappát…",
 
+        update_existing: "Meglévő célmappa frissítése",
+
+        update_existing_hint: "A változatlan fájlokat kihagyja. A módosult fájlokat csak sikeres ellenőrzés után cseréli le.",
+
         browse: "Tallózás…",
 
         choose_source: "Küldendő mappa kiválasztása",
@@ -293,6 +304,12 @@ impl Text {
 
         resume_connection: "Kapcsolat",
 
+        resume_update_mode: "Meglévő mappa frissítése",
+
+        enabled: "Bekapcsolva",
+
+        disabled: "Kikapcsolva",
+
         resume_continue: "Folytatás",
 
         resume_discard: "Elvetés",
@@ -308,6 +325,10 @@ impl Text {
         failed: "Az átvitel sikertelen",
 
         files: "Fájlok",
+
+        skipped_files: "Kihagyott változatlan fájlok",
+
+        skipped_data: "Kihagyott adatmennyiség",
 
         logical_data: "Adatmennyiség",
 
@@ -381,6 +402,10 @@ impl Text {
 
         destination_hint: "Choose the receiving folder…",
 
+        update_existing: "Update existing destination",
+
+        update_existing_hint: "Skips unchanged files. Changed files are replaced only after the new data passes verification.",
+
         browse: "Browse…",
 
         choose_source: "Choose source folder",
@@ -413,6 +438,12 @@ impl Text {
 
         resume_connection: "Connection",
 
+        resume_update_mode: "Update existing destination",
+
+        enabled: "Enabled",
+
+        disabled: "Disabled",
+
         resume_continue: "Continue",
 
         resume_discard: "Discard",
@@ -428,6 +459,10 @@ impl Text {
         failed: "Transfer failed",
 
         files: "Files",
+
+        skipped_files: "Skipped unchanged files",
+
+        skipped_data: "Skipped data",
 
         logical_data: "Logical data",
 
@@ -475,6 +510,7 @@ struct NetworkCopyGui {
     connection: ConnectionChoice,
     source_folder: String,
     destination_folder: String,
+    update_existing: bool,
     receiver_address: String,
     bind_address: String,
     scanner_workers: usize,
@@ -539,6 +575,8 @@ impl NetworkCopyGui {
             source_folder: String::new(),
 
             destination_folder: String::new(),
+
+            update_existing: false,
 
             receiver_address: "127.0.0.1:7337".to_string(),
 
@@ -677,6 +715,17 @@ impl NetworkCopyGui {
             text.browse,
             text.choose_destination,
         );
+
+        ui.add_space(14.0);
+
+        ui.checkbox(&mut self.update_existing, text.update_existing)
+            .on_hover_text(text.update_existing_hint);
+
+        ui.label(
+            egui::RichText::new(text.update_existing_hint)
+                .small()
+                .color(muted_text()),
+        );
     }
 
     fn transfer_request(&self, text: Text) -> Result<GuiTransferRequest, String> {
@@ -728,6 +777,8 @@ impl NetworkCopyGui {
                     connection,
 
                     destination_root: PathBuf::from(destination),
+
+                    update_existing: self.update_existing,
                 })
             }
         }
@@ -755,10 +806,13 @@ impl NetworkCopyGui {
             GuiTransferRequest::Receive {
                 connection,
                 destination_root,
+                update_existing,
             } => {
                 self.mode = TransferMode::Receive;
 
                 self.destination_folder = destination_root.display().to_string();
+
+                self.update_existing = *update_existing;
 
                 self.apply_connection(TransferMode::Receive, *connection);
             }
@@ -1096,6 +1150,20 @@ impl NetworkCopyGui {
                     ui.strong(summary.files.to_string());
 
                     ui.end_row();
+
+                    if summary.skipped_files > 0 {
+                        ui.label(text.skipped_files);
+
+                        ui.strong(summary.skipped_files.to_string());
+
+                        ui.end_row();
+
+                        ui.label(text.skipped_data);
+
+                        ui.strong(format_bytes(summary.skipped_bytes));
+
+                        ui.end_row();
+                    }
 
                     ui.label(text.logical_data);
 
@@ -1583,7 +1651,7 @@ fn warning_text() -> egui::Color32 {
 }
 
 fn resume_request_summary(ui: &mut egui::Ui, text: Text, request: &GuiTransferRequest) {
-    let (direction, folder, connection, send_options) = match request {
+    let (direction, folder, connection, send_options, update_existing) = match request {
         GuiTransferRequest::Send {
             connection,
             source_root,
@@ -1594,12 +1662,20 @@ fn resume_request_summary(ui: &mut egui::Ui, text: Text, request: &GuiTransferRe
             source_root,
             *connection,
             Some((*worker_count, *calibration_mib)),
+            None,
         ),
 
         GuiTransferRequest::Receive {
             connection,
             destination_root,
-        } => (text.receive, destination_root, *connection, None),
+            update_existing,
+        } => (
+            text.receive,
+            destination_root,
+            *connection,
+            None,
+            Some(*update_existing),
+        ),
     };
 
     let connection = match connection {
@@ -1631,6 +1707,18 @@ fn resume_request_summary(ui: &mut egui::Ui, text: Text, request: &GuiTransferRe
             ui.label(connection);
 
             ui.end_row();
+
+            if let Some(update_existing) = update_existing {
+                ui.label(text.resume_update_mode);
+
+                ui.label(if update_existing {
+                    text.enabled
+                } else {
+                    text.disabled
+                });
+
+                ui.end_row();
+            }
 
             if let Some((worker_count, calibration_mib)) = send_options {
                 ui.label(text.scanner_workers);

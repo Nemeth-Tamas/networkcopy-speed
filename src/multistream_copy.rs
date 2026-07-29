@@ -68,6 +68,8 @@ pub struct MultistreamCopyReport {
     pub compressed_records: u64,
     pub resumed_stripes: u64,
     pub resumed_bytes: u64,
+    pub skipped_files: u64,
+    pub skipped_bytes: u64,
     pub buffer_bytes_per_lane: u64,
     pub buffer_bytes_per_peer: u64,
     pub process_buffer_bytes: u64,
@@ -115,6 +117,11 @@ impl MultistreamCopyReport {
         println!(
             "  Resumed data:         {} bytes",
             format_bytes(self.resumed_bytes)
+        );
+        println!(
+            "  Skipped unchanged:    {} files / {} bytes",
+            format_bytes(self.skipped_files),
+            format_bytes(self.skipped_bytes),
         );
         println!(
             "  Wire savings:         {:.2}%",
@@ -197,6 +204,8 @@ pub struct ReceiveReport {
     pub compressed_records: u64,
     pub resumed_stripes: u64,
     pub resumed_bytes: u64,
+    pub skipped_files: u64,
+    pub skipped_bytes: u64,
     pub tiny_pack_count: u64,
     pub compressed_tiny_pack_count: u64,
     pub raw_tiny_pack_count: u64,
@@ -265,6 +274,11 @@ impl ReceiveReport {
         println!(
             "  Resumed data:         {} bytes",
             format_bytes(self.resumed_bytes,)
+        );
+        println!(
+            "  Skipped unchanged:    {} files / {} bytes",
+            format_bytes(self.skipped_files),
+            format_bytes(self.skipped_bytes),
         );
 
         println!(
@@ -340,6 +354,7 @@ struct LaneReport {
 struct ResumeApplication {
     logical_report: LaneReport,
     stripe_count: u64,
+    resumed_bytes: u64,
     unchanged_file_count: u64,
     unchanged_bytes: u64,
 }
@@ -834,7 +849,11 @@ fn send_internal(
 
         resumed_stripes: resume_application.stripe_count,
 
-        resumed_bytes: resume_application.logical_report.bytes_copied,
+        resumed_bytes: resume_application.resumed_bytes,
+
+        skipped_files: resume_application.unchanged_file_count,
+
+        skipped_bytes: resume_application.unchanged_bytes,
 
         buffer_bytes_per_lane: memory_plan.per_lane_per_peer_bytes,
 
@@ -878,10 +897,6 @@ pub(crate) fn receive_on_listener_with_progress(
     receive_on_listener_internal(listener, destination_root, Some(progress))
 }
 
-#[expect(
-    dead_code,
-    reason = "used by the upcoming GUI update-mode controls",
-)]
 pub(crate) fn receive_on_listener_with_progress_and_mode(
     listener: &TcpListener,
     destination_root: &Path,
@@ -1093,7 +1108,11 @@ fn run_server_with_mode(
 
         resumed_stripes: resume_application.stripe_count,
 
-        resumed_bytes: resume_application.logical_report.bytes_copied,
+        resumed_bytes: resume_application.resumed_bytes,
+
+        skipped_files: resume_application.unchanged_file_count,
+
+        skipped_bytes: resume_application.unchanged_bytes,
 
         tiny_pack_count: ack.tiny_pack_count,
 
@@ -1975,6 +1994,12 @@ fn apply_resume_offer(
                             length,
                             "resumed",
                         )?;
+
+                        application.resumed_bytes =
+                            application
+                                .resumed_bytes
+                                .checked_add(length)
+                                .ok_or_else(|| io::Error::other("resumed byte count overflowed"))?;
 
                         application.stripe_count = application
                             .stripe_count
