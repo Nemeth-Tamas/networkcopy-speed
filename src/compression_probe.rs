@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 const MIB: usize = 1024 * 1024;
 const SAMPLE_BYTES: usize = MIB;
 const MAX_SAMPLE_COUNT: usize = 3;
-const MIN_SAVINGS_PERCENT: f64 = 10.0;
+const MIN_SAVINGS_PERCENT: u64 = 10;
 
 pub const DEFAULT_LEVEL: i32 = 1;
 
@@ -245,17 +245,23 @@ fn sample_ranges(file_bytes: u64) -> Vec<(u64, usize)> {
 }
 
 fn choose_decision(sampled_bytes: u64, compressed_bytes: u64) -> CompressionDecision {
-    if sampled_bytes == 0 {
-        return CompressionDecision::SendRaw;
-    }
-
-    let savings_percent = 100.0 - compression_ratio_percent(sampled_bytes, compressed_bytes);
-
-    if savings_percent >= MIN_SAVINGS_PERCENT {
+    if should_compress_sizes(sampled_bytes, compressed_bytes) {
         CompressionDecision::Compress
     } else {
         CompressionDecision::SendRaw
     }
+}
+
+pub(crate) fn should_compress_sizes(raw_bytes: u64, compressed_bytes: u64) -> bool {
+    if raw_bytes == 0 {
+        return false;
+    }
+
+    let compressed_percent = u128::from(compressed_bytes) * 100;
+
+    let required_percent = u128::from(raw_bytes) * u128::from(100 - MIN_SAVINGS_PERCENT);
+
+    compressed_percent <= required_percent
 }
 
 fn compression_ratio_percent(sampled_bytes: u64, compressed_bytes: u64) -> f64 {

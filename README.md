@@ -22,13 +22,14 @@ The repository currently contains:
 
 ## Current status
 
-Current release:
+Current development version:
 
 ```text
-1.2.0
+1.3.0-dev
 ```
 
-v1.2 is the current stable release.
+v1.2 is the current stable release. v1.3 is focused on smarter transfers,
+lower network usage, and efficient updates to existing destinations.
 
 The GUI includes:
 
@@ -44,6 +45,20 @@ The GUI includes:
 - one-click transfer restart and stripe resume;
 - automatic administrator elevation when Receive requires firewall setup;
 - success, cancellation, and failure summaries.
+
+## v1.3 roadmap
+
+Planned v1.3 work:
+
+- adaptive compression of complete tiny-file packs;
+- update-existing destination mode;
+- fast and BLAKE3-verified unchanged-file detection;
+- automatic Zstandard strategy calibration;
+- clearer compression, skipped-data, and bottleneck diagnostics.
+
+Shared Zstandard dictionaries will be benchmarked after v1.3.
+
+Block-level and content-defined deduplication are reserved for v2.0.
 
 ## Quick start — graphical interface
 

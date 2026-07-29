@@ -9,6 +9,7 @@ use crate::manifest_scan::{self, FileClass, ManifestEntry};
 use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
 use crate::striped_file;
 use crate::tcp_connect;
+use crate::tiny_pack_codec::{self, TinyPackEncoding};
 use crate::transfer_memory;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -27,11 +28,14 @@ const MESSAGE_FILE: u8 = 0x31;
 const MESSAGE_STREAM_END: u8 = 0x32;
 const MESSAGE_TRANSFER_ACK: u8 = 0x33;
 const MESSAGE_FILE_STRIPE: u8 = 0x34;
-const MESSAGE_TINY_PACK: u8 = 0x35;
+const MESSAGE_TINY_PACK_V2: u8 = 0x36;
 
 const NETWORK_BUFFER_BYTES: usize = 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
-const TINY_PACK_TARGET_BYTES: u64 = 8 * 1024 * 1024;
+const TINY_PACK_TARGET_BYTES: u64 = tiny_pack_codec::MAX_TINY_PACK_BYTES as u64;
+
+const CODEC_BUFFER_BYTES: usize =
+    MAX_COMPRESSED_CHUNK_BYTES + tiny_pack_codec::MAX_TINY_PACK_WIRE_BYTES;
 const MAX_TINY_PACK_FILES: usize = 4096;
 const CONTENT_DIGEST_BYTES: usize = 32;
 const MAX_RESUME_OFFER_STRIPES: u32 = 1_000_000;
@@ -355,6 +359,13 @@ struct TinyPackSummary {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TinyPackTransferSummary {
+    summary: TinyPackSummary,
+
+    compressed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StripeDescriptor {
     file_id: usize,
     offset: u64,
@@ -397,7 +408,7 @@ fn run_with_fault(
         data_stream_count,
         NETWORK_BUFFER_BYTES as u64,
         COPY_BUFFER_BYTES as u64,
-        MAX_COMPRESSED_CHUNK_BYTES as u64,
+        CODEC_BUFFER_BYTES as u64,
     )?;
 
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
@@ -467,7 +478,7 @@ fn send_configured(
         data_stream_count,
         NETWORK_BUFFER_BYTES as u64,
         COPY_BUFFER_BYTES as u64,
-        MAX_COMPRESSED_CHUNK_BYTES as u64,
+        CODEC_BUFFER_BYTES as u64,
     )?;
 
     send_internal(
@@ -1651,16 +1662,24 @@ fn send_lane(
                 file_ids,
                 total_bytes,
             } => {
-                let summary = send_tiny_pack(
+                let transfer = send_tiny_pack(
                     &mut writer,
                     source_root,
                     manifest,
                     file_ids,
                     *total_bytes,
                     &mut buffer,
+                    progress.as_ref(),
                 )?;
 
-                add_lane_counts(&mut report, summary.files, summary.bytes, "sender")?;
+                add_lane_counts(
+                    &mut report,
+                    transfer.summary.files,
+                    transfer.summary.bytes,
+                    "sender",
+                )?;
+
+                add_compressed_record(&mut report, transfer.compressed)?;
             }
 
             TransferTask::Stripe {
@@ -1755,7 +1774,8 @@ fn send_tiny_pack(
     file_ids: &[usize],
     expected_total_bytes: u64,
     buffer: &mut [u8],
-) -> io::Result<TinyPackSummary> {
+    progress: Option<&ProgressCounter>,
+) -> io::Result<TinyPackTransferSummary> {
     let summary = summarize_tiny_pack(manifest, file_ids)?;
 
     if summary.bytes != expected_total_bytes {
@@ -1765,7 +1785,91 @@ fn send_tiny_pack(
         ));
     }
 
-    write_u8(writer, MESSAGE_TINY_PACK)?;
+    let total_bytes = usize::try_from(summary.bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tiny-pack byte count cannot be represented",
+        )
+    })?;
+
+    if total_bytes > buffer.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "tiny pack requires {total_bytes} bytes but its buffer contains only {} bytes",
+                buffer.len(),
+            ),
+        ));
+    }
+
+    let mut digests = Vec::with_capacity(file_ids.len());
+
+    let mut offset = 0_usize;
+
+    for &file_id in file_ids {
+        if let Some(progress) = progress {
+            progress.check_cancelled()?;
+        }
+
+        let entry = manifest.get(file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tiny pack contains an invalid file ID",
+            )
+        })?;
+
+        let file_bytes = usize::try_from(entry.file_size).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tiny-file size cannot be represented",
+            )
+        })?;
+
+        let end = offset
+            .checked_add(file_bytes)
+            .ok_or_else(|| io::Error::other("tiny-pack buffer offset overflowed"))?;
+
+        let destination = buffer.get_mut(offset..end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tiny-pack contents exceed their transfer buffer",
+            )
+        })?;
+
+        let path = source_root.join(&entry.relative_path);
+
+        let mut file = File::open(&path)?;
+
+        validate_source_metadata(&file, &path, entry)?;
+
+        file.read_exact(destination)?;
+
+        validate_source_metadata(&file, &path, entry)?;
+
+        digests.push(*blake3::hash(destination).as_bytes());
+
+        offset = end;
+    }
+
+    if offset != total_bytes {
+        return Err(io::Error::other(format!(
+            "tiny-pack assembly produced {offset} bytes, expected {total_bytes}",
+        )));
+    }
+
+    if let Some(progress) = progress {
+        progress.check_cancelled()?;
+    }
+
+    let raw_payload = &buffer[..total_bytes];
+
+    let encoded = tiny_pack_codec::encode(raw_payload, compression_probe::DEFAULT_LEVEL)?;
+
+    let wire_payload = encoded.wire_payload(raw_payload);
+
+    let pack_digest = *blake3::hash(raw_payload).as_bytes();
+
+    write_u8(writer, MESSAGE_TINY_PACK_V2)?;
 
     write_u32(
         writer,
@@ -1779,7 +1883,7 @@ fn send_tiny_pack(
 
     write_u64(writer, summary.bytes)?;
 
-    for &file_id in file_ids {
+    for (&file_id, digest) in file_ids.iter().zip(&digests) {
         let entry = manifest.get(file_id).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1798,30 +1902,27 @@ fn send_tiny_pack(
         )?;
 
         write_u64(writer, entry.file_size)?;
+
+        write_digest(writer, digest)?;
     }
 
-    for &file_id in file_ids {
-        let entry = manifest.get(file_id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "tiny pack contains an invalid file ID",
-            )
-        })?;
+    write_u8(writer, encoded.encoding().wire_value())?;
 
-        let path = source_root.join(&entry.relative_path);
+    write_u64(
+        writer,
+        u64::try_from(wire_payload.len())
+            .map_err(|_| io::Error::other("tiny-pack wire length cannot be represented"))?,
+    )?;
 
-        let mut file = File::open(&path)?;
+    writer.write_all(wire_payload)?;
 
-        validate_source_metadata(&file, &path, entry)?;
+    write_digest(writer, &pack_digest)?;
 
-        let digest = copy_exact_hashed(&mut file, writer, entry.file_size, buffer)?;
+    Ok(TinyPackTransferSummary {
+        summary,
 
-        validate_source_metadata(&file, &path, entry)?;
-
-        write_digest(writer, &digest)?;
-    }
-
-    Ok(summary)
+        compressed: encoded.is_compressed(),
+    })
 }
 
 fn summarize_tiny_pack(
@@ -2093,16 +2194,24 @@ fn receive_lane(
                 file_ids,
                 total_bytes,
             } => {
-                let summary = receive_tiny_pack(
+                let transfer = receive_tiny_pack(
                     &mut reader,
                     destination_root,
                     manifest,
                     file_ids,
                     *total_bytes,
                     &mut buffer,
+                    progress.as_ref(),
                 )?;
 
-                add_lane_counts(&mut report, summary.files, summary.bytes, "receiver")?;
+                add_lane_counts(
+                    &mut report,
+                    transfer.summary.files,
+                    transfer.summary.bytes,
+                    "receiver",
+                )?;
+
+                add_compressed_record(&mut report, transfer.compressed)?;
             }
 
             TransferTask::Stripe {
@@ -2229,13 +2338,14 @@ fn receive_tiny_pack(
     file_ids: &[usize],
     expected_total_bytes: u64,
     buffer: &mut [u8],
-) -> io::Result<TinyPackSummary> {
+    progress: Option<&ProgressCounter>,
+) -> io::Result<TinyPackTransferSummary> {
     let message = read_u8(reader)?;
 
-    if message != MESSAGE_TINY_PACK {
+    if message != MESSAGE_TINY_PACK_V2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("expected tiny-pack message, received 0x{message:02X}"),
+            format!("expected v1.3 tiny-pack message, received 0x{message:02X}",),
         ));
     }
 
@@ -2261,13 +2371,14 @@ fn receive_tiny_pack(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "tiny pack announced {announced_file_count} files and \
-                 {announced_total_bytes} bytes, expected {} files and {} bytes",
+                "tiny pack announced {announced_file_count} files and {announced_total_bytes} bytes, expected {} files and {} bytes",
                 file_ids.len(),
-                summary.bytes
+                summary.bytes,
             ),
         ));
     }
+
+    let mut expected_digests = Vec::with_capacity(file_ids.len());
 
     for &expected_file_id in file_ids {
         let announced_file_id = read_file_id(reader)?;
@@ -2278,8 +2389,7 @@ fn receive_tiny_pack(
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "tiny pack announced file ID {announced_file_id}, expected \
-                     {expected_file_id}"
+                    "tiny pack announced file ID {announced_file_id}, expected {expected_file_id}",
                 ),
             ));
         }
@@ -2295,15 +2405,63 @@ fn receive_tiny_pack(
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "tiny file {expected_file_id} announced {announced_size} bytes, \
-                     expected {}",
-                    entry.file_size
+                    "tiny file {expected_file_id} announced {announced_size} bytes, expected {}",
+                    entry.file_size,
                 ),
             ));
         }
+
+        expected_digests.push(read_digest(reader)?);
     }
 
-    for &file_id in file_ids {
+    let encoding = TinyPackEncoding::from_wire(read_u8(reader)?)?;
+
+    let wire_bytes = usize::try_from(read_u64(reader)?).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tiny-pack wire length cannot be represented",
+        )
+    })?;
+
+    if wire_bytes > tiny_pack_codec::MAX_TINY_PACK_WIRE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "tiny-pack wire payload contains {wire_bytes} bytes, exceeding the supported limit",
+            ),
+        ));
+    }
+
+    if let Some(progress) = progress {
+        progress.check_cancelled()?;
+    }
+
+    let mut wire_payload = vec![0_u8; wire_bytes];
+
+    reader.read_exact(&mut wire_payload)?;
+
+    let total_bytes = usize::try_from(summary.bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tiny-pack logical length cannot be represented",
+        )
+    })?;
+
+    tiny_pack_codec::decode(encoding, &wire_payload, total_bytes, buffer)?;
+
+    let expected_pack_digest = read_digest(reader)?;
+
+    let actual_pack_digest = *blake3::hash(&buffer[..total_bytes]).as_bytes();
+
+    verify_content_digest("tiny pack", &actual_pack_digest, &expected_pack_digest)?;
+
+    let mut offset = 0_usize;
+
+    for (&file_id, expected_digest) in file_ids.iter().zip(&expected_digests) {
+        if let Some(progress) = progress {
+            progress.check_cancelled()?;
+        }
+
         let entry = manifest.get(file_id).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2311,10 +2469,84 @@ fn receive_tiny_pack(
             )
         })?;
 
-        receive_raw_file(reader, destination_root, file_id, entry, buffer)?;
+        let file_bytes = usize::try_from(entry.file_size).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tiny-file size cannot be represented",
+            )
+        })?;
+
+        let end = offset
+            .checked_add(file_bytes)
+            .ok_or_else(|| io::Error::other("tiny-pack receive offset overflowed"))?;
+
+        let contents = buffer.get(offset..end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tiny-pack file contents exceed the decoded payload",
+            )
+        })?;
+
+        receive_buffered_tiny_file(destination_root, file_id, entry, contents, expected_digest)?;
+
+        offset = end;
     }
 
-    Ok(summary)
+    if offset != total_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("decoded tiny files consumed {offset} bytes, expected {total_bytes}",),
+        ));
+    }
+
+    Ok(TinyPackTransferSummary {
+        summary,
+
+        compressed: matches!(encoding, TinyPackEncoding::Zstandard,),
+    })
+}
+
+fn receive_buffered_tiny_file(
+    destination_root: &Path,
+    file_id: usize,
+    entry: &ManifestEntry,
+    contents: &[u8],
+    expected_digest: &[u8; CONTENT_DIGEST_BYTES],
+) -> io::Result<()> {
+    let actual_digest = *blake3::hash(contents).as_bytes();
+
+    let context = format!("tiny file {file_id} ({})", entry.relative_path.display(),);
+
+    verify_content_digest(&context, &actual_digest, expected_digest)?;
+
+    let final_path = destination_root.join(&entry.relative_path);
+
+    let temporary_path = temporary_path(&final_path, file_id);
+
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary_path)?;
+
+    file.set_len(entry.file_size)?;
+
+    let write_result = (|| -> io::Result<()> {
+        file.write_all(contents)?;
+
+        file.flush()
+    })();
+
+    if let Err(error) = write_result {
+        drop(file);
+
+        let _ = fs::remove_file(&temporary_path);
+
+        return Err(error);
+    }
+
+    drop(file);
+
+    fs::rename(temporary_path, final_path)
 }
 
 fn receive_file_stripe(

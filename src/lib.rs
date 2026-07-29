@@ -25,6 +25,7 @@ mod pipeline_bench;
 mod resume_state;
 mod striped_file;
 mod tcp_connect;
+mod tiny_pack_codec;
 mod transfer_memory;
 pub mod windows_elevation;
 mod windows_setup;
