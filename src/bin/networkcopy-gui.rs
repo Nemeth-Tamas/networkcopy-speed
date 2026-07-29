@@ -209,6 +209,12 @@ struct Text {
     logical_data: &'static str,
     speed: &'static str,
     wire_savings: &'static str,
+    tiny_packs: &'static str,
+    compressed_tiny_packs: &'static str,
+    raw_tiny_packs: &'static str,
+    packed_tiny_files: &'static str,
+    tiny_pack_data: &'static str,
+    tiny_pack_savings: &'static str,
     streams: &'static str,
     elapsed: &'static str,
     missing_source: &'static str,
@@ -308,6 +314,18 @@ impl Text {
         speed: "Sebesség",
 
         wire_savings: "Hálózati megtakarítás",
+
+        tiny_packs: "Aprófájl-csomagok",
+
+        compressed_tiny_packs: "Tömörített csomagok",
+
+        raw_tiny_packs: "Nyers csomagok",
+
+        packed_tiny_files: "Csomagolt aprófájlok",
+
+        tiny_pack_data: "Aprófájl-adat (logikai / hálózati)",
+
+        tiny_pack_savings: "Aprófájl-megtakarítás",
 
         streams: "TCP szálak",
 
@@ -416,6 +434,18 @@ impl Text {
         speed: "Speed",
 
         wire_savings: "Network savings",
+
+        tiny_packs: "Tiny-file packs",
+
+        compressed_tiny_packs: "Compressed packs",
+
+        raw_tiny_packs: "Raw packs",
+
+        packed_tiny_files: "Packed tiny files",
+
+        tiny_pack_data: "Tiny-pack data (logical / wire)",
+
+        tiny_pack_savings: "Tiny-pack savings",
 
         streams: "TCP streams",
 
@@ -1084,6 +1114,48 @@ impl NetworkCopyGui {
                     ui.strong(format!("{:.2}%", summary.wire_savings_percent,));
 
                     ui.end_row();
+
+                    if summary.tiny_pack_count > 0 {
+                        ui.label(text.tiny_packs);
+
+                        ui.strong(summary.tiny_pack_count.to_string());
+
+                        ui.end_row();
+
+                        ui.label(text.compressed_tiny_packs);
+
+                        ui.strong(summary.compressed_tiny_pack_count.to_string());
+
+                        ui.end_row();
+
+                        ui.label(text.raw_tiny_packs);
+
+                        ui.strong(summary.raw_tiny_pack_count.to_string());
+
+                        ui.end_row();
+
+                        ui.label(text.packed_tiny_files);
+
+                        ui.strong(summary.tiny_files_packed.to_string());
+
+                        ui.end_row();
+
+                        ui.label(text.tiny_pack_data);
+
+                        ui.strong(format!(
+                            "{} / {}",
+                            format_bytes(summary.tiny_bytes_packed),
+                            format_bytes(summary.tiny_pack_wire_bytes),
+                        ));
+
+                        ui.end_row();
+
+                        ui.label(text.tiny_pack_savings);
+
+                        ui.strong(format!("{:.2}%", summary.tiny_pack_wire_savings_percent,));
+
+                        ui.end_row();
+                    }
 
                     ui.label(text.streams);
 

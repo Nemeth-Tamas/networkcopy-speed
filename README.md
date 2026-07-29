@@ -48,13 +48,15 @@ The GUI includes:
 
 ## v1.3 roadmap
 
-Planned v1.3 work:
+Current v1.3 work:
 
-- adaptive compression of complete tiny-file packs;
-- update-existing destination mode;
-- fast and BLAKE3-verified unchanged-file detection;
-- automatic Zstandard strategy calibration;
-- clearer compression, skipped-data, and bottleneck diagnostics.
+- [x] adaptive compression of complete tiny-file packs;
+- [x] exact compressed/raw pack and pack-wire telemetry;
+- [x] repeatable compressible and incompressible tiny-pack benchmarks;
+- [ ] update-existing destination mode;
+- [ ] fast and BLAKE3-verified unchanged-file detection;
+- [ ] automatic Zstandard strategy calibration;
+- [ ] clearer skipped-data and bottleneck diagnostics.
 
 Shared Zstandard dictionaries will be benchmarked after v1.3.
 

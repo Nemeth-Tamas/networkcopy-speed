@@ -38,6 +38,10 @@ const CODEC_BUFFER_BYTES: usize =
     MAX_COMPRESSED_CHUNK_BYTES + tiny_pack_codec::MAX_TINY_PACK_WIRE_BYTES;
 const MAX_TINY_PACK_FILES: usize = 4096;
 const CONTENT_DIGEST_BYTES: usize = 32;
+
+const TINY_PACK_FIXED_WIRE_BYTES: u64 = 1 + 4 + 8 + 1 + 8 + CONTENT_DIGEST_BYTES as u64;
+
+const TINY_PACK_FILE_METADATA_WIRE_BYTES: u64 = 8 + 8 + CONTENT_DIGEST_BYTES as u64;
 const MAX_RESUME_OFFER_STRIPES: u32 = 1_000_000;
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -61,8 +65,11 @@ pub struct MultistreamCopyReport {
     pub transfer_buffer_budget_bytes: u64,
     pub manifest_wire_bytes: u64,
     pub tiny_pack_count: u64,
+    pub compressed_tiny_pack_count: u64,
+    pub raw_tiny_pack_count: u64,
     pub tiny_files_packed: u64,
     pub tiny_bytes_packed: u64,
+    pub tiny_pack_wire_bytes: u64,
     pub scan_elapsed: Duration,
     pub connection_elapsed: Duration,
     pub manifest_elapsed: Duration,
@@ -124,13 +131,23 @@ impl MultistreamCopyReport {
             format_bytes(self.manifest_wire_bytes)
         );
         println!(
-            "  Tiny packs:           {}",
-            format_bytes(self.tiny_pack_count)
+            "  Tiny packs:           {} total, {} compressed, {} raw",
+            format_bytes(self.tiny_pack_count),
+            format_bytes(self.compressed_tiny_pack_count),
+            format_bytes(self.raw_tiny_pack_count),
         );
         println!(
-            "  Packed tiny files:    {} / {} bytes",
+            "  Packed tiny files:    {} / {} logical bytes",
             format_bytes(self.tiny_files_packed),
-            format_bytes(self.tiny_bytes_packed)
+            format_bytes(self.tiny_bytes_packed),
+        );
+        println!(
+            "  Tiny-pack wire size:  {} bytes",
+            format_bytes(self.tiny_pack_wire_bytes),
+        );
+        println!(
+            "  Tiny-pack savings:    {:.2}%",
+            wire_savings_percent(self.tiny_bytes_packed, self.tiny_pack_wire_bytes),
         );
         println!("  Integrity:            BLAKE3 verified");
         println!(
@@ -171,6 +188,12 @@ pub struct ReceiveReport {
     pub compressed_records: u64,
     pub resumed_stripes: u64,
     pub resumed_bytes: u64,
+    pub tiny_pack_count: u64,
+    pub compressed_tiny_pack_count: u64,
+    pub raw_tiny_pack_count: u64,
+    pub tiny_files_packed: u64,
+    pub tiny_bytes_packed: u64,
+    pub tiny_pack_wire_bytes: u64,
     pub elapsed: Duration,
 }
 
@@ -200,6 +223,29 @@ impl ReceiveReport {
         println!(
             "  Compressed records:   {}",
             format_bytes(self.compressed_records,)
+        );
+
+        println!(
+            "  Tiny packs:           {} total, {} compressed, {} raw",
+            format_bytes(self.tiny_pack_count),
+            format_bytes(self.compressed_tiny_pack_count),
+            format_bytes(self.raw_tiny_pack_count),
+        );
+
+        println!(
+            "  Packed tiny files:    {} / {} logical bytes",
+            format_bytes(self.tiny_files_packed),
+            format_bytes(self.tiny_bytes_packed),
+        );
+
+        println!(
+            "  Tiny-pack wire size:  {} bytes",
+            format_bytes(self.tiny_pack_wire_bytes),
+        );
+
+        println!(
+            "  Tiny-pack savings:    {:.2}%",
+            wire_savings_percent(self.tiny_bytes_packed, self.tiny_pack_wire_bytes),
         );
 
         println!(
@@ -246,6 +292,12 @@ struct TransferAck {
     bytes_copied: u64,
     data_wire_bytes: u64,
     compressed_records: u64,
+    tiny_pack_count: u64,
+    compressed_tiny_pack_count: u64,
+    raw_tiny_pack_count: u64,
+    tiny_files_packed: u64,
+    tiny_bytes_packed: u64,
+    tiny_pack_wire_bytes: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -260,6 +312,12 @@ struct LaneReport {
     bytes_copied: u64,
     data_wire_bytes: u64,
     compressed_records: u64,
+    tiny_pack_count: u64,
+    compressed_tiny_pack_count: u64,
+    raw_tiny_pack_count: u64,
+    tiny_files_packed: u64,
+    tiny_bytes_packed: u64,
+    tiny_pack_wire_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -363,6 +421,8 @@ struct TinyPackTransferSummary {
     summary: TinyPackSummary,
 
     compressed: bool,
+
+    wire_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -678,6 +738,8 @@ fn send_internal(
         transferred_sender_report,
     ])?;
 
+    validate_tiny_pack_plan(&sender_report, plan_stats)?;
+
     if let Some(progress) = &progress {
         progress.check_cancelled()?;
 
@@ -703,6 +765,12 @@ fn send_internal(
             || transfer_ack.bytes_copied != receiver_report.bytes_received
             || transfer_ack.data_wire_bytes != receiver_report.data_wire_bytes
             || transfer_ack.compressed_records != receiver_report.compressed_records
+            || transfer_ack.tiny_pack_count != receiver_report.tiny_pack_count
+            || transfer_ack.compressed_tiny_pack_count != receiver_report.compressed_tiny_pack_count
+            || transfer_ack.raw_tiny_pack_count != receiver_report.raw_tiny_pack_count
+            || transfer_ack.tiny_files_packed != receiver_report.tiny_files_packed
+            || transfer_ack.tiny_bytes_packed != receiver_report.tiny_bytes_packed
+            || transfer_ack.tiny_pack_wire_bytes != receiver_report.tiny_pack_wire_bytes
         {
             return Err(io::Error::other(
                 "client and server transfer reports differ",
@@ -722,6 +790,12 @@ fn send_internal(
         || sender_report.bytes_copied != transfer_ack.bytes_copied
         || sender_report.data_wire_bytes != transfer_ack.data_wire_bytes
         || sender_report.compressed_records != transfer_ack.compressed_records
+        || sender_report.tiny_pack_count != transfer_ack.tiny_pack_count
+        || sender_report.compressed_tiny_pack_count != transfer_ack.compressed_tiny_pack_count
+        || sender_report.raw_tiny_pack_count != transfer_ack.raw_tiny_pack_count
+        || sender_report.tiny_files_packed != transfer_ack.tiny_files_packed
+        || sender_report.tiny_bytes_packed != transfer_ack.tiny_bytes_packed
+        || sender_report.tiny_pack_wire_bytes != transfer_ack.tiny_pack_wire_bytes
     {
         return Err(io::Error::other(
             "sender and receiver transfer reports differ",
@@ -749,9 +823,12 @@ fn send_internal(
         transfer_buffer_budget_bytes: memory_plan.budget_bytes,
 
         manifest_wire_bytes,
-        tiny_pack_count: plan_stats.tiny_pack_count,
-        tiny_files_packed: plan_stats.tiny_files_packed,
-        tiny_bytes_packed: plan_stats.tiny_bytes_packed,
+        tiny_pack_count: transfer_ack.tiny_pack_count,
+        compressed_tiny_pack_count: transfer_ack.compressed_tiny_pack_count,
+        raw_tiny_pack_count: transfer_ack.raw_tiny_pack_count,
+        tiny_files_packed: transfer_ack.tiny_files_packed,
+        tiny_bytes_packed: transfer_ack.tiny_bytes_packed,
+        tiny_pack_wire_bytes: transfer_ack.tiny_pack_wire_bytes,
         scan_elapsed,
         connection_elapsed,
         manifest_elapsed,
@@ -907,6 +984,12 @@ fn run_server(
         bytes_copied: report.bytes_copied,
         data_wire_bytes: report.data_wire_bytes,
         compressed_records: report.compressed_records,
+        tiny_pack_count: report.tiny_pack_count,
+        compressed_tiny_pack_count: report.compressed_tiny_pack_count,
+        raw_tiny_pack_count: report.raw_tiny_pack_count,
+        tiny_files_packed: report.tiny_files_packed,
+        tiny_bytes_packed: report.tiny_bytes_packed,
+        tiny_pack_wire_bytes: report.tiny_pack_wire_bytes,
     };
 
     if ack.files_copied != summary.entries || ack.bytes_copied != summary.total_file_bytes {
@@ -938,6 +1021,18 @@ fn run_server(
         resumed_stripes: resume_application.stripe_count,
 
         resumed_bytes: resume_application.logical_report.bytes_copied,
+
+        tiny_pack_count: ack.tiny_pack_count,
+
+        compressed_tiny_pack_count: ack.compressed_tiny_pack_count,
+
+        raw_tiny_pack_count: ack.raw_tiny_pack_count,
+
+        tiny_files_packed: ack.tiny_files_packed,
+
+        tiny_bytes_packed: ack.tiny_bytes_packed,
+
+        tiny_pack_wire_bytes: ack.tiny_pack_wire_bytes,
 
         elapsed: session_started.elapsed(),
     })
@@ -1704,6 +1799,8 @@ fn send_lane(
                 )?;
 
                 add_compressed_record(&mut report, transfer.compressed)?;
+
+                add_tiny_pack_stats(&mut report, transfer, "sender")?;
             }
 
             TransferTask::Stripe {
@@ -1789,6 +1886,65 @@ fn add_compressed_record(report: &mut LaneReport, compressed: bool) -> io::Resul
         .ok_or_else(|| io::Error::other("compressed record count overflowed"))?;
 
     Ok(())
+}
+
+fn add_tiny_pack_stats(
+    report: &mut LaneReport,
+    transfer: TinyPackTransferSummary,
+    side: &str,
+) -> io::Result<()> {
+    report.tiny_pack_count = report
+        .tiny_pack_count
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other(format!("{side} tiny-pack count overflowed")))?;
+
+    if transfer.compressed {
+        report.compressed_tiny_pack_count = report
+            .compressed_tiny_pack_count
+            .checked_add(1)
+            .ok_or_else(|| {
+                io::Error::other(format!("{side} compressed tiny-pack count overflowed"))
+            })?;
+    } else {
+        report.raw_tiny_pack_count = report
+            .raw_tiny_pack_count
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other(format!("{side} raw tiny-pack count overflowed")))?;
+    }
+
+    report.tiny_files_packed = report
+        .tiny_files_packed
+        .checked_add(transfer.summary.files)
+        .ok_or_else(|| io::Error::other(format!("{side} packed tiny-file count overflowed")))?;
+
+    report.tiny_bytes_packed = report
+        .tiny_bytes_packed
+        .checked_add(transfer.summary.bytes)
+        .ok_or_else(|| io::Error::other(format!("{side} packed tiny-byte count overflowed")))?;
+
+    report.tiny_pack_wire_bytes = report
+        .tiny_pack_wire_bytes
+        .checked_add(transfer.wire_bytes)
+        .ok_or_else(|| io::Error::other(format!("{side} tiny-pack wire-byte count overflowed")))?;
+
+    Ok(())
+}
+
+fn tiny_pack_record_wire_bytes(file_count: usize, payload_bytes: usize) -> io::Result<u64> {
+    let file_count = u64::try_from(file_count)
+        .map_err(|_| io::Error::other("tiny-pack file count cannot be represented"))?;
+
+    let payload_bytes = u64::try_from(payload_bytes)
+        .map_err(|_| io::Error::other("tiny-pack payload length cannot be represented"))?;
+
+    let metadata_bytes = file_count
+        .checked_mul(TINY_PACK_FILE_METADATA_WIRE_BYTES)
+        .ok_or_else(|| io::Error::other("tiny-pack metadata size overflowed"))?;
+
+    TINY_PACK_FIXED_WIRE_BYTES
+        .checked_add(metadata_bytes)
+        .and_then(|bytes| bytes.checked_add(payload_bytes))
+        .ok_or_else(|| io::Error::other("tiny-pack record size overflowed"))
 }
 
 fn send_tiny_pack(
@@ -1891,6 +2047,8 @@ fn send_tiny_pack(
 
     let wire_payload = encoded.wire_payload(raw_payload);
 
+    let record_wire_bytes = tiny_pack_record_wire_bytes(file_ids.len(), wire_payload.len())?;
+
     let pack_digest = *blake3::hash(raw_payload).as_bytes();
 
     write_u8(writer, MESSAGE_TINY_PACK_V2)?;
@@ -1946,6 +2104,8 @@ fn send_tiny_pack(
         summary,
 
         compressed: encoded.is_compressed(),
+
+        wire_bytes: record_wire_bytes,
     })
 }
 
@@ -2236,6 +2396,8 @@ fn receive_lane(
                 )?;
 
                 add_compressed_record(&mut report, transfer.compressed)?;
+
+                add_tiny_pack_stats(&mut report, transfer, "receiver")?;
             }
 
             TransferTask::Stripe {
@@ -2456,6 +2618,8 @@ fn receive_tiny_pack(
         ));
     }
 
+    let record_wire_bytes = tiny_pack_record_wire_bytes(file_ids.len(), wire_bytes)?;
+
     if let Some(progress) = progress {
         progress.check_cancelled()?;
     }
@@ -2527,6 +2691,8 @@ fn receive_tiny_pack(
         summary,
 
         compressed: matches!(encoding, TinyPackEncoding::Zstandard,),
+
+        wire_bytes: record_wire_bytes,
     })
 }
 
@@ -2810,9 +2976,58 @@ fn merge_lane_reports(reports: Vec<LaneReport>) -> io::Result<LaneReport> {
             .compressed_records
             .checked_add(report.compressed_records)
             .ok_or_else(|| io::Error::other("merged compressed-record count overflowed"))?;
+
+        merged.tiny_pack_count = merged
+            .tiny_pack_count
+            .checked_add(report.tiny_pack_count)
+            .ok_or_else(|| io::Error::other("merged tiny-pack count overflowed"))?;
+
+        merged.compressed_tiny_pack_count = merged
+            .compressed_tiny_pack_count
+            .checked_add(report.compressed_tiny_pack_count)
+            .ok_or_else(|| io::Error::other("merged compressed tiny-pack count overflowed"))?;
+
+        merged.raw_tiny_pack_count = merged
+            .raw_tiny_pack_count
+            .checked_add(report.raw_tiny_pack_count)
+            .ok_or_else(|| io::Error::other("merged raw tiny-pack count overflowed"))?;
+
+        merged.tiny_files_packed = merged
+            .tiny_files_packed
+            .checked_add(report.tiny_files_packed)
+            .ok_or_else(|| io::Error::other("merged packed tiny-file count overflowed"))?;
+
+        merged.tiny_bytes_packed = merged
+            .tiny_bytes_packed
+            .checked_add(report.tiny_bytes_packed)
+            .ok_or_else(|| io::Error::other("merged packed tiny-byte count overflowed"))?;
+
+        merged.tiny_pack_wire_bytes = merged
+            .tiny_pack_wire_bytes
+            .checked_add(report.tiny_pack_wire_bytes)
+            .ok_or_else(|| io::Error::other("merged tiny-pack wire-byte count overflowed"))?;
     }
 
     Ok(merged)
+}
+
+fn validate_tiny_pack_plan(report: &LaneReport, expected: TransferPlanStats) -> io::Result<()> {
+    let encoded_pack_count = report
+        .compressed_tiny_pack_count
+        .checked_add(report.raw_tiny_pack_count)
+        .ok_or_else(|| io::Error::other("tiny-pack encoding count overflowed"))?;
+
+    if report.tiny_pack_count != expected.tiny_pack_count
+        || report.tiny_files_packed != expected.tiny_files_packed
+        || report.tiny_bytes_packed != expected.tiny_bytes_packed
+        || encoded_pack_count != report.tiny_pack_count
+    {
+        return Err(io::Error::other(
+            "actual tiny-pack statistics do not match the transfer plan",
+        ));
+    }
+
+    Ok(())
 }
 
 fn write_receiver_ready(writer: &mut impl Write, ready: &ReceiverReady) -> io::Result<()> {
@@ -2932,6 +3147,18 @@ fn write_transfer_ack(writer: &mut impl Write, ack: TransferAck) -> io::Result<(
 
     write_u64(writer, ack.compressed_records)?;
 
+    write_u64(writer, ack.tiny_pack_count)?;
+
+    write_u64(writer, ack.compressed_tiny_pack_count)?;
+
+    write_u64(writer, ack.raw_tiny_pack_count)?;
+
+    write_u64(writer, ack.tiny_files_packed)?;
+
+    write_u64(writer, ack.tiny_bytes_packed)?;
+
+    write_u64(writer, ack.tiny_pack_wire_bytes)?;
+
     writer.flush()
 }
 
@@ -2953,6 +3180,18 @@ fn read_transfer_ack(reader: &mut impl Read) -> io::Result<TransferAck> {
         data_wire_bytes: read_u64(reader)?,
 
         compressed_records: read_u64(reader)?,
+
+        tiny_pack_count: read_u64(reader)?,
+
+        compressed_tiny_pack_count: read_u64(reader)?,
+
+        raw_tiny_pack_count: read_u64(reader)?,
+
+        tiny_files_packed: read_u64(reader)?,
+
+        tiny_bytes_packed: read_u64(reader)?,
+
+        tiny_pack_wire_bytes: read_u64(reader)?,
     })
 }
 
@@ -3101,8 +3340,9 @@ mod tests {
     use super::{
         ReceiverReady, TINY_PACK_TARGET_BYTES, TransferFault, TransferTask, accept_session,
         apply_resume_offer, build_transfer_plan, connect_with_retry_config, read_receiver_ready,
-        receive_once, run, run_with_fault, send, temporary_path, validate_resume_offer,
-        validate_source_metadata, verify_content_digest, write_receiver_ready,
+        receive_once, run, run_with_fault, send, temporary_path, tiny_pack_record_wire_bytes,
+        validate_resume_offer, validate_source_metadata, verify_content_digest,
+        write_receiver_ready,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::file_metadata;
@@ -3120,6 +3360,13 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+
+    #[test]
+    fn tiny_pack_wire_size_includes_protocol_metadata() {
+        assert_eq!(tiny_pack_record_wire_bytes(2, 100,).unwrap(), 250,);
+
+        assert!(tiny_pack_record_wire_bytes(usize::MAX, usize::MAX,).is_err(),);
+    }
 
     #[test]
     fn scheduler_stripes_large_files_and_packs_tiny_files() {

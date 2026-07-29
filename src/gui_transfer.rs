@@ -113,6 +113,20 @@ pub struct GuiTransferSummary {
     pub wire_megabytes_per_second: f64,
 
     pub wire_savings_percent: f64,
+
+    pub tiny_pack_count: u64,
+
+    pub compressed_tiny_pack_count: u64,
+
+    pub raw_tiny_pack_count: u64,
+
+    pub tiny_files_packed: u64,
+
+    pub tiny_bytes_packed: u64,
+
+    pub tiny_pack_wire_bytes: u64,
+
+    pub tiny_pack_wire_savings_percent: f64,
 }
 
 pub fn run_gui_transfer(request: GuiTransferRequest) -> io::Result<GuiTransferSummary> {
@@ -242,6 +256,23 @@ fn send_summary(report: CalibratedSendReport) -> GuiTransferSummary {
         wire_megabytes_per_second,
 
         wire_savings_percent: wire_savings_percent(transfer.bytes_copied, transfer.data_wire_bytes),
+
+        tiny_pack_count: transfer.tiny_pack_count,
+
+        compressed_tiny_pack_count: transfer.compressed_tiny_pack_count,
+
+        raw_tiny_pack_count: transfer.raw_tiny_pack_count,
+
+        tiny_files_packed: transfer.tiny_files_packed,
+
+        tiny_bytes_packed: transfer.tiny_bytes_packed,
+
+        tiny_pack_wire_bytes: transfer.tiny_pack_wire_bytes,
+
+        tiny_pack_wire_savings_percent: signed_wire_savings_percent(
+            transfer.tiny_bytes_packed,
+            transfer.tiny_pack_wire_bytes,
+        ),
     }
 }
 
@@ -278,6 +309,23 @@ fn receive_summary(report: CalibratedReceiveReport) -> GuiTransferSummary {
             transfer.bytes_received,
             transfer.data_wire_bytes,
         ),
+
+        tiny_pack_count: transfer.tiny_pack_count,
+
+        compressed_tiny_pack_count: transfer.compressed_tiny_pack_count,
+
+        raw_tiny_pack_count: transfer.raw_tiny_pack_count,
+
+        tiny_files_packed: transfer.tiny_files_packed,
+
+        tiny_bytes_packed: transfer.tiny_bytes_packed,
+
+        tiny_pack_wire_bytes: transfer.tiny_pack_wire_bytes,
+
+        tiny_pack_wire_savings_percent: signed_wire_savings_percent(
+            transfer.tiny_bytes_packed,
+            transfer.tiny_pack_wire_bytes,
+        ),
     }
 }
 
@@ -295,6 +343,14 @@ fn wire_savings_percent(logical_bytes: u64, wire_bytes: u64) -> f64 {
     }
 
     (logical_bytes - wire_bytes) as f64 / logical_bytes as f64 * 100.0
+}
+
+fn signed_wire_savings_percent(logical_bytes: u64, wire_bytes: u64) -> f64 {
+    if logical_bytes == 0 {
+        return 0.0;
+    }
+
+    100.0 - wire_bytes as f64 / logical_bytes as f64 * 100.0
 }
 
 #[cfg(test)]
@@ -377,6 +433,33 @@ mod tests {
                 .len(),
             384 * 1024,
         );
+
+        assert_eq!(
+            sender_summary.tiny_pack_count,
+            receiver_summary.tiny_pack_count,
+        );
+
+        assert_eq!(
+            sender_summary.compressed_tiny_pack_count,
+            receiver_summary.compressed_tiny_pack_count,
+        );
+
+        assert_eq!(
+            sender_summary.raw_tiny_pack_count,
+            receiver_summary.raw_tiny_pack_count,
+        );
+
+        assert_eq!(
+            sender_summary.tiny_files_packed,
+            receiver_summary.tiny_files_packed,
+        );
+
+        assert_eq!(
+            sender_summary.tiny_pack_wire_bytes,
+            receiver_summary.tiny_pack_wire_bytes,
+        );
+
+        assert!(sender_summary.tiny_pack_count > 0,);
 
         fs::remove_dir_all(parent).unwrap();
     }
