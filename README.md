@@ -50,15 +50,16 @@ The GUI includes:
 
 Implementation order:
 
-- [ ] held-out shared Zstandard dictionary benchmark;
-- [ ] dictionary-size matrix on synthetic and realistic tiny-file datasets;
+- [x] held-out shared Zstandard dictionary benchmark;
+- [x] dictionary-size matrix on synthetic and realistic tiny-file datasets;
 - [ ] adaptive receiver filesystem worker calibration;
 - [ ] bounded parallel tiny-file materialization;
 - [ ] final end-to-end tiny-file benchmark and telemetry.
 
-Shared dictionaries will be retained only if their one-time wire cost and
-training cost produce a meaningful held-out improvement over the existing
-complete-pack Zstandard compression.
+Shared Zstandard dictionaries were rejected after held-out testing. They did
+not improve complete-pack compression on synthetic or realistic tiny-file
+datasets once dictionary transmission was counted. The existing adaptive raw
+or complete-pack Zstandard strategy remains unchanged.
 
 ## v1.3 highlights
 

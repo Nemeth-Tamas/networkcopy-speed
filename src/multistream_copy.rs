@@ -10,6 +10,7 @@ use crate::manifest_scan::{self, FileClass, ManifestEntry};
 use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
 use crate::striped_file;
 use crate::tcp_connect;
+use crate::tiny_file_materialize;
 use crate::tiny_pack_codec::{self, TinyPackEncoding};
 use crate::transfer_memory;
 use crate::update_verification::{self, FILE_DIGEST_BYTES, FileDigest};
@@ -3227,34 +3228,7 @@ fn receive_buffered_tiny_file(
 
     verify_content_digest(&context, &actual_digest, expected_digest)?;
 
-    let final_path = destination_root.join(&entry.relative_path);
-
-    let temporary_path = temporary_path(&final_path, file_id);
-
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary_path)?;
-
-    file.set_len(entry.file_size)?;
-
-    let write_result = (|| -> io::Result<()> {
-        file.write_all(contents)?;
-
-        file.flush()
-    })();
-
-    if let Err(error) = write_result {
-        drop(file);
-
-        let _ = fs::remove_file(&temporary_path);
-
-        return Err(error);
-    }
-
-    drop(file);
-
-    windows_file_replace::replace(&temporary_path, &final_path)
+    tiny_file_materialize::write_verified(destination_root, file_id, &entry.relative_path, contents)
 }
 
 fn receive_file_stripe(

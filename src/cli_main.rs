@@ -39,6 +39,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         "bench-hash" => run_hash_bench(&mut arguments),
         "probe-compression" => run_compression_probe(&mut arguments),
         "bench-zstd-dictionary" => run_zstd_dictionary_bench(&mut arguments),
+        "bench-tiny-file-writes" => {
+            run_tiny_file_write_bench(&mut arguments)
+        }
         "bench-pipeline" => run_bench_pipeline(&mut arguments),
         "probe-iocp" => run_iocp_probe(&mut arguments),
         "probe-overlapped-read" => run_overlapped_read_probe(&mut arguments),
@@ -429,6 +432,57 @@ fn run_zstd_dictionary_bench(
         zstd_dictionary_bench::run(&root, worker_count, dictionary_kib, level)?;
 
     report.print();
+    Ok(())
+}
+
+fn run_tiny_file_write_bench(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let source_root =
+        PathBuf::from(required_argument(arguments, "source root directory")?);
+
+    let output_root =
+        PathBuf::from(required_argument(arguments, "empty output directory")?);
+
+    let max_workers = match arguments.next() {
+        Some(value) => parse_usize_count(&value, "maximum worker count")?,
+
+        None => tiny_file_write_bench::default_max_workers(),
+    };
+
+    let scan_workers = match arguments.next() {
+        Some(value) => parse_usize_count(&value, "scanner worker count")?,
+
+        None => manifest_scan::default_worker_count(),
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    tiny_file_write_bench::validate_max_workers(max_workers)?;
+    manifest_scan::validate_worker_count(scan_workers)?;
+
+    println!("NetworkCopy Speed Edition tiny-file write calibration");
+    println!("  Source:          {}", source_root.display());
+    println!("  Output:          {}", output_root.display());
+    println!("  Maximum workers: {max_workers}");
+    println!("  Scanner workers: {scan_workers}");
+    println!();
+
+    let report = tiny_file_write_bench::run(
+        &source_root,
+        &output_root,
+        max_workers,
+        scan_workers,
+    )?;
+
+    report.print();
+
     Ok(())
 }
 
@@ -1275,6 +1329,10 @@ fn print_usage(program: &OsStr) {
     println!(
         "  {program} bench-zstd-dictionary <root-directory> \
          [dictionary-kib] [zstd-level] [workers]"
+    );
+    println!(
+        "  {program} bench-tiny-file-writes <source-root> <empty-output-root> \
+         [max-workers] [scan-workers]"
     );
     println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
     println!("  {program} probe-iocp");
