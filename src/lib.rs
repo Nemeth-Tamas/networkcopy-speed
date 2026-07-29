@@ -26,6 +26,7 @@ mod resume_state;
 mod striped_file;
 mod tcp_connect;
 mod transfer_memory;
+pub mod windows_elevation;
 mod windows_setup;
 
 include!("cli_main.rs");

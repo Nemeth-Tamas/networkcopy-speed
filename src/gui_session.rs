@@ -71,9 +71,17 @@ pub fn save(request: &GuiTransferRequest) -> io::Result<PathBuf> {
 }
 
 pub fn load_latest() -> io::Result<Option<GuiTransferRequest>> {
+    load_latest_for_kinds(&[SessionKind::Send, SessionKind::Receive])
+}
+
+pub fn load_receive() -> io::Result<Option<GuiTransferRequest>> {
+    load_latest_for_kinds(&[SessionKind::Receive])
+}
+
+fn load_latest_for_kinds(kinds: &[SessionKind]) -> io::Result<Option<GuiTransferRequest>> {
     let mut candidates = Vec::new();
 
-    for kind in [SessionKind::Send, SessionKind::Receive] {
+    for &kind in kinds {
         for path in session_paths(kind)? {
             match fs::metadata(&path) {
                 Ok(metadata) if metadata.is_file() => {

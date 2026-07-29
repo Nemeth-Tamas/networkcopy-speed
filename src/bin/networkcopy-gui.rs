@@ -9,7 +9,10 @@ use networkcopy_speed::gui_transfer::{
     GuiConnectionMode, GuiTransferControl, GuiTransferProgress, GuiTransferRequest,
     GuiTransferSummary, run_gui_transfer_with_control,
 };
+use networkcopy_speed::windows_elevation;
 use rfd::FileDialog;
+use std::env;
+use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -18,7 +21,12 @@ use std::time::{Duration, Instant};
 
 const APP_NAME: &str = "NetworkCopy Speed Edition";
 
+const AUTO_RESUME_RECEIVE_ARGUMENT: &str = "--resume-receive";
+
 fn main() -> eframe::Result {
+    let auto_resume_receive =
+        env::args_os().any(|argument| argument == OsStr::new(AUTO_RESUME_RECEIVE_ARGUMENT));
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([760.0, 560.0])
@@ -33,7 +41,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         APP_NAME,
         options,
-        Box::new(|_creation_context| Ok(Box::new(NetworkCopyGui::new()))),
+        Box::new(move |_creation_context| Ok(Box::new(NetworkCopyGui::new(auto_resume_receive)))),
     )
 }
 
@@ -204,6 +212,7 @@ struct Text {
     invalid_address: &'static str,
     worker_start_failed: &'static str,
     worker_disconnected: &'static str,
+    elevation_failed: &'static str,
     development_status: &'static str,
     engine_pending: &'static str,
 }
@@ -309,6 +318,8 @@ impl Text {
         worker_start_failed: "Nem sikerült elindítani az átviteli háttérfolyamatot",
 
         worker_disconnected: "Az átviteli háttérfolyamat válasz nélkül leállt",
+
+        elevation_failed: "A fogadás rendszergazdai indítása nem sikerült",
 
         development_status: "v1.2 fejlesztői felület",
 
@@ -416,6 +427,8 @@ impl Text {
 
         worker_disconnected: "The transfer worker stopped without returning a result",
 
+        elevation_failed: "Failed to start the receiver with administrator privileges",
+
         development_status: "v1.2 development interface",
 
         engine_pending: "Interrupted transfer settings are saved automatically so the operation can be resumed later.",
@@ -449,15 +462,25 @@ struct NetworkCopyGui {
     show_resume_prompt: bool,
 
     session_warning: Option<String>,
+
+    auto_start_pending: bool,
+
+    close_requested: bool,
 }
 
 impl NetworkCopyGui {
-    fn new() -> Self {
+    fn new(auto_resume_receive: bool) -> Self {
         let language = Language::initial();
 
         let text = language.text();
 
-        let (pending_session, session_warning) = match gui_session::load_latest() {
+        let load_result = if auto_resume_receive {
+            gui_session::load_receive()
+        } else {
+            gui_session::load_latest()
+        };
+
+        let (pending_session, session_warning) = match load_result {
             Ok(session) => (session, None),
 
             Err(error) => (
@@ -466,7 +489,11 @@ impl NetworkCopyGui {
             ),
         };
 
-        let show_resume_prompt = pending_session.is_some();
+        let has_pending_session = pending_session.is_some();
+
+        let show_resume_prompt = has_pending_session && !auto_resume_receive;
+
+        let auto_start_pending = has_pending_session && auto_resume_receive;
 
         Self {
             language,
@@ -503,6 +530,10 @@ impl NetworkCopyGui {
             show_resume_prompt,
 
             session_warning,
+
+            auto_start_pending,
+
+            close_requested: false,
         }
     }
 
@@ -838,6 +869,43 @@ impl NetworkCopyGui {
 
         self.show_resume_prompt = false;
 
+        let is_receive = matches!(&request, GuiTransferRequest::Receive { .. },);
+
+        if is_receive {
+            let elevated = match windows_elevation::is_elevated() {
+                Ok(elevated) => elevated,
+
+                Err(error) => {
+                    self.last_summary = None;
+
+                    self.last_cancelled = false;
+
+                    self.last_error = Some(format!("{}: {error}", text.elevation_failed,));
+
+                    return;
+                }
+            };
+
+            if !elevated {
+                match windows_elevation::relaunch_elevated(OsStr::new(AUTO_RESUME_RECEIVE_ARGUMENT))
+                {
+                    Ok(()) => {
+                        self.close_requested = true;
+                    }
+
+                    Err(error) => {
+                        self.last_summary = None;
+
+                        self.last_cancelled = false;
+
+                        self.last_error = Some(format!("{}: {error}", text.elevation_failed,));
+                    }
+                }
+
+                return;
+            }
+        }
+
         let control = GuiTransferControl::new();
 
         let worker_control = control.clone();
@@ -1166,6 +1234,12 @@ impl eframe::App for NetworkCopyGui {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let text = self.language.text();
 
+        if self.auto_start_pending && self.transfer_receiver.is_none() {
+            self.auto_start_pending = false;
+
+            self.resume_pending(text);
+        }
+
         self.poll_transfer(ui.ctx(), text);
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -1225,6 +1299,12 @@ impl eframe::App for NetworkCopyGui {
 
             self.status_panel(ui, text);
         });
+
+        if self.close_requested {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+
+            return;
+        }
 
         self.resume_prompt(ui.ctx(), text);
     }
