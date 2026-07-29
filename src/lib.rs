@@ -29,6 +29,7 @@ mod tcp_connect;
 mod tiny_pack_codec;
 mod transfer_memory;
 pub mod windows_elevation;
+mod windows_file_replace;
 mod windows_setup;
 
 include!("cli_main.rs");

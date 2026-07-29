@@ -12,6 +12,7 @@ use crate::striped_file;
 use crate::tcp_connect;
 use crate::tiny_pack_codec::{self, TinyPackEncoding};
 use crate::transfer_memory;
+use crate::windows_file_replace;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -50,6 +51,12 @@ const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub const DEFAULT_DATA_STREAMS: usize = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DestinationMode {
+    Fresh,
+    UpdateFast,
+}
 
 #[derive(Debug)]
 pub struct MultistreamCopyReport {
@@ -306,6 +313,12 @@ struct TransferAck {
 struct ReceiverReady {
     summary: ManifestSummary,
     completed_stripes: BTreeSet<ResumeStripe>,
+    unchanged_file_ids: BTreeSet<usize>,
+}
+
+#[derive(Debug)]
+struct PreparedDestination {
+    journal: ResumeJournal,
     unchanged_file_ids: BTreeSet<usize>,
 }
 
@@ -703,11 +716,11 @@ fn send_internal(
         &receiver_ready.unchanged_file_ids,
     )?;
 
+    let effective_plan_stats = summarize_transfer_plan(&transfer_plan)?;
+
     if let Some(progress) = &progress {
         progress.set_completed(resume_application.logical_report.bytes_copied);
     }
-
-    let plan_stats = summarize_transfer_plan(&transfer_plan)?;
 
     let data_started = Instant::now();
     let source_root = Arc::new(source_root);
@@ -747,7 +760,7 @@ fn send_internal(
         transferred_sender_report,
     ])?;
 
-    validate_tiny_pack_plan(&sender_report, plan_stats)?;
+    validate_tiny_pack_plan(&sender_report, effective_plan_stats)?;
 
     if let Some(progress) = &progress {
         progress.check_cancelled()?;
@@ -865,6 +878,25 @@ pub(crate) fn receive_on_listener_with_progress(
     receive_on_listener_internal(listener, destination_root, Some(progress))
 }
 
+#[expect(
+    dead_code,
+    reason = "used by the upcoming GUI update-mode controls",
+)]
+pub(crate) fn receive_on_listener_with_progress_and_mode(
+    listener: &TcpListener,
+    destination_root: &Path,
+    progress: ProgressCounter,
+    destination_mode: DestinationMode,
+) -> io::Result<ReceiveReport> {
+    run_server_with_mode(
+        listener,
+        destination_root.to_path_buf(),
+        Arc::new(TransferFault::disabled()),
+        Some(progress),
+        destination_mode,
+    )
+}
+
 fn receive_on_listener_internal(
     listener: &TcpListener,
     destination_root: &Path,
@@ -883,6 +915,22 @@ fn run_server(
     destination_root: PathBuf,
     fault_injection: Arc<TransferFault>,
     progress: Option<ProgressCounter>,
+) -> io::Result<ReceiveReport> {
+    run_server_with_mode(
+        listener,
+        destination_root,
+        fault_injection,
+        progress,
+        DestinationMode::Fresh,
+    )
+}
+
+fn run_server_with_mode(
+    listener: &TcpListener,
+    destination_root: PathBuf,
+    fault_injection: Arc<TransferFault>,
+    progress: Option<ProgressCounter>,
+    destination_mode: DestinationMode,
 ) -> io::Result<ReceiveReport> {
     let (mut control_stream, data_streams, accepted_session) =
         accept_session(listener, progress.as_ref())?;
@@ -903,20 +951,30 @@ fn run_server(
 
     let mut transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
 
-    let resume_journal = prepare_destination(
+    let PreparedDestination {
+        journal: resume_journal,
+        unchanged_file_ids,
+    } = prepare_destination(
         &destination_root,
         &manifest,
         summary,
         data_stream_count,
         &transfer_plan,
+        destination_mode,
     )?;
+
+    let completed_stripes = resume_journal
+        .completed_stripes()
+        .filter(|stripe| {
+            usize::try_from(stripe.file_id)
+                .map_or(true, |file_id| !unchanged_file_ids.contains(&file_id))
+        })
+        .collect();
 
     let receiver_ready = ReceiverReady {
         summary,
-
-        completed_stripes: resume_journal.completed_stripes().collect(),
-
-        unchanged_file_ids: BTreeSet::new(),
+        completed_stripes,
+        unchanged_file_ids,
     };
 
     let resume_application = apply_resume_offer(
@@ -1211,7 +1269,8 @@ fn prepare_destination(
     summary: ManifestSummary,
     data_stream_count: usize,
     transfer_plan: &TransferPlan,
-) -> io::Result<ResumeJournal> {
+    destination_mode: DestinationMode,
+) -> io::Result<PreparedDestination> {
     if destination_root.try_exists()? {
         let root_metadata = fs::metadata(destination_root)?;
 
@@ -1228,13 +1287,30 @@ fn prepare_destination(
         let journal_path = destination_root.join(JOURNAL_FILE_NAME);
 
         if journal_path.try_exists()? {
-            return prepare_resume_destination(
+            let unchanged_file_ids = if destination_mode == DestinationMode::UpdateFast {
+                let inventory = destination_inventory::compare_fast(destination_root, manifest)?;
+
+                validate_update_inventory(destination_root, &inventory)?;
+
+                inventory.unchanged_file_ids
+            } else {
+                BTreeSet::new()
+            };
+
+            let journal = prepare_resume_destination(
                 destination_root,
                 manifest,
                 summary,
                 data_stream_count,
                 transfer_plan,
-            );
+                &unchanged_file_ids,
+                destination_mode == DestinationMode::UpdateFast,
+            )?;
+
+            return Ok(PreparedDestination {
+                journal,
+                unchanged_file_ids,
+            });
         }
 
         let mut entries = fs::read_dir(destination_root)?;
@@ -1242,24 +1318,68 @@ fn prepare_destination(
         if entries.next().transpose()?.is_some() {
             let inventory = destination_inventory::compare_fast(destination_root, manifest)?;
 
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!(
-                    "destination directory is not empty and update mode is not enabled: {}. Fast comparison found {} unchanged file(s) / {} byte(s), {} changed file(s), {} missing file(s), and {} conflicting entry or entries",
-                    destination_root.display(),
-                    inventory.unchanged_files(),
-                    inventory.unchanged_bytes,
-                    inventory.changed_files,
-                    inventory.missing_files,
-                    inventory.conflicting_entries,
-                ),
-            ));
+            if destination_mode == DestinationMode::Fresh {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "destination directory is not empty and update mode is not enabled: {}. Fast comparison found {} unchanged file(s) / {} byte(s), {} changed file(s), {} missing file(s), and {} conflicting entry or entries",
+                        destination_root.display(),
+                        inventory.unchanged_files(),
+                        inventory.unchanged_bytes,
+                        inventory.changed_files,
+                        inventory.missing_files,
+                        inventory.conflicting_entries,
+                    ),
+                ));
+            }
+
+            validate_update_inventory(destination_root, &inventory)?;
+
+            let unchanged_file_ids = inventory.unchanged_file_ids;
+
+            let journal = prepare_update_destination(
+                destination_root,
+                manifest,
+                summary,
+                data_stream_count,
+                &unchanged_file_ids,
+            )?;
+
+            return Ok(PreparedDestination {
+                journal,
+                unchanged_file_ids,
+            });
         }
     } else {
         fs::create_dir_all(destination_root)?;
     }
 
-    prepare_fresh_destination(destination_root, manifest, summary, data_stream_count)
+    let journal =
+        prepare_fresh_destination(destination_root, manifest, summary, data_stream_count)?;
+
+    Ok(PreparedDestination {
+        journal,
+
+        unchanged_file_ids: BTreeSet::new(),
+    })
+}
+
+fn validate_update_inventory(
+    destination_root: &Path,
+    inventory: &destination_inventory::DestinationInventory,
+) -> io::Result<()> {
+    if inventory.conflicting_entries == 0 {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "destination contains {} conflicting entry or entries at source file paths and cannot be updated safely: {}",
+            inventory.conflicting_entries,
+            destination_root.display(),
+        ),
+    ))
 }
 
 fn prepare_fresh_destination(
@@ -1294,12 +1414,53 @@ fn prepare_fresh_destination(
     ResumeJournal::load_existing(destination_root, summary.fingerprint, data_stream_count)
 }
 
+fn prepare_update_destination(
+    destination_root: &Path,
+    manifest: &[ManifestEntry],
+    summary: ManifestSummary,
+    data_stream_count: usize,
+    unchanged_file_ids: &BTreeSet<usize>,
+) -> io::Result<ResumeJournal> {
+    for (file_id, entry) in manifest.iter().enumerate() {
+        create_destination_parent(destination_root, entry)?;
+
+        let final_path = destination_root.join(&entry.relative_path);
+
+        let temporary_path = temporary_path(&final_path, file_id);
+
+        remove_file_if_present(&temporary_path)?;
+
+        if unchanged_file_ids.contains(&file_id) {
+            continue;
+        }
+
+        if entry.class != FileClass::Large {
+            continue;
+        }
+
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_path)?;
+
+        file.set_len(entry.file_size)?;
+    }
+
+    let journal = ResumeJournal::new(summary.fingerprint, data_stream_count)?;
+
+    journal.save_atomic(destination_root)?;
+
+    ResumeJournal::load_existing(destination_root, summary.fingerprint, data_stream_count)
+}
+
 fn prepare_resume_destination(
     destination_root: &Path,
     manifest: &[ManifestEntry],
     summary: ManifestSummary,
     data_stream_count: usize,
     transfer_plan: &TransferPlan,
+    unchanged_file_ids: &BTreeSet<usize>,
+    preserve_existing_final: bool,
 ) -> io::Result<ResumeJournal> {
     let root_metadata = fs::metadata(destination_root)?;
 
@@ -1327,6 +1488,11 @@ fn prepare_resume_destination(
 
         let temporary_path = temporary_path(&final_path, file_id);
 
+        if unchanged_file_ids.contains(&file_id) {
+            remove_file_if_present(&temporary_path)?;
+            continue;
+        }
+
         match entry.class {
             FileClass::Large => {
                 prepare_resume_large_file(
@@ -1336,13 +1502,16 @@ fn prepare_resume_destination(
                     &temporary_path,
                     transfer_plan,
                     &completed_stripes,
+                    preserve_existing_final,
                 )?;
             }
 
             FileClass::Medium | FileClass::Tiny => {
                 remove_file_if_present(&temporary_path)?;
 
-                remove_file_if_present(&final_path)?;
+                if !preserve_existing_final {
+                    remove_file_if_present(&final_path)?;
+                }
             }
         }
     }
@@ -1369,6 +1538,7 @@ fn prepare_resume_large_file(
     temporary_path: &Path,
     transfer_plan: &TransferPlan,
     completed_stripes: &BTreeSet<ResumeStripe>,
+    preserve_existing_final: bool,
 ) -> io::Result<()> {
     let final_exists = final_path.try_exists()?;
 
@@ -1391,6 +1561,10 @@ fn prepare_resume_large_file(
             }
 
             validate_resume_file(final_path, entry.file_size, "finalized large file")
+        }
+
+        (true, true) if preserve_existing_final => {
+            validate_resume_file(temporary_path, entry.file_size, "partial update file")
         }
 
         (true, true) => Err(io::Error::new(
@@ -2854,7 +3028,7 @@ fn receive_buffered_tiny_file(
 
     drop(file);
 
-    fs::rename(temporary_path, final_path)
+    windows_file_replace::replace(&temporary_path, &final_path)
 }
 
 fn receive_file_stripe(
@@ -2946,7 +3120,7 @@ fn finalize_large_files(destination_root: &Path, manifest: &[ManifestEntry]) -> 
             (false, true) => {
                 validate_resume_file(&temporary_path, entry.file_size, "striped temporary file")?;
 
-                fs::rename(temporary_path, final_path)?;
+                windows_file_replace::replace(&temporary_path, &final_path)?;
             }
 
             (true, false) => {
@@ -3028,7 +3202,7 @@ fn receive_file(
 
     drop(file);
 
-    fs::rename(temporary_path, final_path)?;
+    windows_file_replace::replace(&temporary_path, &final_path)?;
 
     Ok(compressed)
 }
@@ -3511,11 +3685,11 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReceiverReady, TINY_PACK_TARGET_BYTES, TransferFault, TransferTask, accept_session,
-        apply_resume_offer, build_transfer_plan, connect_with_retry_config, read_receiver_ready,
-        receive_once, run, run_with_fault, send, temporary_path, tiny_pack_record_wire_bytes,
-        validate_resume_offer, validate_source_metadata, verify_content_digest,
-        write_receiver_ready,
+        DestinationMode, ReceiverReady, TINY_PACK_TARGET_BYTES, TransferFault, TransferTask,
+        accept_session, apply_resume_offer, build_transfer_plan, connect_with_retry_config,
+        prepare_destination, read_receiver_ready, receive_once, run, run_with_fault, send,
+        temporary_path, tiny_pack_record_wire_bytes, validate_resume_offer,
+        validate_source_metadata, verify_content_digest, write_receiver_ready,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::file_metadata;
@@ -4375,5 +4549,126 @@ mod tests {
             file_attributes: 0,
             class,
         }
+    }
+
+    fn temporary_directory(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        env::temp_dir().join(format!("networkcopy-{name}-{}-{unique}", process::id()))
+    }
+
+    #[test]
+    fn update_preparation_preserves_old_files_and_offers_exact_matches() {
+        let root = temporary_directory("update-preparation");
+
+        fs::create_dir_all(&root).unwrap();
+
+        let unchanged_path = root.join("unchanged.bin");
+
+        let changed_path = root.join("changed.bin");
+
+        let large_path = root.join("large.bin");
+
+        let unrelated_path = root.join("unrelated.bin");
+
+        fs::write(&unchanged_path, b"unchanged").unwrap();
+
+        fs::write(&changed_path, b"old changed contents").unwrap();
+
+        fs::write(&large_path, vec![0x11_u8; 1024]).unwrap();
+
+        fs::write(&unrelated_path, b"leave me alone").unwrap();
+
+        let unchanged_metadata = fs::metadata(&unchanged_path).unwrap();
+
+        let changed_metadata = fs::metadata(&changed_path).unwrap();
+
+        let large_metadata = fs::metadata(&large_path).unwrap();
+
+        let manifest = vec![
+            ManifestEntry {
+                relative_path: PathBuf::from("unchanged.bin"),
+
+                file_size: unchanged_metadata.len(),
+
+                last_write_time: unchanged_metadata.last_write_time(),
+
+                file_attributes: unchanged_metadata.file_attributes(),
+
+                class: FileClass::Tiny,
+            },
+            ManifestEntry {
+                relative_path: PathBuf::from("changed.bin"),
+
+                file_size: changed_metadata.len(),
+
+                last_write_time: changed_metadata.last_write_time().checked_add(1).unwrap(),
+
+                file_attributes: changed_metadata.file_attributes(),
+
+                class: FileClass::Medium,
+            },
+            ManifestEntry {
+                relative_path: PathBuf::from("missing.bin"),
+
+                file_size: 123,
+
+                last_write_time: 456,
+
+                file_attributes: 0,
+
+                class: FileClass::Tiny,
+            },
+            ManifestEntry {
+                relative_path: PathBuf::from("large.bin"),
+
+                file_size: large_metadata.len(),
+
+                last_write_time: large_metadata.last_write_time().checked_add(1).unwrap(),
+
+                file_attributes: large_metadata.file_attributes(),
+
+                class: FileClass::Large,
+            },
+        ];
+
+        let summary = ManifestSummary {
+            entries: manifest.len() as u64,
+
+            total_file_bytes: manifest.iter().map(|entry| entry.file_size).sum(),
+
+            fingerprint: 0x1234_5678_9ABC_DEF0,
+        };
+
+        let transfer_plan = build_transfer_plan(&manifest, 2).unwrap();
+
+        let prepared = prepare_destination(
+            &root,
+            &manifest,
+            summary,
+            2,
+            &transfer_plan,
+            DestinationMode::UpdateFast,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.unchanged_file_ids, BTreeSet::from([0_usize]),);
+
+        assert_eq!(fs::read(&changed_path).unwrap(), b"old changed contents",);
+
+        assert_eq!(fs::read(&unrelated_path).unwrap(), b"leave me alone",);
+
+        let large_temporary = temporary_path(&large_path, 3);
+
+        assert_eq!(fs::metadata(large_temporary).unwrap().len(), 1024,);
+
+        assert!(root.join(JOURNAL_FILE_NAME).exists());
+
+        drop(prepared);
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
