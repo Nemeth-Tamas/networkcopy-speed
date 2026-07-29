@@ -480,7 +480,7 @@ mod tests {
             },
             TinyFileWriteRun {
                 worker_count: 2,
-                elapsed: Duration::from_millis(104),
+                elapsed: Duration::from_millis(105),
             },
             TinyFileWriteRun {
                 worker_count: 4,
@@ -488,7 +488,7 @@ mod tests {
             },
             TinyFileWriteRun {
                 worker_count: 8,
-                elapsed: Duration::from_millis(99),
+                elapsed: Duration::from_millis(101),
             },
         ];
 

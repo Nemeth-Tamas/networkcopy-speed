@@ -279,13 +279,13 @@ impl TinyFileMaterializerHandle {
                 ));
             }
 
-            if let Some(progress) = &self.inner.progress {
-                if let Err(error) = progress.check_cancelled() {
-                    record_failure_locked(&mut state, &error);
-                    self.inner.changed.notify_all();
+            if let Some(progress) = &self.inner.progress
+                && let Err(error) = progress.check_cancelled()
+            {
+                record_failure_locked(&mut state, &error);
+                self.inner.changed.notify_all();
 
-                    return Err(error);
-                }
+                return Err(error);
             }
 
             if state.jobs.len() < self.inner.queue_capacity {
@@ -323,13 +323,13 @@ impl TinyFileMaterializerHandle {
                 return Ok(());
             }
 
-            if let Some(progress) = &self.inner.progress {
-                if let Err(error) = progress.check_cancelled() {
-                    record_failure_locked(&mut state, &error);
-                    self.inner.changed.notify_all();
+            if let Some(progress) = &self.inner.progress
+                && let Err(error) = progress.check_cancelled()
+            {
+                record_failure_locked(&mut state, &error);
+                self.inner.changed.notify_all();
 
-                    return Err(error);
-                }
+                return Err(error);
             }
 
             let waited = self

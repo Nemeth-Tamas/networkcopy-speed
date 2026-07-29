@@ -1104,13 +1104,15 @@ fn run_server_with_mode(
                     .spawn_scoped(scope, move || {
                         receive_lane(
                             stream,
-                            lane_destination.as_path(),
-                            &lane_manifest,
                             &tasks,
-                            &lane_resume_journal,
-                            lane_fault_injection.as_ref(),
-                            &lane_tiny_materializer,
-                            lane_progress,
+                            ReceiveLaneContext {
+                                destination_root: lane_destination.as_path(),
+                                manifest: lane_manifest.as_slice(),
+                                resume_journal: lane_resume_journal.as_ref(),
+                                fault_injection: lane_fault_injection.as_ref(),
+                                tiny_materializer: &lane_tiny_materializer,
+                                progress: lane_progress,
+                            },
                         )
                     })?,
             );
@@ -2842,16 +2844,28 @@ fn validate_source_metadata(file: &File, path: &Path, entry: &ManifestEntry) -> 
     Ok(())
 }
 
+struct ReceiveLaneContext<'a> {
+    destination_root: &'a Path,
+    manifest: &'a [ManifestEntry],
+    resume_journal: &'a Mutex<ResumeJournal>,
+    fault_injection: &'a TransferFault,
+    tiny_materializer: &'a tiny_file_pool::TinyFileMaterializerHandle,
+    progress: Option<ProgressCounter>,
+}
+
 fn receive_lane(
     stream: TcpStream,
-    destination_root: &Path,
-    manifest: &[ManifestEntry],
     tasks: &[TransferTask],
-    resume_journal: &Mutex<ResumeJournal>,
-    fault_injection: &TransferFault,
-    tiny_materializer: &tiny_file_pool::TinyFileMaterializerHandle,
-    progress: Option<ProgressCounter>,
+    context: ReceiveLaneContext<'_>,
 ) -> io::Result<LaneReport> {
+    let ReceiveLaneContext {
+        destination_root,
+        manifest,
+        resume_journal,
+        fault_injection,
+        tiny_materializer,
+        progress,
+    } = context;
     let buffered = BufReader::with_capacity(NETWORK_BUFFER_BYTES, stream);
 
     let mut reader = CountingReader::new(buffered);
