@@ -27,6 +27,7 @@ mod resume_state;
 mod striped_file;
 mod tcp_connect;
 mod tiny_file_materialize;
+mod tiny_file_pool;
 mod tiny_file_write_bench;
 mod tiny_pack_codec;
 mod transfer_memory;

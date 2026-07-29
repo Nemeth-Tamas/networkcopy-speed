@@ -52,14 +52,19 @@ Implementation order:
 
 - [x] held-out shared Zstandard dictionary benchmark;
 - [x] dictionary-size matrix on synthetic and realistic tiny-file datasets;
-- [ ] adaptive receiver filesystem worker calibration;
-- [ ] bounded parallel tiny-file materialization;
+- [x] adaptive receiver filesystem worker calibration;
+- [x] bounded parallel tiny-file materialization;
 - [ ] final end-to-end tiny-file benchmark and telemetry.
 
 Shared Zstandard dictionaries were rejected after held-out testing. They did
 not improve complete-pack compression on synthetic or realistic tiny-file
 datasets once dictionary transmission was counted. The existing adaptive raw
 or complete-pack Zstandard strategy remains unchanged.
+
+Receiver filesystem calibration selected a shared two-worker tiny-file
+materialization pool. The pool is bounded globally across all TCP lanes,
+preserves per-file BLAKE3 verification and atomic replacement, and falls back
+to one worker on single-core systems.
 
 ## v1.3 highlights
 

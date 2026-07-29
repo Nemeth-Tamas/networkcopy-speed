@@ -10,7 +10,7 @@ use crate::manifest_scan::{self, FileClass, ManifestEntry};
 use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
 use crate::striped_file;
 use crate::tcp_connect;
-use crate::tiny_file_materialize;
+use crate::tiny_file_pool;
 use crate::tiny_pack_codec::{self, TinyPackEncoding};
 use crate::transfer_memory;
 use crate::update_verification::{self, FILE_DIGEST_BYTES, FileDigest};
@@ -203,6 +203,7 @@ impl MultistreamCopyReport {
 pub struct ReceiveReport {
     pub session_id: u64,
     pub data_stream_count: usize,
+    pub tiny_materialization_workers: usize,
     pub files_received: u64,
     pub bytes_received: u64,
     pub data_wire_bytes: u64,
@@ -227,6 +228,10 @@ impl ReceiveReport {
         println!("  Session ID:           {:016X}", self.session_id);
 
         println!("  TCP data streams:     {}", self.data_stream_count);
+        println!(
+            "  Tiny write workers:     {}",
+            self.tiny_materialization_workers,
+        );
 
         println!(
             "  Files received:       {}",
@@ -1068,7 +1073,16 @@ fn run_server_with_mode(
 
     let destination_root = Arc::new(destination_root);
 
-    let lane_reports = thread::scope(|scope| -> io::Result<Vec<LaneReport>> {
+    let tiny_materializer = tiny_file_pool::TinyFileMaterializer::start(
+        Arc::clone(&destination_root),
+        progress.clone(),
+    )?;
+
+    let tiny_materialization_workers = tiny_materializer.worker_count();
+
+    let tiny_materializer_handle = tiny_materializer.handle();
+
+    let lane_result = thread::scope(|scope| -> io::Result<Vec<LaneReport>> {
         let mut handles = Vec::with_capacity(data_stream_count);
 
         for (stream, tasks) in data_streams.into_iter().zip(transfer_plan.lanes) {
@@ -1082,6 +1096,8 @@ fn run_server_with_mode(
 
             let lane_progress = progress.clone();
 
+            let lane_tiny_materializer = tiny_materializer_handle.clone();
+
             handles.push(
                 thread::Builder::new()
                     .name("networkcopy-data-receiver".to_string())
@@ -1093,6 +1109,7 @@ fn run_server_with_mode(
                             &tasks,
                             &lane_resume_journal,
                             lane_fault_injection.as_ref(),
+                            &lane_tiny_materializer,
                             lane_progress,
                         )
                     })?,
@@ -1100,7 +1117,17 @@ fn run_server_with_mode(
         }
 
         join_lane_threads(handles)
-    })?;
+    });
+
+    let materializer_result = tiny_materializer.finish();
+
+    let lane_reports = match (lane_result, materializer_result) {
+        (Ok(reports), Ok(())) => reports,
+
+        (Err(error), _) => return Err(error),
+
+        (Ok(_), Err(error)) => return Err(error),
+    };
 
     let transferred_report = merge_lane_reports(lane_reports)?;
 
@@ -1154,6 +1181,8 @@ fn run_server_with_mode(
         session_id: accepted_session.session_id,
 
         data_stream_count,
+
+        tiny_materialization_workers,
 
         files_received: ack.files_copied,
 
@@ -2820,6 +2849,7 @@ fn receive_lane(
     tasks: &[TransferTask],
     resume_journal: &Mutex<ResumeJournal>,
     fault_injection: &TransferFault,
+    tiny_materializer: &tiny_file_pool::TinyFileMaterializerHandle,
     progress: Option<ProgressCounter>,
 ) -> io::Result<LaneReport> {
     let buffered = BufReader::with_capacity(NETWORK_BUFFER_BYTES, stream);
@@ -2899,11 +2929,11 @@ fn receive_lane(
             } => {
                 let transfer = receive_tiny_pack(
                     &mut reader,
-                    destination_root,
                     manifest,
                     file_ids,
                     *total_bytes,
                     &mut buffer,
+                    tiny_materializer,
                     progress.as_ref(),
                 )?;
 
@@ -3038,11 +3068,11 @@ fn checkpoint_completed_stripe(
 
 fn receive_tiny_pack(
     reader: &mut impl Read,
-    destination_root: &Path,
     manifest: &[ManifestEntry],
     file_ids: &[usize],
     expected_total_bytes: u64,
     buffer: &mut [u8],
+    tiny_materializer: &tiny_file_pool::TinyFileMaterializerHandle,
     progress: Option<&ProgressCounter>,
 ) -> io::Result<TinyPackTransferSummary> {
     let message = read_u8(reader)?;
@@ -3162,6 +3192,10 @@ fn receive_tiny_pack(
 
     verify_content_digest("tiny pack", &actual_pack_digest, &expected_pack_digest)?;
 
+    let payload: Arc<[u8]> = Arc::from(&buffer[..total_bytes]);
+
+    let mut materialization_requests = Vec::with_capacity(file_ids.len());
+
     let mut offset = 0_usize;
 
     for (&file_id, expected_digest) in file_ids.iter().zip(&expected_digests) {
@@ -3187,14 +3221,20 @@ fn receive_tiny_pack(
             .checked_add(file_bytes)
             .ok_or_else(|| io::Error::other("tiny-pack receive offset overflowed"))?;
 
-        let contents = buffer.get(offset..end).ok_or_else(|| {
+        let contents = payload.get(offset..end).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "tiny-pack file contents exceed the decoded payload",
             )
         })?;
 
-        receive_buffered_tiny_file(destination_root, file_id, entry, contents, expected_digest)?;
+        materialization_requests.push(prepare_buffered_tiny_file(
+            file_id,
+            entry,
+            contents,
+            expected_digest,
+            offset..end,
+        )?);
 
         offset = end;
     }
@@ -3206,6 +3246,8 @@ fn receive_tiny_pack(
         ));
     }
 
+    tiny_materializer.materialize_batch(payload, materialization_requests)?;
+
     Ok(TinyPackTransferSummary {
         summary,
 
@@ -3215,20 +3257,24 @@ fn receive_tiny_pack(
     })
 }
 
-fn receive_buffered_tiny_file(
-    destination_root: &Path,
+fn prepare_buffered_tiny_file(
     file_id: usize,
     entry: &ManifestEntry,
     contents: &[u8],
     expected_digest: &[u8; CONTENT_DIGEST_BYTES],
-) -> io::Result<()> {
+    range: std::ops::Range<usize>,
+) -> io::Result<tiny_file_pool::TinyFileMaterializeRequest> {
     let actual_digest = *blake3::hash(contents).as_bytes();
 
     let context = format!("tiny file {file_id} ({})", entry.relative_path.display(),);
 
     verify_content_digest(&context, &actual_digest, expected_digest)?;
 
-    tiny_file_materialize::write_verified(destination_root, file_id, &entry.relative_path, contents)
+    Ok(tiny_file_pool::TinyFileMaterializeRequest::new(
+        file_id,
+        entry.relative_path.clone(),
+        range,
+    ))
 }
 
 fn receive_file_stripe(
