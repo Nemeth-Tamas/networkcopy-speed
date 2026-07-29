@@ -325,9 +325,9 @@ impl Text {
 
         elevation_failed: "A fogadás rendszergazdai indítása nem sikerült",
 
-        development_status: "v1.2 fejlesztői felület",
+        development_status: "Készen áll az átvitelre",
 
-        engine_pending: "A félbemaradt átvitelek beállításait a program automatikusan megőrzi a későbbi folytatáshoz.",
+        engine_pending: "Válassza ki a kapcsolatot és a mappát, majd indítsa el az átvitelt. A félbemaradt műveletek később folytathatók.",
     };
 
     const ENGLISH: Self = Self {
@@ -433,9 +433,9 @@ impl Text {
 
         elevation_failed: "Failed to start the receiver with administrator privileges",
 
-        development_status: "v1.2 development interface",
+        development_status: "Ready to transfer",
 
-        engine_pending: "Interrupted transfer settings are saved automatically so the operation can be resumed later.",
+        engine_pending: "Choose the connection and folder, then start the transfer. Interrupted operations can be resumed later.",
     };
 }
 

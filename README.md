@@ -22,14 +22,13 @@ The repository currently contains:
 
 ## Current status
 
-Current development version:
+Current release:
 
 ```text
-1.2.0-dev
+1.2.0
 ```
 
-v1.2 GUI functionality is complete and currently in final visual-polish and
-release preparation.
+v1.2 is the current stable release.
 
 The GUI includes:
 
