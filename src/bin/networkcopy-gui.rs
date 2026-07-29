@@ -4,6 +4,7 @@
 )]
 
 use eframe::egui;
+use networkcopy_speed::gui_session;
 use networkcopy_speed::gui_transfer::{
     GuiConnectionMode, GuiTransferControl, GuiTransferProgress, GuiTransferRequest,
     GuiTransferSummary, run_gui_transfer_with_control,
@@ -180,6 +181,16 @@ struct Text {
     cancelling: &'static str,
     cancelled: &'static str,
     cancelled_detail: &'static str,
+    resume_title: &'static str,
+    resume_question: &'static str,
+    resume_direction: &'static str,
+    resume_folder: &'static str,
+    resume_connection: &'static str,
+    resume_continue: &'static str,
+    resume_discard: &'static str,
+    session_save_failed: &'static str,
+    session_load_failed: &'static str,
+    session_clear_failed: &'static str,
     completed: &'static str,
     failed: &'static str,
     files: &'static str,
@@ -253,6 +264,26 @@ impl Text {
 
         cancelled_detail: "Az átvitel biztonságosan leállt. A fogadóoldalon elkészült nagyfájl-részletek megmaradnak a későbbi folytatáshoz.",
 
+        resume_title: "Megszakadt átvitel",
+
+        resume_question: "Találtam egy korábban félbemaradt átvitelt. Folytatja ugyanazokkal a beállításokkal?",
+
+        resume_direction: "Művelet",
+
+        resume_folder: "Mappa",
+
+        resume_connection: "Kapcsolat",
+
+        resume_continue: "Folytatás",
+
+        resume_discard: "Elvetés",
+
+        session_save_failed: "Nem sikerült elmenteni a folytatáshoz szükséges adatokat",
+
+        session_load_failed: "Nem sikerült betölteni a félbemaradt átvitelt",
+
+        session_clear_failed: "Nem sikerült törölni a befejezett átvitel folytatási adatait",
+
         completed: "Az átvitel sikeresen befejeződött",
 
         failed: "Az átvitel sikertelen",
@@ -281,7 +312,7 @@ impl Text {
 
         development_status: "v1.2 fejlesztői felület",
 
-        engine_pending: "Az Indítás gomb már valódi átvitelt végez. A részletes élő folyamatjelzés és a megszakítás holnap érkezik.",
+        engine_pending: "A félbemaradt átvitelek beállításait a program automatikusan megőrzi a későbbi folytatáshoz.",
     };
 
     const ENGLISH: Self = Self {
@@ -339,6 +370,26 @@ impl Text {
 
         cancelled_detail: "The transfer stopped safely. Completed large-file stripes remain available on the receiver for a later resume.",
 
+        resume_title: "Interrupted transfer",
+
+        resume_question: "A previous transfer did not finish. Continue it using the same settings?",
+
+        resume_direction: "Operation",
+
+        resume_folder: "Folder",
+
+        resume_connection: "Connection",
+
+        resume_continue: "Continue",
+
+        resume_discard: "Discard",
+
+        session_save_failed: "Failed to save the information required to resume this transfer",
+
+        session_load_failed: "Failed to load the interrupted transfer",
+
+        session_clear_failed: "Failed to remove the completed transfer's resume information",
+
         completed: "Transfer completed successfully",
 
         failed: "Transfer failed",
@@ -367,7 +418,7 @@ impl Text {
 
         development_status: "v1.2 development interface",
 
-        engine_pending: "The Start button now performs a real transfer. Detailed live progress and cancellation arrive tomorrow.",
+        engine_pending: "Interrupted transfer settings are saved automatically so the operation can be resumed later.",
     };
 }
 
@@ -392,12 +443,33 @@ struct NetworkCopyGui {
     last_error: Option<String>,
 
     last_cancelled: bool,
+
+    pending_session: Option<GuiTransferRequest>,
+
+    show_resume_prompt: bool,
+
+    session_warning: Option<String>,
 }
 
 impl NetworkCopyGui {
     fn new() -> Self {
+        let language = Language::initial();
+
+        let text = language.text();
+
+        let (pending_session, session_warning) = match gui_session::load_latest() {
+            Ok(session) => (session, None),
+
+            Err(error) => (
+                None,
+                Some(format!("{}: {error}", text.session_load_failed,)),
+            ),
+        };
+
+        let show_resume_prompt = pending_session.is_some();
+
         Self {
-            language: Language::initial(),
+            language,
 
             mode: TransferMode::Send,
 
@@ -425,6 +497,12 @@ impl NetworkCopyGui {
             last_error: None,
 
             last_cancelled: false,
+
+            pending_session,
+
+            show_resume_prompt,
+
+            session_warning,
         }
     }
 
@@ -574,6 +652,157 @@ impl NetworkCopyGui {
         }
     }
 
+    fn apply_request(&mut self, request: &GuiTransferRequest) {
+        match request {
+            GuiTransferRequest::Send {
+                connection,
+                source_root,
+                worker_count,
+                calibration_mib,
+            } => {
+                self.mode = TransferMode::Send;
+
+                self.source_folder = source_root.display().to_string();
+
+                self.scanner_workers = *worker_count;
+
+                self.calibration_mib = *calibration_mib;
+
+                self.apply_connection(TransferMode::Send, *connection);
+            }
+
+            GuiTransferRequest::Receive {
+                connection,
+                destination_root,
+            } => {
+                self.mode = TransferMode::Receive;
+
+                self.destination_folder = destination_root.display().to_string();
+
+                self.apply_connection(TransferMode::Receive, *connection);
+            }
+        }
+    }
+
+    fn apply_connection(&mut self, mode: TransferMode, connection: GuiConnectionMode) {
+        match connection {
+            GuiConnectionMode::Direct => {
+                self.connection = ConnectionChoice::Direct;
+            }
+
+            GuiConnectionMode::Address(address) => {
+                self.connection = ConnectionChoice::Address;
+
+                match mode {
+                    TransferMode::Send => {
+                        self.receiver_address = address.to_string();
+                    }
+
+                    TransferMode::Receive => {
+                        self.bind_address = address.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    fn resume_pending(&mut self, text: Text) {
+        let Some(request) = self.pending_session.clone() else {
+            return;
+        };
+
+        self.apply_request(&request);
+
+        self.show_resume_prompt = false;
+
+        self.start_transfer(text);
+    }
+
+    fn discard_pending(&mut self, text: Text) {
+        let Some(request) = self.pending_session.take() else {
+            self.show_resume_prompt = false;
+
+            return;
+        };
+
+        match gui_session::clear(&request) {
+            Ok(()) => match gui_session::load_latest() {
+                Ok(next) => {
+                    self.pending_session = next;
+
+                    self.show_resume_prompt = self.pending_session.is_some();
+                }
+
+                Err(error) => {
+                    self.show_resume_prompt = false;
+
+                    self.session_warning = Some(format!("{}: {error}", text.session_load_failed,));
+                }
+            },
+
+            Err(error) => {
+                self.show_resume_prompt = false;
+
+                self.session_warning = Some(format!("{}: {error}", text.session_clear_failed,));
+            }
+        }
+    }
+
+    fn clear_completed_session(&mut self, text: Text) {
+        let Some(request) = self.pending_session.take() else {
+            return;
+        };
+
+        if let Err(error) = gui_session::clear(&request) {
+            self.session_warning = Some(format!("{}: {error}", text.session_clear_failed,));
+        }
+    }
+
+    fn resume_prompt(&mut self, context: &egui::Context, text: Text) {
+        if !self.show_resume_prompt || self.transfer_receiver.is_some() {
+            return;
+        }
+
+        let Some(request) = self.pending_session.clone() else {
+            self.show_resume_prompt = false;
+
+            return;
+        };
+
+        let mut resume = false;
+
+        let mut discard = false;
+
+        egui::Window::new(text.resume_title)
+            .id(egui::Id::new("networkcopy_resume_prompt"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(context, |ui| {
+                ui.set_min_width(440.0);
+
+                ui.label(text.resume_question);
+
+                ui.add_space(12.0);
+
+                resume_request_summary(ui, text, &request);
+
+                ui.add_space(16.0);
+
+                ui.horizontal(|ui| {
+                    resume = ui.button(text.resume_continue).clicked();
+
+                    discard = ui.button(text.resume_discard).clicked();
+                });
+            });
+
+        if resume {
+            self.resume_pending(text);
+        } else if discard {
+            self.discard_pending(text);
+        }
+    }
+
     fn start_transfer(&mut self, text: Text) {
         if self.transfer_receiver.is_some() {
             return;
@@ -592,6 +821,22 @@ impl NetworkCopyGui {
                 return;
             }
         };
+
+        let session_request = request.clone();
+
+        match gui_session::save(&session_request) {
+            Ok(_path) => {
+                self.session_warning = None;
+            }
+
+            Err(error) => {
+                self.session_warning = Some(format!("{}: {error}", text.session_save_failed,));
+            }
+        }
+
+        self.pending_session = Some(session_request);
+
+        self.show_resume_prompt = false;
 
         let control = GuiTransferControl::new();
 
@@ -687,6 +932,8 @@ impl NetworkCopyGui {
 
         match outcome {
             TransferOutcome::Completed(summary) => {
+                self.clear_completed_session(text);
+
                 self.last_summary = Some(summary);
 
                 self.last_error = None;
@@ -859,6 +1106,60 @@ impl NetworkCopyGui {
             self.live_progress_panel(ui, text);
         }
     }
+
+    fn status_panel(&mut self, ui: &mut egui::Ui, text: Text) {
+        if let Some(warning) = &self.session_warning {
+            ui.label(egui::RichText::new(warning).italics());
+
+            ui.add_space(8.0);
+        }
+
+        let can_resume = self.pending_session.is_some() && self.transfer_receiver.is_none();
+
+        if let Some(error) = self.last_error.clone() {
+            let mut resume = false;
+
+            ui.group(|ui| {
+                ui.label(egui::RichText::new(text.failed).strong());
+
+                ui.label(error);
+
+                if can_resume {
+                    ui.add_space(8.0);
+
+                    resume = ui.button(text.resume_continue).clicked();
+                }
+            });
+
+            if resume {
+                self.resume_pending(text);
+            }
+        } else if self.last_cancelled {
+            let mut resume = false;
+
+            ui.group(|ui| {
+                ui.label(egui::RichText::new(text.cancelled).strong());
+
+                ui.label(text.cancelled_detail);
+
+                if can_resume {
+                    ui.add_space(8.0);
+
+                    resume = ui.button(text.resume_continue).clicked();
+                }
+            });
+
+            if resume {
+                self.resume_pending(text);
+            }
+        } else if self.last_summary.is_some() {
+            self.summary_panel(ui, text);
+        } else {
+            ui.label(egui::RichText::new(text.development_status).strong());
+
+            ui.label(text.engine_pending);
+        }
+    }
 }
 
 impl eframe::App for NetworkCopyGui {
@@ -922,27 +1223,77 @@ impl eframe::App for NetworkCopyGui {
             ui.separator();
             ui.add_space(10.0);
 
-            if let Some(error) = &self.last_error {
-                ui.group(|ui| {
-                    ui.label(egui::RichText::new(text.failed).strong());
+            self.status_panel(ui, text);
+        });
 
-                    ui.label(error);
-                });
-            } else if self.last_cancelled {
-                ui.group(|ui| {
-                    ui.label(egui::RichText::new(text.cancelled).strong());
+        self.resume_prompt(ui.ctx(), text);
+    }
+}
 
-                    ui.label(text.cancelled_detail);
-                });
-            } else if self.last_summary.is_some() {
-                self.summary_panel(ui, text);
-            } else {
-                ui.label(egui::RichText::new(text.development_status).strong());
+fn resume_request_summary(ui: &mut egui::Ui, text: Text, request: &GuiTransferRequest) {
+    let (direction, folder, connection, send_options) = match request {
+        GuiTransferRequest::Send {
+            connection,
+            source_root,
+            worker_count,
+            calibration_mib,
+        } => (
+            text.send,
+            source_root,
+            *connection,
+            Some((*worker_count, *calibration_mib)),
+        ),
 
-                ui.label(text.engine_pending);
+        GuiTransferRequest::Receive {
+            connection,
+            destination_root,
+        } => (text.receive, destination_root, *connection, None),
+    };
+
+    let connection = match connection {
+        GuiConnectionMode::Direct => text.direct_connection.to_string(),
+
+        GuiConnectionMode::Address(address) => {
+            format!("{} — {address}", text.ip_connection,)
+        }
+    };
+
+    egui::Grid::new("resume_request_summary")
+        .num_columns(2)
+        .spacing([24.0, 8.0])
+        .show(ui, |ui| {
+            ui.label(text.resume_direction);
+
+            ui.label(direction);
+
+            ui.end_row();
+
+            ui.label(text.resume_folder);
+
+            ui.label(folder.display().to_string());
+
+            ui.end_row();
+
+            ui.label(text.resume_connection);
+
+            ui.label(connection);
+
+            ui.end_row();
+
+            if let Some((worker_count, calibration_mib)) = send_options {
+                ui.label(text.scanner_workers);
+
+                ui.label(worker_count.to_string());
+
+                ui.end_row();
+
+                ui.label(text.calibration_mib);
+
+                ui.label(calibration_mib.to_string());
+
+                ui.end_row();
             }
         });
-    }
 }
 
 fn localized_phase(language: Language, phase: &str) -> String {

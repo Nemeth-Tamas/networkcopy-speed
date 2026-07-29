@@ -911,6 +911,11 @@ Implementation progress:
 * [x] in-window success and failure summaries
 * [x] live phase, byte, percentage, and throughput progress
 * [x] cooperative Cancel during calibration and payload transfer
+* [x] persistent interrupted-transfer request records
+* [x] executable-directory storage with LocalAppData fallback
+* [x] startup resume prompt with one-click restart
+* [x] separate sender and receiver records for loopback development
+* [x] automatic session-record cleanup after successful transfer
 * [ ] immediate Cancel while waiting in Direct Link discovery
 * [x] no separate or duplicated networking implementation
 

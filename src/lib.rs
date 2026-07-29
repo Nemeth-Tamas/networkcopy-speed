@@ -13,6 +13,7 @@ mod direct_route;
 mod direct_tcp;
 mod direct_transfer;
 mod file_metadata;
+pub mod gui_session;
 pub mod gui_transfer;
 mod iocp_copy;
 mod iocp_file_probe;
