@@ -5,14 +5,15 @@
 
 use eframe::egui;
 use networkcopy_speed::gui_transfer::{
-    GuiConnectionMode, GuiTransferRequest, GuiTransferSummary, run_gui_transfer,
+    GuiConnectionMode, GuiTransferControl, GuiTransferProgress, GuiTransferRequest,
+    GuiTransferSummary, run_gui_transfer_with_control,
 };
 use rfd::FileDialog;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const APP_NAME: &str = "NetworkCopy Speed Edition";
 
@@ -75,6 +76,81 @@ enum ConnectionChoice {
     Address,
 }
 
+enum TransferOutcome {
+    Completed(GuiTransferSummary),
+
+    Cancelled,
+
+    Failed(String),
+}
+
+struct LiveProgress {
+    phase: String,
+    completed: u64,
+    total: u64,
+    cancel_requested: bool,
+    phase_started: Instant,
+    phase_start_completed: u64,
+}
+
+impl LiveProgress {
+    fn new(snapshot: GuiTransferProgress) -> Self {
+        Self {
+            phase: snapshot.phase,
+
+            completed: snapshot.completed,
+
+            total: snapshot.total,
+
+            cancel_requested: snapshot.cancel_requested,
+
+            phase_started: Instant::now(),
+
+            phase_start_completed: snapshot.completed,
+        }
+    }
+
+    fn update(&mut self, snapshot: GuiTransferProgress) {
+        let phase_changed = self.phase != snapshot.phase;
+
+        let counter_restarted = snapshot.completed < self.completed;
+
+        if phase_changed || counter_restarted {
+            self.phase_started = Instant::now();
+
+            self.phase_start_completed = snapshot.completed;
+        }
+
+        self.phase = snapshot.phase;
+
+        self.completed = snapshot.completed;
+
+        self.total = snapshot.total;
+
+        self.cancel_requested = snapshot.cancel_requested;
+    }
+
+    fn fraction(&self) -> f32 {
+        if self.total == 0 {
+            return 0.0;
+        }
+
+        (self.completed.min(self.total) as f64 / self.total as f64).clamp(0.0, 1.0) as f32
+    }
+
+    fn megabytes_per_second(&self) -> f64 {
+        let elapsed = self.phase_started.elapsed();
+
+        if elapsed.is_zero() {
+            return 0.0;
+        }
+
+        let phase_bytes = self.completed.saturating_sub(self.phase_start_completed);
+
+        phase_bytes as f64 / elapsed.as_secs_f64() / 1_000_000.0
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Text {
     subtitle: &'static str,
@@ -101,6 +177,9 @@ struct Text {
     start: &'static str,
     cancel: &'static str,
     running: &'static str,
+    cancelling: &'static str,
+    cancelled: &'static str,
+    cancelled_detail: &'static str,
     completed: &'static str,
     failed: &'static str,
     files: &'static str,
@@ -166,7 +245,13 @@ impl Text {
 
         cancel: "Megszakítás",
 
-        running: "Az átvitel folyamatban…",
+        running: "Az átvitel folyamatban",
+
+        cancelling: "Megszakítás folyamatban…",
+
+        cancelled: "Az átvitel megszakítva",
+
+        cancelled_detail: "Az átvitel biztonságosan leállt. A fogadóoldalon elkészült nagyfájl-részletek megmaradnak a későbbi folytatáshoz.",
 
         completed: "Az átvitel sikeresen befejeződött",
 
@@ -246,7 +331,13 @@ impl Text {
 
         cancel: "Cancel",
 
-        running: "Transfer in progress…",
+        running: "Transfer in progress",
+
+        cancelling: "Stopping transfer…",
+
+        cancelled: "Transfer stopped",
+
+        cancelled_detail: "The transfer stopped safely. Completed large-file stripes remain available on the receiver for a later resume.",
 
         completed: "Transfer completed successfully",
 
@@ -290,9 +381,17 @@ struct NetworkCopyGui {
     bind_address: String,
     scanner_workers: usize,
     calibration_mib: u64,
-    transfer_receiver: Option<Receiver<Result<GuiTransferSummary, String>>>,
+    transfer_receiver: Option<Receiver<TransferOutcome>>,
+
+    transfer_control: Option<GuiTransferControl>,
+
+    live_progress: Option<LiveProgress>,
+
     last_summary: Option<GuiTransferSummary>,
+
     last_error: Option<String>,
+
+    last_cancelled: bool,
 }
 
 impl NetworkCopyGui {
@@ -317,9 +416,15 @@ impl NetworkCopyGui {
 
             transfer_receiver: None,
 
+            transfer_control: None,
+
+            live_progress: None,
+
             last_summary: None,
 
             last_error: None,
+
+            last_cancelled: false,
         }
     }
 
@@ -482,31 +587,57 @@ impl NetworkCopyGui {
 
                 self.last_error = Some(error);
 
+                self.last_cancelled = false;
+
                 return;
             }
         };
+
+        let control = GuiTransferControl::new();
+
+        let worker_control = control.clone();
 
         let (sender, receiver) = mpsc::channel();
 
         let worker = thread::Builder::new()
             .name("networkcopy-gui-transfer".to_string())
             .spawn(move || {
-                let result = run_gui_transfer(request).map_err(|error| error.to_string());
+                let outcome = match run_gui_transfer_with_control(request, worker_control) {
+                    Ok(summary) => TransferOutcome::Completed(summary),
 
-                let _ = sender.send(result);
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                        TransferOutcome::Cancelled
+                    }
+
+                    Err(error) => TransferOutcome::Failed(error.to_string()),
+                };
+
+                let _ = sender.send(outcome);
             });
 
         match worker {
             Ok(_worker) => {
                 self.transfer_receiver = Some(receiver);
 
+                self.transfer_control = Some(control);
+
+                self.live_progress = None;
+
                 self.last_summary = None;
 
                 self.last_error = None;
+
+                self.last_cancelled = false;
             }
 
             Err(error) => {
+                self.transfer_control = None;
+
+                self.live_progress = None;
+
                 self.last_summary = None;
+
+                self.last_cancelled = false;
 
                 self.last_error = Some(format!("{}: {error}", text.worker_start_failed,));
             }
@@ -514,20 +645,34 @@ impl NetworkCopyGui {
     }
 
     fn poll_transfer(&mut self, context: &egui::Context, text: Text) {
+        if let Some(control) = self.transfer_control.as_ref() {
+            let snapshot = control.progress();
+
+            match self.live_progress.as_mut() {
+                Some(progress) => {
+                    progress.update(snapshot);
+                }
+
+                None => {
+                    self.live_progress = Some(LiveProgress::new(snapshot));
+                }
+            }
+
+            context.request_repaint_after(Duration::from_millis(100));
+        }
+
         let Some(receiver) = self.transfer_receiver.as_ref() else {
             return;
         };
 
         let outcome = match receiver.try_recv() {
-            Ok(result) => Some(result),
+            Ok(outcome) => Some(outcome),
 
-            Err(TryRecvError::Empty) => {
-                context.request_repaint_after(Duration::from_millis(100));
+            Err(TryRecvError::Empty) => None,
 
-                None
-            }
-
-            Err(TryRecvError::Disconnected) => Some(Err(text.worker_disconnected.to_string())),
+            Err(TryRecvError::Disconnected) => Some(TransferOutcome::Failed(
+                text.worker_disconnected.to_string(),
+            )),
         };
 
         let Some(outcome) = outcome else {
@@ -536,17 +681,33 @@ impl NetworkCopyGui {
 
         self.transfer_receiver = None;
 
+        self.transfer_control = None;
+
+        self.live_progress = None;
+
         match outcome {
-            Ok(summary) => {
+            TransferOutcome::Completed(summary) => {
                 self.last_summary = Some(summary);
 
                 self.last_error = None;
+
+                self.last_cancelled = false;
             }
 
-            Err(error) => {
+            TransferOutcome::Cancelled => {
+                self.last_summary = None;
+
+                self.last_error = None;
+
+                self.last_cancelled = true;
+            }
+
+            TransferOutcome::Failed(error) => {
                 self.last_summary = None;
 
                 self.last_error = Some(error);
+
+                self.last_cancelled = false;
             }
         }
     }
@@ -604,8 +765,63 @@ impl NetworkCopyGui {
         });
     }
 
+    fn live_progress_panel(&self, ui: &mut egui::Ui, text: Text) {
+        let Some(progress) = &self.live_progress else {
+            return;
+        };
+
+        let phase = localized_phase(self.language, &progress.phase);
+
+        ui.group(|ui| {
+            ui.label(egui::RichText::new(text.running).strong());
+
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.spinner();
+
+                if progress.cancel_requested {
+                    ui.label(text.cancelling);
+                } else {
+                    ui.label(phase);
+                }
+            });
+
+            ui.add_space(8.0);
+
+            if progress.total > 0 {
+                let amount = format!(
+                    "{} / {}",
+                    format_bytes(progress.completed.min(progress.total,),),
+                    format_bytes(progress.total,),
+                );
+
+                ui.add(
+                    egui::ProgressBar::new(progress.fraction())
+                        .show_percentage()
+                        .text(amount),
+                );
+
+                ui.add_space(6.0);
+
+                ui.label(format!(
+                    "{}: {:.2} MB/s",
+                    text.speed,
+                    progress.megabytes_per_second(),
+                ));
+            } else {
+                ui.label(format_bytes(progress.completed));
+            }
+        });
+    }
+
     fn action_buttons(&mut self, ui: &mut egui::Ui, text: Text) {
         let running = self.transfer_receiver.is_some();
+
+        let cancel_requested = self
+            .live_progress
+            .as_ref()
+            .is_some_and(|progress| progress.cancel_requested);
 
         ui.horizontal(|ui| {
             let start = ui.add_enabled(
@@ -619,17 +835,29 @@ impl NetworkCopyGui {
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
             }
 
-            ui.add_enabled(
-                false,
+            let cancel = ui.add_enabled(
+                running && !cancel_requested,
                 egui::Button::new(text.cancel).min_size(egui::vec2(120.0, 34.0)),
             );
 
-            if running {
-                ui.spinner();
+            if cancel.clicked() {
+                if let Some(control) = self.transfer_control.as_ref() {
+                    control.cancel();
+                }
 
-                ui.label(text.running);
+                if let Some(progress) = self.live_progress.as_mut() {
+                    progress.cancel_requested = true;
+                }
+
+                ui.ctx().request_repaint_after(Duration::from_millis(50));
             }
         });
+
+        if running {
+            ui.add_space(12.0);
+
+            self.live_progress_panel(ui, text);
+        }
     }
 }
 
@@ -700,6 +928,12 @@ impl eframe::App for NetworkCopyGui {
 
                     ui.label(error);
                 });
+            } else if self.last_cancelled {
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new(text.cancelled).strong());
+
+                    ui.label(text.cancelled_detail);
+                });
             } else if self.last_summary.is_some() {
                 self.summary_panel(ui, text);
             } else {
@@ -708,6 +942,52 @@ impl eframe::App for NetworkCopyGui {
                 ui.label(text.engine_pending);
             }
         });
+    }
+}
+
+fn localized_phase(language: Language, phase: &str) -> String {
+    if language == Language::English {
+        return phase.to_string();
+    }
+
+    match phase {
+        "Preparing transfer" => "Átvitel előkészítése".to_string(),
+
+        "Discovering direct receiver" => "Közvetlen fogadó keresése".to_string(),
+
+        "Waiting for direct sender" => "Várakozás a közvetlen küldőre".to_string(),
+
+        "Connecting calibration" => "Kapcsolódás a sebességméréshez".to_string(),
+
+        "Waiting for calibration" => "Várakozás a sebességmérésre".to_string(),
+
+        "Scanning source" => "Forrásmappa vizsgálata".to_string(),
+
+        "Waiting for transfer" => "Várakozás az átvitelre".to_string(),
+
+        "Transfer send" => "Fájlok küldése".to_string(),
+
+        "Transfer receive" => "Fájlok fogadása".to_string(),
+
+        "Complete" => "Kész".to_string(),
+
+        _ => {
+            if let Some(streams) = phase
+                .strip_prefix("Calibration send - ")
+                .and_then(|value| value.strip_suffix(" streams"))
+            {
+                return format!("Sebességmérés küldése — {streams} TCP szál",);
+            }
+
+            if let Some(streams) = phase
+                .strip_prefix("Calibration receive - ")
+                .and_then(|value| value.strip_suffix(" streams"))
+            {
+                return format!("Sebességmérés fogadása — {streams} TCP szál",);
+            }
+
+            phase.to_string()
+        }
     }
 }
 
@@ -765,7 +1045,7 @@ fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Language, Text};
+    use super::{Language, Text, localized_phase};
 
     #[test]
     fn both_languages_are_embedded() {
@@ -783,5 +1063,13 @@ mod tests {
         };
 
         assert_eq!(Language::initial(), expected,);
+    }
+
+    #[test]
+    fn calibration_phase_is_localized() {
+        assert_eq!(
+            localized_phase(Language::Hungarian, "Calibration send - 4 streams",),
+            "Sebességmérés küldése — 4 TCP szál",
+        );
     }
 }

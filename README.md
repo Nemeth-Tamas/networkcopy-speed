@@ -909,8 +909,9 @@ Implementation progress:
 * [x] working Send and Receive actions
 * [x] Direct Link and manual IP-address mode selectors
 * [x] in-window success and failure summaries
-* [ ] live progress events
-* [ ] cooperative Cancel action
+* [x] live phase, byte, percentage, and throughput progress
+* [x] cooperative Cancel during calibration and payload transfer
+* [ ] immediate Cancel while waiting in Direct Link discovery
 * [x] no separate or duplicated networking implementation
 
 Language and release policy:
