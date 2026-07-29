@@ -58,7 +58,6 @@ pub const DEFAULT_DATA_STREAMS: usize = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DestinationMode {
     Fresh,
-    UpdateFast,
     UpdateVerified,
 }
 
@@ -1423,16 +1422,16 @@ fn prepare_destination(
                 select_update_file_sets(destination_mode, &inventory, verified_unchanged_file_ids)?
             };
 
-            let journal = prepare_resume_destination(
+            let journal = prepare_resume_destination(ResumeDestinationPreparation {
                 destination_root,
                 manifest,
                 summary,
                 data_stream_count,
                 transfer_plan,
-                &unchanged_file_ids,
-                &reset_file_ids,
-                destination_mode != DestinationMode::Fresh,
-            )?;
+                unchanged_file_ids: &unchanged_file_ids,
+                reset_file_ids: &reset_file_ids,
+                preserve_existing_final: destination_mode != DestinationMode::Fresh,
+            })?;
 
             return Ok(PreparedDestination {
                 journal,
@@ -1499,8 +1498,6 @@ fn select_update_file_sets(
 ) -> io::Result<(BTreeSet<usize>, BTreeSet<usize>)> {
     match destination_mode {
         DestinationMode::Fresh => Ok((BTreeSet::new(), BTreeSet::new())),
-
-        DestinationMode::UpdateFast => Ok((inventory.unchanged_file_ids.clone(), BTreeSet::new())),
 
         DestinationMode::UpdateVerified => {
             let verified = verified_unchanged_file_ids.ok_or_else(|| {
@@ -1617,16 +1614,38 @@ fn prepare_update_destination(
     ResumeJournal::load_existing(destination_root, summary.fingerprint, data_stream_count)
 }
 
-fn prepare_resume_destination(
-    destination_root: &Path,
-    manifest: &[ManifestEntry],
+struct ResumeDestinationPreparation<'a> {
+    destination_root: &'a Path,
+
+    manifest: &'a [ManifestEntry],
+
     summary: ManifestSummary,
+
     data_stream_count: usize,
-    transfer_plan: &TransferPlan,
-    unchanged_file_ids: &BTreeSet<usize>,
-    reset_file_ids: &BTreeSet<usize>,
+
+    transfer_plan: &'a TransferPlan,
+
+    unchanged_file_ids: &'a BTreeSet<usize>,
+
+    reset_file_ids: &'a BTreeSet<usize>,
+
     preserve_existing_final: bool,
+}
+
+fn prepare_resume_destination(
+    preparation: ResumeDestinationPreparation<'_>,
 ) -> io::Result<ResumeJournal> {
+    let ResumeDestinationPreparation {
+        destination_root,
+        manifest,
+        summary,
+        data_stream_count,
+        transfer_plan,
+        unchanged_file_ids,
+        reset_file_ids,
+        preserve_existing_final,
+    } = preparation;
+
     let root_metadata = fs::metadata(destination_root)?;
 
     if !root_metadata.is_dir() {
@@ -1664,16 +1683,16 @@ fn prepare_resume_destination(
 
         match entry.class {
             FileClass::Large => {
-                prepare_resume_large_file(
+                prepare_resume_large_file(ResumeLargeFilePreparation {
                     file_id,
                     entry,
-                    &final_path,
-                    &temporary_path,
+                    final_path: &final_path,
+                    temporary_path: &temporary_path,
                     transfer_plan,
-                    &completed_stripes,
-                    reset_file_ids.contains(&file_id),
+                    completed_stripes: &completed_stripes,
+                    reset_completed_stripes: reset_file_ids.contains(&file_id),
                     preserve_existing_final,
-                )?;
+                })?;
             }
 
             FileClass::Medium | FileClass::Tiny => {
@@ -1701,16 +1720,35 @@ fn create_destination_parent(destination_root: &Path, entry: &ManifestEntry) -> 
     fs::create_dir_all(destination_root.join(parent))
 }
 
-fn prepare_resume_large_file(
+struct ResumeLargeFilePreparation<'a> {
     file_id: usize,
-    entry: &ManifestEntry,
-    final_path: &Path,
-    temporary_path: &Path,
-    transfer_plan: &TransferPlan,
-    completed_stripes: &BTreeSet<ResumeStripe>,
+
+    entry: &'a ManifestEntry,
+
+    final_path: &'a Path,
+
+    temporary_path: &'a Path,
+
+    transfer_plan: &'a TransferPlan,
+
+    completed_stripes: &'a BTreeSet<ResumeStripe>,
+
     reset_completed_stripes: bool,
+
     preserve_existing_final: bool,
-) -> io::Result<()> {
+}
+
+fn prepare_resume_large_file(preparation: ResumeLargeFilePreparation<'_>) -> io::Result<()> {
+    let ResumeLargeFilePreparation {
+        file_id,
+        entry,
+        final_path,
+        temporary_path,
+        transfer_plan,
+        completed_stripes,
+        reset_completed_stripes,
+        preserve_existing_final,
+    } = preparation;
     let final_exists = final_path.try_exists()?;
 
     let temporary_exists = temporary_path.try_exists()?;
@@ -4971,14 +5009,16 @@ mod tests {
 
         let transfer_plan = build_transfer_plan(&manifest, 2).unwrap();
 
+        let verified_unchanged_file_ids = BTreeSet::from([0_usize]);
+
         let prepared = prepare_destination(
             &root,
             &manifest,
             summary,
             2,
             &transfer_plan,
-            DestinationMode::UpdateFast,
-            None,
+            DestinationMode::UpdateVerified,
+            Some(&verified_unchanged_file_ids),
         )
         .unwrap();
 

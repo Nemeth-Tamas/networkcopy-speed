@@ -11,8 +11,11 @@ use std::sync::Once;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// Keep the historical family magic stable so older peers reach the
+// explicit protocol-version check instead of failing as invalid data.
 const PROTOCOL_MAGIC: [u8; 4] = *b"NCS4";
-const PROTOCOL_VERSION: u16 = 4;
+
+const PROTOCOL_VERSION: u16 = 5;
 
 const ROLE_CONTROL: u8 = 1;
 const ROLE_DATA: u8 = 2;
@@ -448,7 +451,9 @@ pub(crate) fn read_handshake(reader: &mut impl Read) -> io::Result<Handshake> {
     if version != PROTOCOL_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unsupported protocol version {version}"),
+            format!(
+                "unsupported NetworkCopy wire protocol version {version}; this build requires version {PROTOCOL_VERSION}"
+            ),
         ));
     }
 
@@ -877,8 +882,8 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionRole, ERROR_INVALID_FUNCTION, Handshake, PROTOCOL_VERSION, apply_socket_setting,
-        read_handshake, run, validate_data_stream_count, write_handshake,
+        ConnectionRole, ERROR_INVALID_FUNCTION, Handshake, PROTOCOL_MAGIC, PROTOCOL_VERSION,
+        apply_socket_setting, read_handshake, run, validate_data_stream_count, write_handshake,
     };
     use std::env;
     use std::fs;
@@ -915,7 +920,26 @@ mod tests {
         let actual = read_handshake(&mut cursor).unwrap();
 
         assert_eq!(actual, expected);
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
+    }
+
+    #[test]
+    fn previous_wire_protocol_is_rejected_cleanly() {
+        let mut bytes = Vec::new();
+
+        bytes.extend_from_slice(&PROTOCOL_MAGIC);
+
+        bytes.extend_from_slice(&4_u16.to_be_bytes());
+
+        let error = read_handshake(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let message = error.to_string();
+
+        assert!(message.contains("version 4"));
+
+        assert!(message.contains("requires version 5"));
     }
 
     #[test]

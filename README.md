@@ -63,8 +63,10 @@ Current v1.3 work:
 - [x] GUI and session controls for update-existing destination mode;
 - [x] unchanged-file and skipped-byte telemetry;
 - [x] reusable BLAKE3 candidate hashing and exact digest matching;
-- [x] verified unchanged-file negotiation over the control channel;
-- [x] BLAKE3-verified update mode enabled by default in the GUI;
+- [x] BLAKE3-verified unchanged-file negotiation;
+- [x] verified update mode enabled by default;
+- [x] wire protocol v5 with explicit cross-version rejection;
+- [x] safe reset of stale resumed stripes after verification mismatch;
 - [ ] automatic Zstandard strategy calibration;
 - [ ] clearer skipped-data and bottleneck diagnostics.
 
