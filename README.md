@@ -16,20 +16,21 @@ not require a router, switch, DHCP server, or manually assigned IP addresses.
 
 The repository currently contains:
 
-- the v1.3 command-line transfer engine;
-- the v1.3 desktop GUI;
+- the v1.4 command-line transfer engine;
+- the v1.4 desktop GUI;
 - one shared networking and transfer implementation used by both front ends.
 
 ## Current status
 
-Current development version:
+Current stable version:
 
 ```text
-1.4.0-dev
+1.4.0
 ```
 
-v1.3 is the current stable release. v1.4 focuses on tiny-file compression and
-receiver-side filesystem throughput.
+v1.4 improves tiny-file compression telemetry and receiver-side filesystem
+throughput while retaining verified update mode, resume support, Direct Link
+Mode, and adaptive raw or Zstandard transfer.
 
 The GUI includes:
 
@@ -46,7 +47,7 @@ The GUI includes:
 - automatic administrator elevation when Receive requires firewall setup;
 - success, cancellation, and failure summaries.
 
-## v1.4 roadmap
+## v1.4 highlights
 
 Implementation order:
 
@@ -54,7 +55,7 @@ Implementation order:
 - [x] dictionary-size matrix on synthetic and realistic tiny-file datasets;
 - [x] adaptive receiver filesystem worker calibration;
 - [x] bounded parallel tiny-file materialization;
-- [ ] final end-to-end tiny-file benchmark and telemetry.
+- [x] final end-to-end tiny-file benchmark and telemetry.
 
 Shared Zstandard dictionaries were rejected after held-out testing. They did
 not improve complete-pack compression on synthetic or realistic tiny-file
@@ -69,6 +70,12 @@ to one worker on single-core systems.
 Protocol v6 returns the receiver's selected tiny-file materialization worker
 count in the final transfer acknowledgement, so CLI and GUI summaries on both
 peers report the actual bounded pool width.
+
+The final 10,000-file loopback acceptance run transferred 1.85 MiB of logical
+tiny-file data in 10.17 seconds using two TCP streams and two shared tiny-file
+write workers. The three tiny-file packs used 1.38 MiB on the application wire,
+for 25.51% savings. Compared with the earlier 19.56-second baseline, receiver
+materialization changes reduced total transfer time by approximately 48%.
 
 ## v1.3 highlights
 
@@ -340,14 +347,14 @@ cargo build `
 
 ## Release naming
 
-The v1.3 release assets are executable-only:
+The v1.4 release assets are executable-only:
 
 ```text
 networkcopy-speed-hu.exe
 networkcopy-speed-en.exe
 ```
 
-No installer or ZIP package is required.
+No installer, ZIP package, or checksum sidecar file is required.
 
 ## Quality gate
 
