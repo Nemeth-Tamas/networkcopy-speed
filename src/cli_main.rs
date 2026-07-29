@@ -42,6 +42,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         "bench-tiny-file-writes" => {
             run_tiny_file_write_bench(&mut arguments)
         }
+        "bench-fixed-dedup" => {
+            run_fixed_block_dedup_bench(&mut arguments)
+        }
         "bench-pipeline" => run_bench_pipeline(&mut arguments),
         "probe-iocp" => run_iocp_probe(&mut arguments),
         "probe-overlapped-read" => run_overlapped_read_probe(&mut arguments),
@@ -595,6 +598,66 @@ fn run_iocp_probe(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), 
     println!();
 
     let report = iocp_probe::run()?;
+    report.print();
+
+    Ok(())
+}
+
+fn run_fixed_block_dedup_bench(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let basis = PathBuf::from(required_argument(
+        arguments,
+        "basis file",
+    )?);
+
+    let candidate = PathBuf::from(required_argument(
+        arguments,
+        "candidate file",
+    )?);
+
+    let block_kib = match arguments.next() {
+        Some(value) => {
+            parse_usize_count(
+                &value,
+                "fixed dedup block size in KiB",
+            )?
+        }
+
+        None => {
+            fixed_block_dedup_bench::DEFAULT_BLOCK_KIB
+        }
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    fixed_block_dedup_bench::validate_block_kib(
+        block_kib,
+    )?;
+
+    println!(
+        "NetworkCopy Speed Edition fixed-block dedup benchmark",
+    );
+    println!("  Basis:       {}", basis.display());
+    println!("  Candidate:   {}", candidate.display());
+    println!("  Block size:  {block_kib} KiB");
+    println!();
+
+    let report = fixed_block_dedup_bench::run(
+        &basis,
+        &candidate,
+        block_kib,
+    )?;
+
     report.print();
 
     Ok(())
@@ -1333,6 +1396,10 @@ fn print_usage(program: &OsStr) {
     println!(
         "  {program} bench-tiny-file-writes <source-root> <empty-output-root> \
          [max-workers] [scan-workers]"
+    );
+    println!(
+        "  {program} bench-fixed-dedup <basis-file> \
+         <candidate-file> [block-kib]"
     );
     println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
     println!("  {program} probe-iocp");

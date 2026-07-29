@@ -22,15 +22,15 @@ The repository currently contains:
 
 ## Current status
 
-Current stable version:
+Current development version:
 
 ```text
-1.4.0
+2.0.0-dev
 ```
 
-v1.4 improves tiny-file compression telemetry and receiver-side filesystem
-throughput while retaining verified update mode, resume support, Direct Link
-Mode, and adaptive raw or Zstandard transfer.
+v1.4 is the current stable release. v2 explores block-level and
+content-defined deduplication so modified files can reuse verified data already
+present on the receiver instead of retransmitting complete file contents.
 
 The GUI includes:
 
@@ -46,6 +46,24 @@ The GUI includes:
 - one-click transfer restart and stripe resume;
 - automatic administrator elevation when Receive requires firewall setup;
 - success, cancellation, and failure summaries.
+
+## v2 roadmap
+
+Implementation order:
+
+- [x] single-file fixed-block deduplication control benchmark;
+- [ ] repeatable overwrite, insertion, deletion, and append corpus;
+- [ ] content-defined chunk boundary prototype;
+- [ ] fixed-block versus content-defined chunk-size matrix;
+- [ ] receiver basis-file chunk index;
+- [ ] deduplicated reconstruction prototype with final BLAKE3 verification;
+- [ ] bounded-memory folder-level deduplication planning;
+- [ ] deduplicated transfer protocol, resume behavior, and telemetry.
+
+The first benchmark intentionally uses fixed boundaries from byte zero. It
+measures both same-position reuse and blocks found elsewhere in the basis file.
+This provides the control result that content-defined chunking must beat,
+particularly after insertions or deletions shift subsequent content.
 
 ## v1.4 highlights
 
