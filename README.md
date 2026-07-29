@@ -22,14 +22,14 @@ The repository currently contains:
 
 ## Current status
 
-Current release:
+Current development version:
 
 ```text
-1.3.0
+1.4.0-dev
 ```
 
-v1.3 is the current stable release. It adds smarter transfers, lower network
-usage, and efficient verified updates to existing destinations.
+v1.3 is the current stable release. v1.4 focuses on tiny-file compression and
+receiver-side filesystem throughput.
 
 The GUI includes:
 
@@ -45,6 +45,20 @@ The GUI includes:
 - one-click transfer restart and stripe resume;
 - automatic administrator elevation when Receive requires firewall setup;
 - success, cancellation, and failure summaries.
+
+## v1.4 roadmap
+
+Implementation order:
+
+- [ ] held-out shared Zstandard dictionary benchmark;
+- [ ] dictionary-size matrix on synthetic and realistic tiny-file datasets;
+- [ ] adaptive receiver filesystem worker calibration;
+- [ ] bounded parallel tiny-file materialization;
+- [ ] final end-to-end tiny-file benchmark and telemetry.
+
+Shared dictionaries will be retained only if their one-time wire cost and
+training cost produce a meaningful held-out improvement over the existing
+complete-pack Zstandard compression.
 
 ## v1.3 highlights
 
@@ -75,8 +89,6 @@ files, stripes, and tiny-file packs use Zstandard; incompressible payloads
 automatically fall back to raw transfer. The GUI reports whether a completed
 session was dominated by skipped files, tiny-file overhead, useful
 compression, raw fallback, or showed no clear single limiter.
-
-Shared Zstandard dictionaries will be benchmarked after v1.3.
 
 Block-level and content-defined deduplication are reserved for v2.0.
 

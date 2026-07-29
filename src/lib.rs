@@ -32,5 +32,6 @@ mod update_verification;
 pub mod windows_elevation;
 mod windows_file_replace;
 mod windows_setup;
+mod zstd_dictionary_bench;
 
 include!("cli_main.rs");

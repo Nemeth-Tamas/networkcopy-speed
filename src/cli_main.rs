@@ -38,6 +38,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "bench-copy" => run_bench_copy(&mut arguments),
         "bench-hash" => run_hash_bench(&mut arguments),
         "probe-compression" => run_compression_probe(&mut arguments),
+        "bench-zstd-dictionary" => run_zstd_dictionary_bench(&mut arguments),
         "bench-pipeline" => run_bench_pipeline(&mut arguments),
         "probe-iocp" => run_iocp_probe(&mut arguments),
         "probe-overlapped-read" => run_overlapped_read_probe(&mut arguments),
@@ -378,6 +379,54 @@ fn run_compression_probe(
     println!();
 
     let report = compression_probe::run(&source, level)?;
+
+    report.print();
+    Ok(())
+}
+
+fn run_zstd_dictionary_bench(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let root = PathBuf::from(required_argument(arguments, "root directory")?);
+
+    let dictionary_kib = match arguments.next() {
+        Some(value) => parse_usize_count(&value, "dictionary size in KiB")?,
+
+        None => zstd_dictionary_bench::DEFAULT_DICTIONARY_KIB,
+    };
+
+    let level = match arguments.next() {
+        Some(value) => parse_compression_level(&value)?,
+
+        None => compression_probe::DEFAULT_LEVEL,
+    };
+
+    let worker_count = match arguments.next() {
+        Some(value) => parse_usize_count(&value, "scanner worker count")?,
+
+        None => manifest_scan::default_worker_count(),
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+        )
+        .into());
+    }
+
+    zstd_dictionary_bench::validate_dictionary_kib(dictionary_kib)?;
+    manifest_scan::validate_worker_count(worker_count)?;
+
+    println!("NetworkCopy Speed Edition shared Zstandard dictionary benchmark");
+    println!("  Root:            {}", root.display());
+    println!("  Dictionary:      {dictionary_kib} KiB");
+    println!("  Zstandard level: {level}");
+    println!("  Scanner workers: {worker_count}");
+    println!();
+
+    let report =
+        zstd_dictionary_bench::run(&root, worker_count, dictionary_kib, level)?;
 
     report.print();
     Ok(())
@@ -1168,6 +1217,17 @@ fn parse_u64_count(value: &OsStr, description: &str) -> io::Result<u64> {
     })
 }
 
+fn parse_usize_count(value: &OsStr, description: &str) -> io::Result<usize> {
+    let parsed = parse_u64_count(value, description)?;
+
+    usize::try_from(parsed).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} is larger than usize"),
+        )
+    })
+}
+
 fn parse_buffer_count(value: &OsStr) -> io::Result<usize> {
     let value = value.to_str().ok_or_else(|| {
         io::Error::new(
@@ -1212,6 +1272,10 @@ fn print_usage(program: &OsStr) {
     println!("  {program} bench-copy <source> <destination> [buffer-mib]");
     println!("  {program} bench-hash <source> [buffer-mib]");
     println!("  {program} probe-compression <source> [zstd-level]");
+    println!(
+        "  {program} bench-zstd-dictionary <root-directory> \
+         [dictionary-kib] [zstd-level] [workers]"
+    );
     println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
     println!("  {program} probe-iocp");
     println!("  {program} probe-overlapped-read <source> [read-mib]");
