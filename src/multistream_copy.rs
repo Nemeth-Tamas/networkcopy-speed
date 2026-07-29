@@ -4,6 +4,7 @@ use crate::console_progress::ProgressCounter;
 use crate::content_hash;
 use crate::control_plane::{self, ConnectionRole, Handshake, ManifestSummary};
 use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_second, format_bytes};
+use crate::destination_inventory;
 use crate::file_metadata;
 use crate::manifest_scan::{self, FileClass, ManifestEntry};
 use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
@@ -1225,11 +1226,18 @@ fn prepare_destination(
         let mut entries = fs::read_dir(destination_root)?;
 
         if entries.next().transpose()?.is_some() {
+            let inventory = destination_inventory::compare_fast(destination_root, manifest)?;
+
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!(
-                    "destination directory is not empty and contains no NetworkCopy resume journal: {}",
-                    destination_root.display()
+                    "destination directory is not empty and update mode is not enabled: {}. Fast comparison found {} unchanged file(s) / {} byte(s), {} changed file(s), {} missing file(s), and {} conflicting entry or entries",
+                    destination_root.display(),
+                    inventory.unchanged_files(),
+                    inventory.unchanged_bytes,
+                    inventory.changed_files,
+                    inventory.missing_files,
+                    inventory.conflicting_entries,
                 ),
             ));
         }

@@ -5,6 +5,7 @@ mod console_progress;
 mod content_hash;
 mod control_plane;
 mod copy_bench;
+mod destination_inventory;
 mod direct_address;
 mod direct_discovery;
 mod direct_discovery_v4;
