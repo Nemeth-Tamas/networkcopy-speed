@@ -62,7 +62,8 @@ Current v1.3 work:
 - [x] atomic Windows replacement of completed files;
 - [x] GUI and session controls for update-existing destination mode;
 - [x] unchanged-file and skipped-byte telemetry;
-- [ ] fast and BLAKE3-verified unchanged-file detection;
+- [x] reusable BLAKE3 candidate hashing and exact digest matching;
+- [ ] verified unchanged-file negotiation over the control channel;
 - [ ] automatic Zstandard strategy calibration;
 - [ ] clearer skipped-data and bottleneck diagnostics.
 

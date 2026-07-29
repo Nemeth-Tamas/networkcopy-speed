@@ -28,6 +28,7 @@ mod striped_file;
 mod tcp_connect;
 mod tiny_pack_codec;
 mod transfer_memory;
+mod update_verification;
 pub mod windows_elevation;
 mod windows_file_replace;
 mod windows_setup;

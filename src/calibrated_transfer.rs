@@ -267,19 +267,6 @@ pub fn receive_once(
     })
 }
 
-pub(crate) fn receive_once_with_progress(
-    listener: TcpListener,
-    destination_root: &Path,
-    progress: ProgressCounter,
-) -> io::Result<CalibratedReceiveReport> {
-    receive_once_with_progress_and_mode(
-        listener,
-        destination_root,
-        progress,
-        DestinationMode::Fresh,
-    )
-}
-
 pub(crate) fn receive_once_with_progress_and_mode(
     listener: TcpListener,
     destination_root: &Path,
