@@ -1,1062 +1,357 @@
+<p align="center">
+  <img
+    src="assets/networkcopy-logo.png"
+    alt="NetworkCopy Speed Edition"
+    width="900"
+  >
+</p>
+
 # NetworkCopy Speed Edition
 
-> A Windows-only Rust experiment in moving absurd amounts of data without politely waiting for the operating system to finish thinking about it.
+A high-performance Windows folder-transfer tool written in Rust.
 
-NetworkCopy Speed Edition is a performance-first file-transfer engine built in Rust for Windows.
+NetworkCopy can transfer folders across a normal local network or directly
+between two computers connected by an Ethernet cable. Direct Link Mode does
+not require a router, switch, DHCP server, or manually assigned IP addresses.
 
-The project starts with deliberately simple copy benchmarks, then progressively builds the machinery required for a serious high-speed transfer tool:
+The repository currently contains:
 
-* native Windows overlapped file I/O;
-* I/O completion ports;
-* parallel directory scanning;
-* exact UTF-16 path transport;
-* multiple TCP data lanes;
-* large-file striping;
-* tiny-file packing;
-* BLAKE3 integrity verification;
-* adaptive Zstandard compression;
-* bounded memory usage;
-* durable large-stripe resume journals.
+- the released v1.1 command-line transfer engine;
+- the v1.2 desktop GUI under active development;
+- one shared networking and transfer implementation used by both front ends.
 
-It is currently an **engineering prototype and benchmark laboratory**, not yet a polished replacement for Explorer, Robocopy, or a production transfer appliance.
+## Current status
 
-> **The complete multistream sender and receiver currently run inside one process over TCP loopback.**
->
-> The transfer engine itself is functional, including resume support, but separate two-machine `send` and `receive` commands are the next major milestone.
+Current development version:
 
 ```text
-Platform:          Windows
-Language:          Rust 2024 edition
-Package version:   0.1.0
-Protocol version:  4
-Status:            Experimental resumable loopback transfer engine
-Next milestone:    Real transfers between two Windows machines
+1.2.0-dev
 ```
 
----
-
-## Why?
-
-Copying a file appears simple:
-
-```text
-read bytes
-write bytes
-repeat
-```
-
-Then the source contains 250,000 tiny files, one file is 80 GiB, the destination is across a fast network, Windows caching becomes involved, antivirus starts inspecting everything, and the simple loop develops opinions.
-
-NetworkCopy Speed Edition investigates the components required for a genuinely fast transfer engine:
-
-* fast recursive directory enumeration;
-* bounded and reusable memory;
-* exact Windows path handling;
-* asynchronous native file I/O;
-* multiple simultaneous TCP streams;
-* load balancing across transfer lanes;
-* tiny-file aggregation;
-* large-file striping;
-* inline hashing and compression;
-* interruption-safe partial files;
-* resumable transfers;
-* measured network-path calibration.
-
-The project follows one important rule:
-
-> **Measure every architectural idea before assuming it is faster.**
-
-Several theoretically faster approaches lose to a straightforward synchronous loop under warm-cache local benchmarks. They remain valuable because a real transfer engine must overlap storage, networking, hashing, compression, and remote processing—not merely win a synthetic local copy race.
-
----
-
-# Current capabilities
-
-## Copy engines
-
-* Measured synchronous buffered copying
-* Reusable bounded-buffer pipeline
-* Native Windows overlapped reads and writes
-* I/O completion port integration
-* Multiple outstanding native I/O operations
-* Explicit 64-bit file offsets
-* Positional concurrent reads and writes
-* Configurable chunk and operation counts
-* Strict buffer-pool limits
-
-## Manifest scanner
-
-* Parallel recursive directory scanning
-* Fixed-size worker pool
-* Shared directory work queue
-* Deterministic manifest ordering
-* Exact Windows UTF-16 relative paths
-* File size capture
-* Last-write timestamp capture
-* Windows file attribute capture
-* Reparse-point detection and skipping
-* Sparse and compressed file statistics
-* Tiny, medium, and large file classification
-* Configurable scanner worker count
-
-## TCP control plane
-
-* Versioned binary protocol
-* Session identifiers
-* Separate control and data connection roles
-* Configurable data-stream count
-* Exact UTF-16 path serialization
-* File metadata and class serialization
-* Deterministic manifest fingerprint
-* Receiver-readiness acknowledgement
-* Resume-stripe negotiation
-* Final transfer acknowledgement
-* Socket timeouts
-* TCP_NODELAY configuration
-
-## Transfer engine
-
-* Multiple concurrent TCP data lanes
-* Deterministic sender and receiver scheduling
-* Greedy whole-file load balancing
-* Large-file striping across all active lanes
-* Positional concurrent writes into large files
-* Tiny-file aggregation into bounded packs
-* Temporary destination files
-* Atomic publication by rename
-* Per-lane application-wire byte accounting
-* Sender and receiver report comparison
-* Complete manifest byte-count validation
-
-## Integrity
-
-* Streaming BLAKE3 hashing
-* Inline sender hashing
-* Inline receiver hashing
-* No second disk pass for normal payload verification
-* Whole-file BLAKE3 verification
-* Tiny-pack member verification
-* Per-stripe BLAKE3 verification for large files
-* Digest mismatch rejection before publication
-
-BLAKE3 currently protects against accidental corruption, implementation bugs, and damaged payloads.
-
-It does **not** authenticate peers or protect against an active attacker capable of modifying both the payload and its digest. Encryption and authenticated sessions are future work.
-
-## Adaptive compression
-
-* Zstandard compression through `zstd`
-* Configurable standalone compression probe
-* Start, middle, and end sampling for large ranges
-* Raw fallback when estimated savings are below 10%
-* Independent decisions for medium files and large stripes
-* Reusable compressor and decompressor contexts per lane
-* Independent 1 MiB compression blocks
-* BLAKE3 calculated over uncompressed content
-* Actual application-wire size reporting
-
-Tiny-file packs currently remain uncompressed.
-
-## Bounded memory
-
-The integrated transfer engine accounts for its predictable payload buffers before starting work.
-
-Current per-lane, per-peer allocation plan:
-
-```text
-1 MiB   TCP buffered reader or writer
-8 MiB   transfer buffer
-2 MiB   maximum compressed chunk buffer
-------
-11 MiB  per lane, per peer
-```
-
-A loopback benchmark contains both peers in one process, so two lanes plan approximately:
-
-```text
-11 MiB × 2 lanes × 2 peers = 44 MiB
-```
-
-The current hard application-buffer ceiling is **4 GiB**.
-
-This accounting covers the large deterministic transfer buffers. It does not attempt to include thread stacks, manifest allocations, allocator bookkeeping, or Windows kernel socket buffers.
-
-## Resume support
-
-Verified large-file stripes can survive an interrupted transfer.
-
-The receiver maintains:
-
-```text
-.networkcopy-resume.bin
-```
-
-Large destination files remain unpublished as:
-
-```text
-<filename>.ncs-part-<file-id>
-```
-
-The resume journal records:
-
-* manifest fingerprint;
-* data-stream count;
-* completed large-file stripe identifiers;
-* stripe offsets;
-* stripe lengths.
-
-A stripe is checkpointed only after:
-
-1. its payload has been received;
-2. its BLAKE3 digest has been verified;
-3. its bytes have been written;
-4. the partial file has been synchronized;
-5. the updated journal has been atomically published.
-
-When reopening an interrupted destination:
-
-* the journal must exist;
-* its manifest fingerprint must match;
-* its stream count must match;
-* every offered stripe must exist in the current deterministic transfer plan;
-* large partial files must have the expected logical size;
-* verified stripes are negotiated and omitted from both transfer plans;
-* medium and tiny files are currently retransmitted from the beginning.
-
-On successful completion:
-
-* large temporary files are renamed to their final names;
-* the resume journal is removed.
-
-An existing destination without a valid matching journal is rejected.
-
----
-
-# File classes
-
-| Class  |                       Boundary | Current strategy                   |
-| ------ | -----------------------------: | ---------------------------------- |
-| Tiny   |                  Up to 256 KiB | Group into bounded tiny-file packs |
-| Medium | Above 256 KiB and below 64 MiB | Transfer whole on one lane         |
-| Large  |               64 MiB and above | Stripe across active data lanes    |
-
-These boundaries are architectural defaults, not universal laws carved into an NVMe controller.
-
----
-
-# Architecture
-
-```mermaid
-flowchart LR
-    CLI["CLI / Benchmark Driver"]
-
-    subgraph Sender
-        SCAN["Parallel Manifest Scanner"]
-        CLASSIFY["File Classification"]
-        PLAN["Deterministic Transfer Planner"]
-        SAMPLE["Compression Sampling"]
-        HASH_SEND["Inline BLAKE3"]
-        SOURCE["Source Files"]
-    end
-
-    subgraph Session
-        CONTROL["Control TCP Connection"]
-        D0["Data Lane 0"]
-        D1["Data Lane 1"]
-        DN["Data Lane N"]
-    end
-
-    subgraph Receiver
-        MANIFEST["Manifest Validation"]
-        RESUME["Resume Journal Validation"]
-        PREPARE["Destination Preparation"]
-        DECODE["Raw / Zstandard Decode"]
-        HASH_RECV["Inline BLAKE3 Verification"]
-        TEMP["Temporary Files"]
-        FINAL["Atomic Publication"]
-    end
-
-    CLI --> SCAN
-    SCAN --> CLASSIFY
-    CLASSIFY --> PLAN
-    PLAN --> CONTROL
-
-    CONTROL --> MANIFEST
-    MANIFEST --> RESUME
-    RESUME --> PREPARE
-    RESUME -->|"Completed stripes"| PLAN
-
-    SOURCE --> SAMPLE
-    SAMPLE --> HASH_SEND
-    HASH_SEND --> D0
-    HASH_SEND --> D1
-    HASH_SEND --> DN
-
-    D0 --> DECODE
-    D1 --> DECODE
-    DN --> DECODE
-
-    DECODE --> HASH_RECV
-    HASH_RECV --> TEMP
-    TEMP --> FINAL
-```
-
----
-
-## Transfer planning
-
-```mermaid
-flowchart TD
-    ENTRY["Manifest entry"] --> CLASS{"File class?"}
-
-    CLASS -->|"Tiny"| PACK["Add to bounded tiny pack"]
-    CLASS -->|"Medium"| WHOLE["Whole-file task"]
-    CLASS -->|"Large"| STRIPE["Calculate one range per lane"]
-
-    PACK --> BALANCE["Assign to least-loaded lane"]
-    WHOLE --> BALANCE
-    STRIPE --> LANES["Assign stripe to matching lane"]
-
-    BALANCE --> SEND["Send task"]
-    LANES --> RESUME{"Stripe already verified?"}
-
-    RESUME -->|"Yes"| SKIP["Count as resumed; send nothing"]
-    RESUME -->|"No"| SEND
-
-    SEND --> COMPRESS{"Compression worthwhile?"}
-    COMPRESS -->|"No"| RAW["Raw payload"]
-    COMPRESS -->|"Yes"| ZSTD["Independent Zstandard blocks"]
-
-    RAW --> HASH["BLAKE3 verification"]
-    ZSTD --> HASH
-    HASH --> PUBLISH["Publish completed file"]
-```
-
----
-
-## Session protocol
-
-```mermaid
-sequenceDiagram
-    participant S as Sender
-    participant C as Control TCP
-    participant D as Data Lanes
-    participant R as Receiver
-    participant J as Resume Journal
-
-    S->>C: Protocol v4 control handshake
-    S->>D: Data-lane handshakes
-    S->>C: Manifest and metadata
-    C->>R: Validate manifest fingerprint
-
-    R->>J: Open or create journal
-    J-->>R: Completed verified stripes
-    R-->>S: Receiver ready + resume offer
-
-    S->>S: Validate resume offer
-    S->>S: Remove completed stripes from plan
-    R->>R: Remove completed stripes from plan
-
-    par Data lane 0
-        S->>D: Whole files, tiny packs, or stripes
-        D->>R: Raw or Zstandard payload
-    and Data lane 1
-        S->>D: Whole files, tiny packs, or stripes
-        D->>R: Raw or Zstandard payload
-    and Data lane N
-        S->>D: Whole files, tiny packs, or stripes
-        D->>R: Raw or Zstandard payload
-    end
-
-    R->>R: Verify BLAKE3
-    R->>J: Checkpoint synced stripes
-    R->>R: Publish completed files
-    R->>J: Remove journal after success
-    R-->>S: Final transfer acknowledgement
-```
-
----
-
-# Building
-
-## Requirements
-
-* Windows 10 or Windows 11
-* A recent stable Rust toolchain
-* Cargo
-* A filesystem supporting normal Windows file operations
-
-The project uses:
-
-* `windows-sys` for native Win32 APIs;
-* `blake3` for integrity verification;
-* `zstd` for adaptive compression.
-
-Build an optimized binary:
-
-```powershell
-cargo build --release
-```
-
-The resulting executable is:
-
-```text
-target\release\networkcopy-speed.exe
-```
-
-## Quality gate
-
-Run the complete gate before committing:
-
-```powershell
-cargo fmt
-cargo fmt --check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
-cargo build --release
-```
-
----
-
-# Commands
-
-The current CLI consists of engineering probes and loopback benchmarks.
+v1.2 GUI functionality is complete and currently in final visual-polish and
+release preparation.
+
+The GUI includes:
+
+- Hungarian default language;
+- English built into the same executable;
+- runtime language switching;
+- Direct Link and manual IP-address modes;
+- Send and Receive operation selection;
+- native Windows folder pickers;
+- live phase, byte, percentage, and throughput progress;
+- immediate cooperative cancellation;
+- persistent interrupted-transfer records;
+- one-click transfer restart and stripe resume;
+- automatic administrator elevation when Receive requires firewall setup;
+- success, cancellation, and failure summaries.
+
+## Quick start — graphical interface
 
 Run:
 
 ```powershell
-cargo run --release -- help
+networkcopy-gui.exe
 ```
 
-or execute the built binary directly:
+### Direct Ethernet cable
 
-```powershell
-.\target\release\networkcopy-speed.exe help
-```
+Connect the two Windows computers with an Ethernet cable.
 
----
+On the receiving computer:
 
-## Synchronous copy benchmark
+1. Open **Fogadás / Receive**.
+2. Select **Közvetlen kábel / Direct cable**.
+3. Choose the destination folder.
+4. Press **Indítás / Start**.
+5. Approve administrator elevation when Windows requests it.
 
-```powershell
-cargo run --release -- bench-copy `
-    <source-file> `
-    <destination-file> `
-    [buffer-mib]
-```
+On the sending computer:
 
-Example:
+1. Open **Küldés / Send**.
+2. Select **Közvetlen kábel / Direct cable**.
+3. Choose the source folder.
+4. Press **Indítás / Start**.
 
-```powershell
-cargo run --release -- bench-copy `
-    ".\TestData\incompressible-2GiB.bin" `
-    ".\BenchmarkOutput\baseline.bin" `
-    8
-```
+NetworkCopy automatically:
 
----
+- identifies dedicated Ethernet interfaces;
+- rejects interfaces carrying a default route;
+- discovers the receiver over scoped IPv6 link-local multicast;
+- falls back to IPv4 APIPA when IPv6 is unavailable;
+- binds discovery, calibration, control, and transfer sockets to the selected
+  interface;
+- measures the path with 1, 2, 4, and 8 TCP streams;
+- chooses the smallest stream count reaching at least 90% of the best measured
+  result;
+- starts the folder transfer.
 
-## BLAKE3 benchmark
+### Existing LAN or manual address
 
-```powershell
-cargo run --release -- bench-hash `
-    <source-file> `
-    [buffer-mib]
-```
+Select **IP-cím / IP address**.
 
-Example:
-
-```powershell
-cargo run --release -- bench-hash `
-    ".\TestData\mixed-4GiB.bin" `
-    8
-```
-
----
-
-## Adaptive compression probe
-
-```powershell
-cargo run --release -- probe-compression `
-    <source-file> `
-    [zstd-level]
-```
-
-Example:
-
-```powershell
-cargo run --release -- probe-compression `
-    ".\TestData\compressible-512MiB.bin" `
-    1
-```
-
-The probe samples the file, estimates its compression ratio, and reports whether the integrated engine would send it raw or compressed.
-
----
-
-## Reusable buffered pipeline
-
-```powershell
-cargo run --release -- bench-pipeline `
-    <source-file> `
-    <destination-file> `
-    [chunk-mib] `
-    [buffers]
-```
-
-Example:
-
-```powershell
-cargo run --release -- bench-pipeline `
-    ".\TestData\mixed-4GiB.bin" `
-    ".\BenchmarkOutput\pipeline.bin" `
-    8 `
-    8
-```
-
----
-
-## Native IOCP probe
-
-```powershell
-cargo run --release -- probe-iocp
-```
-
-This creates an I/O completion port, posts a controlled completion packet, retrieves it, and validates the returned completion key and payload.
-
----
-
-## Native overlapped-read probe
-
-```powershell
-cargo run --release -- probe-overlapped-read `
-    <source-file> `
-    [read-mib]
-```
-
-Example:
-
-```powershell
-cargo run --release -- probe-overlapped-read `
-    ".\TestData\incompressible-2GiB.bin" `
-    8
-```
-
----
-
-## Native IOCP file-copy benchmark
-
-```powershell
-cargo run --release -- bench-iocp-copy `
-    <source-file> `
-    <destination-file> `
-    [chunk-mib] `
-    [operations]
-```
-
-Example:
-
-```powershell
-cargo run --release -- bench-iocp-copy `
-    ".\TestData\mixed-4GiB.bin" `
-    ".\BenchmarkOutput\iocp.bin" `
-    8 `
-    8
-```
-
----
-
-## Parallel manifest scanner
-
-```powershell
-cargo run --release -- bench-scan `
-    <root-directory> `
-    [workers]
-```
-
-Example:
-
-```powershell
-cargo run --release -- bench-scan `
-    "$HOME\.cargo\registry" `
-    16
-```
-
----
-
-## TCP control-plane probe
-
-```powershell
-cargo run --release -- probe-control `
-    <root-directory> `
-    [workers] `
-    [data-streams]
-```
-
-This command:
-
-1. scans the source tree;
-2. opens a loopback multistream session;
-3. serializes the manifest;
-4. validates it on the receiver;
-5. returns a manifest acknowledgement.
-
----
-
-## Multistream folder-copy benchmark
-
-```powershell
-cargo run --release -- bench-multistream-copy `
-    <source-root> `
-    <destination-root> `
-    [workers] `
-    [data-streams]
-```
-
-Example:
-
-```powershell
-cargo run --release -- bench-multistream-copy `
-    ".\TestData" `
-    ".\BenchmarkOutput\TestData-copy" `
-    4 `
-    2
-```
-
-This is currently the most complete integrated transfer path.
-
-It exercises:
-
-* parallel scanning;
-* manifest serialization;
-* multiple TCP data lanes;
-* deterministic scheduling;
-* tiny-file packing;
-* large-file striping;
-* adaptive compression;
-* BLAKE3 verification;
-* application-wire accounting;
-* bounded memory;
-* resume negotiation;
-* durable large-stripe checkpoints;
-* atomic final publication.
-
-For a fresh transfer, the destination must not already exist.
-
-For a resumed transfer, the destination must contain a matching valid resume journal and the expected partial large files.
-
----
-
-## Standalone striped-file benchmark
-
-```powershell
-cargo run --release -- bench-striped-file `
-    <source-file> `
-    <destination-file> `
-    [data-streams]
-```
-
-Example:
-
-```powershell
-cargo run --release -- bench-striped-file `
-    ".\TestData\mixed-4GiB.bin" `
-    ".\BenchmarkOutput\striped.bin" `
-    2
-```
-
----
-
-# Representative benchmark snapshot
-
-All measurements below were produced on one Windows development machine using local files and TCP loopback.
-
-They are architecture-development measurements, **not general network-performance claims**.
-
-Results can change significantly due to:
-
-* Windows page cache state;
-* source and destination storage;
-* antivirus activity;
-* compression ratio;
-* CPU frequency and temperature;
-* background I/O;
-* stream count;
-* test ordering.
-
-## Integrated adaptive folder transfer
-
-Representative dataset:
+The receiver enters a local listening address, for example:
 
 ```text
-2 GiB   incompressible file
-4 GiB   mixed-content file
-512 MiB highly compressible file
+0.0.0.0:7337
 ```
 
-Observed result with two TCP data lanes:
+The sender enters the receiver address, for example:
 
 ```text
-Logical data:         6,979,321,856 bytes
-Application wire:    6,442,481,502 bytes
-Compressed records:  2
-Wire reduction:       7.69%
-Planned buffers:      46,137,344 bytes
-Throughput:           roughly 1.5–1.7 GB/s
-Integrity:            BLAKE3 verified
+192.168.1.50:7337
 ```
 
-The wire count is measured at the application data lanes. It does not include TCP, IP, Ethernet, VPN, or Wi-Fi framing overhead.
-
-## Standalone large-file striping
-
-A previous 4 GiB mixed-content loopback test produced:
-
-| TCP lanes | Approximate throughput |
-| --------: | ---------------------: |
-|         1 |             2,093 MB/s |
-|         2 |         **2,389 MB/s** |
-|         4 |             2,241 MB/s |
-|         8 |             1,980 MB/s |
-
-Two streams were the local-loopback sweet spot for that machine. More streams increased contention rather than throughput.
-
-This is exactly why the future two-machine mode will calibrate stream counts instead of blindly assuming that more sockets are better.
-
----
-
-# Roadmap
-
-## Milestone 0 — Baselines
-
-* [x] Synchronous buffered copy
-* [x] Reproducible throughput measurement
-* [x] Configurable copy buffers
-* [x] External hash verification
-
-## Milestone 1 — Reusable buffer pipeline
-
-* [x] Bounded buffer pool
-* [x] Reader and writer pipeline
-* [x] Configurable chunk and buffer counts
-* [x] Hard memory-pool validation
-
-## Milestone 2 — Native Windows I/O
-
-* [x] Native overlapped reads
-* [x] Native overlapped writes
-* [x] I/O completion port wrapper
-* [x] Multiple outstanding operations
-* [x] Explicit offset handling
-* [x] Cancellation and completion draining
-
-## Milestone 3 — Manifest scanner
-
-* [x] Parallel recursive scanning
-* [x] Worker queue
-* [x] Exact UTF-16 relative paths
-* [x] Reparse-point skipping
-* [x] File classification
-* [x] Deterministic ordering
-* [x] Sparse and compressed-file statistics
-
-## Milestone 4 — TCP session
-
-* [x] Versioned protocol
-* [x] Control connection
-* [x] Multiple data lanes
-* [x] Manifest transfer
-* [x] Session and stream identifiers
-* [x] Receiver and final acknowledgements
-
-## Milestone 5 — Transfer scheduling
-
-* [x] Whole-file lane balancing
-* [x] Large-file striping
-* [x] Concurrent positional destination writes
-* [x] Tiny-file packs
-* [x] Temporary files and atomic rename
-* [x] Sender and receiver accounting
-
-## Milestone 6 — Integrity, compression, and memory
-
-* [x] Measured BLAKE3 engine
-* [x] Inline BLAKE3 verification
-* [x] Per-stripe integrity
-* [x] Compression sampling
-* [x] Adaptive Zstandard
-* [x] Raw fallback
-* [x] Actual application-wire accounting
-* [x] Hard 4 GiB transfer-buffer ceiling
-
-## Milestone 7 — Resume and filesystem correctness
-
-* [x] Durable resume journal
-* [x] Atomic journal replacement
-* [x] Verified stripe checkpoints
-* [x] Resume identity validation
-* [x] Resume-stripe control negotiation
-* [x] Transfer-plan filtering
-* [x] Reopen interrupted destinations
-* [x] Restore last-write timestamps and safe Windows attributes
-* [x] Reject source files changed after manifest scanning
-* [x] Automated interruption and resume acceptance test
-
-## Milestone 8 — Real two-machine mode
-
-Next major milestone.
-
-Planned command shape:
+Loopback development and local testing can use:
 
 ```text
-Receiver:
-networkcopy-speed receive <bind-address> <destination>
-
-Sender:
-networkcopy-speed send <receiver-address> <source> [workers] [data-streams]
+127.0.0.1:7337
 ```
 
-Automatic calibrated mode:
+## Cancellation and resume
+
+The GUI's Cancel button interrupts:
+
+- Direct Link discovery;
+- receiver waits;
+- calibration;
+- scanning checkpoints;
+- file payload transfer;
+- large-file stripe processing.
+
+NetworkCopy stores a tiny transfer-request record beside the executable when
+possible. When that directory is not writable, it falls back to:
 
 ```text
-Receiver:
-networkcopy-speed receive-auto <bind-address> <destination>
-
-Sender:
-networkcopy-speed send-auto <receiver-address> <source> [workers] [calibration-mib]
+%LOCALAPPDATA%\NetworkCopy Speed Edition
 ```
 
-### Windows Firewall
+After an interrupted operation, the next launch offers to restore the previous
+settings and restart the operation.
 
-All receiver commands must run from an elevated terminal.
+The destination-side resume journal remains authoritative for completed
+large-file stripes. Restarting the same operation allows those completed
+stripes to be skipped.
 
-Before binding the listener, NetworkCopy automatically refreshes a Windows
-Firewall inbound rule for the selected TCP port. The rule is restricted to:
+A successful transfer removes the corresponding GUI session record.
 
-* the currently running `networkcopy-speed.exe`
-* the selected TCP port
-* remote systems on the local subnet
+## Transfer engine
 
-The rule is recreated whenever a receiver command starts, so changing the
-executable location or listening port requires no manual firewall maintenance.
+The GUI and CLI call the same Rust library. There is no second networking
+implementation and the GUI does not launch or scrape the CLI.
 
-### Release binary
+The transfer engine includes:
 
-NetworkCopy Speed Edition v1.0 is distributed as one self-contained Windows
-executable:
+- parallel directory scanning;
+- UTF-16 Windows path support;
+- one control connection plus calibrated TCP data lanes;
+- tiny-file packing;
+- large-file striping;
+- resumable stripe journals;
+- adaptive Zstandard compression;
+- BLAKE3 integrity verification;
+- sparse-file and metadata handling;
+- bounded reusable transfer buffers;
+- process-wide memory budgeting;
+- explicit source-interface binding for Direct Link Mode.
+
+## Calibration policy
+
+Before a folder transfer, NetworkCopy measures:
 
 ```text
-networkcopy-speed.exe
+1, 2, 4, and 8 TCP streams
 ```
 
-* [x] Derive session identity and stream count from the control connection
-* [x] Separate sender and receiver CLI commands
-* [x] Bind the receiver to a configurable interface and port
-* [x] Connect sender data lanes to a remote machine
-* [x] Preserve the current protocol and transfer planner
-* [x] Raw TCP memory calibration commands
-* [x] Automatic 1, 2, 4, and 8-stream path matrix
-* [x] Recommend the smallest stream count within 90% of the best result
-* [x] Automatic calibrated transfer using the recommended stream count
-* [x] Compare application-wire throughput against the calibrated TCP ceiling
-* [x] Measure a real two-machine path with automatic calibrated transfer
-* [x] Validate current socket buffering and in-flight data on a real path
-* [x] Reach at least 85–90% of the measured path capacity
-* [x] Require elevation and automatically manage the Windows Firewall rule
-* [x] Live chunk-level console progress for automatic calibration and transfers
-* [x] Standalone self-contained release executable
-* [x] End-to-end two-machine acceptance test
+The selected count is the smallest number of streams that reaches at least
+90% of the best measured throughput.
 
-## Milestone 9 — Direct Link Mode
+This avoids using eight connections when fewer lanes already saturate the
+available path.
 
-Planned after the first real-network release:
+## Validated transfer
 
-* [x] Enumerate and classify physical Ethernet interfaces
-* [x] Remove NDIS filter interfaces from candidate enumeration
-* [x] Resolve scoped IPv6 link-local addresses by interface index
-* [x] Discover peers through interface-scoped IPv6 multicast
-* [x] Probe every strict Ethernet candidate concurrently
-* [x] Listen for discovery on every strict Ethernet candidate
-* [x] Reject interfaces with an IPv4 or IPv6 default route
-* [x] Reject Wi-Fi, VPN, Hyper-V, and WSL routes
-* [x] Prefer IPv6 link-local addressing
-* [x] Handle IPv6 scope identifiers correctly
-* [x] Resolve IPv4 APIPA addresses by interface index
-* [x] Fall back to direct-link IPv4
-* [x] Bind every control and data socket explicitly to the selected interface
-* [x] Validate the chosen TCP path
-* [x] Run automatic calibration and folder transfer over the selected direct path
-* [x] Recover cleanly if the link disappears
+The v1.1 Direct Link acceptance dataset contained:
 
-The intended use case is a direct copper cable between two Windows computers, with no router or switch required.
+```text
+2,181 files
+6,807,145,167 logical bytes
+```
 
-## Milestone 10 — v1.2 simple desktop GUI
+Validation covered:
 
-The first GUI will remain deliberately small and will call the same transfer
-engine as the CLI.
+- scoped IPv6 link-local discovery;
+- IPv4 APIPA fallback with IPv6 disabled;
+- explicit local source binding;
+- multistream calibration;
+- compression;
+- tiny-file packing;
+- BLAKE3 verification;
+- cable interruption;
+- restart and completed-stripe resume.
 
-Implementation progress:
+One IPv4 APIPA validation run completed at:
 
-* [x] `egui` / `eframe` native Windows application shell
-* [x] separate `networkcopy-gui` binary
-* [x] Hungarian-first interface with English compiled into the executable
-* [x] runtime Hungarian / English language switching
-* [x] native source and destination folder pickers
-* [x] shared transfer engine exposed through a library facade
-* [x] common Direct Link and manual IP-address transfer requests
-* [x] GUI-facing loopback round-trip coverage
-* [x] background worker thread
-* [x] working Send and Receive actions
-* [x] Direct Link and manual IP-address mode selectors
-* [x] in-window success and failure summaries
-* [x] live phase, byte, percentage, and throughput progress
-* [x] cooperative Cancel during calibration and payload transfer
-* [x] persistent interrupted-transfer request records
-* [x] executable-directory storage with LocalAppData fallback
-* [x] startup resume prompt with one-click restart
-* [x] separate sender and receiver records for loopback development
-* [x] automatic session-record cleanup after successful transfer
-* [x] automatic UAC elevation when starting Receive
-* [x] elevated receiver restores and starts its saved request automatically
-* [x] sender operation remains unelevated
-* [x] immediate Cancel while waiting in Direct Link discovery
-* [x] no separate or duplicated networking implementation
+```text
+282.55 MB/s logical payload throughput
+30.35% application-wire savings
+```
 
-Language and release policy:
+These numbers describe that specific VMware test environment and dataset.
+Actual speed depends on storage, CPU, adapters, drivers, cabling, and the
+compressibility of the transferred data.
 
-* development builds start in Hungarian
-* both Hungarian and English are included in every GUI executable
-* `networkcopy-speed-hu.exe` starts in Hungarian
-* `networkcopy-speed-en.exe` starts in English
-* users can switch language inside either executable
+## Network ports
 
-Planned interface:
+NetworkCopy uses:
 
-* Send and Receive tabs
-* source and destination folder pickers
-* receiver address or local bind address
-* scanner-worker selector
-* data-stream selector
-* Start and Cancel buttons
-* overall progress bar
-* current file and phase
-* logical throughput
-* application-wire throughput
-* compression savings
-* resumed stripe and byte counts
-* compact scrolling event log
-* final success or failure summary
+| Protocol | Port | Purpose |
+|---|---:|---|
+| UDP | 7336 | Direct Link discovery |
+| TCP | 7337 | Calibration, control, and file transfer |
 
-Explicit v1.2 non-goals:
+The GUI receiver configures the required inbound Windows Firewall rules and
+automatically relaunches with administrator privileges when necessary.
 
-* no system service
-* no tray application
-* no account system
-* no transfer history database
-* no remote filesystem browser
-* no theme editor
-* no drag-and-drop protocol changes
-* no separate GUI-only transfer engine
+## Command-line interface
 
-The GUI should make the production CLI easier to operate, not replace or fork
-the core engine.
+Direct Link receiver:
 
-## Later advanced transfer work
+```powershell
+networkcopy-speed.exe direct-receive "C:\Destination"
+```
 
-These features remain planned, but are not required before the first real
-two-machine release:
+Direct Link sender:
 
-* sparse-file allocation preservation
-* medium-file chunk resume
-* tiny-pack resume
-* alternate data stream handling
-* ACL and ownership preservation
-* delta transfer
-* authenticated and encrypted sessions
+```powershell
+networkcopy-speed.exe direct-send "C:\Source" 4 64
+```
 
----
+Sender arguments:
 
-# Known limitations
+```text
+direct-send <source> [scanner-workers] [calibration-mib]
+```
 
-* Windows only
-* Current complete sender and receiver run in one process over loopback
-* No authenticated peer identity
-* No encryption
-* No protection against an active man-in-the-middle
-* No polished production CLI yet
-* No service or background-agent mode
-* No GUI
-* No automatic firewall configuration
-* No metadata restoration yet
-* Sparse files are detected but not preserved sparsely yet
-* Medium and tiny files restart from the beginning after interruption
-* Large-file resume depends on the journal and partial file remaining intact
-* Source files changing during transfer are not fully snapshot-isolated
-* Compression decisions are sample-based
-* Compression is chosen per record, not independently for every block
-* Benchmark results are heavily machine-dependent
+Use the built-in help for benchmark, diagnostic, explicit-address, and
+lower-level commands:
 
----
+```powershell
+networkcopy-speed.exe --help
+```
 
-# Source layout
+## Building
+
+Requirements:
+
+- Windows 11 or a supported Windows 10 installation;
+- stable Rust toolchain;
+- MSVC Rust target and Visual Studio C++ build tools.
+
+Debug GUI:
+
+```powershell
+cargo run --bin networkcopy-gui
+```
+
+Release GUI with Hungarian as the initial language:
+
+```powershell
+cargo build `
+    --release `
+    --bin networkcopy-gui
+```
+
+Release GUI with English as the initial language:
+
+```powershell
+cargo build `
+    --release `
+    --bin networkcopy-gui `
+    --features default-language-en
+```
+
+Both variants contain both languages. The feature only changes which language
+is selected at startup.
+
+Release CLI:
+
+```powershell
+cargo build `
+    --release `
+    --bin networkcopy-speed
+```
+
+## Release naming
+
+The v1.2 release assets will be executable-only:
+
+```text
+networkcopy-speed-hu.exe
+networkcopy-speed-en.exe
+```
+
+No installer or ZIP package is required.
+
+## Quality gate
+
+Before a release:
+
+```powershell
+cargo fmt --check
+
+cargo test
+
+cargo clippy `
+    --all-targets `
+    --all-features `
+    -- `
+    -D warnings
+
+cargo build --release
+```
+
+## Project structure
 
 ```text
 src/
-├── adaptive_compression.rs   Raw/Zstandard payload codec
-├── compression_probe.rs      Sampling and compression decisions
-├── content_hash.rs           BLAKE3 hashing
-├── control_plane.rs          Protocol, handshakes, and manifests
-├── copy_bench.rs             Synchronous copy baseline
-├── iocp_copy.rs              Native overlapped IOCP copy engine
-├── iocp_file_probe.rs        Overlapped file-read probe
-├── iocp_probe.rs             IO completion port wrapper and probe
-├── main.rs                   CLI and benchmark driver
-├── manifest_scan.rs          Parallel deterministic scanner
-├── multistream_copy.rs       Integrated folder-transfer engine
-├── pipeline_bench.rs         Reusable buffered pipeline
-├── resume_state.rs           Durable resume journal
-├── striped_file.rs           Positional striped-file transfer
-└── transfer_memory.rs        Transfer memory planning and limits
+├── bin/
+│   └── networkcopy-gui.rs
+├── lib.rs
+├── cli_main.rs
+├── gui_transfer.rs
+├── gui_session.rs
+├── windows_elevation.rs
+├── direct_discovery.rs
+├── direct_discovery_v4.rs
+├── direct_transfer.rs
+├── calibrated_transfer.rs
+├── multistream_copy.rs
+├── manifest_scan.rs
+├── adaptive_compression.rs
+├── resume_state.rs
+└── ...
 ```
 
----
+Important architectural boundary:
 
-# Development philosophy
+```text
+GUI ─┐
+     ├── shared transfer library ── networking and storage engine
+CLI ─┘
+```
 
-This repository intentionally keeps several generations of the transfer engine.
+## Scope
 
-The older benchmark paths are not dead weight. They provide measured baselines and isolate individual mechanisms:
+NetworkCopy is currently Windows-only and optimized for trusted local
+machine-to-machine transfers.
 
-* synchronous file copying;
-* reusable buffer pipelines;
-* native IOCP;
-* manifest scanning;
-* control-plane serialization;
-* striped file transfer;
-* integrated folder transfer.
+The project intentionally focuses on:
 
-That makes regressions easier to diagnose and prevents architectural enthusiasm from replacing evidence.
+- local Ethernet and LAN paths;
+- maximum practical throughput;
+- restartable transfers;
+- correctness and integrity;
+- a portable standalone executable.
 
-The project is not trying to produce the most abstract file-copy framework possible.
-
-It is trying to answer a much more useful question:
-
-> How close can a carefully measured Windows transfer engine get to the real storage and network limits of the machines running it?
-
----
-
-# Safety and data-loss warning
-
-This project is experimental.
-
-Do not use it as the sole copy of important data.
-
-Before trusting a transfer:
-
-1. keep the source intact;
-2. verify the destination independently;
-3. test interruption and resume behavior on disposable data;
-4. avoid untrusted networks;
-5. do not assume metadata, permissions, sparse allocation, or alternate data streams are preserved.
-
-The current engine validates file payloads with BLAKE3, but payload integrity is only one part of a production-grade file-transfer system.
+See `LICENSE` for licensing terms.
