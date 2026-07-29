@@ -1,4 +1,4 @@
-use crate::console_progress::ConsoleProgress;
+use crate::console_progress::{ConsoleProgress, ProgressCounter};
 use crate::copy_bench::{decimal_megabytes_per_second, format_bytes};
 use crate::multistream_copy::{self, MultistreamCopyReport, ReceiveReport};
 use crate::network_calibration::{self, NetworkCalibrationMatrixReport, NetworkCalibrationReport};
@@ -152,6 +152,74 @@ pub fn send(
     })
 }
 
+pub(crate) fn send_with_progress(
+    receiver_address: SocketAddr,
+    source_root: &Path,
+    worker_count: usize,
+    calibration_bytes: u64,
+    progress: ProgressCounter,
+) -> io::Result<CalibratedSendReport> {
+    progress.set_label("Connecting calibration");
+
+    progress.set_completed(0);
+
+    progress.set_total(0);
+
+    let calibration = network_calibration::send_matrix_with_progress(
+        receiver_address,
+        calibration_bytes,
+        progress.clone(),
+    )?;
+
+    progress.check_cancelled()?;
+
+    let data_stream_count = calibration.recommended.data_stream_count;
+
+    let calibrated_report = calibration.best;
+
+    progress.set_label("Scanning source");
+
+    progress.set_completed(0);
+
+    progress.set_total(0);
+
+    let transfer = multistream_copy::send_with_progress(
+        receiver_address,
+        source_root,
+        worker_count,
+        data_stream_count,
+        progress.clone(),
+    )?;
+
+    progress.check_cancelled()?;
+
+    let calibrated_megabytes_per_second = report_megabytes_per_second(&calibrated_report);
+
+    let logical_megabytes_per_second =
+        decimal_megabytes_per_second(transfer.bytes_copied, transfer.data_elapsed);
+
+    let wire_megabytes_per_second =
+        decimal_megabytes_per_second(transfer.data_wire_bytes, transfer.data_elapsed);
+
+    let path_efficiency_percent =
+        percentage_of(wire_megabytes_per_second, calibrated_megabytes_per_second);
+
+    let total = progress.total();
+
+    progress.set_completed(total);
+
+    progress.set_label("Complete");
+
+    Ok(CalibratedSendReport {
+        calibration,
+        transfer,
+        calibrated_megabytes_per_second,
+        logical_megabytes_per_second,
+        wire_megabytes_per_second,
+        path_efficiency_percent,
+    })
+}
+
 pub fn receive_once(
     listener: TcpListener,
     destination_root: &Path,
@@ -192,6 +260,62 @@ pub fn receive_once(
             ),
         ));
     }
+
+    Ok(CalibratedReceiveReport {
+        calibration,
+        transfer,
+    })
+}
+
+pub(crate) fn receive_once_with_progress(
+    listener: TcpListener,
+    destination_root: &Path,
+    progress: ProgressCounter,
+) -> io::Result<CalibratedReceiveReport> {
+    progress.set_label("Waiting for calibration");
+
+    progress.set_completed(0);
+
+    progress.set_total(0);
+
+    let calibration =
+        network_calibration::receive_matrix_on_listener_with_progress(&listener, progress.clone())?;
+
+    progress.check_cancelled()?;
+
+    progress.set_label("Waiting for transfer");
+
+    progress.set_completed(0);
+
+    progress.set_total(0);
+
+    let transfer = multistream_copy::receive_on_listener_with_progress(
+        &listener,
+        destination_root,
+        progress.clone(),
+    )?;
+
+    progress.check_cancelled()?;
+
+    if !calibration
+        .reports
+        .iter()
+        .any(|report| report.data_stream_count == transfer.data_stream_count)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "transfer used {} streams, which was not included in the calibration matrix",
+                transfer.data_stream_count,
+            ),
+        ));
+    }
+
+    let total = progress.total();
+
+    progress.set_completed(total);
+
+    progress.set_label("Complete");
 
     Ok(CalibratedReceiveReport {
         calibration,

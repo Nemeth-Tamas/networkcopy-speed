@@ -276,6 +276,8 @@ fn send_matrix_internal(
 
     for data_stream_count in MATRIX_STREAM_COUNTS {
         if let Some(progress) = &progress {
+            progress.check_cancelled()?;
+
             progress.set_label(format!("Calibration send - {data_stream_count} streams"));
         }
 
@@ -316,6 +318,8 @@ fn receive_matrix_internal(
 
     for expected_stream_count in MATRIX_STREAM_COUNTS {
         if let Some(progress) = &progress {
+            progress.check_cancelled()?;
+
             progress.set_label(format!(
                 "Calibration receive - {expected_stream_count} streams"
             ));
@@ -339,11 +343,56 @@ fn receive_matrix_internal(
     build_matrix_report(reports)
 }
 
+fn accept_with_progress(
+    listener: &TcpListener,
+    progress: Option<&ProgressCounter>,
+) -> io::Result<(TcpStream, SocketAddr)> {
+    let Some(progress) = progress else {
+        return listener.accept();
+    };
+
+    listener.set_nonblocking(true)?;
+
+    let result = loop {
+        if let Err(error) = progress.check_cancelled() {
+            break Err(error);
+        }
+
+        match listener.accept() {
+            Ok(accepted) => {
+                break Ok(accepted);
+            }
+
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+
+            Err(error) => {
+                break Err(error);
+            }
+        }
+    };
+
+    let restore = listener.set_nonblocking(false);
+
+    match (result, restore) {
+        (Ok((stream, address)), Ok(())) => {
+            stream.set_nonblocking(false)?;
+
+            Ok((stream, address))
+        }
+
+        (Err(error), _) => Err(error),
+
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
 fn receive_one(
     listener: &TcpListener,
     progress: Option<ProgressCounter>,
 ) -> io::Result<NetworkCalibrationReport> {
-    let (mut control_stream, _control_peer) = listener.accept()?;
+    let (mut control_stream, _control_peer) = accept_with_progress(listener, progress.as_ref())?;
 
     control_plane::configure_stream(&control_stream)?;
 
@@ -362,7 +411,7 @@ fn receive_one(
         .collect();
 
     for _ in 0..config.data_stream_count {
-        let (mut stream, _data_peer) = listener.accept()?;
+        let (mut stream, _data_peer) = accept_with_progress(listener, progress.as_ref())?;
 
         control_plane::configure_stream(&stream)?;
 
@@ -576,6 +625,10 @@ fn send_lane(
     let mut remaining = total_bytes;
 
     while remaining > 0 {
+        if let Some(progress) = &progress {
+            progress.check_cancelled()?;
+        }
+
         let count = usize::try_from(remaining.min(payload.len() as u64)).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -607,6 +660,10 @@ fn receive_lane(
     let mut remaining = total_bytes;
 
     while remaining > 0 {
+        if let Some(progress) = &progress {
+            progress.check_cancelled()?;
+        }
+
         let count = usize::try_from(remaining.min(buffer.len() as u64)).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,

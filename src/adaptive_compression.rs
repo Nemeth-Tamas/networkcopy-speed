@@ -112,6 +112,10 @@ impl PayloadEncoder {
         let mut transferred = 0_u64;
 
         while transferred < byte_count {
+            if let Some(progress) = progress {
+                progress.check_cancelled()?;
+            }
+
             let remaining = byte_count - transferred;
 
             let requested =
@@ -266,6 +270,10 @@ impl PayloadDecoder {
         let mut transferred = 0_u64;
 
         while transferred < byte_count {
+            if let Some(progress) = progress {
+                progress.check_cancelled()?;
+            }
+
             match decision {
                 CompressionDecision::SendRaw => {
                     let requested =

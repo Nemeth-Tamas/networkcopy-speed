@@ -19,6 +19,7 @@ struct ProgressInner {
     completed: AtomicU64,
     total: AtomicU64,
     finished: AtomicBool,
+    cancelled: AtomicBool,
 }
 
 pub struct ConsoleProgress {
@@ -28,7 +29,7 @@ pub struct ConsoleProgress {
 }
 
 impl ProgressCounter {
-    fn new(label: &str, total: u64) -> Self {
+    pub(crate) fn new(label: &str, total: u64) -> Self {
         Self {
             inner: Arc::new(ProgressInner {
                 label: Mutex::new(label.to_string()),
@@ -38,6 +39,8 @@ impl ProgressCounter {
                 total: AtomicU64::new(total),
 
                 finished: AtomicBool::new(false),
+
+                cancelled: AtomicBool::new(false),
             }),
         }
     }
@@ -73,6 +76,25 @@ impl ProgressCounter {
         *current = label.into();
     }
 
+    pub(crate) fn cancel(&self) {
+        self.inner.cancelled.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn check_cancelled(&self) -> io::Result<()> {
+        if self.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "transfer cancelled by the user",
+            ));
+        }
+
+        Ok(())
+    }
+
     fn complete(&self) {
         let total = self.total();
 
@@ -89,7 +111,7 @@ impl ProgressCounter {
         self.inner.finished.load(Ordering::Acquire)
     }
 
-    fn snapshot(&self) -> ProgressSnapshot {
+    pub(crate) fn snapshot(&self) -> ProgressSnapshot {
         let label = self
             .inner
             .label
@@ -108,10 +130,10 @@ impl ProgressCounter {
 }
 
 #[derive(Debug)]
-struct ProgressSnapshot {
-    label: String,
-    completed: u64,
-    total: u64,
+pub(crate) struct ProgressSnapshot {
+    pub(crate) label: String,
+    pub(crate) completed: u64,
+    pub(crate) total: u64,
 }
 
 impl ConsoleProgress {
@@ -272,7 +294,8 @@ fn format_amount(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProgressSnapshot, format_progress_line};
+    use super::{ProgressCounter, ProgressSnapshot, format_progress_line};
+    use std::io;
     use std::time::Duration;
 
     #[test]
@@ -295,5 +318,20 @@ mod tests {
         assert!(line.contains("Transfer send",));
 
         assert!(line.chars().count() < 100);
+    }
+
+    #[test]
+    fn cancellation_is_reported_as_interrupted() {
+        let progress = ProgressCounter::new("test", 0);
+
+        assert!(!progress.is_cancelled(),);
+
+        progress.cancel();
+
+        assert!(progress.is_cancelled(),);
+
+        let error = progress.check_cancelled().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted,);
     }
 }

@@ -1,4 +1,5 @@
 use crate::calibrated_transfer::{self, CalibratedReceiveReport, CalibratedSendReport};
+use crate::console_progress::{ProgressCounter, ProgressSnapshot};
 use crate::direct_address::DIRECT_TRANSFER_PORT;
 use crate::direct_discovery;
 use crate::direct_transfer;
@@ -42,6 +43,52 @@ pub enum GuiTransferDirection {
 }
 
 #[derive(Clone, Debug)]
+pub struct GuiTransferControl {
+    progress: ProgressCounter,
+}
+
+#[derive(Clone, Debug)]
+pub struct GuiTransferProgress {
+    pub phase: String,
+    pub completed: u64,
+    pub total: u64,
+    pub cancel_requested: bool,
+}
+
+impl GuiTransferControl {
+    pub fn new() -> Self {
+        Self {
+            progress: ProgressCounter::new("Preparing transfer", 0),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.progress.cancel();
+    }
+
+    pub fn progress(&self) -> GuiTransferProgress {
+        let ProgressSnapshot {
+            label,
+            completed,
+            total,
+        } = self.progress.snapshot();
+
+        GuiTransferProgress {
+            phase: label,
+            completed,
+            total,
+            cancel_requested: self.progress.is_cancelled(),
+        }
+    }
+}
+
+impl Default for GuiTransferControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct GuiTransferSummary {
     pub direction: GuiTransferDirection,
 
@@ -69,6 +116,15 @@ pub struct GuiTransferSummary {
 }
 
 pub fn run_gui_transfer(request: GuiTransferRequest) -> io::Result<GuiTransferSummary> {
+    run_gui_transfer_with_control(request, GuiTransferControl::new())
+}
+
+pub fn run_gui_transfer_with_control(
+    request: GuiTransferRequest,
+    control: GuiTransferControl,
+) -> io::Result<GuiTransferSummary> {
+    control.progress.check_cancelled()?;
+
     match request {
         GuiTransferRequest::Send {
             connection,
@@ -81,16 +137,22 @@ pub fn run_gui_transfer(request: GuiTransferRequest) -> io::Result<GuiTransferSu
             let calibration_bytes = network_calibration::bytes_from_mib(calibration_mib)?;
 
             let report = match connection {
-                GuiConnectionMode::Direct => {
-                    direct_transfer::send(&source_root, worker_count, calibration_bytes)?
-                }
-
-                GuiConnectionMode::Address(receiver_address) => calibrated_transfer::send(
-                    receiver_address,
+                GuiConnectionMode::Direct => direct_transfer::send_with_progress(
                     &source_root,
                     worker_count,
                     calibration_bytes,
+                    control.progress.clone(),
                 )?,
+
+                GuiConnectionMode::Address(receiver_address) => {
+                    calibrated_transfer::send_with_progress(
+                        receiver_address,
+                        &source_root,
+                        worker_count,
+                        calibration_bytes,
+                        control.progress.clone(),
+                    )?
+                }
             };
 
             Ok(send_summary(report))
@@ -104,7 +166,10 @@ pub fn run_gui_transfer(request: GuiTransferRequest) -> io::Result<GuiTransferSu
                 GuiConnectionMode::Direct => {
                     prepare_direct_receiver()?;
 
-                    direct_transfer::receive_once(&destination_root)?
+                    direct_transfer::receive_once_with_progress(
+                        &destination_root,
+                        control.progress.clone(),
+                    )?
                 }
 
                 GuiConnectionMode::Address(bind_address) => {
@@ -112,7 +177,11 @@ pub fn run_gui_transfer(request: GuiTransferRequest) -> io::Result<GuiTransferSu
 
                     let listener = TcpListener::bind(bind_address)?;
 
-                    calibrated_transfer::receive_once(listener, &destination_root)?
+                    calibrated_transfer::receive_once_with_progress(
+                        listener,
+                        &destination_root,
+                        control.progress.clone(),
+                    )?
                 }
             };
 
@@ -230,7 +299,10 @@ fn wire_savings_percent(logical_bytes: u64, wire_bytes: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{GuiConnectionMode, GuiTransferDirection, GuiTransferRequest, run_gui_transfer};
+    use super::{
+        GuiConnectionMode, GuiTransferControl, GuiTransferDirection, GuiTransferRequest,
+        run_gui_transfer,
+    };
     use std::env;
     use std::fs;
     use std::net::TcpListener;
@@ -307,5 +379,20 @@ mod tests {
         );
 
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn gui_control_exposes_cancellation() {
+        let control = GuiTransferControl::new();
+
+        let before = control.progress();
+
+        assert!(!before.cancel_requested,);
+
+        control.cancel();
+
+        let after = control.progress();
+
+        assert!(after.cancel_requested,);
     }
 }

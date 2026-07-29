@@ -557,6 +557,8 @@ fn send_internal(
     let summary = control_plane::summarize_manifest(&manifest)?;
 
     if let Some(progress) = &progress {
+        progress.check_cancelled()?;
+
         progress.set_label("Transfer send");
 
         progress.set_completed(0);
@@ -775,7 +777,8 @@ fn run_server(
     fault_injection: Arc<TransferFault>,
     progress: Option<ProgressCounter>,
 ) -> io::Result<ReceiveReport> {
-    let (mut control_stream, data_streams, accepted_session) = accept_session(listener)?;
+    let (mut control_stream, data_streams, accepted_session) =
+        accept_session(listener, progress.as_ref())?;
 
     let session_started = Instant::now();
 
@@ -905,10 +908,56 @@ fn run_server(
     })
 }
 
+fn accept_with_progress(
+    listener: &TcpListener,
+    progress: Option<&ProgressCounter>,
+) -> io::Result<(TcpStream, SocketAddr)> {
+    let Some(progress) = progress else {
+        return listener.accept();
+    };
+
+    listener.set_nonblocking(true)?;
+
+    let result = loop {
+        if let Err(error) = progress.check_cancelled() {
+            break Err(error);
+        }
+
+        match listener.accept() {
+            Ok(accepted) => {
+                break Ok(accepted);
+            }
+
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
+
+            Err(error) => {
+                break Err(error);
+            }
+        }
+    };
+
+    let restore = listener.set_nonblocking(false);
+
+    match (result, restore) {
+        (Ok((stream, address)), Ok(())) => {
+            stream.set_nonblocking(false)?;
+
+            Ok((stream, address))
+        }
+
+        (Err(error), _) => Err(error),
+
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
 fn accept_session(
     listener: &TcpListener,
+    progress: Option<&ProgressCounter>,
 ) -> io::Result<(TcpStream, Vec<TcpStream>, AcceptedSession)> {
-    let (mut control_stream, _control_peer) = listener.accept()?;
+    let (mut control_stream, _control_peer) = accept_with_progress(listener, progress)?;
 
     control_plane::configure_stream(&control_stream)?;
 
@@ -948,7 +997,7 @@ fn accept_session(
         .collect();
 
     for _ in 0..data_stream_count {
-        let (mut stream, _data_peer) = listener.accept()?;
+        let (mut stream, _data_peer) = accept_with_progress(listener, progress)?;
 
         control_plane::configure_stream(&stream)?;
 
@@ -1568,6 +1617,10 @@ fn send_lane(
     let mut report = LaneReport::default();
 
     for task in tasks {
+        if let Some(progress) = &progress {
+            progress.check_cancelled()?;
+        }
+
         match task {
             TransferTask::WholeFile { file_id } => {
                 let file_id = *file_id;
@@ -1976,6 +2029,10 @@ fn receive_lane(
     let mut report = LaneReport::default();
 
     for task in tasks {
+        if let Some(progress) = &progress {
+            progress.check_cancelled()?;
+        }
+
         match task {
             TransferTask::WholeFile { file_id } => {
                 let file_id = *file_id;
@@ -3019,7 +3076,7 @@ mod tests {
 
         let session_id = 0x1234_5678_9ABC_DEF0;
 
-        let receiver = thread::spawn(move || accept_session(&listener));
+        let receiver = thread::spawn(move || accept_session(&listener, None));
 
         let mut control_stream = TcpStream::connect(address).unwrap();
 
