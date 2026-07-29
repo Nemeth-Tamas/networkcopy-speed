@@ -1150,7 +1150,7 @@ impl NetworkCopyGui {
                     ))
                     .strong(),
                 );
-            } else {
+            } else if progress.completed > 0 {
                 ui.label(format_bytes(progress.completed));
             }
         });
@@ -1601,6 +1601,10 @@ fn localized_phase(language: Language, phase: &str) -> String {
         "Transfer receive" => "Fájlok fogadása".to_string(),
 
         "Complete" => "Kész".to_string(),
+
+        "Waiting for receiver finalization" => "Várakozás a fogadó lezárására".to_string(),
+
+        "Finalizing destination" => "Célmappa véglegesítése".to_string(),
 
         _ => {
             if let Some(streams) = phase

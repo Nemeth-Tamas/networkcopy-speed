@@ -1,7 +1,7 @@
 use crate::adaptive_compression::{MAX_COMPRESSED_CHUNK_BYTES, PayloadDecoder, PayloadEncoder};
 use crate::compression_probe;
 use crate::console_progress::ProgressCounter;
-use crate::content_hash::{self, ContentHasher};
+use crate::content_hash;
 use crate::control_plane::{self, ConnectionRole, Handshake, ManifestSummary};
 use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_second, format_bytes};
 use crate::file_metadata;
@@ -678,6 +678,16 @@ fn send_internal(
         transferred_sender_report,
     ])?;
 
+    if let Some(progress) = &progress {
+        progress.check_cancelled()?;
+
+        progress.set_label("Waiting for receiver finalization");
+
+        progress.set_completed(0);
+
+        progress.set_total(0);
+    }
+
     let transfer_ack = read_transfer_ack(&mut control_stream)?;
 
     let data_elapsed = data_started.elapsed();
@@ -874,9 +884,23 @@ fn run_server(
 
     let report = merge_lane_reports(vec![resume_application.logical_report, transferred_report])?;
 
+    if let Some(progress) = &progress {
+        progress.check_cancelled()?;
+
+        progress.set_label("Finalizing destination");
+
+        progress.set_completed(0);
+
+        progress.set_total(0);
+    }
+
     finalize_large_files(destination_root.as_path(), &manifest)?;
 
     file_metadata::restore_manifest_files(destination_root.as_path(), &manifest)?;
+
+    if let Some(progress) = &progress {
+        progress.check_cancelled()?;
+    }
 
     let ack = TransferAck {
         files_copied: report.files_copied,
@@ -2670,49 +2694,6 @@ fn finalize_large_files(destination_root: &Path, manifest: &[ManifestEntry]) -> 
     Ok(())
 }
 
-fn receive_raw_file(
-    reader: &mut impl Read,
-    destination_root: &Path,
-    file_id: usize,
-    entry: &ManifestEntry,
-    buffer: &mut [u8],
-) -> io::Result<()> {
-    let final_path = destination_root.join(&entry.relative_path);
-
-    let temporary_path = temporary_path(&final_path, file_id);
-
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary_path)?;
-
-    file.set_len(entry.file_size)?;
-
-    let transfer_result = (|| -> io::Result<()> {
-        let actual_digest = copy_exact_hashed(reader, &mut file, entry.file_size, buffer)?;
-
-        let expected_digest = read_digest(reader)?;
-
-        let context = format!("file {file_id} ({})", entry.relative_path.display());
-
-        verify_content_digest(&context, &actual_digest, &expected_digest)?;
-
-        file.flush()
-    })();
-
-    if let Err(error) = transfer_result {
-        drop(file);
-
-        let _ = fs::remove_file(&temporary_path);
-
-        return Err(error);
-    }
-
-    drop(file);
-
-    fs::rename(temporary_path, final_path)
-}
-
 fn receive_file(
     reader: &mut impl Read,
     destination_root: &Path,
@@ -2773,38 +2754,6 @@ fn temporary_path(final_path: &Path, file_id: usize) -> PathBuf {
 
     temporary.push(format!(".ncs-part-{file_id}"));
     PathBuf::from(temporary)
-}
-
-fn copy_exact_hashed(
-    reader: &mut impl Read,
-    writer: &mut impl Write,
-    byte_count: u64,
-    buffer: &mut [u8],
-) -> io::Result<[u8; CONTENT_DIGEST_BYTES]> {
-    let mut remaining = byte_count;
-    let mut hasher = ContentHasher::new();
-
-    while remaining > 0 {
-        let requested = remaining.min(buffer.len() as u64) as usize;
-
-        let read = reader.read(&mut buffer[..requested])?;
-
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!("stream ended with {remaining} bytes remaining"),
-            ));
-        }
-
-        writer.write_all(&buffer[..read])?;
-        hasher.update(&buffer[..read]);
-
-        remaining = remaining
-            .checked_sub(read as u64)
-            .ok_or_else(|| io::Error::other("hashed copy byte count underflowed"))?;
-    }
-
-    Ok(hasher.finalize())
 }
 
 fn join_lane_threads<T>(
@@ -3151,10 +3100,9 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 mod tests {
     use super::{
         ReceiverReady, TINY_PACK_TARGET_BYTES, TransferFault, TransferTask, accept_session,
-        apply_resume_offer, build_transfer_plan, connect_with_retry_config, copy_exact_hashed,
-        read_receiver_ready, receive_once, run, run_with_fault, send, temporary_path,
-        validate_resume_offer, validate_source_metadata, verify_content_digest,
-        write_receiver_ready,
+        apply_resume_offer, build_transfer_plan, connect_with_retry_config, read_receiver_ready,
+        receive_once, run, run_with_fault, send, temporary_path, validate_resume_offer,
+        validate_source_metadata, verify_content_digest, write_receiver_ready,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::file_metadata;
@@ -3266,26 +3214,6 @@ mod tests {
 
         assert_eq!(packed_files, 33);
         assert_eq!(pack_payloads, vec![tiny_file_size, TINY_PACK_TARGET_BYTES,]);
-    }
-
-    #[test]
-    fn hashed_copy_matches_blake3() {
-        let contents = b"NetworkCopy inline integrity payload";
-
-        let mut reader = Cursor::new(contents);
-        let mut destination = Vec::new();
-        let mut buffer = [0_u8; 7];
-
-        let digest = copy_exact_hashed(
-            &mut reader,
-            &mut destination,
-            contents.len() as u64,
-            &mut buffer,
-        )
-        .unwrap();
-
-        assert_eq!(destination, contents);
-        assert_eq!(digest, *blake3::hash(contents).as_bytes());
     }
 
     #[test]
