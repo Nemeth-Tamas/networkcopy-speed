@@ -44,6 +44,7 @@ const TINY_PACK_FIXED_WIRE_BYTES: u64 = 1 + 4 + 8 + 1 + 8 + CONTENT_DIGEST_BYTES
 
 const TINY_PACK_FILE_METADATA_WIRE_BYTES: u64 = 8 + 8 + CONTENT_DIGEST_BYTES as u64;
 const MAX_RESUME_OFFER_STRIPES: u32 = 1_000_000;
+const MAX_UNCHANGED_OFFER_FILES: u32 = 1_000_000;
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -305,6 +306,7 @@ struct TransferAck {
 struct ReceiverReady {
     summary: ManifestSummary,
     completed_stripes: BTreeSet<ResumeStripe>,
+    unchanged_file_ids: BTreeSet<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -325,6 +327,8 @@ struct LaneReport {
 struct ResumeApplication {
     logical_report: LaneReport,
     stripe_count: u64,
+    unchanged_file_count: u64,
+    unchanged_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -692,8 +696,12 @@ fn send_internal(
 
     let mut transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
 
-    let resume_application =
-        apply_resume_offer(&mut transfer_plan, &receiver_ready.completed_stripes)?;
+    let resume_application = apply_resume_offer(
+        &mut transfer_plan,
+        &manifest,
+        &receiver_ready.completed_stripes,
+        &receiver_ready.unchanged_file_ids,
+    )?;
 
     if let Some(progress) = &progress {
         progress.set_completed(resume_application.logical_report.bytes_copied);
@@ -907,10 +915,16 @@ fn run_server(
         summary,
 
         completed_stripes: resume_journal.completed_stripes().collect(),
+
+        unchanged_file_ids: BTreeSet::new(),
     };
 
-    let resume_application =
-        apply_resume_offer(&mut transfer_plan, &receiver_ready.completed_stripes)?;
+    let resume_application = apply_resume_offer(
+        &mut transfer_plan,
+        &manifest,
+        &receiver_ready.completed_stripes,
+        &receiver_ready.unchanged_file_ids,
+    )?;
 
     if let Some(progress) = &progress {
         progress.set_completed(resume_application.logical_report.bytes_copied);
@@ -1674,33 +1688,117 @@ fn validate_resume_offer(
     Ok(())
 }
 
+fn validate_unchanged_offer(
+    manifest: &[ManifestEntry],
+    unchanged_file_ids: &BTreeSet<usize>,
+) -> io::Result<()> {
+    if unchanged_file_ids.len() > MAX_UNCHANGED_OFFER_FILES as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unchanged-file offer exceeds the supported limit",
+        ));
+    }
+
+    for &file_id in unchanged_file_ids {
+        if file_id >= manifest.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("receiver offered unknown unchanged file ID {file_id}"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn apply_resume_offer(
     transfer_plan: &mut TransferPlan,
+    manifest: &[ManifestEntry],
     offered: &BTreeSet<ResumeStripe>,
+    unchanged_file_ids: &BTreeSet<usize>,
 ) -> io::Result<ResumeApplication> {
     validate_resume_offer(transfer_plan, offered)?;
 
+    validate_unchanged_offer(manifest, unchanged_file_ids)?;
+
+    if let Some(overlap) = offered.iter().find(|stripe| {
+        usize::try_from(stripe.file_id)
+            .ok()
+            .is_some_and(|file_id| unchanged_file_ids.contains(&file_id))
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "receiver offered file {} as both unchanged and partially resumed",
+                overlap.file_id,
+            ),
+        ));
+    }
+
     let mut application = ResumeApplication::default();
+
+    for &file_id in unchanged_file_ids {
+        let entry = manifest.get(file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("receiver offered unknown unchanged file ID {file_id}"),
+            )
+        })?;
+
+        add_lane_counts(
+            &mut application.logical_report,
+            1,
+            entry.file_size,
+            "unchanged",
+        )?;
+
+        application.unchanged_file_count = application
+            .unchanged_file_count
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("unchanged file count overflowed"))?;
+
+        application.unchanged_bytes = application
+            .unchanged_bytes
+            .checked_add(entry.file_size)
+            .ok_or_else(|| io::Error::other("unchanged byte count overflowed"))?;
+    }
 
     for lane in &mut transfer_plan.lanes {
         let mut remaining_tasks = Vec::with_capacity(lane.len());
 
         for task in lane.drain(..) {
-            let completed = match &task {
+            match task {
+                TransferTask::WholeFile { file_id } if unchanged_file_ids.contains(&file_id) => {}
+
+                TransferTask::Stripe { file_id, .. } if unchanged_file_ids.contains(&file_id) => {}
+
+                TransferTask::TinyPack { mut file_ids, .. } => {
+                    file_ids.retain(|file_id| !unchanged_file_ids.contains(file_id));
+
+                    if file_ids.is_empty() {
+                        continue;
+                    }
+
+                    let summary = summarize_tiny_pack(manifest, &file_ids)?;
+
+                    remaining_tasks.push(TransferTask::TinyPack {
+                        file_ids,
+                        total_bytes: summary.bytes,
+                    });
+                }
+
                 TransferTask::Stripe {
                     file_id,
                     offset,
                     length,
                 } => {
-                    let stripe = ResumeStripe::new(*file_id, *offset, *length)?;
+                    let stripe = ResumeStripe::new(file_id, offset, length)?;
 
-                    if !offered.contains(&stripe) {
-                        false
-                    } else {
+                    if offered.contains(&stripe) {
                         add_lane_counts(
                             &mut application.logical_report,
-                            u64::from(*offset == 0),
-                            *length,
+                            u64::from(offset == 0),
+                            length,
                             "resumed",
                         )?;
 
@@ -1708,16 +1806,18 @@ fn apply_resume_offer(
                             .stripe_count
                             .checked_add(1)
                             .ok_or_else(|| io::Error::other("resumed stripe count overflowed"))?;
-
-                        true
+                    } else {
+                        remaining_tasks.push(TransferTask::Stripe {
+                            file_id,
+                            offset,
+                            length,
+                        });
                     }
                 }
 
-                TransferTask::WholeFile { .. } | TransferTask::TinyPack { .. } => false,
-            };
-
-            if !completed {
-                remaining_tasks.push(task);
+                task => {
+                    remaining_tasks.push(task);
+                }
             }
         }
 
@@ -1730,7 +1830,17 @@ fn apply_resume_offer(
     if application.stripe_count != expected_stripe_count {
         return Err(io::Error::other(format!(
             "applied {} resumed stripes, expected {expected_stripe_count}",
-            application.stripe_count
+            application.stripe_count,
+        )));
+    }
+
+    let expected_unchanged_count = u64::try_from(unchanged_file_ids.len())
+        .map_err(|_| io::Error::other("unchanged-file offer count cannot be represented"))?;
+
+    if application.unchanged_file_count != expected_unchanged_count {
+        return Err(io::Error::other(format!(
+            "applied {} unchanged files, expected {expected_unchanged_count}",
+            application.unchanged_file_count,
         )));
     }
 
@@ -3071,6 +3181,36 @@ fn write_receiver_ready(writer: &mut impl Write, ready: &ReceiverReady) -> io::R
         write_u64(writer, stripe.length)?;
     }
 
+    let unchanged_count = u32::try_from(ready.unchanged_file_ids.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unchanged-file offer contains too many file IDs",
+        )
+    })?;
+
+    if unchanged_count > MAX_UNCHANGED_OFFER_FILES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unchanged-file offer contains {unchanged_count} files, exceeding the supported limit",
+            ),
+        ));
+    }
+
+    write_u32(writer, unchanged_count)?;
+
+    for &file_id in &ready.unchanged_file_ids {
+        write_u64(
+            writer,
+            u64::try_from(file_id).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unchanged file ID cannot be represented",
+                )
+            })?,
+        )?;
+    }
+
     writer.flush()
 }
 
@@ -3138,9 +3278,34 @@ fn read_receiver_ready(reader: &mut impl Read) -> io::Result<ReceiverReady> {
         }
     }
 
+    let unchanged_count = read_u32(reader)?;
+
+    if unchanged_count > MAX_UNCHANGED_OFFER_FILES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "receiver offered {unchanged_count} unchanged files, exceeding the supported limit",
+            ),
+        ));
+    }
+
+    let mut unchanged_file_ids = BTreeSet::new();
+
+    for _ in 0..unchanged_count {
+        let file_id = read_file_id(reader)?;
+
+        if !unchanged_file_ids.insert(file_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "receiver offered a duplicate unchanged file ID",
+            ));
+        }
+    }
+
     Ok(ReceiverReady {
         summary,
         completed_stripes,
+        unchanged_file_ids,
     })
 }
 
@@ -3701,7 +3866,8 @@ mod tests {
 
         let offered = BTreeSet::from([completed_stripe]);
 
-        let application = apply_resume_offer(&mut transfer_plan, &offered).unwrap();
+        let application =
+            apply_resume_offer(&mut transfer_plan, &manifest, &offered, &BTreeSet::new()).unwrap();
 
         assert_eq!(application.stripe_count, 1);
 
@@ -3743,6 +3909,51 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_offer_removes_complete_files_and_repacks_tiny_files() {
+        let manifest = vec![
+            entry("large.bin", 1_000, FileClass::Large),
+            entry("medium.bin", 500, FileClass::Medium),
+            entry("tiny-a.bin", 10, FileClass::Tiny),
+            entry("tiny-b.bin", 20, FileClass::Tiny),
+            entry("tiny-c.bin", 30, FileClass::Tiny),
+        ];
+
+        let mut plan = build_transfer_plan(&manifest, 2).unwrap();
+
+        let unchanged = BTreeSet::from([0_usize, 1_usize, 3_usize]);
+
+        let application =
+            apply_resume_offer(&mut plan, &manifest, &BTreeSet::new(), &unchanged).unwrap();
+
+        assert_eq!(application.unchanged_file_count, 3,);
+
+        assert_eq!(application.unchanged_bytes, 1_520,);
+
+        assert_eq!(application.logical_report.files_copied, 3,);
+
+        assert_eq!(application.logical_report.bytes_copied, 1_520,);
+
+        let remaining = plan.lanes.iter().flatten().collect::<Vec<_>>();
+
+        assert_eq!(remaining.len(), 1,);
+
+        match remaining[0] {
+            TransferTask::TinyPack {
+                file_ids,
+                total_bytes,
+            } => {
+                assert_eq!(file_ids, &vec![2, 4],);
+
+                assert_eq!(*total_bytes, 40,);
+            }
+
+            task => {
+                panic!("unexpected remaining task: {task:?}",);
+            }
+        }
+    }
+
+    #[test]
     fn empty_resume_offer_preserves_tasks() {
         let manifest = vec![
             entry("large.bin", 1_000, FileClass::Large),
@@ -3753,7 +3964,13 @@ mod tests {
 
         let task_count_before = transfer_plan.lanes.iter().map(Vec::len).sum::<usize>();
 
-        let application = apply_resume_offer(&mut transfer_plan, &BTreeSet::new()).unwrap();
+        let application = apply_resume_offer(
+            &mut transfer_plan,
+            &manifest,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
 
         let task_count_after = transfer_plan.lanes.iter().map(Vec::len).sum::<usize>();
 
@@ -3779,6 +3996,8 @@ mod tests {
                 ResumeStripe::new(2, 0, 4096).unwrap(),
                 ResumeStripe::new(2, 4096, 2048).unwrap(),
             ]),
+
+            unchanged_file_ids: BTreeSet::from([1_usize, 3_usize, 8_usize]),
         };
 
         let mut bytes = Vec::new();

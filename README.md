@@ -54,7 +54,9 @@ Current v1.3 work:
 - [x] exact compressed/raw pack and pack-wire telemetry;
 - [x] repeatable compressible and incompressible tiny-pack benchmarks;
 - [x] read-only fast destination inventory by path, size, and timestamp;
-- [ ] sender/receiver unchanged-file offer protocol;
+- [x] sender/receiver unchanged-file offer protocol;
+- [x] scheduler removal of unchanged whole files and large-file stripes;
+- [x] partial tiny-pack filtering and repacking;
 - [ ] update-existing destination mode;
 - [ ] fast and BLAKE3-verified unchanged-file detection;
 - [ ] automatic Zstandard strategy calibration;
