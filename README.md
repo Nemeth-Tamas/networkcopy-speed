@@ -53,7 +53,7 @@ Implementation order:
 
 - [x] single-file fixed-block deduplication control benchmark;
 - [x] repeatable overwrite, insertion, deletion, and append corpus;
-- [ ] content-defined chunk boundary prototype;
+- [x] content-defined chunk boundary prototype;
 - [ ] fixed-block versus content-defined chunk-size matrix;
 - [ ] receiver basis-file chunk index;
 - [ ] deduplicated reconstruction prototype with final BLAKE3 verification;
@@ -70,6 +70,13 @@ insertion, unaligned insertion, unaligned deletion, and append candidates. It
 runs the fixed-block benchmark at 4, 16, 64, and 256 KiB so future
 content-defined chunking implementations can be evaluated against identical
 inputs.
+
+The first content-defined prototype uses a continuous 64-byte rolling Buzhash
+window. Chunk identities use full BLAKE3 digests; the rolling hash only selects
+boundaries. The default target is 64 KiB, with 32 KiB minimum and 128 KiB
+maximum chunks. Because boundary selection depends on nearby content rather
+than absolute file offsets, scanning can resynchronize after insertions or
+deletions.
 
 ## v1.4 highlights
 

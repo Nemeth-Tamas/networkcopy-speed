@@ -45,6 +45,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         "bench-fixed-dedup" => {
             run_fixed_block_dedup_bench(&mut arguments)
         }
+        "bench-cdc-dedup" => {
+            run_content_defined_dedup_bench(
+                &mut arguments,
+            )
+        }
         "bench-pipeline" => run_bench_pipeline(&mut arguments),
         "probe-iocp" => run_iocp_probe(&mut arguments),
         "probe-overlapped-read" => run_overlapped_read_probe(&mut arguments),
@@ -657,6 +662,76 @@ fn run_fixed_block_dedup_bench(
         &candidate,
         block_kib,
     )?;
+
+    report.print();
+
+    Ok(())
+}
+
+fn run_content_defined_dedup_bench(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let basis = PathBuf::from(required_argument(
+        arguments,
+        "basis file",
+    )?);
+
+    let candidate = PathBuf::from(required_argument(
+        arguments,
+        "candidate file",
+    )?);
+
+    let average_kib = match arguments.next() {
+        Some(value) => {
+            parse_usize_count(
+                &value,
+                "content-defined average chunk size in KiB",
+            )?
+        }
+
+        None => {
+            content_defined_dedup_bench::
+                DEFAULT_AVERAGE_KIB
+        }
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    content_defined_dedup_bench::
+        validate_average_kib(average_kib)?;
+
+    println!(
+        "NetworkCopy Speed Edition content-defined dedup benchmark",
+    );
+
+    println!("  Basis:          {}", basis.display());
+
+    println!(
+        "  Candidate:      {}",
+        candidate.display(),
+    );
+
+    println!(
+        "  Target average: {average_kib} KiB",
+    );
+
+    println!();
+
+    let report =
+        content_defined_dedup_bench::run(
+            &basis,
+            &candidate,
+            average_kib,
+        )?;
 
     report.print();
 
@@ -1400,6 +1475,10 @@ fn print_usage(program: &OsStr) {
     println!(
         "  {program} bench-fixed-dedup <basis-file> \
          <candidate-file> [block-kib]"
+    );
+    println!(
+        "  {program} bench-cdc-dedup <basis-file> \
+         <candidate-file> [average-kib]"
     );
     println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
     println!("  {program} probe-iocp");
