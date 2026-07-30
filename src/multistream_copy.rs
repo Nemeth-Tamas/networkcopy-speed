@@ -12,6 +12,7 @@ use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
 use crate::session_cdc_catalog::{
     self, CatalogCandidate, CatalogGeneration, CatalogLimits, CatalogPlan,
 };
+use crate::session_cdc_lane;
 use crate::striped_file;
 use crate::tcp_connect;
 use crate::tiny_file_pool;
@@ -1234,6 +1235,7 @@ fn send_internal(
             source_root.as_path(),
             manifest.as_slice(),
             progress.clone(),
+            None,
             LaneEnd::Stream,
         )?
     };
@@ -1647,6 +1649,7 @@ fn run_server_with_mode(
             &tiny_materializer_handle,
             progress.clone(),
             true,
+            None,
             LaneEnd::Stream,
         )
     };
@@ -4111,6 +4114,7 @@ fn send_lane_group(
     source_root: &Path,
     manifest: &[ManifestEntry],
     progress: Option<ProgressCounter>,
+    session_basis_file_ids: Option<&[usize]>,
     lane_end: LaneEnd,
 ) -> io::Result<LaneReport> {
     if data_streams.len() != lanes.len() {
@@ -4136,6 +4140,7 @@ fn send_lane_group(
                             manifest,
                             tasks,
                             lane_progress,
+                            session_basis_file_ids,
                             lane_end,
                         )
                     })?,
@@ -4176,6 +4181,7 @@ fn send_fresh_generation_plan(
             source_root,
             manifest,
             progress.clone(),
+            Some(&generation.basis_file_ids),
             LaneEnd::Generation(generation.index),
         )?;
 
@@ -4200,6 +4206,7 @@ fn send_fresh_generation_plan(
         source_root,
         manifest,
         progress,
+        None,
         LaneEnd::Stream,
     )?);
 
@@ -4217,6 +4224,7 @@ fn receive_lane_group(
     tiny_materializer: &tiny_file_pool::TinyFileMaterializerHandle,
     progress: Option<ProgressCounter>,
     cdc_enabled: bool,
+    session_basis_file_ids: Option<&[usize]>,
     lane_end: LaneEnd,
 ) -> io::Result<LaneReport> {
     if data_streams.len() != lanes.len() {
@@ -4249,6 +4257,7 @@ fn receive_lane_group(
                                 tiny_materializer: &lane_tiny_materializer,
                                 progress: lane_progress,
                                 cdc_enabled,
+                                session_basis_file_ids,
                             },
                             lane_end,
                         )
@@ -4298,6 +4307,7 @@ fn receive_fresh_generation_plan(
             tiny_materializer,
             progress.clone(),
             false,
+            Some(&generation.basis_file_ids),
             LaneEnd::Generation(generation.index),
         )?;
 
@@ -4327,6 +4337,7 @@ fn receive_fresh_generation_plan(
         tiny_materializer,
         progress,
         false,
+        None,
         LaneEnd::Stream,
     )?);
 
@@ -4392,6 +4403,7 @@ fn send_lane(
     manifest: &[ManifestEntry],
     tasks: &[TransferTask],
     progress: Option<ProgressCounter>,
+    session_basis_file_ids: Option<&[usize]>,
     lane_end: LaneEnd,
 ) -> io::Result<LaneReport> {
     let reader_stream = stream.try_clone()?;
@@ -4428,15 +4440,25 @@ fn send_lane(
                     )
                 })?;
 
-                writer.flush()?;
+                let cdc_decision = if let Some(basis_file_ids) = session_basis_file_ids {
+                    session_cdc_lane::sender_try_plan(
+                        &mut writer,
+                        source_root,
+                        manifest,
+                        file_id,
+                        basis_file_ids,
+                    )?
+                } else {
+                    writer.flush()?;
 
-                let cdc_decision = cdc_lane::sender_negotiate(
-                    &mut reader,
-                    &mut writer,
-                    source_root,
-                    file_id,
-                    entry,
-                )?;
+                    cdc_lane::sender_negotiate(
+                        &mut reader,
+                        &mut writer,
+                        source_root,
+                        file_id,
+                        entry,
+                    )?
+                };
 
                 report.cdc.merge(cdc_decision.stats)?;
 
@@ -4546,6 +4568,28 @@ fn add_progress(progress: &Option<ProgressCounter>, bytes: u64) {
     if let Some(progress) = progress {
         progress.add(bytes);
     }
+}
+
+fn complete_received_cdc_file(
+    report: &mut LaneReport,
+    destination_root: &Path,
+    entry: &ManifestEntry,
+    progress: &Option<ProgressCounter>,
+    fault_injection: &TransferFault,
+) -> io::Result<()> {
+    let completed_path = destination_root.join(&entry.relative_path);
+
+    file_metadata::restore_file(
+        &completed_path,
+        entry.last_write_time,
+        entry.file_attributes,
+    )?;
+
+    add_lane_counts(report, 1, entry.file_size, "receiver CDC")?;
+
+    add_progress(progress, entry.file_size);
+
+    fault_injection.after_reconstructed_cdc_file()
 }
 
 fn add_lane_counts(report: &mut LaneReport, files: u64, bytes: u64, side: &str) -> io::Result<()> {
@@ -4989,6 +5033,7 @@ struct ReceiveLaneContext<'a> {
     tiny_materializer: &'a tiny_file_pool::TinyFileMaterializerHandle,
     progress: Option<ProgressCounter>,
     cdc_enabled: bool,
+    session_basis_file_ids: Option<&'a [usize]>,
 }
 
 fn receive_lane(
@@ -5005,6 +5050,7 @@ fn receive_lane(
         tiny_materializer,
         progress,
         cdc_enabled,
+        session_basis_file_ids,
     } = context;
     let reader_stream = stream.try_clone()?;
 
@@ -5040,36 +5086,65 @@ fn receive_lane(
                     )
                 })?;
 
-                let cdc_decision = cdc_lane::receiver_negotiate(
-                    &mut reader,
-                    &mut writer,
-                    destination_root,
-                    file_id,
-                    entry,
-                    cdc_enabled,
-                )?;
+                let message = if let Some(basis_file_ids) = session_basis_file_ids {
+                    let message = read_u8(&mut reader)?;
 
-                report.cdc.merge(cdc_decision.stats)?;
+                    if message == session_cdc_lane::MESSAGE_SESSION_CDC_PLAN {
+                        let cdc_decision = session_cdc_lane::receiver_apply_plan(
+                            &mut reader,
+                            destination_root,
+                            manifest,
+                            file_id,
+                            basis_file_ids,
+                        )?;
 
-                if cdc_decision.completed {
-                    let completed_path = destination_root.join(&entry.relative_path);
+                        report.cdc.merge(cdc_decision.stats)?;
 
-                    file_metadata::restore_file(
-                        &completed_path,
-                        entry.last_write_time,
-                        entry.file_attributes,
+                        if !cdc_decision.completed {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "session CDC plan did not complete its target",
+                            ));
+                        }
+
+                        complete_received_cdc_file(
+                            &mut report,
+                            destination_root,
+                            entry,
+                            &progress,
+                            fault_injection,
+                        )?;
+
+                        continue;
+                    }
+
+                    message
+                } else {
+                    let cdc_decision = cdc_lane::receiver_negotiate(
+                        &mut reader,
+                        &mut writer,
+                        destination_root,
+                        file_id,
+                        entry,
+                        cdc_enabled,
                     )?;
 
-                    add_lane_counts(&mut report, 1, entry.file_size, "receiver CDC")?;
+                    report.cdc.merge(cdc_decision.stats)?;
 
-                    add_progress(&progress, entry.file_size);
+                    if cdc_decision.completed {
+                        complete_received_cdc_file(
+                            &mut report,
+                            destination_root,
+                            entry,
+                            &progress,
+                            fault_injection,
+                        )?;
 
-                    fault_injection.after_reconstructed_cdc_file()?;
+                        continue;
+                    }
 
-                    continue;
-                }
-
-                let message = read_u8(&mut reader)?;
+                    read_u8(&mut reader)?
+                };
 
                 if message != MESSAGE_FILE {
                     return Err(io::Error::new(
@@ -6889,20 +6964,15 @@ mod tests {
             evicted_file_ids: vec![0, 1],
         };
 
-        let expected_wire_bytes =
-            generation_commit_wire_bytes(&expected).unwrap();
+        let expected_wire_bytes = generation_commit_wire_bytes(&expected).unwrap();
 
         let mut bytes = Vec::new();
 
         write_generation_commit(&mut bytes, &expected).unwrap();
 
-        assert_eq!(
-            u64::try_from(bytes.len()).unwrap(),
-            expected_wire_bytes,
-        );
+        assert_eq!(u64::try_from(bytes.len()).unwrap(), expected_wire_bytes,);
 
-        let actual =
-            read_generation_commit(&mut Cursor::new(bytes)).unwrap();
+        let actual = read_generation_commit(&mut Cursor::new(bytes)).unwrap();
 
         assert_eq!(actual, expected);
     }
@@ -6925,16 +6995,11 @@ mod tests {
 
         bytes.extend_from_slice(&0_u32.to_be_bytes());
 
-        let error =
-            read_generation_commit(&mut Cursor::new(bytes)).unwrap_err();
+        let error = read_generation_commit(&mut Cursor::new(bytes)).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
-        assert!(
-            error
-                .to_string()
-                .contains("duplicate file ID 1"),
-        );
+        assert!(error.to_string().contains("duplicate file ID 1"),);
     }
 
     #[test]
@@ -6944,93 +7009,57 @@ mod tests {
             entry("medium-b.bin", 200, FileClass::Medium),
         ];
 
-        let transfer_plan =
-            build_transfer_plan(&manifest, 2).unwrap();
+        let transfer_plan = build_transfer_plan(&manifest, 2).unwrap();
 
-        let generation_plan =
-            build_fresh_generation_plan_with_limits(
-                &manifest,
-                &transfer_plan,
-                CatalogLimits {
-                    generation_target_bytes: 1_000,
-                    max_catalog_entries: 100,
-                },
-            )
-            .unwrap();
+        let generation_plan = build_fresh_generation_plan_with_limits(
+            &manifest,
+            &transfer_plan,
+            CatalogLimits {
+                generation_target_bytes: 1_000,
+                max_catalog_entries: 100,
+            },
+        )
+        .unwrap();
 
         let generation = &generation_plan.catalog.generations[0];
 
         let expected = expected_generation_commit(generation);
 
-        validate_generation_commit(
-            &expected,
-            generation,
-            manifest.len(),
-        )
-        .unwrap();
+        validate_generation_commit(&expected, generation, manifest.len()).unwrap();
 
         let mut wrong_index = expected.clone();
 
-        wrong_index.generation_index =
-            wrong_index.generation_index.checked_add(1).unwrap();
+        wrong_index.generation_index = wrong_index.generation_index.checked_add(1).unwrap();
 
-        let error = validate_generation_commit(
-            &wrong_index,
-            generation,
-            manifest.len(),
-        )
-        .unwrap_err();
+        let error =
+            validate_generation_commit(&wrong_index, generation, manifest.len()).unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("expected"),
-        );
+        assert!(error.to_string().contains("expected"),);
 
         let mut unknown_file = expected.clone();
 
         unknown_file.committed_file_ids[0] = manifest.len();
 
-        let error = validate_generation_commit(
-            &unknown_file,
-            generation,
-            manifest.len(),
-        )
-        .unwrap_err();
+        let error =
+            validate_generation_commit(&unknown_file, generation, manifest.len()).unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("unknown file ID"),
-        );
+        assert!(error.to_string().contains("unknown file ID"),);
 
         let mut wrong_publication = expected.clone();
 
         wrong_publication.published_file_ids.clear();
 
-        let error = validate_generation_commit(
-            &wrong_publication,
-            generation,
-            manifest.len(),
-        )
-        .unwrap_err();
+        let error =
+            validate_generation_commit(&wrong_publication, generation, manifest.len()).unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("published-file list differs"),
-        );
+        assert!(error.to_string().contains("published-file list differs"),);
     }
 
     #[test]
     fn lane_generation_end_round_trips_and_validates_index() {
         let mut generation_bytes = Vec::new();
 
-        write_lane_end(
-            &mut generation_bytes,
-            LaneEnd::Generation(4),
-        )
-        .unwrap();
+        write_lane_end(&mut generation_bytes, LaneEnd::Generation(4)).unwrap();
 
         read_lane_end(
             &mut Cursor::new(generation_bytes.clone()),
@@ -7038,33 +7067,18 @@ mod tests {
         )
         .unwrap();
 
-        let error = read_lane_end(
-            &mut Cursor::new(generation_bytes),
-            LaneEnd::Generation(5),
-        )
-        .unwrap_err();
+        let error =
+            read_lane_end(&mut Cursor::new(generation_bytes), LaneEnd::Generation(5)).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
-        assert!(
-            error
-                .to_string()
-                .contains("expected 5"),
-        );
+        assert!(error.to_string().contains("expected 5"),);
 
         let mut stream_bytes = Vec::new();
 
-        write_lane_end(
-            &mut stream_bytes,
-            LaneEnd::Stream,
-        )
-        .unwrap();
+        write_lane_end(&mut stream_bytes, LaneEnd::Stream).unwrap();
 
-        read_lane_end(
-            &mut Cursor::new(stream_bytes),
-            LaneEnd::Stream,
-        )
-        .unwrap();
+        read_lane_end(&mut Cursor::new(stream_bytes), LaneEnd::Stream).unwrap();
     }
 
     #[test]
@@ -7085,24 +7099,11 @@ mod tests {
 
         fs::create_dir_all(&source).unwrap();
 
-        fs::write(
-            source.join("tiny-a.txt"),
-            b"protocol v10 tiny file A",
-        )
-        .unwrap();
+        fs::write(source.join("tiny-a.txt"), b"protocol v10 tiny file A").unwrap();
 
-        fs::write(
-            source.join("tiny-b.txt"),
-            b"protocol v10 tiny file B",
-        )
-        .unwrap();
+        fs::write(source.join("tiny-b.txt"), b"protocol v10 tiny file B").unwrap();
 
-        let transfer_result = run(
-            &source,
-            &destination,
-            2,
-            2,
-        );
+        let transfer_result = run(&source, &destination, 2, 2);
 
         let cleanup_result = fs::remove_dir_all(&parent);
 
@@ -7114,11 +7115,8 @@ mod tests {
 
         assert_eq!(
             report.bytes_copied,
-            u64::try_from(
-                b"protocol v10 tiny file A".len()
-                    + b"protocol v10 tiny file B".len(),
-            )
-            .unwrap(),
+            u64::try_from(b"protocol v10 tiny file A".len() + b"protocol v10 tiny file B".len(),)
+                .unwrap(),
         );
 
         assert_eq!(report.tiny_files_packed, 2);
