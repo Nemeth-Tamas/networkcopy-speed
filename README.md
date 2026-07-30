@@ -16,26 +16,29 @@ not require a router, switch, DHCP server, or manually assigned IP addresses.
 
 The repository currently contains:
 
-- the v1.4 command-line transfer engine;
-- the v1.4 desktop GUI;
+- the v2.0 command-line transfer engine;
+- the v2.0 desktop GUI;
 - one shared networking and transfer implementation used by both front ends.
 
 ## Current status
 
-Current development version:
+Current stable release:
 
 ```text
-2.0.0-dev
+2.0.0
 ```
 
-v1.4 is the current stable release. v2 now uses protocol v10. Its update path
-reuses verified content from older receiver-side medium and large files,
-transmitting reconstruction references plus changed literal bytes whenever CDC
-is profitable. Fresh transfers now execute through deterministic bounded
-catalog generations: every generation completes across all TCP lanes, the
-receiver commits its files, and an explicit commit acknowledgement is validated
-before the next generation begins. Actual cross-file chunk references and final
-physical two-machine acceptance remain under development.
+v2 uses protocol v10 and supports verified content reuse during both updates
+and fresh folder transfers. Update mode reuses content from older receiver-side
+medium and large files. Fresh transfers use deterministic bounded catalog
+generations, explicit receiver commit acknowledgements, exact-file reuse, and
+session-scoped cross-file CDC using files committed by earlier generations.
+
+The v2 transfer engine has passed physical two-machine acceptance over a normal
+LAN. The acceptance run achieved 98.48 MB/s, reconstructed a 60 MiB related
+file using 59.88 MiB of receiver-side data, transmitted no CDC basis index,
+reported 99.80% CDC savings, and passed independent SHA-256 verification for
+every transferred file.
 
 The GUI includes:
 
@@ -70,10 +73,10 @@ Implementation order:
 - [ ] extend exact reuse to tiny packs and striped large files;
 - [x] deterministic bounded session catalog and generation planner;
 - [x] protocol-v10 generation barriers and receiver commit acknowledgements;
-- [ ] session-scoped cross-file CDC using completed files as chunk bases;
+- [x] session-scoped cross-file CDC using completed files as chunk bases;
 - [ ] interrupted-session catalog rebuild and retry behavior;
 - [x] GUI CDC telemetry and mixed-workload loopback acceptance;
-- [ ] physical two-machine acceptance.
+- [x] physical two-machine acceptance.
 
 The first benchmark intentionally uses fixed boundaries from byte zero. It
 measures both same-position reuse and blocks found elsewhere in the basis file.
