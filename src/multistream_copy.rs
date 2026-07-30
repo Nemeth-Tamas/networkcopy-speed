@@ -4361,6 +4361,8 @@ fn receive_fresh_generation_plan(
         let commit =
             commit_fresh_generation(destination_root, manifest, generation, progress.as_ref())?;
 
+        persist_generation_commit(destination_root, resume_journal, &commit)?;
+
         write_generation_commit(control_stream, &commit)?;
 
         reports.push(report);
@@ -4385,6 +4387,35 @@ fn receive_fresh_generation_plan(
     )?);
 
     merge_lane_reports(reports)
+}
+
+fn persist_generation_commit(
+    destination_root: &Path,
+    resume_journal: &Mutex<ResumeJournal>,
+    commit: &GenerationCommit,
+) -> io::Result<()> {
+    let mut journal = resume_journal
+        .lock()
+        .map_err(|_| io::Error::other("resume journal mutex was poisoned"))?;
+
+    for &file_id in &commit.committed_file_ids {
+        journal.mark_file_completed(file_id);
+    }
+
+    let persisted_file_ids: BTreeSet<usize> = journal.completed_file_ids().collect();
+
+    if !commit
+        .committed_file_ids
+        .iter()
+        .all(|file_id| persisted_file_ids.contains(file_id))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "resume journal did not retain every committed generation file",
+        ));
+    }
+
+    journal.save_atomic(destination_root)
 }
 
 fn commit_fresh_generation(
@@ -6785,12 +6816,12 @@ mod tests {
         TINY_PACK_TARGET_BYTES, TransferAck, TransferFault, TransferTask, accept_session,
         apply_resume_offer, build_fresh_generation_plan_with_limits, build_transfer_plan,
         catalog_task_file_id, connect_with_retry_config, expected_generation_commit,
-        finalize_large_files, generation_commit_wire_bytes, prepare_destination,
-        read_generation_commit, read_lane_end, read_receiver_ready, read_transfer_ack,
-        receive_once, run, run_update, run_update_with_fault, run_with_fault, send, temporary_path,
-        tiny_pack_record_wire_bytes, validate_generation_commit, validate_resume_offer,
-        validate_source_metadata, verify_content_digest, write_generation_commit, write_lane_end,
-        write_receiver_ready, write_transfer_ack,
+        finalize_large_files, generation_commit_wire_bytes, persist_generation_commit,
+        prepare_destination, read_generation_commit, read_lane_end, read_receiver_ready,
+        read_transfer_ack, receive_once, run, run_update, run_update_with_fault, run_with_fault,
+        send, temporary_path, tiny_pack_record_wire_bytes, validate_generation_commit,
+        validate_resume_offer, validate_source_metadata, verify_content_digest,
+        write_generation_commit, write_lane_end, write_receiver_ready, write_transfer_ack,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::file_metadata;
@@ -6805,7 +6836,7 @@ mod tests {
     use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::process;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
@@ -8454,6 +8485,36 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
 
         assert!(error.to_string().contains("both final and temporary",),);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn generation_commit_is_persisted_before_acknowledgement() {
+        let root = temporary_root("persist-generation-commit");
+
+        fs::create_dir_all(&root).unwrap();
+
+        let journal = ResumeJournal::new(0x1234_5678_9ABC_DEF0, 2).unwrap();
+        journal.save_atomic(&root).unwrap();
+
+        let journal = Mutex::new(journal);
+
+        let commit = GenerationCommit {
+            generation_index: 0,
+            committed_file_ids: vec![2, 4, 7],
+            published_file_ids: vec![2, 4],
+            evicted_file_ids: Vec::new(),
+        };
+
+        persist_generation_commit(&root, &journal, &commit).unwrap();
+
+        let loaded = ResumeJournal::load_existing(&root, 0x1234_5678_9ABC_DEF0, 2).unwrap();
+
+        assert_eq!(
+            loaded.completed_file_ids().collect::<Vec<_>>(),
+            vec![2, 4, 7],
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
