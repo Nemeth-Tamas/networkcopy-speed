@@ -62,7 +62,8 @@ Implementation order:
 - [x] protocol-v7 medium-file CDC transfer and ordinary-transfer fallback;
 - [ ] large striped-file CDC integration;
 - [ ] CDC-aware interruption and resume behavior;
-- [ ] final GUI telemetry and two-machine acceptance.
+- [x] GUI CDC telemetry and mixed-workload loopback acceptance;
+- [ ] physical two-machine acceptance.
 
 The first benchmark intentionally uses fixed boundaries from byte zero. It
 measures both same-position reuse and blocks found elsewhere in the basis file.
