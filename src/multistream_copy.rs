@@ -806,6 +806,7 @@ struct FreshGenerationPlan {
     catalog: CatalogPlan,
     generation_lanes: Vec<Vec<Vec<TransferTask>>>,
     trailing_lanes: Vec<Vec<TransferTask>>,
+    completed_generation_count: usize,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1280,13 +1281,6 @@ fn send_internal(
 
     apply_large_cdc_preflight(&mut transfer_plan, &manifest, &large_cdc_preflight)?;
 
-    let resume_application = apply_resume_offer(
-        &mut transfer_plan,
-        &manifest,
-        &receiver_ready.completed_stripes,
-        &receiver_ready.unchanged_file_ids,
-    )?;
-
     let exact_reuse_plan = if update_session {
         ExactReusePlan::default()
     } else {
@@ -1302,7 +1296,7 @@ fn send_internal(
         !update_session,
     )?;
 
-    let fresh_generation_plan = if update_session {
+    let mut fresh_generation_plan = if update_session {
         None
     } else {
         Some(build_fresh_generation_plan_with_limits(
@@ -1311,6 +1305,21 @@ fn send_internal(
             catalog_limits,
         )?)
     };
+
+    if let Some(generation_plan) = fresh_generation_plan.as_mut() {
+        apply_fresh_resume_prefix(generation_plan, &receiver_ready.unchanged_file_ids)?;
+    }
+
+    let resume_application = apply_resume_offer(
+        &mut transfer_plan,
+        &manifest,
+        &receiver_ready.completed_stripes,
+        &receiver_ready.unchanged_file_ids,
+    )?;
+
+    if let Some(generation_plan) = fresh_generation_plan.as_mut() {
+        rebuild_fresh_generation_execution(generation_plan, &transfer_plan)?;
+    }
 
     let effective_plan_stats = summarize_transfer_plan(&transfer_plan)?;
 
@@ -1686,28 +1695,6 @@ fn run_server_with_mode(
 
     apply_large_cdc_preflight(&mut transfer_plan, &manifest, &large_cdc_preflight)?;
 
-    let resume_application = apply_resume_offer(
-        &mut transfer_plan,
-        &manifest,
-        &receiver_ready.completed_stripes,
-        &receiver_ready.unchanged_file_ids,
-    )?;
-
-    let completed_before_transfer = large_cdc_preflight
-        .report
-        .bytes_copied
-        .checked_add(resume_application.logical_report.bytes_copied)
-        .ok_or_else(|| {
-            io::Error::other(
-                "initial receive progress \
-                 overflowed",
-            )
-        })?;
-
-    if let Some(progress) = &progress {
-        progress.set_completed(completed_before_transfer);
-    }
-
     write_receiver_ready(&mut control_stream, &receiver_ready)?;
 
     let exact_reuse_plan = read_exact_reuse_plan(&mut control_stream)?;
@@ -1719,7 +1706,7 @@ fn run_server_with_mode(
         destination_mode == DestinationMode::Fresh,
     )?;
 
-    let fresh_generation_plan = if destination_mode == DestinationMode::Fresh {
+    let mut fresh_generation_plan = if destination_mode == DestinationMode::Fresh {
         Some(build_fresh_generation_plan_with_limits(
             &manifest,
             &transfer_plan,
@@ -1728,6 +1715,31 @@ fn run_server_with_mode(
     } else {
         None
     };
+
+    if let Some(generation_plan) = fresh_generation_plan.as_mut() {
+        apply_fresh_resume_prefix(generation_plan, &receiver_ready.unchanged_file_ids)?;
+    }
+
+    let resume_application = apply_resume_offer(
+        &mut transfer_plan,
+        &manifest,
+        &receiver_ready.completed_stripes,
+        &receiver_ready.unchanged_file_ids,
+    )?;
+
+    if let Some(generation_plan) = fresh_generation_plan.as_mut() {
+        rebuild_fresh_generation_execution(generation_plan, &transfer_plan)?;
+    }
+
+    let completed_before_transfer = large_cdc_preflight
+        .report
+        .bytes_copied
+        .checked_add(resume_application.logical_report.bytes_copied)
+        .ok_or_else(|| io::Error::other("initial receive progress overflowed"))?;
+
+    if let Some(progress) = &progress {
+        progress.set_completed(completed_before_transfer);
+    }
 
     let resume_journal = Arc::new(Mutex::new(resume_journal));
 
@@ -2833,11 +2845,282 @@ fn build_fresh_generation_plan_with_limits(
         catalog,
         generation_lanes,
         trailing_lanes,
+        completed_generation_count: 0,
     };
 
     validate_fresh_generation_plan(manifest, transfer_plan, &plan)?;
 
     Ok(plan)
+}
+
+fn apply_fresh_resume_prefix(
+    plan: &mut FreshGenerationPlan,
+    completed_file_ids: &BTreeSet<usize>,
+) -> io::Result<()> {
+    if plan.completed_generation_count != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "fresh resume prefix was already applied",
+        ));
+    }
+
+    let mut expected_prefix_file_ids = BTreeSet::new();
+    let mut completed_generation_count = 0_usize;
+
+    for generation in &plan.catalog.generations {
+        let generation_file_ids: BTreeSet<usize> = generation
+            .transfer_files
+            .iter()
+            .map(|candidate| candidate.file_id)
+            .collect();
+
+        if generation_file_ids.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fresh-transfer catalog contains an empty generation",
+            ));
+        }
+
+        let completed_in_generation = generation_file_ids.intersection(completed_file_ids).count();
+
+        if completed_in_generation == generation_file_ids.len() {
+            expected_prefix_file_ids.extend(generation_file_ids);
+            completed_generation_count = completed_generation_count
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("completed fresh-generation count overflowed"))?;
+
+            continue;
+        }
+
+        if completed_in_generation != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "resume journal contains only part of fresh generation {}",
+                    generation.index,
+                ),
+            ));
+        }
+
+        break;
+    }
+
+    if let Some(file_id) = completed_file_ids
+        .difference(&expected_prefix_file_ids)
+        .next()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "resume journal completed file {file_id} does not belong to a contiguous generation prefix"
+            ),
+        ));
+    }
+
+    plan.completed_generation_count = completed_generation_count;
+
+    Ok(())
+}
+
+fn rebuild_fresh_generation_execution(
+    plan: &mut FreshGenerationPlan,
+    transfer_plan: &TransferPlan,
+) -> io::Result<()> {
+    let lane_count = transfer_plan.lanes.len();
+
+    let mut generation_by_file_id = BTreeMap::new();
+
+    for (generation_index, generation) in plan.catalog.generations.iter().enumerate() {
+        for candidate in &generation.transfer_files {
+            if generation_by_file_id
+                .insert(candidate.file_id, generation_index)
+                .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fresh-transfer catalog schedules the same file in multiple generations",
+                ));
+            }
+        }
+    }
+
+    let mut generation_lanes: Vec<Vec<Vec<TransferTask>>> = (0..plan.catalog.generations.len())
+        .map(|_| vec![Vec::new(); lane_count])
+        .collect();
+
+    let mut trailing_lanes = vec![Vec::new(); lane_count];
+
+    for (lane_id, lane) in transfer_plan.lanes.iter().enumerate() {
+        for task in lane {
+            let Some(file_id) = catalog_task_file_id(task) else {
+                trailing_lanes[lane_id].push(task.clone());
+
+                continue;
+            };
+
+            let generation_index =
+                generation_by_file_id
+                    .get(&file_id)
+                    .copied()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "remaining fresh-transfer task for file {file_id} is absent from the original catalog"
+                            ),
+                        )
+                    })?;
+
+            let generation = generation_lanes.get_mut(generation_index).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fresh-transfer generation index is outside the rebuilt execution plan",
+                )
+            })?;
+
+            let rebuilt_lane = generation.get_mut(lane_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fresh-transfer lane index is outside the rebuilt execution plan",
+                )
+            })?;
+
+            rebuilt_lane.push(task.clone());
+        }
+    }
+
+    plan.generation_lanes = generation_lanes;
+    plan.trailing_lanes = trailing_lanes;
+
+    validate_rebuilt_fresh_generation_execution(plan, transfer_plan)
+}
+
+fn validate_rebuilt_fresh_generation_execution(
+    plan: &FreshGenerationPlan,
+    transfer_plan: &TransferPlan,
+) -> io::Result<()> {
+    let lane_count = transfer_plan.lanes.len();
+
+    if plan.completed_generation_count > plan.catalog.generations.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "completed fresh-generation count exceeds the catalog",
+        ));
+    }
+
+    if plan.generation_lanes.len() != plan.catalog.generations.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "rebuilt fresh-generation count differs from the catalog",
+        ));
+    }
+
+    if plan.trailing_lanes.len() != lane_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "rebuilt trailing lane count differs from the transfer plan",
+        ));
+    }
+
+    for (generation_index, (generation, lanes)) in plan
+        .catalog
+        .generations
+        .iter()
+        .zip(&plan.generation_lanes)
+        .enumerate()
+    {
+        if lanes.len() != lane_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rebuilt fresh generation has an incorrect lane count",
+            ));
+        }
+
+        if generation_index < plan.completed_generation_count
+            && lanes.iter().any(|lane| !lane.is_empty())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "completed fresh generation {generation_index} still contains transfer tasks"
+                ),
+            ));
+        }
+
+        let expected_file_ids: BTreeSet<usize> = generation
+            .transfer_files
+            .iter()
+            .map(|candidate| candidate.file_id)
+            .collect();
+
+        for task in lanes.iter().flatten() {
+            let file_id = catalog_task_file_id(task).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "rebuilt catalog generation contains a trailing task",
+                )
+            })?;
+
+            if !expected_file_ids.contains(&file_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("rebuilt fresh generation contains unexpected file ID {file_id}"),
+                ));
+            }
+        }
+    }
+
+    for task in plan.trailing_lanes.iter().flatten() {
+        if catalog_task_file_id(task).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rebuilt trailing lanes contain a catalog-eligible task",
+            ));
+        }
+    }
+
+    let expected_task_count = transfer_plan
+        .lanes
+        .iter()
+        .try_fold(0_usize, |count, lane| {
+            count
+                .checked_add(lane.len())
+                .ok_or_else(|| io::Error::other("remaining transfer task count overflowed"))
+        })?;
+
+    let generation_task_count = plan
+        .generation_lanes
+        .iter()
+        .flat_map(|generation| generation.iter())
+        .try_fold(0_usize, |count, lane| {
+            count
+                .checked_add(lane.len())
+                .ok_or_else(|| io::Error::other("rebuilt generation task count overflowed"))
+        })?;
+
+    let trailing_task_count = plan
+        .trailing_lanes
+        .iter()
+        .try_fold(0_usize, |count, lane| {
+            count
+                .checked_add(lane.len())
+                .ok_or_else(|| io::Error::other("rebuilt trailing task count overflowed"))
+        })?;
+
+    let actual_task_count = generation_task_count
+        .checked_add(trailing_task_count)
+        .ok_or_else(|| io::Error::other("rebuilt execution task count overflowed"))?;
+
+    if actual_task_count != expected_task_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "rebuilt fresh execution contains {actual_task_count} tasks, expected {expected_task_count}"
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 fn collect_fresh_catalog_candidates(
@@ -4361,16 +4644,31 @@ fn send_fresh_generation_plan(
     plan: &FreshGenerationPlan,
     progress: Option<ProgressCounter>,
 ) -> io::Result<LaneReport> {
-    let report_capacity = plan
+    let remaining_generation_count = plan
         .catalog
         .generations
         .len()
+        .checked_sub(plan.completed_generation_count)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "completed fresh-generation count exceeds the catalog",
+            )
+        })?;
+
+    let report_capacity = remaining_generation_count
         .checked_add(1)
         .ok_or_else(|| io::Error::other("fresh-generation report capacity overflowed"))?;
 
     let mut reports = Vec::with_capacity(report_capacity);
 
-    for (generation, lanes) in plan.catalog.generations.iter().zip(&plan.generation_lanes) {
+    for (generation, lanes) in plan
+        .catalog
+        .generations
+        .iter()
+        .zip(&plan.generation_lanes)
+        .skip(plan.completed_generation_count)
+    {
         if let Some(progress) = &progress {
             progress.check_cancelled()?;
         }
@@ -4483,16 +4781,31 @@ fn receive_fresh_generation_plan(
     progress: Option<ProgressCounter>,
     plan: &FreshGenerationPlan,
 ) -> io::Result<LaneReport> {
-    let report_capacity = plan
+    let remaining_generation_count = plan
         .catalog
         .generations
         .len()
+        .checked_sub(plan.completed_generation_count)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "completed fresh-generation count exceeds the catalog",
+            )
+        })?;
+
+    let report_capacity = remaining_generation_count
         .checked_add(1)
         .ok_or_else(|| io::Error::other("fresh-generation report capacity overflowed"))?;
 
     let mut reports = Vec::with_capacity(report_capacity);
 
-    for (generation, lanes) in plan.catalog.generations.iter().zip(&plan.generation_lanes) {
+    for (generation, lanes) in plan
+        .catalog
+        .generations
+        .iter()
+        .zip(&plan.generation_lanes)
+        .skip(plan.completed_generation_count)
+    {
         if let Some(progress) = &progress {
             progress.check_cancelled()?;
         }
@@ -6976,14 +7289,15 @@ mod tests {
     use super::{
         DestinationMode, GenerationCommit, LaneEnd, MESSAGE_GENERATION_COMMIT, ReceiverReady,
         TINY_PACK_TARGET_BYTES, TransferAck, TransferFault, TransferTask, accept_session,
-        apply_resume_offer, build_fresh_generation_plan_with_limits, build_transfer_plan,
-        catalog_task_file_id, connect_with_retry_config, expected_generation_commit,
-        finalize_large_files, generation_commit_wire_bytes, persist_generation_commit,
-        prepare_destination, read_generation_commit, read_lane_end, read_receiver_ready,
-        read_transfer_ack, receive_once, run, run_update, run_update_with_fault, run_with_fault,
-        send, temporary_path, tiny_pack_record_wire_bytes, validate_generation_commit,
-        validate_resume_offer, validate_source_metadata, verify_content_digest,
-        write_generation_commit, write_lane_end, write_receiver_ready, write_transfer_ack,
+        apply_fresh_resume_prefix, apply_resume_offer, build_fresh_generation_plan_with_limits,
+        build_transfer_plan, catalog_task_file_id, connect_with_retry_config,
+        expected_generation_commit, finalize_large_files, generation_commit_wire_bytes,
+        persist_generation_commit, prepare_destination, read_generation_commit, read_lane_end,
+        read_receiver_ready, read_transfer_ack, rebuild_fresh_generation_execution, receive_once,
+        run, run_update, run_update_with_fault, run_with_fault, send, temporary_path,
+        tiny_pack_record_wire_bytes, validate_generation_commit, validate_resume_offer,
+        validate_source_metadata, verify_content_digest, write_generation_commit, write_lane_end,
+        write_receiver_ready, write_transfer_ack,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::file_metadata;
@@ -7188,6 +7502,212 @@ mod tests {
                 .iter()
                 .flatten()
                 .all(|task| matches!(task, TransferTask::TinyPack { .. }))
+        );
+    }
+
+    #[test]
+    fn fresh_resume_accepts_complete_generation_prefix() {
+        let manifest = vec![
+            entry("medium-a.bin", 100, FileClass::Medium),
+            entry("medium-b.bin", 100, FileClass::Medium),
+            entry("medium-c.bin", 100, FileClass::Medium),
+        ];
+
+        let transfer_plan = build_transfer_plan(&manifest, 2).unwrap();
+
+        let mut generation_plan = build_fresh_generation_plan_with_limits(
+            &manifest,
+            &transfer_plan,
+            CatalogLimits {
+                generation_target_bytes: 100,
+                max_catalog_entries: 100,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(generation_plan.catalog.generations.len(), 3,);
+
+        let completed_file_ids: BTreeSet<usize> = generation_plan.catalog.generations[0]
+            .transfer_files
+            .iter()
+            .map(|candidate| candidate.file_id)
+            .collect();
+
+        let expected_next_basis = generation_plan.catalog.generations[1]
+            .basis_file_ids
+            .clone();
+
+        apply_fresh_resume_prefix(&mut generation_plan, &completed_file_ids).unwrap();
+
+        assert_eq!(generation_plan.completed_generation_count, 1,);
+
+        assert_eq!(
+            generation_plan.catalog.generations[1].basis_file_ids,
+            expected_next_basis,
+        );
+
+        assert!(
+            expected_next_basis
+                .iter()
+                .all(|file_id| { completed_file_ids.contains(file_id) }),
+        );
+    }
+
+    #[test]
+    fn fresh_resume_rejects_partial_generation() {
+        let manifest = vec![
+            entry("medium-a.bin", 100, FileClass::Medium),
+            entry("medium-b.bin", 100, FileClass::Medium),
+        ];
+
+        let transfer_plan = build_transfer_plan(&manifest, 2).unwrap();
+
+        let mut generation_plan = build_fresh_generation_plan_with_limits(
+            &manifest,
+            &transfer_plan,
+            CatalogLimits {
+                generation_target_bytes: 1_000,
+                max_catalog_entries: 100,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(generation_plan.catalog.generations.len(), 1,);
+
+        assert_eq!(
+            generation_plan.catalog.generations[0].transfer_files.len(),
+            2,
+        );
+
+        let completed_file_ids =
+            BTreeSet::from([generation_plan.catalog.generations[0].transfer_files[0].file_id]);
+
+        let error =
+            apply_fresh_resume_prefix(&mut generation_plan, &completed_file_ids).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+
+        assert!(error.to_string().contains("only part of fresh generation"),);
+    }
+
+    #[test]
+    fn fresh_resume_rejects_nonprefix_generation() {
+        let manifest = vec![
+            entry("medium-a.bin", 100, FileClass::Medium),
+            entry("medium-b.bin", 100, FileClass::Medium),
+        ];
+
+        let transfer_plan = build_transfer_plan(&manifest, 2).unwrap();
+
+        let mut generation_plan = build_fresh_generation_plan_with_limits(
+            &manifest,
+            &transfer_plan,
+            CatalogLimits {
+                generation_target_bytes: 100,
+                max_catalog_entries: 100,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(generation_plan.catalog.generations.len(), 2,);
+
+        let completed_file_ids: BTreeSet<usize> = generation_plan.catalog.generations[1]
+            .transfer_files
+            .iter()
+            .map(|candidate| candidate.file_id)
+            .collect();
+
+        let error =
+            apply_fresh_resume_prefix(&mut generation_plan, &completed_file_ids).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+
+        assert!(error.to_string().contains("contiguous generation prefix"),);
+    }
+
+    #[test]
+    fn fresh_resume_rebuild_removes_completed_stripe_from_execution() {
+        let manifest = vec![
+            entry("large.bin", 1_000, FileClass::Large),
+            entry("medium.bin", 200, FileClass::Medium),
+        ];
+
+        let mut transfer_plan = build_transfer_plan(&manifest, 2).unwrap();
+
+        let completed_stripe = transfer_plan
+            .lanes
+            .iter()
+            .flatten()
+            .find_map(|task| {
+                let TransferTask::Stripe {
+                    file_id,
+                    offset,
+                    length,
+                } = task
+                else {
+                    return None;
+                };
+
+                Some(ResumeStripe::new(*file_id, *offset, *length).unwrap())
+            })
+            .unwrap();
+
+        let mut generation_plan = build_fresh_generation_plan_with_limits(
+            &manifest,
+            &transfer_plan,
+            CatalogLimits {
+                generation_target_bytes: 2_000,
+                max_catalog_entries: 100,
+            },
+        )
+        .unwrap();
+
+        let offered = BTreeSet::from([completed_stripe]);
+
+        let resume_application =
+            apply_resume_offer(&mut transfer_plan, &manifest, &offered, &BTreeSet::new()).unwrap();
+
+        assert_eq!(resume_application.stripe_count, 1,);
+
+        rebuild_fresh_generation_execution(&mut generation_plan, &transfer_plan).unwrap();
+
+        assert!(
+            generation_plan
+                .generation_lanes
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|task| {
+                    !matches!(
+                        task,
+                        TransferTask::Stripe {
+                            file_id,
+                            offset,
+                            length,
+                        } if *file_id
+                            == usize::try_from(
+                                completed_stripe.file_id,
+                            )
+                            .unwrap()
+                            && *offset
+                                == completed_stripe.offset
+                            && *length
+                                == completed_stripe.length
+                    )
+                }),
+        );
+
+        assert_eq!(generation_plan.completed_generation_count, 0,);
+
+        assert!(
+            generation_plan
+                .catalog
+                .generations
+                .iter()
+                .flat_map(|generation| { generation.transfer_files.iter() })
+                .any(|candidate| {
+                    candidate.file_id == usize::try_from(completed_stripe.file_id).unwrap()
+                }),
         );
     }
 
