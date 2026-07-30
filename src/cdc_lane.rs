@@ -222,7 +222,9 @@ pub(crate) fn receiver_negotiate(
     entry: &ManifestEntry,
     enabled: bool,
 ) -> io::Result<CdcLaneDecision> {
-    if !enabled || entry.class != FileClass::Medium || entry.file_size < MINIMUM_FILE_BYTES {
+    let eligible_class = matches!(entry.class, FileClass::Medium | FileClass::Large,);
+
+    if !enabled || !eligible_class || entry.file_size < MINIMUM_FILE_BYTES {
         send_unavailable(writer, file_id)?;
 
         return Ok(CdcLaneDecision {

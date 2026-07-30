@@ -28,10 +28,13 @@ Current development version:
 2.0.0-dev
 ```
 
-v1.4 is the current stable release. v2 now includes a protocol-v7 medium-file
-update path that reuses verified content from an older receiver-side file and
-transmits only reconstruction references plus changed literal bytes. Large striped-file deduplication, CDC-aware resume behavior, and final
-two-machine v2 acceptance remain under development.
+v1.4 is the current stable release. v2 now includes a protocol-v8 update path
+that reuses verified content from older receiver-side medium and large files,
+transmitting reconstruction references plus changed literal bytes whenever CDC
+is profitable. Medium files retain ordinary whole-file fallback, while large
+files retain the existing multi-lane striped fallback. Fresh-transfer
+cross-file reuse and final physical two-machine acceptance remain under
+development.
 
 The GUI includes:
 
@@ -59,9 +62,12 @@ Implementation order:
 - [x] receiver basis-file chunk index;
 - [x] deduplicated reconstruction prototype with final BLAKE3 verification;
 - [x] bounded-memory folder-level deduplication planning;
-- [x] protocol-v7 medium-file CDC transfer and ordinary-transfer fallback;
-- [ ] large striped-file CDC integration;
+- [x] protocol-v8 medium-file CDC transfer and ordinary whole-file fallback;
+- [x] large-file CDC with retained multi-lane striped fallback;
 - [x] CDC-aware interruption and file-level retry behavior;
+- [ ] fresh-transfer exact-file reuse using previously committed files;
+- [ ] session-scoped rolling cross-file CDC using completed files as bases;
+- [ ] bounded chunk catalog with multi-lane generation barriers and retry support;
 - [x] GUI CDC telemetry and mixed-workload loopback acceptance;
 - [ ] physical two-machine acceptance.
 
@@ -297,11 +303,11 @@ flowchart TD
     S["Unchanged same-path files"]
     C["Changed same-path files"]
     K["Verify and skip"]
-    M{"Medium file of at least 1 MiB?"}
-    D["Protocol-v7 CDC negotiation"]
+    M{"Medium or large file of at least 1 MiB?"}
+    D["Protocol-v8 CDC negotiation"]
     P{"Index plus plan beats full file?"}
     R["Reconstruct, verify BLAKE3, replace"]
-    F["Ordinary whole-file or striped transfer"]
+    F["Ordinary whole-file or multi-lane striped fallback"]
 
     G --> U
     U --> I
@@ -348,6 +354,38 @@ metadata immediately. If the session then fails before the final transfer
 acknowledgement, the next verified update recognizes the completed file and
 skips it. Resume therefore occurs at file granularity for CDC updates; incomplete
 plans are safely discarded rather than checkpointed.
+
+### Planned fresh-transfer reuse
+
+Fresh transfers begin without receiver-side basis files. The planned rolling
+catalog will make each completed and verified file available as a basis for
+files transferred later in the same session.
+
+```mermaid
+flowchart LR
+    A["Transfer first generation normally"]
+    B["Verify and atomically commit files"]
+    C["Publish whole-file and chunk catalog entries"]
+    D["Plan later generation against committed content"]
+    E{"Reuse profitable?"}
+    F["Send references plus new literals"]
+    G["Use ordinary transfer fallback"]
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E -->|Yes| F
+    E -->|No| G
+    F --> B
+    G --> B
+```
+
+Only fully committed files will be valid bases. Files within one generation may
+still transfer across multiple TCP lanes, while generation barriers prevent a
+lane from referencing data that another lane has not completed. The first slice
+will reuse exact duplicate files; later slices will add a bounded rolling chunk
+catalog for cross-file CDC.
 
 The `NCI1` prototype wire format uses a 24-byte header followed by one 44-byte
 record per chunk. The receiver builds and encodes the index once; the sender

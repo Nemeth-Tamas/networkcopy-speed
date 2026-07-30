@@ -36,6 +36,7 @@ const MESSAGE_FILE_STRIPE: u8 = 0x34;
 const MESSAGE_UPDATE_VERIFY_REQUEST: u8 = 0x35;
 const MESSAGE_TINY_PACK_V2: u8 = 0x36;
 const MESSAGE_UPDATE_VERIFY_RESPONSE: u8 = 0x37;
+const MESSAGE_LARGE_CDC_BEGIN: u8 = 0x3C;
 
 const NETWORK_BUFFER_BYTES: usize = 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
@@ -49,6 +50,18 @@ const CONTENT_DIGEST_BYTES: usize = 32;
 const TINY_PACK_FIXED_WIRE_BYTES: u64 = 1 + 4 + 8 + 1 + 8 + CONTENT_DIGEST_BYTES as u64;
 
 const TINY_PACK_FILE_METADATA_WIRE_BYTES: u64 = 8 + 8 + CONTENT_DIGEST_BYTES as u64;
+
+const LARGE_CDC_BEGIN_FIXED_WIRE_BYTES: u64 = 1 + 4;
+
+const LARGE_CDC_FILE_ID_WIRE_BYTES: u64 = 8;
+
+const CDC_UNAVAILABLE_WIRE_BYTES: u64 = 1 + 8;
+
+const CDC_INDEX_FIXED_WIRE_BYTES: u64 = 1 + 8 + 8;
+
+const CDC_FALLBACK_WIRE_BYTES: u64 = 1 + 8;
+
+const CDC_PLAN_FIXED_WIRE_BYTES: u64 = 1 + 8 + 8;
 const MAX_RESUME_OFFER_STRIPES: u32 = 1_000_000;
 const MAX_UNCHANGED_OFFER_FILES: u32 = 1_000_000;
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -463,6 +476,13 @@ struct LaneReport {
     tiny_files_packed: u64,
     tiny_bytes_packed: u64,
     tiny_pack_wire_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LargeCdcPreflight {
+    completed_file_ids: BTreeSet<usize>,
+
+    report: LaneReport,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -951,14 +971,22 @@ fn send_internal(
 
     let manifest_wire_bytes = control_plane::send_manifest(&mut control_stream, &manifest)?;
 
-    let preparation_message = read_u8(&mut control_stream).map_err(|error| {
+    let manifest_elapsed = manifest_started.elapsed();
+
+    let data_started = Instant::now();
+
+    let mut preparation_message = read_u8(&mut control_stream).map_err(|error| {
         io::Error::new(
             error.kind(),
-            format!("receiver disconnected while preparing the transfer: {error}"),
+            format!(
+                "receiver disconnected \
+                     while preparing the \
+                     transfer: {error}",
+            ),
         )
     })?;
 
-    let receiver_ready = if preparation_message == MESSAGE_UPDATE_VERIFY_REQUEST {
+    if preparation_message == MESSAGE_UPDATE_VERIFY_REQUEST {
         let destination_digests = read_update_verification_request(&mut control_stream)?;
 
         let candidate_file_ids: BTreeSet<usize> = destination_digests.keys().copied().collect();
@@ -967,8 +995,11 @@ fn send_internal(
 
         if let Some(progress) = &progress {
             progress.check_cancelled()?;
+
             progress.set_label("Verifying source files");
+
             progress.set_completed(0);
+
             progress.set_total(0);
         }
 
@@ -980,19 +1011,47 @@ fn send_internal(
 
         write_update_verification_response(&mut control_stream, &matching_file_ids)?;
 
-        if let Some(progress) = &progress {
-            progress.check_cancelled()?;
-            progress.set_label("Transfer send");
-            progress.set_completed(0);
-            progress.set_total(summary.total_file_bytes);
-        }
+        preparation_message = read_u8(&mut control_stream).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "receiver disconnected \
+                         during large-file CDC \
+                         preparation: {error}",
+                ),
+            )
+        })?;
+    }
 
-        read_receiver_ready(&mut control_stream)?
+    let large_cdc_preflight = if preparation_message == MESSAGE_LARGE_CDC_BEGIN {
+        let mut control_reader = control_stream.try_clone()?;
+
+        let preflight = negotiate_large_cdc_sender(
+            &mut control_reader,
+            &mut control_stream,
+            &source_root,
+            &manifest,
+            progress.as_ref(),
+        )?;
+
+        preparation_message = read_u8(&mut control_stream).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "receiver disconnected \
+                             after large-file CDC \
+                             preparation: {error}",
+                ),
+            )
+        })?;
+
+        preflight
     } else {
-        read_receiver_ready_after_message(&mut control_stream, preparation_message)?
+        LargeCdcPreflight::default()
     };
 
-    let manifest_elapsed = manifest_started.elapsed();
+    let receiver_ready =
+        read_receiver_ready_after_message(&mut control_stream, preparation_message)?;
 
     if receiver_ready.summary != summary {
         return Err(io::Error::new(
@@ -1003,6 +1062,8 @@ fn send_internal(
 
     let mut transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
 
+    apply_large_cdc_preflight(&mut transfer_plan, &manifest, &large_cdc_preflight)?;
+
     let resume_application = apply_resume_offer(
         &mut transfer_plan,
         &manifest,
@@ -1012,11 +1073,22 @@ fn send_internal(
 
     let effective_plan_stats = summarize_transfer_plan(&transfer_plan)?;
 
+    let completed_before_transfer = large_cdc_preflight
+        .report
+        .bytes_copied
+        .checked_add(resume_application.logical_report.bytes_copied)
+        .ok_or_else(|| io::Error::other("initial transfer progress overflowed"))?;
+
     if let Some(progress) = &progress {
-        progress.set_completed(resume_application.logical_report.bytes_copied);
+        progress.check_cancelled()?;
+
+        progress.set_label("Transfer send");
+
+        progress.set_total(summary.total_file_bytes);
+
+        progress.set_completed(completed_before_transfer);
     }
 
-    let data_started = Instant::now();
     let source_root = Arc::new(source_root);
 
     let sender_reports = thread::scope(|scope| -> io::Result<Vec<LaneReport>> {
@@ -1050,6 +1122,7 @@ fn send_internal(
     let transferred_sender_report = merge_lane_reports(sender_reports)?;
 
     let sender_report = merge_lane_reports(vec![
+        large_cdc_preflight.report,
         resume_application.logical_report,
         transferred_sender_report,
     ])?;
@@ -1301,9 +1374,35 @@ fn run_server_with_mode(
         None
     };
 
+    let large_cdc_preflight = if destination_mode == DestinationMode::UpdateVerified {
+        let mut control_reader = control_stream.try_clone()?;
+
+        negotiate_large_cdc_receiver(
+            &mut control_reader,
+            &mut control_stream,
+            &destination_root,
+            &manifest,
+            verified_unchanged_file_ids.as_ref(),
+            progress.as_ref(),
+            fault_injection.as_ref(),
+        )?
+    } else {
+        LargeCdcPreflight::default()
+    };
+
+    let mut preserved_file_ids = verified_unchanged_file_ids.clone().unwrap_or_default();
+
+    preserved_file_ids.extend(large_cdc_preflight.completed_file_ids.iter().copied());
+
+    let preparation_verified_file_ids = if destination_mode == DestinationMode::UpdateVerified {
+        Some(&preserved_file_ids)
+    } else {
+        None
+    };
+
     let PreparedDestination {
         journal: resume_journal,
-        unchanged_file_ids,
+        unchanged_file_ids: preserved_file_ids,
     } = prepare_destination(
         &destination_root,
         &manifest,
@@ -1311,22 +1410,37 @@ fn run_server_with_mode(
         data_stream_count,
         &transfer_plan,
         destination_mode,
-        verified_unchanged_file_ids.as_ref(),
+        preparation_verified_file_ids,
     )?;
 
     let completed_stripes = resume_journal
         .completed_stripes()
         .filter(|stripe| {
             usize::try_from(stripe.file_id)
-                .map_or(true, |file_id| !unchanged_file_ids.contains(&file_id))
+                .map_or(true, |file_id| !preserved_file_ids.contains(&file_id))
         })
         .collect();
+
+    let mut unchanged_file_ids = preserved_file_ids;
+
+    for &file_id in &large_cdc_preflight.completed_file_ids {
+        if !unchanged_file_ids.remove(&file_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "completed large CDC file \
+             was not preserved during \
+             destination preparation",
+            ));
+        }
+    }
 
     let receiver_ready = ReceiverReady {
         summary,
         completed_stripes,
         unchanged_file_ids,
     };
+
+    apply_large_cdc_preflight(&mut transfer_plan, &manifest, &large_cdc_preflight)?;
 
     let resume_application = apply_resume_offer(
         &mut transfer_plan,
@@ -1335,8 +1449,19 @@ fn run_server_with_mode(
         &receiver_ready.unchanged_file_ids,
     )?;
 
+    let completed_before_transfer = large_cdc_preflight
+        .report
+        .bytes_copied
+        .checked_add(resume_application.logical_report.bytes_copied)
+        .ok_or_else(|| {
+            io::Error::other(
+                "initial receive progress \
+                 overflowed",
+            )
+        })?;
+
     if let Some(progress) = &progress {
-        progress.set_completed(resume_application.logical_report.bytes_copied);
+        progress.set_completed(completed_before_transfer);
     }
 
     write_receiver_ready(&mut control_stream, &receiver_ready)?;
@@ -1408,7 +1533,11 @@ fn run_server_with_mode(
 
     let transferred_report = merge_lane_reports(lane_reports)?;
 
-    let report = merge_lane_reports(vec![resume_application.logical_report, transferred_report])?;
+    let report = merge_lane_reports(vec![
+        large_cdc_preflight.report,
+        resume_application.logical_report,
+        transferred_report,
+    ])?;
 
     if let Some(progress) = &progress {
         progress.check_cancelled()?;
@@ -2427,6 +2556,444 @@ fn validate_unchanged_offer(
                 format!("receiver offered unknown unchanged file ID {file_id}"),
             ));
         }
+    }
+
+    Ok(())
+}
+
+fn large_cdc_candidate_file_ids(
+    manifest: &[ManifestEntry],
+    excluded_file_ids: Option<&BTreeSet<usize>>,
+) -> Vec<usize> {
+    manifest
+        .iter()
+        .enumerate()
+        .filter_map(|(file_id, entry)| {
+            let excluded = excluded_file_ids.is_some_and(|file_ids| file_ids.contains(&file_id));
+
+            if entry.class == FileClass::Large && !excluded {
+                Some(file_id)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn write_large_cdc_begin(writer: &mut impl Write, file_ids: &[usize]) -> io::Result<()> {
+    let count = u32::try_from(file_ids.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "large CDC candidate \
+                     count cannot be \
+                     represented",
+        )
+    })?;
+
+    if count > MAX_UNCHANGED_OFFER_FILES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "large CDC candidate count \
+             exceeds the supported limit",
+        ));
+    }
+
+    write_u8(writer, MESSAGE_LARGE_CDC_BEGIN)?;
+
+    write_u32(writer, count)?;
+
+    for &file_id in file_ids {
+        write_u64(
+            writer,
+            u64::try_from(file_id).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "large CDC file ID \
+                         cannot be \
+                         represented",
+                )
+            })?,
+        )?;
+    }
+
+    writer.flush()
+}
+
+fn read_large_cdc_candidate_file_ids(
+    reader: &mut impl Read,
+    manifest: &[ManifestEntry],
+) -> io::Result<Vec<usize>> {
+    let count = read_u32(reader)?;
+
+    if count > MAX_UNCHANGED_OFFER_FILES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "large CDC candidate count \
+             exceeds the supported limit",
+        ));
+    }
+
+    let mut file_ids = Vec::with_capacity(count as usize);
+
+    let mut seen = BTreeSet::new();
+
+    for _ in 0..count {
+        let file_id = read_file_id(reader)?;
+
+        if !seen.insert(file_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "large CDC candidate list \
+                 contains a duplicate \
+                 file ID",
+            ));
+        }
+
+        let entry = manifest.get(file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "large CDC candidate \
+                         references an \
+                         unknown file",
+            )
+        })?;
+
+        if entry.class != FileClass::Large {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "large CDC candidate is \
+                 not a large file",
+            ));
+        }
+
+        file_ids.push(file_id);
+    }
+
+    Ok(file_ids)
+}
+
+fn large_cdc_begin_wire_bytes(file_count: usize) -> io::Result<u64> {
+    let file_count = u64::try_from(file_count).map_err(|_| {
+        io::Error::other(
+            "large CDC candidate \
+                     count cannot be \
+                     represented",
+        )
+    })?;
+
+    LARGE_CDC_BEGIN_FIXED_WIRE_BYTES
+        .checked_add(
+            file_count
+                .checked_mul(LARGE_CDC_FILE_ID_WIRE_BYTES)
+                .ok_or_else(|| {
+                    io::Error::other(
+                        "large CDC candidate \
+                         wire size overflowed",
+                    )
+                })?,
+        )
+        .ok_or_else(|| {
+            io::Error::other(
+                "large CDC begin wire size \
+                 overflowed",
+            )
+        })
+}
+
+fn large_cdc_decision_wire_bytes(decision: cdc_lane::CdcLaneDecision) -> io::Result<u64> {
+    let stats = decision.stats;
+
+    match (
+        stats.offered_files,
+        stats.completed_files,
+        stats.fallback_files,
+        decision.completed,
+    ) {
+        (0, 0, 0, false) => Ok(CDC_UNAVAILABLE_WIRE_BYTES),
+
+        (1, 1, 0, true) => CDC_INDEX_FIXED_WIRE_BYTES
+            .checked_add(stats.index_wire_bytes)
+            .and_then(|bytes| bytes.checked_add(CDC_PLAN_FIXED_WIRE_BYTES))
+            .and_then(|bytes| bytes.checked_add(stats.plan_wire_bytes))
+            .ok_or_else(|| {
+                io::Error::other(
+                    "completed large CDC \
+                         wire size overflowed",
+                )
+            }),
+
+        (1, 0, 1, false) => CDC_INDEX_FIXED_WIRE_BYTES
+            .checked_add(stats.index_wire_bytes)
+            .and_then(|bytes| bytes.checked_add(CDC_FALLBACK_WIRE_BYTES))
+            .ok_or_else(|| {
+                io::Error::other(
+                    "large CDC fallback \
+                         wire size overflowed",
+                )
+            }),
+
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "large CDC negotiation returned \
+             inconsistent statistics",
+        )),
+    }
+}
+
+fn add_large_cdc_decision(
+    preflight: &mut LargeCdcPreflight,
+    file_id: usize,
+    entry: &ManifestEntry,
+    decision: cdc_lane::CdcLaneDecision,
+    side: &str,
+) -> io::Result<()> {
+    if entry.class != FileClass::Large {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "large CDC decision referenced \
+             a non-large file",
+        ));
+    }
+
+    let wire_bytes = large_cdc_decision_wire_bytes(decision)?;
+
+    preflight.report.data_wire_bytes = preflight
+        .report
+        .data_wire_bytes
+        .checked_add(wire_bytes)
+        .ok_or_else(|| {
+            io::Error::other(
+                "large CDC wire-byte \
+                     count overflowed",
+            )
+        })?;
+
+    preflight.report.cdc.merge(decision.stats)?;
+
+    if !decision.completed {
+        return Ok(());
+    }
+
+    if !preflight.completed_file_ids.insert(file_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "large CDC completed the same \
+             file more than once",
+        ));
+    }
+
+    add_lane_counts(&mut preflight.report, 1, entry.file_size, side)
+}
+
+fn negotiate_large_cdc_sender(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    source_root: &Path,
+    manifest: &[ManifestEntry],
+    progress: Option<&ProgressCounter>,
+) -> io::Result<LargeCdcPreflight> {
+    let file_ids = read_large_cdc_candidate_file_ids(reader, manifest)?;
+
+    let mut preflight = LargeCdcPreflight::default();
+
+    preflight.report.data_wire_bytes = large_cdc_begin_wire_bytes(file_ids.len())?;
+
+    if let Some(progress) = progress {
+        progress.check_cancelled()?;
+
+        progress.set_label("Planning large-file CDC");
+
+        progress.set_completed(0);
+        progress.set_total(0);
+    }
+
+    for file_id in file_ids {
+        if let Some(progress) = progress {
+            progress.check_cancelled()?;
+        }
+
+        let entry = manifest.get(file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "large CDC sender \
+                         referenced an \
+                         unknown file",
+            )
+        })?;
+
+        let decision = cdc_lane::sender_negotiate(reader, writer, source_root, file_id, entry)?;
+
+        add_large_cdc_decision(&mut preflight, file_id, entry, decision, "sender large CDC")?;
+    }
+
+    Ok(preflight)
+}
+
+fn negotiate_large_cdc_receiver(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    destination_root: &Path,
+    manifest: &[ManifestEntry],
+    excluded_file_ids: Option<&BTreeSet<usize>>,
+    progress: Option<&ProgressCounter>,
+    fault_injection: &TransferFault,
+) -> io::Result<LargeCdcPreflight> {
+    let file_ids = large_cdc_candidate_file_ids(manifest, excluded_file_ids);
+
+    write_large_cdc_begin(writer, &file_ids)?;
+
+    let mut preflight = LargeCdcPreflight::default();
+
+    preflight.report.data_wire_bytes = large_cdc_begin_wire_bytes(file_ids.len())?;
+
+    if let Some(progress) = progress {
+        progress.check_cancelled()?;
+
+        progress.set_label("Planning large-file CDC");
+
+        progress.set_completed(0);
+        progress.set_total(0);
+    }
+
+    for file_id in file_ids {
+        if let Some(progress) = progress {
+            progress.check_cancelled()?;
+        }
+
+        let entry = manifest.get(file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "large CDC receiver \
+                         referenced an \
+                         unknown file",
+            )
+        })?;
+
+        let decision =
+            cdc_lane::receiver_negotiate(reader, writer, destination_root, file_id, entry, true)?;
+
+        if decision.completed {
+            let completed_path = destination_root.join(&entry.relative_path);
+
+            file_metadata::restore_file(
+                &completed_path,
+                entry.last_write_time,
+                entry.file_attributes,
+            )?;
+        }
+
+        add_large_cdc_decision(
+            &mut preflight,
+            file_id,
+            entry,
+            decision,
+            "receiver large CDC",
+        )?;
+
+        if decision.completed {
+            fault_injection.after_reconstructed_cdc_file()?;
+        }
+    }
+
+    Ok(preflight)
+}
+
+fn apply_large_cdc_preflight(
+    transfer_plan: &mut TransferPlan,
+    manifest: &[ManifestEntry],
+    preflight: &LargeCdcPreflight,
+) -> io::Result<()> {
+    let expected_files = u64::try_from(preflight.completed_file_ids.len()).map_err(|_| {
+        io::Error::other(
+            "large CDC completed-file \
+                 count cannot be represented",
+        )
+    })?;
+
+    let mut expected_bytes = 0_u64;
+
+    for &file_id in &preflight.completed_file_ids {
+        let entry = manifest.get(file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "large CDC completed \
+                         an unknown file",
+            )
+        })?;
+
+        if entry.class != FileClass::Large {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "large CDC completed a \
+                 non-large file",
+            ));
+        }
+
+        expected_bytes = expected_bytes.checked_add(entry.file_size).ok_or_else(|| {
+            io::Error::other(
+                "large CDC logical \
+                         byte count overflowed",
+            )
+        })?;
+    }
+
+    if preflight.report.files_copied != expected_files
+        || preflight.report.bytes_copied != expected_bytes
+        || preflight.report.cdc.completed_files != expected_files
+        || preflight.report.cdc.logical_bytes != expected_bytes
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "large CDC report does not \
+             match its completed file set",
+        ));
+    }
+
+    let mut removed_file_ids = BTreeSet::new();
+
+    for lane in &mut transfer_plan.lanes {
+        let mut remaining_tasks = Vec::with_capacity(lane.len());
+
+        for task in lane.drain(..) {
+            let task_file_id = match &task {
+                TransferTask::Stripe { file_id, .. } => Some(*file_id),
+
+                TransferTask::WholeFile { file_id } => Some(*file_id),
+
+                TransferTask::TinyPack { .. } => None,
+            };
+
+            if let Some(file_id) = task_file_id
+                && preflight.completed_file_ids.contains(&file_id)
+            {
+                if !matches!(&task, TransferTask::Stripe { .. },) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "large CDC file \
+                             was not \
+                             scheduled as \
+                             stripes",
+                    ));
+                }
+
+                removed_file_ids.insert(file_id);
+
+                continue;
+            }
+
+            remaining_tasks.push(task);
+        }
+
+        *lane = remaining_tasks;
+    }
+
+    if removed_file_ids != preflight.completed_file_ids {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "large CDC completed-file set \
+             does not match the striped \
+             transfer plan",
+        ));
     }
 
     Ok(())
@@ -4162,6 +4729,7 @@ fn write_receiver_ready(writer: &mut impl Write, ready: &ReceiverReady) -> io::R
     writer.flush()
 }
 
+#[cfg(test)]
 fn read_receiver_ready(reader: &mut impl Read) -> io::Result<ReceiverReady> {
     let message = read_u8(reader).map_err(|error| {
         io::Error::new(
@@ -5208,6 +5776,102 @@ mod tests {
         assert!(!destination.join(JOURNAL_FILE_NAME,).exists(),);
 
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn loopback_update_uses_cdc_for_changed_large_file() {
+        let root = temporary_directory("large-cdc-update");
+
+        let source = root.join("source");
+
+        let destination = root.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        fs::create_dir_all(&destination).unwrap();
+
+        let file_bytes = 72 * 1024 * 1024 + 137;
+
+        let basis = vec![0x5A_u8; file_bytes];
+
+        let mut candidate = basis.clone();
+
+        let changed_offset = 24 * 1024 * 1024;
+
+        candidate[changed_offset..changed_offset + 1024 * 1024].fill(0xC3);
+
+        fs::write(source.join("large.bin"), &candidate).unwrap();
+
+        fs::write(destination.join("large.bin"), &basis).unwrap();
+
+        let report = run_update(&source, &destination, 2, 2).unwrap();
+
+        assert_eq!(report.files_copied, 1,);
+
+        assert_eq!(report.cdc_offered_files, 1,);
+
+        assert_eq!(report.cdc_files, 1,);
+
+        assert_eq!(report.cdc_fallback_files, 0,);
+
+        assert_eq!(report.cdc_logical_bytes, candidate.len() as u64,);
+
+        assert!(report.cdc_reused_bytes > candidate.len() as u64 * 90 / 100,);
+
+        assert!(report.data_wire_bytes < 4 * 1024 * 1024,);
+
+        assert_eq!(report.resumed_stripes, 0,);
+
+        assert_eq!(
+            fs::read(destination.join("large.bin",),).unwrap(),
+            candidate,
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unprofitable_large_cdc_keeps_striped_fallback() {
+        let root = temporary_directory("large-cdc-fallback");
+
+        let source = root.join("source");
+
+        let destination = root.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        fs::create_dir_all(&destination).unwrap();
+
+        let file_bytes = 64 * 1024 * 1024 + 137;
+
+        let source_bytes = vec![0x11_u8; file_bytes];
+
+        let destination_bytes = vec![0x22_u8; file_bytes];
+
+        fs::write(source.join("large.bin"), &source_bytes).unwrap();
+
+        fs::write(destination.join("large.bin"), &destination_bytes).unwrap();
+
+        let report = run_update(&source, &destination, 2, 2).unwrap();
+
+        assert_eq!(report.files_copied, 1,);
+
+        assert_eq!(report.cdc_offered_files, 1,);
+
+        assert_eq!(report.cdc_files, 0,);
+
+        assert_eq!(report.cdc_fallback_files, 1,);
+
+        assert_eq!(report.cdc_plan_wire_bytes, 0,);
+
+        assert!(report.cdc_index_wire_bytes > 0,);
+
+        assert_eq!(
+            fs::read(destination.join("large.bin",),).unwrap(),
+            source_bytes,
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
