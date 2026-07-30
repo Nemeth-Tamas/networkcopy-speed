@@ -54,7 +54,7 @@ Implementation order:
 - [x] single-file fixed-block deduplication control benchmark;
 - [x] repeatable overwrite, insertion, deletion, and append corpus;
 - [x] content-defined chunk boundary prototype;
-- [ ] fixed-block versus content-defined chunk-size matrix;
+- [x] fixed-block versus content-defined chunk-size matrix;
 - [ ] receiver basis-file chunk index;
 - [ ] deduplicated reconstruction prototype with final BLAKE3 verification;
 - [ ] bounded-memory folder-level deduplication planning;
@@ -77,6 +77,15 @@ boundaries. The default target is 64 KiB, with 32 KiB minimum and 128 KiB
 maximum chunks. Because boundary selection depends on nearby content rather
 than absolute file offsets, scanning can resynchronize after insertions or
 deletions.
+
+The comparison matrix evaluates fixed and content-defined boundaries at 4,
+16, 64, and 256 KiB. It reports reusable and literal bytes, estimated index
+payload, and total basis-indexing plus candidate-scanning throughput.
+
+On the first 64 KiB prototype corpus, an unaligned 4097-byte insertion improved
+from 14.98% fixed-block reuse to 98.68% content-defined reuse. The corresponding
+deletion improved from 14.99% to 98.80%. CDC reduced estimated literal payload
+from roughly 5.95 MB to 92,322 and 84,128 bytes respectively.
 
 ## v1.4 highlights
 

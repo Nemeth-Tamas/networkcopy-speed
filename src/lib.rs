@@ -6,6 +6,7 @@ mod content_defined_dedup_bench;
 mod content_hash;
 mod control_plane;
 mod copy_bench;
+mod dedup_comparison_bench;
 mod destination_inventory;
 mod direct_address;
 mod direct_discovery;

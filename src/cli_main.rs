@@ -50,6 +50,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &mut arguments,
             )
         }
+        "bench-dedup-matrix" => {
+            run_dedup_comparison_bench(
+                &mut arguments,
+            )
+        }
         "bench-pipeline" => run_bench_pipeline(&mut arguments),
         "probe-iocp" => run_iocp_probe(&mut arguments),
         "probe-overlapped-read" => run_overlapped_read_probe(&mut arguments),
@@ -732,6 +737,57 @@ fn run_content_defined_dedup_bench(
             &candidate,
             average_kib,
         )?;
+
+    report.print();
+
+    Ok(())
+}
+
+fn run_dedup_comparison_bench(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let basis = PathBuf::from(required_argument(
+        arguments,
+        "basis file",
+    )?);
+
+    let candidate = PathBuf::from(required_argument(
+        arguments,
+        "candidate file",
+    )?);
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    println!(
+        "NetworkCopy Speed Edition deduplication comparison matrix",
+    );
+
+    println!("  Basis:     {}", basis.display());
+
+    println!(
+        "  Candidate: {}",
+        candidate.display(),
+    );
+
+    println!(
+        "  Sizes:     4, 16, 64, 256 KiB",
+    );
+
+    println!();
+
+    let report = dedup_comparison_bench::run(
+        &basis,
+        &candidate,
+    )?;
 
     report.print();
 
@@ -1479,6 +1535,10 @@ fn print_usage(program: &OsStr) {
     println!(
         "  {program} bench-cdc-dedup <basis-file> \
          <candidate-file> [average-kib]"
+    );
+    println!(
+        "  {program} bench-dedup-matrix <basis-file> \
+         <candidate-file>"
     );
     println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
     println!("  {program} probe-iocp");
