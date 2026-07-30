@@ -8,8 +8,11 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 const JOURNAL_MAGIC: [u8; 4] = *b"NCR1";
-const JOURNAL_VERSION: u16 = 1;
+const JOURNAL_VERSION_V1: u16 = 1;
+const JOURNAL_VERSION: u16 = 2;
+
 const MAX_COMPLETED_STRIPES: u32 = 10_000_000;
+const MAX_COMPLETED_FILES: u32 = 1_000_000;
 
 pub(crate) const JOURNAL_FILE_NAME: &str = ".networkcopy-resume.bin";
 
@@ -50,6 +53,7 @@ pub(crate) struct ResumeJournal {
     manifest_fingerprint: u64,
     data_stream_count: u32,
     completed_stripes: BTreeSet<ResumeStripe>,
+    completed_file_ids: BTreeSet<usize>,
 }
 
 impl ResumeJournal {
@@ -72,6 +76,7 @@ impl ResumeJournal {
             })?,
 
             completed_stripes: BTreeSet::new(),
+            completed_file_ids: BTreeSet::new(),
         })
     }
 
@@ -125,14 +130,27 @@ impl ResumeJournal {
         self.completed_stripes.iter().copied()
     }
 
+    pub(crate) fn mark_file_completed(&mut self, file_id: usize) -> bool {
+        self.completed_file_ids.insert(file_id)
+    }
+
+    pub(crate) fn completed_file_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.completed_file_ids.iter().copied()
+    }
+
     pub(crate) fn remove_completed_files(&mut self, file_ids: &BTreeSet<usize>) -> bool {
-        let previous_count = self.completed_stripes.len();
+        let previous_stripe_count = self.completed_stripes.len();
+        let previous_file_count = self.completed_file_ids.len();
 
         self.completed_stripes.retain(|stripe| {
             usize::try_from(stripe.file_id).map_or(true, |file_id| !file_ids.contains(&file_id))
         });
 
-        self.completed_stripes.len() != previous_count
+        self.completed_file_ids
+            .retain(|file_id| !file_ids.contains(file_id));
+
+        self.completed_stripes.len() != previous_stripe_count
+            || self.completed_file_ids.len() != previous_file_count
     }
 
     pub(crate) fn save_atomic(&self, destination_root: &Path) -> io::Result<()> {
@@ -212,10 +230,32 @@ impl ResumeJournal {
             })?,
         )?;
 
+        write_u32(
+            writer,
+            u32::try_from(self.completed_file_ids.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "resume journal contains too many completed files",
+                )
+            })?,
+        )?;
+
         for stripe in &self.completed_stripes {
             write_u64(writer, stripe.file_id)?;
             write_u64(writer, stripe.offset)?;
             write_u64(writer, stripe.length)?;
+        }
+
+        for &file_id in &self.completed_file_ids {
+            write_u64(
+                writer,
+                u64::try_from(file_id).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "completed resume file ID cannot be represented",
+                    )
+                })?,
+            )?;
         }
 
         Ok(())
@@ -236,7 +276,7 @@ impl ResumeJournal {
 
         let version = read_u16(&mut file)?;
 
-        if version != JOURNAL_VERSION {
+        if !matches!(version, JOURNAL_VERSION_V1 | JOURNAL_VERSION) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported resume journal version {version}"),
@@ -265,11 +305,26 @@ impl ResumeJournal {
 
         let stripe_count = read_u32(&mut file)?;
 
+        let completed_file_count = if version >= JOURNAL_VERSION {
+            read_u32(&mut file)?
+        } else {
+            0
+        };
+
         if stripe_count > MAX_COMPLETED_STRIPES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
                     "resume journal contains {stripe_count} stripes, exceeding the supported limit"
+                ),
+            ));
+        }
+
+        if completed_file_count > MAX_COMPLETED_FILES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "resume journal contains {completed_file_count} completed files, exceeding the supported limit"
                 ),
             ));
         }
@@ -300,6 +355,26 @@ impl ResumeJournal {
             }
         }
 
+        let mut completed_file_ids = BTreeSet::new();
+
+        for _ in 0..completed_file_count {
+            let encoded_file_id = read_u64(&mut file)?;
+
+            let file_id = usize::try_from(encoded_file_id).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "completed resume file ID cannot be represented",
+                )
+            })?;
+
+            if !completed_file_ids.insert(file_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "resume journal contains a duplicate completed file ID",
+                ));
+            }
+        }
+
         let mut trailing = [0_u8; 1];
 
         if file.read(&mut trailing)? != 0 {
@@ -313,6 +388,7 @@ impl ResumeJournal {
             manifest_fingerprint,
             data_stream_count,
             completed_stripes,
+            completed_file_ids,
         })
     }
 }
@@ -372,7 +448,11 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe, TEMPORARY_JOURNAL_FILE_NAME};
+    use super::{
+        JOURNAL_FILE_NAME, JOURNAL_MAGIC, JOURNAL_VERSION_V1, ResumeJournal, ResumeStripe,
+        TEMPORARY_JOURNAL_FILE_NAME, write_u16, write_u32, write_u64,
+    };
+    use std::collections::BTreeSet;
     use std::env;
     use std::fs::{self, OpenOptions};
     use std::io::{self, Write};
@@ -388,10 +468,12 @@ mod tests {
         let mut journal = ResumeJournal::new(0x1234_5678_9ABC_DEF0, 4).unwrap();
 
         journal.mark_completed(ResumeStripe::new(7, 0, 1024).unwrap());
+        journal.mark_file_completed(3);
 
         journal.save_atomic(&root).unwrap();
 
         journal.mark_completed(ResumeStripe::new(7, 1024, 2048).unwrap());
+        journal.mark_file_completed(9);
 
         journal.save_atomic(&root).unwrap();
 
@@ -399,11 +481,53 @@ mod tests {
 
         assert_eq!(loaded, journal);
 
+        assert_eq!(loaded.completed_file_ids().collect::<Vec<_>>(), vec![3, 9],);
+
         assert!(!root.join(TEMPORARY_JOURNAL_FILE_NAME,).exists());
 
         ResumeJournal::remove(&root).unwrap();
 
         assert!(!root.join(JOURNAL_FILE_NAME).exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn journal_reads_version_one_without_completed_files() {
+        let root = temporary_root("version-one");
+
+        fs::create_dir_all(&root).unwrap();
+
+        let path = root.join(JOURNAL_FILE_NAME);
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        file.write_all(&JOURNAL_MAGIC).unwrap();
+        write_u16(&mut file, JOURNAL_VERSION_V1).unwrap();
+        write_u16(&mut file, 0).unwrap();
+        write_u64(&mut file, 0x1234_5678_9ABC_DEF0).unwrap();
+        write_u32(&mut file, 4).unwrap();
+        write_u32(&mut file, 1).unwrap();
+
+        write_u64(&mut file, 7).unwrap();
+        write_u64(&mut file, 1024).unwrap();
+        write_u64(&mut file, 2048).unwrap();
+
+        file.flush().unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let loaded = ResumeJournal::load_existing(&root, 0x1234_5678_9ABC_DEF0, 4).unwrap();
+
+        assert_eq!(
+            loaded.completed_stripes().collect::<Vec<_>>(),
+            vec![ResumeStripe::new(7, 1024, 2048).unwrap()],
+        );
+
+        assert_eq!(loaded.completed_file_ids().count(), 0);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -437,6 +561,28 @@ mod tests {
         assert!(stream_error.to_string().contains("data streams"));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removing_completed_files_clears_stripes_and_file_ids() {
+        let mut journal = ResumeJournal::new(42, 2).unwrap();
+
+        journal.mark_completed(ResumeStripe::new(3, 0, 1024).unwrap());
+        journal.mark_completed(ResumeStripe::new(4, 0, 2048).unwrap());
+
+        journal.mark_file_completed(3);
+        journal.mark_file_completed(4);
+
+        let reset_file_ids = BTreeSet::from([3]);
+
+        assert!(journal.remove_completed_files(&reset_file_ids));
+
+        assert_eq!(
+            journal.completed_stripes().collect::<Vec<_>>(),
+            vec![ResumeStripe::new(4, 0, 2048).unwrap()],
+        );
+
+        assert_eq!(journal.completed_file_ids().collect::<Vec<_>>(), vec![4],);
     }
 
     #[test]

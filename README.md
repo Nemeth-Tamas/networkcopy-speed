@@ -28,6 +28,17 @@ Current stable release:
 2.0.0
 ```
 
+Current development version:
+
+```text
+2.1.0-dev
+```
+
+v2.1 focuses on stronger interrupted-transfer recovery and broader local reuse.
+Its first milestone persists fully committed fresh-transfer files so a resumed
+session can safely rebuild the same bounded CDC catalog instead of retransmitting
+already completed generations.
+
 v2 uses protocol v10 and supports verified content reuse during both updates
 and fresh folder transfers. Update mode reuses content from older receiver-side
 medium and large files. Fresh transfers use deterministic bounded catalog
@@ -53,7 +64,16 @@ The GUI includes:
 - persistent interrupted-transfer records;
 - one-click transfer restart and stripe resume;
 - automatic administrator elevation when Receive requires firewall setup;
-- success, cancellation, and failure summaries.
+## v2.1 roadmap
+
+- [x] persist committed fresh-transfer file IDs in the resume journal;
+- [ ] preserve and verify committed files during fresh-session restart;
+- [ ] rebuild deterministic catalog state from a committed generation prefix;
+- [ ] retain cross-file CDC reuse after interruption and restart;
+- [ ] extend exact reuse to tiny-file packs;
+- [ ] extend exact reuse to striped large files;
+- [ ] add repeated crash, corruption, and restart acceptance tests;
+- [ ] complete physical two-machine interruption acceptance.
 
 ## v2 roadmap
 
