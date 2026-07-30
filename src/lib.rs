@@ -1,5 +1,6 @@
 mod adaptive_compression;
 mod calibrated_transfer;
+mod cdc_basis_index;
 mod compression_probe;
 mod console_progress;
 mod content_defined_dedup_bench;

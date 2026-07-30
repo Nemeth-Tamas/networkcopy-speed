@@ -55,7 +55,7 @@ Implementation order:
 - [x] repeatable overwrite, insertion, deletion, and append corpus;
 - [x] content-defined chunk boundary prototype;
 - [x] fixed-block versus content-defined chunk-size matrix;
-- [ ] receiver basis-file chunk index;
+- [x] receiver basis-file chunk index;
 - [ ] deduplicated reconstruction prototype with final BLAKE3 verification;
 - [ ] bounded-memory folder-level deduplication planning;
 - [ ] deduplicated transfer protocol, resume behavior, and telemetry.
@@ -87,6 +87,66 @@ On the 64 KiB mutation corpus, an unaligned 4097-byte insertion improved from
 improved from 14.99% to 99.52%. Estimated literal payload fell from roughly
 5.95 MB to 41,575 and 33,381 bytes respectively. Gear CDC analyzed the basis
 and candidate at approximately 1.17 to 1.20 GB/s on the acceptance machine.
+
+### How v2 deduplication works
+
+The receiver already has an older copy of a file. It scans that file once and
+builds a compact index containing each chunk's offset, length, and BLAKE3
+identity.
+
+```mermaid
+flowchart LR
+    R["Receiver: old destination file"]
+    RC["Gear chunking"]
+    I["Basis index<br/>offset + length + BLAKE3"]
+    W["Compact index sent once"]
+    S["Sender: new source file"]
+    SC["Same Gear chunking"]
+    M["Match chunk identities"]
+    P["Reconstruction plan<br/>references + literal bytes"]
+    B["Receiver rebuilds temporary file"]
+    V["Final whole-file BLAKE3"]
+    A["Atomic destination replacement"]
+
+    R --> RC
+    RC --> I
+    I --> W
+    S --> SC
+    W --> M
+    SC --> M
+    M --> P
+    P --> B
+    B --> V
+    V --> A
+```
+
+A small insertion does not require resending everything after it:
+
+```text
+Receiver already has:
+[ A ][ B ][ C ][ D ][ E ]
+
+Sender now has:
+[ A ][ B ][ NEW ][ C ][ D ][ E ]
+
+Sender transmits:
+[ref A][ref B][literal NEW][ref C][ref D][ref E]
+```
+
+The index behaves like a map from chunk identity to an existing receiver-file
+location:
+
+```text
+BLAKE3(A), length(A)  -> offset 0
+BLAKE3(B), length(B)  -> offset after A
+BLAKE3(C), length(C)  -> offset after B
+...
+```
+
+The `NCI1` prototype wire format uses a 24-byte header followed by one 44-byte
+record per chunk. The receiver builds and encodes the index once; the sender
+decodes it once and performs local hash lookups while scanning the new file.
+There is no network round trip for each individual chunk.
 
 ## v1.4 highlights
 

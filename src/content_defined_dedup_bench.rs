@@ -18,17 +18,17 @@ const READ_BUFFER_BYTES: usize = 1024 * 1024;
 const GEAR_TABLE: [u64; 256] = build_gear_table();
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct ChunkKey {
-    digest: [u8; 32],
-    length: u32,
+pub(crate) struct ChunkKey {
+    pub(crate) digest: [u8; 32],
+    pub(crate) length: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ChunkConfig {
-    average_bytes: usize,
-    minimum_bytes: usize,
-    maximum_bytes: usize,
-    boundary_mask: u64,
+pub(crate) struct ChunkConfig {
+    pub(crate) average_bytes: usize,
+    pub(crate) minimum_bytes: usize,
+    pub(crate) maximum_bytes: usize,
+    pub(crate) boundary_mask: u64,
 }
 
 #[derive(Debug)]
@@ -39,12 +39,12 @@ struct BasisIndex {
 }
 
 #[derive(Debug, Default)]
-struct ChunkingStats {
-    bytes: u64,
-    chunks: u64,
-    minimum_chunk_bytes: u64,
-    maximum_chunk_bytes: u64,
-    elapsed: Duration,
+pub(crate) struct ChunkingStats {
+    pub(crate) bytes: u64,
+    pub(crate) chunks: u64,
+    pub(crate) minimum_chunk_bytes: u64,
+    pub(crate) maximum_chunk_bytes: u64,
+    pub(crate) elapsed: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -94,7 +94,7 @@ pub struct ContentDefinedDedupReport {
 }
 
 impl ChunkConfig {
-    fn from_average_kib(average_kib: usize) -> io::Result<Self> {
+    pub(crate) fn from_average_kib(average_kib: usize) -> io::Result<Self> {
         validate_average_kib(average_kib)?;
 
         let average_bytes = average_kib
@@ -391,7 +391,7 @@ fn scan_candidate(
     Ok(candidate)
 }
 
-fn chunk_reader(
+pub(crate) fn chunk_reader(
     mut reader: impl Read,
     config: ChunkConfig,
     mut visitor: impl FnMut(u64, &[u8]) -> io::Result<()>,
@@ -489,7 +489,7 @@ fn emit_chunk(
     Ok(())
 }
 
-fn chunk_key(contents: &[u8]) -> io::Result<ChunkKey> {
+pub(crate) fn chunk_key(contents: &[u8]) -> io::Result<ChunkKey> {
     let length = u32::try_from(contents.len()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
