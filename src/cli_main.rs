@@ -60,6 +60,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &mut arguments,
             )
         }
+        "bench-cdc-reconstruct" => {
+            run_cdc_reconstruction_bench(
+                &mut arguments,
+            )
+        }
         "bench-pipeline" => run_bench_pipeline(&mut arguments),
         "probe-iocp" => run_iocp_probe(&mut arguments),
         "probe-overlapped-read" => run_overlapped_read_probe(&mut arguments),
@@ -857,6 +862,92 @@ fn run_cdc_basis_index_bench(
     Ok(())
 }
 
+fn run_cdc_reconstruction_bench(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let basis = PathBuf::from(required_argument(
+        arguments,
+        "basis file",
+    )?);
+
+    let candidate =
+        PathBuf::from(required_argument(
+            arguments,
+            "candidate file",
+        )?);
+
+    let output =
+        PathBuf::from(required_argument(
+            arguments,
+            "reconstructed output file",
+        )?);
+
+    let average_kib = match arguments.next() {
+        Some(value) => {
+            parse_usize_count(
+                &value,
+                "content-defined average chunk size in KiB",
+            )?
+        }
+
+        None => {
+            content_defined_dedup_bench::
+                DEFAULT_AVERAGE_KIB
+        }
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    content_defined_dedup_bench::
+        validate_average_kib(average_kib)?;
+
+    println!(
+        "NetworkCopy Speed Edition CDC reconstruction benchmark",
+    );
+
+    println!(
+        "  Basis:          {}",
+        basis.display(),
+    );
+
+    println!(
+        "  Candidate:      {}",
+        candidate.display(),
+    );
+
+    println!(
+        "  Output:         {}",
+        output.display(),
+    );
+
+    println!(
+        "  Target average: {average_kib} KiB",
+    );
+
+    println!();
+
+    let report =
+        cdc_reconstruction_bench::run(
+            &basis,
+            &candidate,
+            &output,
+            average_kib,
+        )?;
+
+    report.print();
+
+    Ok(())
+}
+
 fn run_overlapped_read_probe(
     arguments: &mut impl Iterator<Item = OsString>,
 ) -> Result<(), Box<dyn Error>> {
@@ -1606,6 +1697,10 @@ fn print_usage(program: &OsStr) {
     println!(
         "  {program} bench-cdc-index <basis-file> \
          [average-kib]"
+    );
+    println!(
+        "  {program} bench-cdc-reconstruct <basis-file> \
+         <candidate-file> <output-file> [average-kib]"
     );
     println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
     println!("  {program} probe-iocp");

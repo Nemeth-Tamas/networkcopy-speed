@@ -56,7 +56,7 @@ Implementation order:
 - [x] content-defined chunk boundary prototype;
 - [x] fixed-block versus content-defined chunk-size matrix;
 - [x] receiver basis-file chunk index;
-- [ ] deduplicated reconstruction prototype with final BLAKE3 verification;
+- [x] deduplicated reconstruction prototype with final BLAKE3 verification;
 - [ ] bounded-memory folder-level deduplication planning;
 - [ ] deduplicated transfer protocol, resume behavior, and telemetry.
 
@@ -142,6 +142,52 @@ BLAKE3(B), length(B)  -> offset after A
 BLAKE3(C), length(C)  -> offset after B
 ...
 ```
+
+### What reconstruction actually does
+
+The sender does not transmit a separate command for every chunk. Neighboring
+references are merged into large ranges so reconstruction normally needs only a
+few operations.
+
+```text
+Old receiver file:
+[ A ][ B ][ C ][ D ][ E ]
+
+New sender file:
+[ A ][ B ][ NEW ][ C ][ D ][ E ]
+
+Merged reconstruction plan:
+1. COPY basis range containing A + B
+2. WRITE literal bytes containing NEW
+3. COPY basis range containing C + D + E
+```
+
+```mermaid
+sequenceDiagram
+    participant R as Receiver
+    participant S as Sender
+
+    R->>R: Scan old file and build NCI1 index
+    R->>S: Send compact NCI1 chunk index
+
+    S->>S: Scan new file and build NCP1 plan
+    S->>S: Merge neighboring basis references
+    S->>R: Send NCP1 ranges plus literal bytes
+
+    R->>R: Read referenced ranges from old file
+    R->>R: Write references and literals to temporary file
+    R->>R: Calculate BLAKE3 while writing
+
+    alt BLAKE3 matches sender digest
+        R->>R: Atomically replace destination
+    else BLAKE3 mismatch
+        R->>R: Delete temporary file and keep old destination
+    end
+```
+
+The sender calculates the expected whole-file BLAKE3 while scanning the new
+file. The receiver calculates the reconstructed whole-file BLAKE3 while writing
+the temporary file. This avoids an additional verification read of either file.
 
 The `NCI1` prototype wire format uses a 24-byte header followed by one 44-byte
 record per chunk. The receiver builds and encodes the index once; the sender
