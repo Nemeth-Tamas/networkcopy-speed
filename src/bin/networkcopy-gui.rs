@@ -89,9 +89,8 @@ enum ConnectionChoice {
     Address,
 }
 
-#[allow(clippy::large_enum_variant)]
 enum TransferOutcome {
-    Completed(GuiTransferSummary),
+    Completed(Box<GuiTransferSummary>),
 
     Cancelled,
 
@@ -1098,7 +1097,7 @@ impl NetworkCopyGui {
             .name("networkcopy-gui-transfer".to_string())
             .spawn(move || {
                 let outcome = match run_gui_transfer_with_control(request, worker_control) {
-                    Ok(summary) => TransferOutcome::Completed(summary),
+                    Ok(summary) => TransferOutcome::Completed(Box::new(summary)),
 
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                         TransferOutcome::Cancelled
@@ -1184,7 +1183,7 @@ impl NetworkCopyGui {
             TransferOutcome::Completed(summary) => {
                 self.clear_completed_session(text);
 
-                self.last_summary = Some(summary);
+                self.last_summary = Some(*summary);
 
                 self.last_error = None;
 

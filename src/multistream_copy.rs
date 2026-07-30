@@ -1341,7 +1341,7 @@ fn run_server_with_mode(
         progress.set_total(0);
     }
 
-    finalize_large_files(destination_root.as_path(), &manifest)?;
+    finalize_large_files(destination_root.as_path(), &manifest, destination_mode)?;
 
     file_metadata::restore_manifest_files(destination_root.as_path(), &manifest)?;
 
@@ -3635,7 +3635,11 @@ fn validate_stripe(entry: &ManifestEntry, offset: u64, length: u64) -> io::Resul
     Ok(())
 }
 
-fn finalize_large_files(destination_root: &Path, manifest: &[ManifestEntry]) -> io::Result<()> {
+fn finalize_large_files(
+    destination_root: &Path,
+    manifest: &[ManifestEntry],
+    destination_mode: DestinationMode,
+) -> io::Result<()> {
     for (file_id, entry) in manifest.iter().enumerate() {
         if entry.class != FileClass::Large {
             continue;
@@ -3660,12 +3664,22 @@ fn finalize_large_files(destination_root: &Path, manifest: &[ManifestEntry]) -> 
                 validate_resume_file(&final_path, entry.file_size, "finalized striped file")?;
             }
 
+            (true, true) if destination_mode == DestinationMode::UpdateVerified => {
+                validate_resume_file(
+                    &temporary_path,
+                    entry.file_size,
+                    "striped update temporary file",
+                )?;
+
+                windows_file_replace::replace(&temporary_path, &final_path)?;
+            }
+
             (true, true) => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
                         "both final and temporary striped files exist: {}",
-                        final_path.display()
+                        final_path.display(),
                     ),
                 ));
             }
@@ -4400,10 +4414,10 @@ mod tests {
     use super::{
         DestinationMode, ReceiverReady, TINY_PACK_TARGET_BYTES, TransferAck, TransferFault,
         TransferTask, accept_session, apply_resume_offer, build_transfer_plan,
-        connect_with_retry_config, prepare_destination, read_receiver_ready, read_transfer_ack,
-        receive_once, run, run_with_fault, send, temporary_path, tiny_pack_record_wire_bytes,
-        validate_resume_offer, validate_source_metadata, verify_content_digest,
-        write_receiver_ready, write_transfer_ack,
+        connect_with_retry_config, finalize_large_files, prepare_destination, read_receiver_ready,
+        read_transfer_ack, receive_once, run, run_with_fault, send, temporary_path,
+        tiny_pack_record_wire_bytes, validate_resume_offer, validate_source_metadata,
+        verify_content_digest, write_receiver_ready, write_transfer_ack,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::file_metadata;
@@ -5385,6 +5399,60 @@ mod tests {
         assert!(root.join(JOURNAL_FILE_NAME).exists());
 
         drop(prepared);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn temporary_root(name: &str) -> PathBuf {
+        temporary_directory(name)
+    }
+
+    #[test]
+    fn update_finalization_replaces_existing_large_file() {
+        let root = temporary_root("update-large-finalization");
+
+        fs::create_dir_all(&root).unwrap();
+
+        let manifest = vec![entry("large.bin", 8, FileClass::Large)];
+
+        let final_path = root.join("large.bin");
+
+        let temporary_path = temporary_path(&final_path, 0);
+
+        fs::write(&final_path, b"old-data").unwrap();
+
+        fs::write(&temporary_path, b"new-data").unwrap();
+
+        finalize_large_files(&root, &manifest, DestinationMode::UpdateVerified).unwrap();
+
+        assert_eq!(fs::read(&final_path).unwrap(), b"new-data",);
+
+        assert!(!temporary_path.try_exists().unwrap(),);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_finalization_rejects_existing_final_and_temporary() {
+        let root = temporary_root("fresh-large-finalization");
+
+        fs::create_dir_all(&root).unwrap();
+
+        let manifest = vec![entry("large.bin", 8, FileClass::Large)];
+
+        let final_path = root.join("large.bin");
+
+        let temporary_path = temporary_path(&final_path, 0);
+
+        fs::write(&final_path, b"old-data").unwrap();
+
+        fs::write(&temporary_path, b"new-data").unwrap();
+
+        let error = finalize_large_files(&root, &manifest, DestinationMode::Fresh).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+
+        assert!(error.to_string().contains("both final and temporary",),);
 
         fs::remove_dir_all(root).unwrap();
     }
