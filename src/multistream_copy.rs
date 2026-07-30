@@ -586,6 +586,10 @@ struct TransferFault {
     fail_after_reconstructed_cdc_files: Option<u64>,
 
     reconstructed_cdc_files: AtomicU64,
+
+    fail_after_persisted_generations: Option<u64>,
+
+    persisted_generations: AtomicU64,
 }
 
 impl TransferFault {
@@ -600,6 +604,10 @@ impl TransferFault {
             fail_after_reconstructed_cdc_files: None,
 
             reconstructed_cdc_files: AtomicU64::new(0),
+
+            fail_after_persisted_generations: None,
+
+            persisted_generations: AtomicU64::new(0),
         }
     }
 
@@ -632,6 +640,10 @@ impl TransferFault {
             fail_after_reconstructed_cdc_files: None,
 
             reconstructed_cdc_files: AtomicU64::new(0),
+
+            fail_after_persisted_generations: None,
+
+            persisted_generations: AtomicU64::new(0),
         })
     }
 
@@ -655,6 +667,36 @@ impl TransferFault {
             fail_after_reconstructed_cdc_files: Some(file_count),
 
             reconstructed_cdc_files: AtomicU64::new(0),
+
+            fail_after_persisted_generations: None,
+
+            persisted_generations: AtomicU64::new(0),
+        })
+    }
+
+    #[cfg(test)]
+    fn fail_after_persisted_generations(generation_count: u64) -> io::Result<Self> {
+        if generation_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fault injection generation count must not be zero",
+            ));
+        }
+
+        Ok(Self {
+            catalog_limits: CatalogLimits::default(),
+
+            fail_after_checkpointed_stripes: None,
+
+            checkpointed_stripes: AtomicU64::new(0),
+
+            fail_after_reconstructed_cdc_files: None,
+
+            reconstructed_cdc_files: AtomicU64::new(0),
+
+            fail_after_persisted_generations: Some(generation_count),
+
+            persisted_generations: AtomicU64::new(0),
         })
     }
 
@@ -707,6 +749,31 @@ impl TransferFault {
                 "fault injection stopped the \
                  receiver after {completed} \
                  reconstructed CDC file(s)",
+            ),
+        ))
+    }
+
+    fn after_persisted_generation(&self) -> io::Result<()> {
+        let Some(failure_limit) = self.fail_after_persisted_generations else {
+            return Ok(());
+        };
+
+        let completed = self
+            .persisted_generations
+            .fetch_add(1, Ordering::SeqCst)
+            .checked_add(1)
+            .ok_or_else(|| {
+                io::Error::other("fault-injection persisted-generation count overflowed")
+            })?;
+
+        if completed < failure_limit {
+            return Ok(());
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!(
+                "fault injection stopped the receiver after {completed} persisted generation(s)"
             ),
         ))
     }
@@ -4361,7 +4428,7 @@ fn receive_fresh_generation_plan(
         let commit =
             commit_fresh_generation(destination_root, manifest, generation, progress.as_ref())?;
 
-        persist_generation_commit(destination_root, resume_journal, &commit)?;
+        persist_generation_commit(destination_root, resume_journal, &commit, fault_injection)?;
 
         write_generation_commit(control_stream, &commit)?;
 
@@ -4393,6 +4460,7 @@ fn persist_generation_commit(
     destination_root: &Path,
     resume_journal: &Mutex<ResumeJournal>,
     commit: &GenerationCommit,
+    fault_injection: &TransferFault,
 ) -> io::Result<()> {
     let mut journal = resume_journal
         .lock()
@@ -4415,7 +4483,11 @@ fn persist_generation_commit(
         ));
     }
 
-    journal.save_atomic(destination_root)
+    journal.save_atomic(destination_root)?;
+
+    drop(journal);
+
+    fault_injection.after_persisted_generation()
 }
 
 fn commit_fresh_generation(
@@ -8507,13 +8579,49 @@ mod tests {
             evicted_file_ids: Vec::new(),
         };
 
-        persist_generation_commit(&root, &journal, &commit).unwrap();
+        persist_generation_commit(&root, &journal, &commit, &TransferFault::disabled()).unwrap();
 
         let loaded = ResumeJournal::load_existing(&root, 0x1234_5678_9ABC_DEF0, 2).unwrap();
 
         assert_eq!(
             loaded.completed_file_ids().collect::<Vec<_>>(),
             vec![2, 4, 7],
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crash_after_persisted_generation_keeps_durable_file_ids() {
+        let root = temporary_root("crash-after-persisted-generation");
+
+        fs::create_dir_all(&root).unwrap();
+
+        let journal = ResumeJournal::new(0x1234_5678_9ABC_DEF0, 2).unwrap();
+        journal.save_atomic(&root).unwrap();
+
+        let journal = Mutex::new(journal);
+
+        let commit = GenerationCommit {
+            generation_index: 0,
+            committed_file_ids: vec![1, 3, 5],
+            published_file_ids: vec![1, 3, 5],
+            evicted_file_ids: Vec::new(),
+        };
+
+        let fault = TransferFault::fail_after_persisted_generations(1).unwrap();
+
+        let error = persist_generation_commit(&root, &journal, &commit, &fault).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+
+        assert!(error.to_string().contains("persisted generation"),);
+
+        let loaded = ResumeJournal::load_existing(&root, 0x1234_5678_9ABC_DEF0, 2).unwrap();
+
+        assert_eq!(
+            loaded.completed_file_ids().collect::<Vec<_>>(),
+            vec![1, 3, 5],
         );
 
         fs::remove_dir_all(root).unwrap();
