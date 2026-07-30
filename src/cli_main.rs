@@ -76,8 +76,21 @@ fn run() -> Result<(), Box<dyn Error>> {
         "bench-iocp-copy" => run_iocp_copy_bench(&mut arguments),
         "bench-scan" => run_manifest_scan_bench(&mut arguments),
         "probe-control" => run_control_plane_probe(&mut arguments),
-        "bench-multistream-copy" => run_multistream_copy_bench(&mut arguments),
-        "bench-striped-file" => run_striped_file_bench(&mut arguments),
+        "bench-multistream-copy" => {
+            run_multistream_copy_bench(
+                &mut arguments,
+            )
+        }
+        "bench-multistream-update" => {
+            run_multistream_update_bench(
+                &mut arguments,
+            )
+        }
+        "bench-striped-file" => {
+            run_striped_file_bench(
+                &mut arguments,
+            )
+        }
 
         "direct-interfaces" => run_direct_interfaces(&mut arguments),
 
@@ -1632,6 +1645,107 @@ fn run_multistream_copy_bench(
     Ok(())
 }
 
+fn run_multistream_update_bench(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let source_root =
+        PathBuf::from(required_argument(
+            arguments,
+            "source root directory",
+        )?);
+
+    let destination_root =
+        PathBuf::from(required_argument(
+            arguments,
+            "destination root directory",
+        )?);
+
+    let worker_count =
+        match arguments.next() {
+            Some(value) => {
+                parse_buffer_count(
+                    &value,
+                )?
+            }
+
+            None => {
+                manifest_scan::
+                    default_worker_count()
+            }
+        };
+
+    let data_stream_count =
+        match arguments.next() {
+            Some(value) => {
+                parse_buffer_count(
+                    &value,
+                )?
+            }
+
+            None => {
+                multistream_copy::
+                    DEFAULT_DATA_STREAMS
+            }
+        };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    manifest_scan::
+        validate_worker_count(
+            worker_count,
+        )?;
+
+    control_plane::
+        validate_data_stream_count(
+            data_stream_count,
+        )?;
+
+    println!(
+        "NetworkCopy Speed Edition protocol-v7 CDC update",
+    );
+
+    println!(
+        "  Source:       {}",
+        source_root.display(),
+    );
+
+    println!(
+        "  Destination:  {}",
+        destination_root.display(),
+    );
+
+    println!(
+        "  Scan workers: {worker_count}",
+    );
+
+    println!(
+        "  Data streams: {data_stream_count}",
+    );
+
+    println!();
+
+    let report =
+        multistream_copy::run_update(
+            &source_root,
+            &destination_root,
+            worker_count,
+            data_stream_count,
+        )?;
+
+    report.print();
+
+    Ok(())
+}
+
 fn run_striped_file_bench(
     arguments: &mut impl Iterator<Item = OsString>,
 ) -> Result<(), Box<dyn Error>> {
@@ -1845,6 +1959,10 @@ fn print_usage(program: &OsStr) {
     println!(
         "  {program} bench-multistream-copy <source-root> <destination-root> \
          [workers] [data-streams]"
+    );
+    println!(
+        "  {program} bench-multistream-update <source-root> \
+         <destination-root> [workers] [data-streams]"
     );
     println!("  {program} bench-striped-file <source> <destination> [data-streams]");
     println!();

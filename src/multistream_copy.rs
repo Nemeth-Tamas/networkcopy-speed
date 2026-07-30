@@ -1,4 +1,5 @@
 use crate::adaptive_compression::{MAX_COMPRESSED_CHUNK_BYTES, PayloadDecoder, PayloadEncoder};
+use crate::cdc_lane;
 use crate::compression_probe;
 use crate::console_progress::ProgressCounter;
 use crate::content_hash;
@@ -71,6 +72,15 @@ pub struct MultistreamCopyReport {
     pub bytes_copied: u64,
     pub data_wire_bytes: u64,
     pub compressed_records: u64,
+
+    pub cdc_offered_files: u64,
+    pub cdc_files: u64,
+    pub cdc_fallback_files: u64,
+    pub cdc_logical_bytes: u64,
+    pub cdc_reused_bytes: u64,
+    pub cdc_literal_bytes: u64,
+    pub cdc_index_wire_bytes: u64,
+    pub cdc_plan_wire_bytes: u64,
     pub resumed_stripes: u64,
     pub resumed_bytes: u64,
     pub skipped_files: u64,
@@ -114,6 +124,43 @@ impl MultistreamCopyReport {
             "  Data wire size:       {} bytes",
             format_bytes(self.data_wire_bytes)
         );
+        println!(
+            "  CDC offers:           {}",
+            format_bytes(self.cdc_offered_files),
+        );
+
+        println!("  CDC updated files:    {}", format_bytes(self.cdc_files),);
+
+        println!(
+            "  CDC fallbacks:        {}",
+            format_bytes(self.cdc_fallback_files),
+        );
+
+        println!(
+            "  CDC logical data:     {} bytes",
+            format_bytes(self.cdc_logical_bytes),
+        );
+
+        println!(
+            "  CDC reused data:      {} bytes",
+            format_bytes(self.cdc_reused_bytes),
+        );
+
+        println!(
+            "  CDC literal data:     {} bytes",
+            format_bytes(self.cdc_literal_bytes),
+        );
+
+        println!(
+            "  CDC index wire:       {} bytes",
+            format_bytes(self.cdc_index_wire_bytes),
+        );
+
+        println!(
+            "  CDC plan wire:        {} bytes",
+            format_bytes(self.cdc_plan_wire_bytes),
+        );
+
         println!("  Compression strategy: adaptive per-record probing");
         println!(
             "  Compressed records:   {}",
@@ -213,6 +260,15 @@ pub struct ReceiveReport {
     pub bytes_received: u64,
     pub data_wire_bytes: u64,
     pub compressed_records: u64,
+
+    pub cdc_offered_files: u64,
+    pub cdc_files: u64,
+    pub cdc_fallback_files: u64,
+    pub cdc_logical_bytes: u64,
+    pub cdc_reused_bytes: u64,
+    pub cdc_literal_bytes: u64,
+    pub cdc_index_wire_bytes: u64,
+    pub cdc_plan_wire_bytes: u64,
     pub resumed_stripes: u64,
     pub resumed_bytes: u64,
     pub skipped_files: u64,
@@ -251,6 +307,43 @@ impl ReceiveReport {
         println!(
             "  Data wire size:       {} bytes",
             format_bytes(self.data_wire_bytes,)
+        );
+
+        println!(
+            "  CDC offers:           {}",
+            format_bytes(self.cdc_offered_files),
+        );
+
+        println!("  CDC updated files:    {}", format_bytes(self.cdc_files),);
+
+        println!(
+            "  CDC fallbacks:        {}",
+            format_bytes(self.cdc_fallback_files),
+        );
+
+        println!(
+            "  CDC logical data:     {} bytes",
+            format_bytes(self.cdc_logical_bytes),
+        );
+
+        println!(
+            "  CDC reused data:      {} bytes",
+            format_bytes(self.cdc_reused_bytes),
+        );
+
+        println!(
+            "  CDC literal data:     {} bytes",
+            format_bytes(self.cdc_literal_bytes),
+        );
+
+        println!(
+            "  CDC index wire:       {} bytes",
+            format_bytes(self.cdc_index_wire_bytes),
+        );
+
+        println!(
+            "  CDC plan wire:        {} bytes",
+            format_bytes(self.cdc_plan_wire_bytes),
         );
 
         println!("  Compression strategy: adaptive per-record probing");
@@ -331,6 +424,9 @@ struct TransferAck {
     bytes_copied: u64,
     data_wire_bytes: u64,
     compressed_records: u64,
+
+    cdc: cdc_lane::CdcLaneStats,
+
     tiny_materialization_workers: u32,
     tiny_pack_count: u64,
     compressed_tiny_pack_count: u64,
@@ -359,6 +455,8 @@ struct LaneReport {
     bytes_copied: u64,
     data_wire_bytes: u64,
     compressed_records: u64,
+
+    cdc: cdc_lane::CdcLaneStats,
     tiny_pack_count: u64,
     compressed_tiny_pack_count: u64,
     raw_tiny_pack_count: u64,
@@ -500,6 +598,52 @@ pub fn run(
         worker_count,
         data_stream_count,
         Arc::new(TransferFault::disabled()),
+    )
+}
+
+pub fn run_update(
+    source_root: &Path,
+    destination_root: &Path,
+    worker_count: usize,
+    data_stream_count: usize,
+) -> io::Result<MultistreamCopyReport> {
+    manifest_scan::validate_worker_count(worker_count)?;
+
+    control_plane::validate_data_stream_count(data_stream_count)?;
+
+    let memory_plan = transfer_memory::plan_loopback(
+        data_stream_count,
+        NETWORK_BUFFER_BYTES as u64,
+        COPY_BUFFER_BYTES as u64,
+        CODEC_BUFFER_BYTES as u64,
+    )?;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+
+    let address = listener.local_addr()?;
+
+    let server_destination = destination_root.to_path_buf();
+
+    let server = thread::Builder::new()
+        .name("networkcopy-update-server".to_string())
+        .spawn(move || {
+            run_server_with_mode(
+                &listener,
+                server_destination,
+                Arc::new(TransferFault::disabled()),
+                None,
+                DestinationMode::UpdateVerified,
+            )
+        })?;
+
+    send_internal(
+        address,
+        source_root,
+        worker_count,
+        data_stream_count,
+        memory_plan,
+        Some(server),
+        None,
     )
 }
 
@@ -876,6 +1020,14 @@ fn send_internal(
             || transfer_ack.bytes_copied != receiver_report.bytes_received
             || transfer_ack.data_wire_bytes != receiver_report.data_wire_bytes
             || transfer_ack.compressed_records != receiver_report.compressed_records
+            || transfer_ack.cdc.offered_files != receiver_report.cdc_offered_files
+            || transfer_ack.cdc.completed_files != receiver_report.cdc_files
+            || transfer_ack.cdc.fallback_files != receiver_report.cdc_fallback_files
+            || transfer_ack.cdc.logical_bytes != receiver_report.cdc_logical_bytes
+            || transfer_ack.cdc.reused_bytes != receiver_report.cdc_reused_bytes
+            || transfer_ack.cdc.literal_bytes != receiver_report.cdc_literal_bytes
+            || transfer_ack.cdc.index_wire_bytes != receiver_report.cdc_index_wire_bytes
+            || transfer_ack.cdc.plan_wire_bytes != receiver_report.cdc_plan_wire_bytes
             || tiny_materialization_workers != receiver_report.tiny_materialization_workers
             || transfer_ack.tiny_pack_count != receiver_report.tiny_pack_count
             || transfer_ack.compressed_tiny_pack_count != receiver_report.compressed_tiny_pack_count
@@ -902,6 +1054,7 @@ fn send_internal(
         || sender_report.bytes_copied != transfer_ack.bytes_copied
         || sender_report.data_wire_bytes != transfer_ack.data_wire_bytes
         || sender_report.compressed_records != transfer_ack.compressed_records
+        || sender_report.cdc != transfer_ack.cdc
         || sender_report.tiny_pack_count != transfer_ack.tiny_pack_count
         || sender_report.compressed_tiny_pack_count != transfer_ack.compressed_tiny_pack_count
         || sender_report.raw_tiny_pack_count != transfer_ack.raw_tiny_pack_count
@@ -922,6 +1075,22 @@ fn send_internal(
         bytes_copied: transfer_ack.bytes_copied,
         data_wire_bytes: transfer_ack.data_wire_bytes,
         compressed_records: transfer_ack.compressed_records,
+
+        cdc_offered_files: transfer_ack.cdc.offered_files,
+
+        cdc_files: transfer_ack.cdc.completed_files,
+
+        cdc_fallback_files: transfer_ack.cdc.fallback_files,
+
+        cdc_logical_bytes: transfer_ack.cdc.logical_bytes,
+
+        cdc_reused_bytes: transfer_ack.cdc.reused_bytes,
+
+        cdc_literal_bytes: transfer_ack.cdc.literal_bytes,
+
+        cdc_index_wire_bytes: transfer_ack.cdc.index_wire_bytes,
+
+        cdc_plan_wire_bytes: transfer_ack.cdc.plan_wire_bytes,
 
         resumed_stripes: resume_application.stripe_count,
 
@@ -1138,6 +1307,7 @@ fn run_server_with_mode(
                                 fault_injection: lane_fault_injection.as_ref(),
                                 tiny_materializer: &lane_tiny_materializer,
                                 progress: lane_progress,
+                                cdc_enabled: destination_mode == DestinationMode::UpdateVerified,
                             },
                         )
                     })?,
@@ -1184,6 +1354,7 @@ fn run_server_with_mode(
         bytes_copied: report.bytes_copied,
         data_wire_bytes: report.data_wire_bytes,
         compressed_records: report.compressed_records,
+        cdc: report.cdc,
         tiny_materialization_workers: u32::try_from(tiny_materialization_workers).map_err(
             |_| io::Error::other("tiny-file materialization worker count cannot be represented"),
         )?,
@@ -1222,6 +1393,22 @@ fn run_server_with_mode(
         data_wire_bytes: ack.data_wire_bytes,
 
         compressed_records: ack.compressed_records,
+
+        cdc_offered_files: ack.cdc.offered_files,
+
+        cdc_files: ack.cdc.completed_files,
+
+        cdc_fallback_files: ack.cdc.fallback_files,
+
+        cdc_logical_bytes: ack.cdc.logical_bytes,
+
+        cdc_reused_bytes: ack.cdc.reused_bytes,
+
+        cdc_literal_bytes: ack.cdc.literal_bytes,
+
+        cdc_index_wire_bytes: ack.cdc.index_wire_bytes,
+
+        cdc_plan_wire_bytes: ack.cdc.plan_wire_bytes,
 
         resumed_stripes: resume_application.stripe_count,
 
@@ -2315,9 +2502,15 @@ fn send_lane(
     tasks: &[TransferTask],
     progress: Option<ProgressCounter>,
 ) -> io::Result<LaneReport> {
-    let buffered = BufWriter::with_capacity(NETWORK_BUFFER_BYTES, stream);
+    let reader_stream = stream.try_clone()?;
 
-    let mut writer = CountingWriter::new(buffered);
+    let buffered_reader = BufReader::with_capacity(NETWORK_BUFFER_BYTES, reader_stream);
+
+    let mut reader = CountingReader::new(buffered_reader);
+
+    let buffered_writer = BufWriter::with_capacity(NETWORK_BUFFER_BYTES, stream);
+
+    let mut writer = CountingWriter::new(buffered_writer);
 
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
 
@@ -2341,19 +2534,37 @@ fn send_lane(
                     )
                 })?;
 
-                let compressed = send_whole_file(
+                writer.flush()?;
+
+                let cdc_decision = cdc_lane::sender_negotiate(
+                    &mut reader,
                     &mut writer,
                     source_root,
                     file_id,
                     entry,
-                    &mut buffer,
-                    &mut encoder,
-                    progress.as_ref(),
                 )?;
 
-                add_lane_counts(&mut report, 1, entry.file_size, "sender")?;
+                report.cdc.merge(cdc_decision.stats)?;
 
-                add_compressed_record(&mut report, compressed)?;
+                if cdc_decision.completed {
+                    add_lane_counts(&mut report, 1, entry.file_size, "sender CDC")?;
+
+                    add_progress(&progress, entry.file_size);
+                } else {
+                    let compressed = send_whole_file(
+                        &mut writer,
+                        source_root,
+                        file_id,
+                        entry,
+                        &mut buffer,
+                        &mut encoder,
+                        progress.as_ref(),
+                    )?;
+
+                    add_lane_counts(&mut report, 1, entry.file_size, "sender")?;
+
+                    add_compressed_record(&mut report, compressed)?;
+                }
             }
 
             TransferTask::TinyPack {
@@ -2429,7 +2640,10 @@ fn send_lane(
 
     writer.flush()?;
 
-    report.data_wire_bytes = writer.bytes_written();
+    report.data_wire_bytes = writer
+        .bytes_written()
+        .checked_add(reader.bytes_read())
+        .ok_or_else(|| io::Error::other("sender bidirectional wire count overflowed"))?;
 
     Ok(report)
 }
@@ -2880,6 +3094,7 @@ struct ReceiveLaneContext<'a> {
     fault_injection: &'a TransferFault,
     tiny_materializer: &'a tiny_file_pool::TinyFileMaterializerHandle,
     progress: Option<ProgressCounter>,
+    cdc_enabled: bool,
 }
 
 fn receive_lane(
@@ -2894,10 +3109,17 @@ fn receive_lane(
         fault_injection,
         tiny_materializer,
         progress,
+        cdc_enabled,
     } = context;
-    let buffered = BufReader::with_capacity(NETWORK_BUFFER_BYTES, stream);
+    let writer_stream = stream.try_clone()?;
 
-    let mut reader = CountingReader::new(buffered);
+    let buffered_reader = BufReader::with_capacity(NETWORK_BUFFER_BYTES, stream);
+
+    let mut reader = CountingReader::new(buffered_reader);
+
+    let buffered_writer = BufWriter::with_capacity(NETWORK_BUFFER_BYTES, writer_stream);
+
+    let mut writer = CountingWriter::new(buffered_writer);
 
     let mut buffer = vec![0_u8; COPY_BUFFER_BYTES];
 
@@ -2913,6 +3135,32 @@ fn receive_lane(
         match task {
             TransferTask::WholeFile { file_id } => {
                 let file_id = *file_id;
+
+                let entry = manifest.get(file_id).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("received unknown file ID {file_id}",),
+                    )
+                })?;
+
+                let cdc_decision = cdc_lane::receiver_negotiate(
+                    &mut reader,
+                    &mut writer,
+                    destination_root,
+                    file_id,
+                    entry,
+                    cdc_enabled,
+                )?;
+
+                report.cdc.merge(cdc_decision.stats)?;
+
+                if cdc_decision.completed {
+                    add_lane_counts(&mut report, 1, entry.file_size, "receiver CDC")?;
+
+                    add_progress(&progress, entry.file_size);
+
+                    continue;
+                }
 
                 let message = read_u8(&mut reader)?;
 
@@ -2933,13 +3181,6 @@ fn receive_lane(
                 }
 
                 let announced_size = read_u64(&mut reader)?;
-
-                let entry = manifest.get(file_id).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("received unknown file ID {file_id}"),
-                    )
-                })?;
 
                 if announced_size != entry.file_size {
                     return Err(io::Error::new(
@@ -3075,7 +3316,10 @@ fn receive_lane(
         ));
     }
 
-    report.data_wire_bytes = reader.bytes_read();
+    report.data_wire_bytes = reader
+        .bytes_read()
+        .checked_add(writer.bytes_written())
+        .ok_or_else(|| io::Error::other("receiver bidirectional wire count overflowed"))?;
 
     Ok(report)
 }
@@ -3558,6 +3802,8 @@ fn merge_lane_reports(reports: Vec<LaneReport>) -> io::Result<LaneReport> {
             .checked_add(report.compressed_records)
             .ok_or_else(|| io::Error::other("merged compressed-record count overflowed"))?;
 
+        merged.cdc.merge(report.cdc)?;
+
         merged.tiny_pack_count = merged
             .tiny_pack_count
             .checked_add(report.tiny_pack_count)
@@ -3923,6 +4169,22 @@ fn write_transfer_ack(writer: &mut impl Write, ack: TransferAck) -> io::Result<(
 
     write_u64(writer, ack.compressed_records)?;
 
+    write_u64(writer, ack.cdc.offered_files)?;
+
+    write_u64(writer, ack.cdc.completed_files)?;
+
+    write_u64(writer, ack.cdc.fallback_files)?;
+
+    write_u64(writer, ack.cdc.logical_bytes)?;
+
+    write_u64(writer, ack.cdc.reused_bytes)?;
+
+    write_u64(writer, ack.cdc.literal_bytes)?;
+
+    write_u64(writer, ack.cdc.index_wire_bytes)?;
+
+    write_u64(writer, ack.cdc.plan_wire_bytes)?;
+
     write_u32(writer, ack.tiny_materialization_workers)?;
 
     write_u64(writer, ack.tiny_pack_count)?;
@@ -3958,6 +4220,24 @@ fn read_transfer_ack(reader: &mut impl Read) -> io::Result<TransferAck> {
         data_wire_bytes: read_u64(reader)?,
 
         compressed_records: read_u64(reader)?,
+
+        cdc: cdc_lane::CdcLaneStats {
+            offered_files: read_u64(reader)?,
+
+            completed_files: read_u64(reader)?,
+
+            fallback_files: read_u64(reader)?,
+
+            logical_bytes: read_u64(reader)?,
+
+            reused_bytes: read_u64(reader)?,
+
+            literal_bytes: read_u64(reader)?,
+
+            index_wire_bytes: read_u64(reader)?,
+
+            plan_wire_bytes: read_u64(reader)?,
+        },
 
         tiny_materialization_workers: read_u32(reader)?,
 
@@ -5116,6 +5396,7 @@ mod tests {
             bytes_copied: 1_920_000,
             data_wire_bytes: 1_430_000,
             compressed_records: 2,
+            cdc: Default::default(),
             tiny_materialization_workers: 2,
             tiny_pack_count: 3,
             compressed_tiny_pack_count: 2,

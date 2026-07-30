@@ -265,7 +265,7 @@ impl ReconstructionPlan {
         Ok(encoded)
     }
 
-    fn decode_wire(encoded: &[u8]) -> io::Result<Self> {
+    pub(crate) fn decode_wire(encoded: &[u8]) -> io::Result<Self> {
         if encoded.len() < PLAN_HEADER_BYTES {
             return Err(invalid_plan(
                 "reconstruction plan header \
@@ -771,6 +771,15 @@ fn append_literal(operations: &mut Vec<ReconstructionOp>, contents: &[u8]) -> io
     operations.push(ReconstructionOp::Literal(literal));
 
     Ok(())
+}
+
+pub(crate) fn reconstruct_verified(
+    basis_path: &Path,
+    output_path: &Path,
+    expected_basis_bytes: u64,
+    plan: &ReconstructionPlan,
+) -> io::Result<()> {
+    reconstruct(basis_path, output_path, expected_basis_bytes, plan).map(|_| ())
 }
 
 fn reconstruct(

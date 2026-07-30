@@ -28,9 +28,11 @@ Current development version:
 2.0.0-dev
 ```
 
-v1.4 is the current stable release. v2 explores block-level and
-content-defined deduplication so modified files can reuse verified data already
-present on the receiver instead of retransmitting complete file contents.
+v1.4 is the current stable release. v2 now includes a protocol-v7 medium-file
+update path that reuses verified content from an older receiver-side file and
+transmits only reconstruction references plus changed literal bytes. Large
+striped-file deduplication, CDC-aware resume behavior, and final GUI telemetry
+remain under development.
 
 The GUI includes:
 
@@ -228,6 +230,56 @@ active reconstruction plan. If the limit is reached, or the complete CDC wire
 payload would not beat an ordinary full-file transfer, that file immediately
 falls back to the existing transfer engine. Folder size and file count therefore
 do not cause unbounded chunk-index or literal memory growth.
+
+### Protocol v7 medium-file update path
+
+Protocol v7 performs CDC negotiation independently on each TCP data lane.
+A changed medium file can use the existing destination file as its basis.
+Missing, unsuitable, or unprofitable candidates fall back to the ordinary
+whole-file transfer record.
+
+```mermaid
+sequenceDiagram
+    participant R as Receiver data lane
+    participant S as Sender data lane
+
+    R->>R: Scan old destination file
+    R->>R: Build NCI1 chunk index
+    R->>S: Send one compact NCI1 index
+
+    S->>S: Scan new source file
+    S->>S: Match chunks against NCI1
+    S->>S: Build bounded NCP1 reconstruction plan
+
+    alt CDC is smaller than full-file transfer
+        S->>R: Send NCP1 references and literal bytes
+        R->>R: Copy referenced ranges from old file
+        R->>R: Insert received literal bytes
+        R->>R: Calculate final BLAKE3 while writing
+        R->>R: Atomically replace destination
+    else CDC unavailable or unprofitable
+        S->>R: Send fallback marker
+        S->>R: Send ordinary whole-file record
+    end
+```
+
+```text
+Old receiver file:
+[ unchanged prefix ][ old section ][ unchanged suffix ]
+
+New sender file:
+[ unchanged prefix ][ NEW section ][ unchanged suffix ]
+
+Protocol v7 sends:
+[ reference prefix ][ literal NEW section ][ reference suffix ]
+```
+
+The first protocol-v7 loopback acceptance updated three medium files containing
+20,990,976 logical bytes. It reused 20,864,841 receiver-side bytes and sent
+126,135 literal bytes. Including three receiver indexes, three reconstruction
+plans, CDC framing, and stream termination, the data lanes carried 140,722
+bytes for 99.33% savings. All reconstructed files passed receiver-side BLAKE3
+verification and independent SHA-256 comparison.
 
 The `NCI1` prototype wire format uses a 24-byte header followed by one 44-byte
 record per chunk. The receiver builds and encodes the index once; the sender
