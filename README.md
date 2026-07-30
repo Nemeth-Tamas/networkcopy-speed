@@ -68,8 +68,8 @@ The GUI includes:
 
 - [x] persist committed fresh-transfer file IDs in the resume journal;
 - [ ] preserve and verify committed files during fresh-session restart;
-- [ ] rebuild deterministic catalog state from a committed generation prefix;
-- [ ] retain cross-file CDC reuse after interruption and restart;
+- [x] rebuild deterministic catalog state from a committed generation prefix;
+- [x] retain cross-file CDC reuse after interruption and restart;
 - [ ] extend exact reuse to tiny-file packs;
 - [ ] extend exact reuse to striped large files;
 - [ ] add repeated crash, corruption, and restart acceptance tests;

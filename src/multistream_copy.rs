@@ -623,6 +623,25 @@ impl TransferFault {
     }
 
     #[cfg(test)]
+    fn with_catalog_limits_and_persisted_generation_failure(
+        catalog_limits: CatalogLimits,
+        generation_count: u64,
+    ) -> io::Result<Self> {
+        if generation_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fault injection generation count must not be zero",
+            ));
+        }
+
+        let mut fault = Self::with_catalog_limits(catalog_limits)?;
+
+        fault.fail_after_persisted_generations = Some(generation_count);
+
+        Ok(fault)
+    }
+
+    #[cfg(test)]
     fn fail_after_checkpointed_stripes(stripe_count: u64) -> io::Result<Self> {
         if stripe_count == 0 {
             return Err(io::Error::new(
@@ -8873,6 +8892,154 @@ mod tests {
         assert_eq!(fs::read(destination.join("01-target.bin")).unwrap(), target,);
 
         assert!(!destination.join(JOURNAL_FILE_NAME).exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_restart_retains_committed_basis_for_cross_file_cdc() {
+        let root = temporary_directory("fresh-restart-session-cdc");
+
+        let source = root.join("source");
+        let destination = root.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        let basis = deterministic_test_bytes(8 * 1024 * 1024, 0x1234_5678_90AB_CDEF);
+
+        let insertion = deterministic_test_bytes(4097, 0xCAFE_BABE_DEAD_BEEF);
+
+        let insertion_offset = 4 * 1024 * 1024 + 123;
+
+        let mut target = Vec::with_capacity(basis.len() + insertion.len());
+
+        target.extend_from_slice(&basis[..insertion_offset]);
+
+        target.extend_from_slice(&insertion);
+
+        target.extend_from_slice(&basis[insertion_offset..]);
+
+        fs::write(source.join("00-basis.bin"), &basis).unwrap();
+
+        fs::write(source.join("01-target.bin"), &target).unwrap();
+
+        let scan = manifest_scan::run(&source, 2).unwrap();
+
+        let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+
+        let basis_file_id = scan
+            .manifest
+            .iter()
+            .position(|entry| entry.relative_path == Path::new("00-basis.bin"))
+            .unwrap();
+
+        let target_file_id = scan
+            .manifest
+            .iter()
+            .position(|entry| entry.relative_path == Path::new("01-target.bin"))
+            .unwrap();
+
+        assert_eq!(scan.manifest[basis_file_id].class, FileClass::Medium,);
+
+        assert_eq!(scan.manifest[target_file_id].class, FileClass::Medium,);
+
+        let catalog_limits = CatalogLimits {
+            generation_target_bytes: basis.len() as u64,
+
+            ..CatalogLimits::default()
+        };
+
+        let transfer_plan = build_transfer_plan(&scan.manifest, 2).unwrap();
+
+        let generation_plan =
+            build_fresh_generation_plan_with_limits(&scan.manifest, &transfer_plan, catalog_limits)
+                .unwrap();
+
+        assert_eq!(generation_plan.catalog.generations.len(), 2,);
+
+        assert_eq!(
+            generation_plan.catalog.generations[0]
+                .transfer_files
+                .iter()
+                .map(|candidate| candidate.file_id)
+                .collect::<Vec<_>>(),
+            vec![basis_file_id],
+        );
+
+        assert_eq!(
+            generation_plan.catalog.generations[1]
+                .transfer_files
+                .iter()
+                .map(|candidate| candidate.file_id)
+                .collect::<Vec<_>>(),
+            vec![target_file_id],
+        );
+
+        assert!(
+            generation_plan.catalog.generations[1]
+                .basis_file_ids
+                .contains(&basis_file_id),
+        );
+
+        let first_fault =
+            TransferFault::with_catalog_limits_and_persisted_generation_failure(catalog_limits, 1)
+                .unwrap();
+
+        let first_result = run_with_fault(&source, &destination, 2, 2, Arc::new(first_fault));
+
+        assert!(first_result.is_err());
+
+        assert!(destination.join(JOURNAL_FILE_NAME).exists(),);
+
+        let journal = ResumeJournal::load_existing(&destination, summary.fingerprint, 2).unwrap();
+
+        assert_eq!(
+            journal.completed_file_ids().collect::<Vec<_>>(),
+            vec![basis_file_id],
+        );
+
+        assert_eq!(fs::read(destination.join("00-basis.bin"),).unwrap(), basis,);
+
+        assert!(!destination.join("01-target.bin").exists(),);
+
+        let restart_fault = TransferFault::with_catalog_limits(catalog_limits).unwrap();
+
+        let report = run_with_fault(&source, &destination, 2, 2, Arc::new(restart_fault)).unwrap();
+
+        assert_eq!(report.files_copied, 2);
+
+        assert_eq!(report.bytes_copied, (basis.len() + target.len()) as u64,);
+
+        assert_eq!(report.skipped_files, 1);
+
+        assert_eq!(report.skipped_bytes, basis.len() as u64,);
+
+        assert_eq!(report.exact_reused_files, 0);
+
+        assert_eq!(report.cdc_offered_files, 1);
+
+        assert_eq!(report.cdc_files, 1);
+
+        assert_eq!(report.cdc_fallback_files, 0);
+
+        assert_eq!(report.cdc_logical_bytes, target.len() as u64,);
+
+        assert!(report.cdc_reused_bytes > target.len() as u64 * 90 / 100,);
+
+        assert!(report.cdc_literal_bytes < 1024 * 1024,);
+
+        assert_eq!(report.cdc_index_wire_bytes, 0,);
+
+        assert!(report.cdc_plan_wire_bytes > 0,);
+
+        assert_eq!(fs::read(destination.join("00-basis.bin"),).unwrap(), basis,);
+
+        assert_eq!(
+            fs::read(destination.join("01-target.bin"),).unwrap(),
+            target,
+        );
+
+        assert!(!destination.join(JOURNAL_FILE_NAME).exists(),);
 
         fs::remove_dir_all(root).unwrap();
     }
