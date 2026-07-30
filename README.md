@@ -57,7 +57,7 @@ Implementation order:
 - [x] fixed-block versus content-defined chunk-size matrix;
 - [x] receiver basis-file chunk index;
 - [x] deduplicated reconstruction prototype with final BLAKE3 verification;
-- [ ] bounded-memory folder-level deduplication planning;
+- [x] bounded-memory folder-level deduplication planning;
 - [ ] deduplicated transfer protocol, resume behavior, and telemetry.
 
 The first benchmark intentionally uses fixed boundaries from byte zero. It
@@ -188,6 +188,46 @@ sequenceDiagram
 The sender calculates the expected whole-file BLAKE3 while scanning the new
 file. The receiver calculates the reconstructed whole-file BLAKE3 while writing
 the temporary file. This avoids an additional verification read of either file.
+
+### How folder transfers stay memory-bounded
+
+Files are planned independently. A completed file's chunk index, reconstruction
+plan, and literal staging are discarded before the next file begins.
+
+```mermaid
+flowchart TD
+    M["Existing folder manifest"]
+    F1["Select next same-path changed file"]
+    G["Cheap first/last sample gate"]
+    I["Build one receiver NCI1 index"]
+    P["Build one bounded sender NCP1 plan"]
+    D{"Plan smaller than full file?"}
+    C["Queue CDC transfer"]
+    X["Queue ordinary full-file transfer"]
+    R["Drop per-file index and plan"]
+    N{"More files?"}
+
+    M --> F1
+    F1 --> G
+    G -->|Probably related| I
+    G -->|Probably unrelated| X
+    I --> P
+    P -->|Literal limit exceeded| X
+    P --> D
+    D -->|Yes| C
+    D -->|No| X
+    C --> R
+    X --> R
+    R --> N
+    N -->|Yes| F1
+    N -->|No| Z["Folder plan complete"]
+```
+
+The prototype defaults to a 64 MiB ceiling for literal bytes belonging to one
+active reconstruction plan. If the limit is reached, or the complete CDC wire
+payload would not beat an ordinary full-file transfer, that file immediately
+falls back to the existing transfer engine. Folder size and file count therefore
+do not cause unbounded chunk-index or literal memory growth.
 
 The `NCI1` prototype wire format uses a 24-byte header followed by one 44-byte
 record per chunk. The receiver builds and encodes the index once; the sender

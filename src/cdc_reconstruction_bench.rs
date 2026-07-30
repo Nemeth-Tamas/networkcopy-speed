@@ -3,7 +3,9 @@ use crate::content_defined_dedup_bench::{ChunkConfig, chunk_key, chunk_reader};
 use crate::content_hash::{ContentHasher, format_digest};
 use crate::copy_bench::{decimal_megabytes_per_second, format_bytes};
 use crate::windows_file_replace;
+use std::error::Error;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -23,6 +25,30 @@ const OP_LITERAL: u8 = 1;
 
 const RECONSTRUCTION_BUFFER_BYTES: usize = 1024 * 1024;
 
+#[derive(Debug)]
+struct LiteralLimitExceeded {
+    limit_bytes: u64,
+}
+
+impl fmt::Display for LiteralLimitExceeded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "reconstruction literal staging exceeded {} bytes",
+            self.limit_bytes,
+        )
+    }
+}
+
+impl Error for LiteralLimitExceeded {}
+
+pub(crate) fn is_literal_limit_exceeded(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<LiteralLimitExceeded>())
+        .is_some()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ReconstructionOp {
     Basis { offset: u64, length: u64 },
@@ -31,7 +57,7 @@ enum ReconstructionOp {
 }
 
 #[derive(Clone, Debug)]
-struct ReconstructionPlan {
+pub(crate) struct ReconstructionPlan {
     target_bytes: u64,
     target_digest: [u8; 32],
 
@@ -86,6 +112,14 @@ pub struct ReconstructionBenchReport {
 
 impl ReconstructionPlan {
     fn build(candidate_path: &Path, index: &BasisFileIndex) -> io::Result<Self> {
+        Self::build_bounded(candidate_path, index, u64::MAX)
+    }
+
+    pub(crate) fn build_bounded(
+        candidate_path: &Path,
+        index: &BasisFileIndex,
+        maximum_literal_bytes: u64,
+    ) -> io::Result<Self> {
         let candidate_file = File::open(candidate_path)?;
 
         let expected_bytes = candidate_file.metadata()?.len();
@@ -121,14 +155,19 @@ impl ReconstructionPlan {
                     )
                 })?;
             } else {
+                let next_literal_bytes = literal_bytes
+                    .checked_add(chunk_bytes)
+                    .ok_or_else(|| io::Error::other("literal byte count overflowed"))?;
+
+                if next_literal_bytes > maximum_literal_bytes {
+                    return Err(io::Error::other(LiteralLimitExceeded {
+                        limit_bytes: maximum_literal_bytes,
+                    }));
+                }
+
                 append_literal(&mut operations, contents)?;
 
-                literal_bytes = literal_bytes.checked_add(chunk_bytes).ok_or_else(|| {
-                    io::Error::other(
-                        "literal byte count \
-                                     overflowed",
-                    )
-                })?;
+                literal_bytes = next_literal_bytes;
             }
 
             Ok(())
@@ -174,7 +213,7 @@ impl ReconstructionPlan {
         })
     }
 
-    fn encode_wire(&self) -> io::Result<Vec<u8>> {
+    pub(crate) fn encode_wire(&self) -> io::Result<Vec<u8>> {
         let operation_count = u64::try_from(self.operations.len()).map_err(|_| {
             io::Error::other(
                 "reconstruction operation count \
@@ -370,6 +409,22 @@ impl ReconstructionPlan {
         })
     }
 
+    pub(crate) fn target_bytes(&self) -> u64 {
+        self.target_bytes
+    }
+
+    pub(crate) fn referenced_bytes(&self) -> u64 {
+        self.referenced_bytes
+    }
+
+    pub(crate) fn literal_bytes(&self) -> u64 {
+        self.literal_bytes
+    }
+
+    pub(crate) fn build_elapsed(&self) -> Duration {
+        self.build_elapsed
+    }
+
     fn wire_size(&self) -> io::Result<usize> {
         let mut size = PLAN_HEADER_BYTES;
 
@@ -398,14 +453,14 @@ impl ReconstructionPlan {
         Ok(size)
     }
 
-    fn basis_range_count(&self) -> usize {
+    pub(crate) fn basis_range_count(&self) -> usize {
         self.operations
             .iter()
             .filter(|operation| matches!(operation, ReconstructionOp::Basis { .. }))
             .count()
     }
 
-    fn literal_range_count(&self) -> usize {
+    pub(crate) fn literal_range_count(&self) -> usize {
         self.operations
             .iter()
             .filter(|operation| matches!(operation, ReconstructionOp::Literal(_,)))
@@ -1023,7 +1078,7 @@ fn reduction_percent(full_bytes: u64, reduced_bytes: u64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReconstructionPlan, reconstruct, run};
+    use super::{ReconstructionPlan, is_literal_limit_exceeded, reconstruct, run};
     use crate::cdc_basis_index::BasisFileIndex;
     use std::env;
     use std::fs;
@@ -1134,6 +1189,34 @@ mod tests {
         assert!(report.literal_bytes < 512 * 1024,);
 
         assert_eq!(fs::read(&output_path).unwrap(), candidate,);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bounded_plan_stops_before_unbounded_literal_growth() {
+        let root = temporary_root("literal-limit");
+
+        fs::create_dir_all(&root).unwrap();
+
+        let basis_path = root.join("basis.bin");
+
+        let candidate_path = root.join("candidate.bin");
+
+        let basis = deterministic_bytes(2 * 1024 * 1024, 0xABCD_EF01_2345_6789);
+
+        let candidate = deterministic_bytes(2 * 1024 * 1024, 0x9876_5432_10FE_DCBA);
+
+        fs::write(&basis_path, &basis).unwrap();
+
+        fs::write(&candidate_path, &candidate).unwrap();
+
+        let index = BasisFileIndex::build(&basis_path, 64).unwrap();
+
+        let error =
+            ReconstructionPlan::build_bounded(&candidate_path, &index, 64 * 1024).unwrap_err();
+
+        assert!(is_literal_limit_exceeded(&error,),);
 
         fs::remove_dir_all(root).unwrap();
     }

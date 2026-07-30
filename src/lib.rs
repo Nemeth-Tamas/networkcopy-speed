@@ -19,6 +19,7 @@ mod direct_tcp;
 mod direct_transfer;
 mod file_metadata;
 mod fixed_block_dedup_bench;
+mod folder_dedup_bench;
 pub mod gui_session;
 pub mod gui_transfer;
 mod iocp_copy;

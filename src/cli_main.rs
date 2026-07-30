@@ -65,6 +65,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &mut arguments,
             )
         }
+        "bench-cdc-folder-plan" => {
+            run_cdc_folder_plan_bench(
+                &mut arguments,
+            )
+        }
         "bench-pipeline" => run_bench_pipeline(&mut arguments),
         "probe-iocp" => run_iocp_probe(&mut arguments),
         "probe-overlapped-read" => run_overlapped_read_probe(&mut arguments),
@@ -948,6 +953,130 @@ fn run_cdc_reconstruction_bench(
     Ok(())
 }
 
+fn run_cdc_folder_plan_bench(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let source_root =
+        PathBuf::from(required_argument(
+            arguments,
+            "source root directory",
+        )?);
+
+    let destination_root =
+        PathBuf::from(required_argument(
+            arguments,
+            "destination root directory",
+        )?);
+
+    let average_kib =
+        match arguments.next() {
+            Some(value) => {
+                parse_usize_count(
+                    &value,
+                    "content-defined average chunk size in KiB",
+                )?
+            }
+
+            None => {
+                content_defined_dedup_bench::
+                    DEFAULT_AVERAGE_KIB
+            }
+        };
+
+    let minimum_file_mib =
+        match arguments.next() {
+            Some(value) => {
+                parse_usize_count(
+                    &value,
+                    "minimum candidate size in MiB",
+                )?
+            }
+
+            None => {
+                folder_dedup_bench::
+                    DEFAULT_MINIMUM_FILE_MIB
+            }
+        };
+
+    let maximum_literal_mib =
+        match arguments.next() {
+            Some(value) => {
+                parse_usize_count(
+                    &value,
+                    "maximum literal staging in MiB",
+                )?
+            }
+
+            None => {
+                folder_dedup_bench::
+                    DEFAULT_MAXIMUM_LITERAL_MIB
+            }
+        };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    content_defined_dedup_bench::
+        validate_average_kib(
+            average_kib,
+        )?;
+
+    folder_dedup_bench::
+        validate_limits(
+            minimum_file_mib,
+            maximum_literal_mib,
+        )?;
+
+    println!(
+        "NetworkCopy Speed Edition bounded folder CDC planner",
+    );
+
+    println!(
+        "  Source:          {}",
+        source_root.display(),
+    );
+
+    println!(
+        "  Destination:     {}",
+        destination_root.display(),
+    );
+
+    println!(
+        "  Target average:  {average_kib} KiB",
+    );
+
+    println!(
+        "  Minimum file:    {minimum_file_mib} MiB",
+    );
+
+    println!(
+        "  Literal ceiling: {maximum_literal_mib} MiB",
+    );
+
+    println!();
+
+    let report =
+        folder_dedup_bench::run(
+            &source_root,
+            &destination_root,
+            average_kib,
+            minimum_file_mib,
+            maximum_literal_mib,
+        )?;
+
+    report.print();
+
+    Ok(())
+}
+
 fn run_overlapped_read_probe(
     arguments: &mut impl Iterator<Item = OsString>,
 ) -> Result<(), Box<dyn Error>> {
@@ -1281,7 +1410,7 @@ fn run_send_auto(arguments: &mut impl Iterator<Item = OsString>) -> Result<(), B
     if let Some(extra) = arguments.next() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+            format!("unexpected extra argument: {}", extra.to_string_lossy(),),
         )
         .into());
     }
@@ -1330,7 +1459,7 @@ fn run_receive_auto(arguments: &mut impl Iterator<Item = OsString>) -> Result<()
     if let Some(extra) = arguments.next() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("unexpected extra argument: {}", extra.to_string_lossy()),
+            format!("unexpected extra argument: {}", extra.to_string_lossy(),),
         )
         .into());
     }
@@ -1701,6 +1830,11 @@ fn print_usage(program: &OsStr) {
     println!(
         "  {program} bench-cdc-reconstruct <basis-file> \
          <candidate-file> <output-file> [average-kib]"
+    );
+    println!(
+        "  {program} bench-cdc-folder-plan <source-root> \
+         <destination-root> [average-kib] [minimum-file-mib] \
+         [maximum-literal-mib]"
     );
     println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
     println!("  {program} probe-iocp");
