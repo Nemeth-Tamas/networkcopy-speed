@@ -67,8 +67,10 @@ Implementation order:
 - [x] CDC-aware interruption and file-level retry behavior;
 - [x] fresh-transfer exact reuse for repeated medium files;
 - [ ] extend exact reuse to tiny packs and striped large files;
-- [ ] session-scoped rolling cross-file CDC using completed files as bases;
-- [ ] bounded chunk catalog with multi-lane generation barriers and retry support;
+- [x] deterministic bounded session catalog and generation planner;
+- [ ] protocol-v10 generation barriers and receiver commit acknowledgements;
+- [ ] session-scoped cross-file CDC using completed files as chunk bases;
+- [ ] interrupted-session catalog rebuild and retry behavior;
 - [x] GUI CDC telemetry and mixed-workload loopback acceptance;
 - [ ] physical two-machine acceptance.
 
