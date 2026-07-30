@@ -95,6 +95,7 @@ impl Default for GuiTransferControl {
 pub enum GuiTransferDiagnostic {
     AllFilesSkipped,
     TinyFileHeavy,
+    ExactReuseEffective,
     CdcEffective,
     CompressionEffective,
     CompressionBypassed,
@@ -106,6 +107,8 @@ struct DiagnosticInput {
     files: u64,
     logical_bytes: u64,
     wire_bytes: u64,
+
+    exact_reused_files: u64,
 
     cdc_files: u64,
     cdc_reused_bytes: u64,
@@ -149,6 +152,11 @@ pub struct GuiTransferSummary {
 
     pub wire_savings_percent: f64,
 
+    pub exact_reused_files: u64,
+    pub exact_reused_bytes: u64,
+    pub exact_reuse_plan_wire_bytes: u64,
+    pub exact_reuse_wire_savings_percent: f64,
+
     pub cdc_offered_files: u64,
     pub cdc_files: u64,
     pub cdc_fallback_files: u64,
@@ -186,6 +194,8 @@ impl GuiTransferSummary {
 
             wire_bytes: self.wire_bytes,
 
+            exact_reused_files: self.exact_reused_files,
+
             cdc_files: self.cdc_files,
             cdc_reused_bytes: self.cdc_reused_bytes,
 
@@ -215,6 +225,10 @@ fn diagnose_transfer(input: DiagnosticInput) -> GuiTransferDiagnostic {
 
     if input.tiny_files_packed >= 1_000 && average_file_bytes <= 64 * 1024 {
         return GuiTransferDiagnostic::TinyFileHeavy;
+    }
+
+    if input.exact_reused_files > 0 {
+        return GuiTransferDiagnostic::ExactReuseEffective;
     }
 
     if input.cdc_files > 0 && input.cdc_reused_bytes > 0 {
@@ -381,6 +395,17 @@ fn send_summary(report: CalibratedSendReport) -> GuiTransferSummary {
 
         wire_savings_percent: wire_savings_percent(transfer.bytes_copied, transfer.data_wire_bytes),
 
+        exact_reused_files: transfer.exact_reused_files,
+
+        exact_reused_bytes: transfer.exact_reused_bytes,
+
+        exact_reuse_plan_wire_bytes: transfer.exact_reuse_plan_wire_bytes,
+
+        exact_reuse_wire_savings_percent: wire_savings_percent(
+            transfer.exact_reused_bytes,
+            transfer.exact_reuse_plan_wire_bytes,
+        ),
+
         cdc_offered_files: transfer.cdc_offered_files,
 
         cdc_files: transfer.cdc_files,
@@ -464,6 +489,17 @@ fn receive_summary(report: CalibratedReceiveReport) -> GuiTransferSummary {
             transfer.data_wire_bytes,
         ),
 
+        exact_reused_files: transfer.exact_reused_files,
+
+        exact_reused_bytes: transfer.exact_reused_bytes,
+
+        exact_reuse_plan_wire_bytes: transfer.exact_reuse_plan_wire_bytes,
+
+        exact_reuse_wire_savings_percent: wire_savings_percent(
+            transfer.exact_reused_bytes,
+            transfer.exact_reuse_plan_wire_bytes,
+        ),
+
         cdc_offered_files: transfer.cdc_offered_files,
 
         cdc_files: transfer.cdc_files,
@@ -544,6 +580,8 @@ mod tests {
 
                 wire_bytes: 0,
 
+                exact_reused_files: 0,
+
                 cdc_files: 0,
                 cdc_reused_bytes: 0,
 
@@ -570,6 +608,8 @@ mod tests {
 
                 wire_bytes: 1_200_000,
 
+                exact_reused_files: 0,
+
                 cdc_files: 0,
                 cdc_reused_bytes: 0,
 
@@ -588,12 +628,40 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_detects_exact_file_reuse() {
+        assert_eq!(
+            diagnose_transfer(DiagnosticInput {
+                files: 4,
+                logical_bytes: 8 * 1024 * 1024,
+
+                wire_bytes: 4 * 1024 * 1024,
+
+                exact_reused_files: 2,
+
+                cdc_files: 0,
+                cdc_reused_bytes: 0,
+
+                compressed_records: 0,
+
+                skipped_files: 0,
+                skipped_bytes: 0,
+
+                tiny_files_packed: 0,
+                raw_tiny_pack_count: 0,
+            },),
+            GuiTransferDiagnostic::ExactReuseEffective,
+        );
+    }
+
+    #[test]
     fn diagnostic_detects_effective_cdc() {
         assert_eq!(
             diagnose_transfer(DiagnosticInput {
                 files: 3,
                 logical_bytes: 20_990_976,
                 wire_bytes: 140_722,
+
+                exact_reused_files: 0,
 
                 cdc_files: 3,
                 cdc_reused_bytes: 20_864_841,
@@ -618,6 +686,8 @@ mod tests {
                 logical_bytes: 100_000_000,
 
                 wire_bytes: 25_000_000,
+
+                exact_reused_files: 0,
 
                 cdc_files: 0,
                 cdc_reused_bytes: 0,
@@ -644,6 +714,8 @@ mod tests {
                 logical_bytes: 20_000_000,
 
                 wire_bytes: 20_100_000,
+
+                exact_reused_files: 0,
 
                 cdc_files: 0,
                 cdc_reused_bytes: 0,
@@ -686,6 +758,12 @@ mod tests {
 
         fs::write(source.join("compressible.bin"), vec![0x5A_u8; 384 * 1024]).unwrap();
 
+        let duplicate_bytes = vec![0xA7_u8; 2 * 1024 * 1024];
+
+        fs::write(source.join("duplicate-a.bin"), &duplicate_bytes).unwrap();
+
+        fs::write(source.join("duplicate-b.bin"), &duplicate_bytes).unwrap();
+
         let port_probe = TcpListener::bind(("127.0.0.1", 0)).unwrap();
 
         let address = port_probe.local_addr().unwrap();
@@ -721,9 +799,45 @@ mod tests {
 
         assert_eq!(receiver_summary.direction, GuiTransferDirection::Receive,);
 
-        assert_eq!(sender_summary.files, 2,);
+        assert_eq!(sender_summary.files, 4,);
 
-        assert_eq!(receiver_summary.files, 2,);
+        assert_eq!(receiver_summary.files, 4,);
+
+        assert_eq!(sender_summary.exact_reused_files, 1,);
+
+        assert_eq!(receiver_summary.exact_reused_files, 1,);
+
+        assert_eq!(
+            sender_summary.exact_reused_bytes,
+            duplicate_bytes.len() as u64,
+        );
+
+        assert_eq!(
+            receiver_summary.exact_reused_bytes,
+            duplicate_bytes.len() as u64,
+        );
+
+        assert_eq!(
+            sender_summary.exact_reuse_plan_wire_bytes,
+            receiver_summary.exact_reuse_plan_wire_bytes,
+        );
+
+        assert!(sender_summary.exact_reuse_plan_wire_bytes > 0,);
+
+        assert_eq!(
+            sender_summary.diagnostic(),
+            GuiTransferDiagnostic::ExactReuseEffective,
+        );
+
+        assert_eq!(
+            fs::read(destination.join("duplicate-a.bin",),).unwrap(),
+            duplicate_bytes,
+        );
+
+        assert_eq!(
+            fs::read(destination.join("duplicate-b.bin",),).unwrap(),
+            duplicate_bytes,
+        );
 
         assert_eq!(
             fs::read(destination.join("hello.txt")).unwrap(),

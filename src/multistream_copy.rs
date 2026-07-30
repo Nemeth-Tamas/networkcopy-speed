@@ -99,6 +99,9 @@ pub struct MultistreamCopyReport {
     pub cdc_literal_bytes: u64,
     pub cdc_index_wire_bytes: u64,
     pub cdc_plan_wire_bytes: u64,
+    pub exact_reused_files: u64,
+    pub exact_reused_bytes: u64,
+    pub exact_reuse_plan_wire_bytes: u64,
     pub resumed_stripes: u64,
     pub resumed_bytes: u64,
     pub skipped_files: u64,
@@ -142,6 +145,28 @@ impl MultistreamCopyReport {
             "  Data wire size:       {} bytes",
             format_bytes(self.data_wire_bytes)
         );
+        if self.exact_reused_files > 0 {
+            println!(
+                "  Exact reused files:   {}",
+                format_bytes(self.exact_reused_files,),
+            );
+
+            println!(
+                "  Exact reused data:    {} bytes",
+                format_bytes(self.exact_reused_bytes,),
+            );
+
+            println!(
+                "  Exact reuse wire:     {} bytes",
+                format_bytes(self.exact_reuse_plan_wire_bytes,),
+            );
+
+            println!(
+                "  Exact reuse savings:  {:.2}%",
+                wire_savings_percent(self.exact_reused_bytes, self.exact_reuse_plan_wire_bytes,),
+            );
+        }
+
         println!(
             "  CDC offers:           {}",
             format_bytes(self.cdc_offered_files),
@@ -287,6 +312,9 @@ pub struct ReceiveReport {
     pub cdc_literal_bytes: u64,
     pub cdc_index_wire_bytes: u64,
     pub cdc_plan_wire_bytes: u64,
+    pub exact_reused_files: u64,
+    pub exact_reused_bytes: u64,
+    pub exact_reuse_plan_wire_bytes: u64,
     pub resumed_stripes: u64,
     pub resumed_bytes: u64,
     pub skipped_files: u64,
@@ -326,6 +354,28 @@ impl ReceiveReport {
             "  Data wire size:       {} bytes",
             format_bytes(self.data_wire_bytes,)
         );
+
+        if self.exact_reused_files > 0 {
+            println!(
+                "  Exact reused files:   {}",
+                format_bytes(self.exact_reused_files,),
+            );
+
+            println!(
+                "  Exact reused data:    {} bytes",
+                format_bytes(self.exact_reused_bytes,),
+            );
+
+            println!(
+                "  Exact reuse wire:     {} bytes",
+                format_bytes(self.exact_reuse_plan_wire_bytes,),
+            );
+
+            println!(
+                "  Exact reuse savings:  {:.2}%",
+                wire_savings_percent(self.exact_reused_bytes, self.exact_reuse_plan_wire_bytes,),
+            );
+        }
 
         println!(
             "  CDC offers:           {}",
@@ -475,6 +525,9 @@ struct LaneReport {
     compressed_records: u64,
 
     cdc: cdc_lane::CdcLaneStats,
+    exact_reused_files: u64,
+    exact_reused_bytes: u64,
+    exact_reuse_plan_wire_bytes: u64,
     tiny_pack_count: u64,
     compressed_tiny_pack_count: u64,
     raw_tiny_pack_count: u64,
@@ -1218,6 +1271,10 @@ fn send_internal(
             || transfer_ack.cdc.literal_bytes != receiver_report.cdc_literal_bytes
             || transfer_ack.cdc.index_wire_bytes != receiver_report.cdc_index_wire_bytes
             || transfer_ack.cdc.plan_wire_bytes != receiver_report.cdc_plan_wire_bytes
+            || sender_report.exact_reused_files != receiver_report.exact_reused_files
+            || sender_report.exact_reused_bytes != receiver_report.exact_reused_bytes
+            || sender_report.exact_reuse_plan_wire_bytes
+                != receiver_report.exact_reuse_plan_wire_bytes
             || tiny_materialization_workers != receiver_report.tiny_materialization_workers
             || transfer_ack.tiny_pack_count != receiver_report.tiny_pack_count
             || transfer_ack.compressed_tiny_pack_count != receiver_report.compressed_tiny_pack_count
@@ -1281,6 +1338,12 @@ fn send_internal(
         cdc_index_wire_bytes: transfer_ack.cdc.index_wire_bytes,
 
         cdc_plan_wire_bytes: transfer_ack.cdc.plan_wire_bytes,
+
+        exact_reused_files: sender_report.exact_reused_files,
+
+        exact_reused_bytes: sender_report.exact_reused_bytes,
+
+        exact_reuse_plan_wire_bytes: sender_report.exact_reuse_plan_wire_bytes,
 
         resumed_stripes: resume_application.stripe_count,
 
@@ -1672,6 +1735,12 @@ fn run_server_with_mode(
         cdc_index_wire_bytes: ack.cdc.index_wire_bytes,
 
         cdc_plan_wire_bytes: ack.cdc.plan_wire_bytes,
+
+        exact_reused_files: report.exact_reused_files,
+
+        exact_reused_bytes: report.exact_reused_bytes,
+
+        exact_reuse_plan_wire_bytes: report.exact_reuse_plan_wire_bytes,
 
         resumed_stripes: resume_application.stripe_count,
 
@@ -3391,13 +3460,27 @@ fn apply_exact_reuse_plan(
         });
     }
 
+    let exact_reused_files = u64::try_from(plan.entries.len())
+        .map_err(|_| io::Error::other("exact-reuse file count cannot be represented"))?;
+
+    let plan_wire_bytes = exact_reuse_plan_wire_bytes(plan.entries.len())?;
+
+    let telemetry_wire_bytes = if plan.entries.is_empty() {
+        0
+    } else {
+        plan_wire_bytes
+    };
+
     Ok(LaneReport {
-        files_copied: u64::try_from(plan.entries.len())
-            .map_err(|_| io::Error::other("exact-reuse file count cannot be represented"))?,
+        files_copied: exact_reused_files,
 
         bytes_copied: logical_bytes,
 
-        data_wire_bytes: exact_reuse_plan_wire_bytes(plan.entries.len())?,
+        data_wire_bytes: plan_wire_bytes,
+
+        exact_reused_files,
+        exact_reused_bytes: logical_bytes,
+        exact_reuse_plan_wire_bytes: telemetry_wire_bytes,
 
         ..LaneReport::default()
     })
@@ -4971,6 +5054,21 @@ fn merge_lane_reports(reports: Vec<LaneReport>) -> io::Result<LaneReport> {
 
         merged.cdc.merge(report.cdc)?;
 
+        merged.exact_reused_files = merged
+            .exact_reused_files
+            .checked_add(report.exact_reused_files)
+            .ok_or_else(|| io::Error::other("merged exact-reuse file count overflowed"))?;
+
+        merged.exact_reused_bytes = merged
+            .exact_reused_bytes
+            .checked_add(report.exact_reused_bytes)
+            .ok_or_else(|| io::Error::other("merged exact-reuse byte count overflowed"))?;
+
+        merged.exact_reuse_plan_wire_bytes = merged
+            .exact_reuse_plan_wire_bytes
+            .checked_add(report.exact_reuse_plan_wire_bytes)
+            .ok_or_else(|| io::Error::other("merged exact-reuse wire count overflowed"))?;
+
         merged.tiny_pack_count = merged
             .tiny_pack_count
             .checked_add(report.tiny_pack_count)
@@ -5261,7 +5359,7 @@ fn read_receiver_ready_after_message(
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "receiver offered {stripe_count} completed stripes, exceeding the supported limit"
+                "receiver offered {stripe_count} completed stripes, exceeding the supported limit",
             ),
         ));
     }
@@ -6548,6 +6646,14 @@ mod tests {
         assert_eq!(report.files_copied, 4,);
 
         assert_eq!(report.bytes_copied, (shared.len() * 4) as u64,);
+
+        assert_eq!(report.exact_reused_files, 2,);
+
+        assert_eq!(report.exact_reused_bytes, (shared.len() * 2) as u64,);
+
+        assert!(report.exact_reuse_plan_wire_bytes > 0,);
+
+        assert!(report.exact_reuse_plan_wire_bytes < report.exact_reused_bytes,);
 
         assert_eq!(report.cdc_offered_files, 0,);
 

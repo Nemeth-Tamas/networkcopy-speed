@@ -217,6 +217,11 @@ struct Text {
     speed: &'static str,
     wire_savings: &'static str,
 
+    exact_reuse_files: &'static str,
+    exact_reuse_data: &'static str,
+    exact_reuse_wire: &'static str,
+    exact_reuse_savings: &'static str,
+
     cdc_updates: &'static str,
     cdc_fallbacks: &'static str,
     cdc_data: &'static str,
@@ -245,6 +250,7 @@ struct Text {
     transfer_diagnostic: &'static str,
     diagnostic_all_skipped: &'static str,
     diagnostic_tiny_files: &'static str,
+    diagnostic_exact_reuse: &'static str,
     diagnostic_cdc_effective: &'static str,
     diagnostic_compression_effective: &'static str,
     diagnostic_compression_bypassed: &'static str,
@@ -287,7 +293,7 @@ impl Text {
 
         update_existing: "Meglévő célmappa frissítése",
 
-        update_existing_hint: "A változatlan fájlokat kihagyja. A módosult közepes fájloknál újra felhasználja a meglévő tartalmat, és csak az eltéréseket küldi át. A célfájlt csak sikeres ellenőrzés után cseréli le.",
+        update_existing_hint: "Új célmappánál az azonos közepes fájlokat egyszer küldi át, majd helyben újra felhasználja. Frissítéskor a módosult közepes és nagy fájlok meglévő tartalmából csak a szükséges eltéréseket küldi át. A célfájlt csak sikeres ellenőrzés után cseréli le.",
 
         browse: "Tallózás…",
 
@@ -353,7 +359,15 @@ impl Text {
 
         wire_savings: "Hálózati megtakarítás",
 
-        cdc_updates: "CDC-frissítések (sikeres / felajánlott)",
+        exact_reuse_files: "Helyben újrafelhasznált azonos fájlok",
+
+        exact_reuse_data: "Azonos fájlok újrafelhasznált adata",
+
+        exact_reuse_wire: "Azonosfájl-terv hálózati mérete",
+
+        exact_reuse_savings: "Azonosfájl-megtakarítás",
+
+        cdc_updates: "CDC-frissítések (kész / felkínált)",
 
         cdc_fallbacks: "Teljes fájlra visszaváltás",
 
@@ -407,6 +421,8 @@ impl Text {
 
         diagnostic_tiny_files: "Valószínű korlát: fájlonkénti többletmunka a sok apró fájl miatt.",
 
+        diagnostic_exact_reuse: "Az azonos fájlok helyi újrafelhasználása elkerülte ugyanazon tartalom ismételt átküldését.",
+
         diagnostic_cdc_effective: "A tartalomalapú újrafelhasználás jelentősen csökkentette a hálózati forgalmat.",
 
         diagnostic_compression_effective: "A tömörítés érdemben csökkentette a hálózati forgalmat.",
@@ -451,7 +467,7 @@ impl Text {
 
         update_existing: "Update existing destination",
 
-        update_existing_hint: "Skips unchanged files. For changed medium files, existing destination content is reused and only the differences are transferred. The destination is replaced only after verification succeeds.",
+        update_existing_hint: "For a fresh destination, identical medium files are transferred once and then reused locally. During updates, existing content from changed medium and large files is reused so only the necessary differences cross the network. Destination files are replaced only after verification succeeds.",
 
         browse: "Browse…",
 
@@ -517,6 +533,14 @@ impl Text {
 
         wire_savings: "Network savings",
 
+        exact_reuse_files: "Exact files reused locally",
+
+        exact_reuse_data: "Exact data reused locally",
+
+        exact_reuse_wire: "Exact-reuse plan wire size",
+
+        exact_reuse_savings: "Exact-reuse savings",
+
         cdc_updates: "CDC updates (completed / offered)",
 
         cdc_fallbacks: "Whole-file fallbacks",
@@ -570,6 +594,8 @@ impl Text {
         diagnostic_all_skipped: "No payload was required; every file was already current.",
 
         diagnostic_tiny_files: "Likely limiter: per-file overhead from a large number of tiny files.",
+
+        diagnostic_exact_reuse: "Exact-file reuse avoided retransmitting duplicate content.",
 
         diagnostic_cdc_effective: "Content-defined reuse avoided retransmitting most of the changed-file data.",
 
@@ -1260,6 +1286,32 @@ impl NetworkCopyGui {
 
                     ui.end_row();
 
+                    if summary.exact_reused_files > 0 {
+                        ui.label(text.exact_reuse_files);
+
+                        ui.strong(summary.exact_reused_files.to_string());
+
+                        ui.end_row();
+
+                        ui.label(text.exact_reuse_data);
+
+                        ui.strong(format_bytes(summary.exact_reused_bytes));
+
+                        ui.end_row();
+
+                        ui.label(text.exact_reuse_wire);
+
+                        ui.strong(format_bytes(summary.exact_reuse_plan_wire_bytes));
+
+                        ui.end_row();
+
+                        ui.label(text.exact_reuse_savings);
+
+                        ui.strong(format!("{:.2}%", summary.exact_reuse_wire_savings_percent,));
+
+                        ui.end_row();
+                    }
+
                     if summary.cdc_offered_files > 0 {
                         ui.label(text.cdc_updates);
 
@@ -1316,6 +1368,8 @@ impl NetworkCopyGui {
                         GuiTransferDiagnostic::AllFilesSkipped => text.diagnostic_all_skipped,
 
                         GuiTransferDiagnostic::TinyFileHeavy => text.diagnostic_tiny_files,
+
+                        GuiTransferDiagnostic::ExactReuseEffective => text.diagnostic_exact_reuse,
 
                         GuiTransferDiagnostic::CdcEffective => text.diagnostic_cdc_effective,
 
@@ -1910,6 +1964,8 @@ fn localized_phase(language: Language, phase: &str) -> String {
         "Waiting for calibration" => "Várakozás a sebességmérésre".to_string(),
 
         "Scanning source" => "Forrásmappa vizsgálata".to_string(),
+
+        "Finding exact duplicates" => "Azonos fájlok keresése".to_string(),
 
         "Waiting for transfer" => "Várakozás az átvitelre".to_string(),
 
