@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
 const MESSAGE_RECEIVER_READY: u8 = 0x30;
 const MESSAGE_FILE: u8 = 0x31;
@@ -2142,16 +2143,17 @@ fn prepare_destination(
                 select_update_file_sets(destination_mode, &inventory, verified_unchanged_file_ids)?
             };
 
-            let journal = prepare_resume_destination(ResumeDestinationPreparation {
-                destination_root,
-                manifest,
-                summary,
-                data_stream_count,
-                transfer_plan,
-                unchanged_file_ids: &unchanged_file_ids,
-                reset_file_ids: &reset_file_ids,
-                preserve_existing_final: destination_mode != DestinationMode::Fresh,
-            })?;
+            let (journal, unchanged_file_ids) =
+                prepare_resume_destination(ResumeDestinationPreparation {
+                    destination_root,
+                    manifest,
+                    summary,
+                    data_stream_count,
+                    transfer_plan,
+                    unchanged_file_ids: &unchanged_file_ids,
+                    reset_file_ids: &reset_file_ids,
+                    preserve_existing_final: destination_mode != DestinationMode::Fresh,
+                })?;
 
             return Ok(PreparedDestination {
                 journal,
@@ -2354,7 +2356,7 @@ struct ResumeDestinationPreparation<'a> {
 
 fn prepare_resume_destination(
     preparation: ResumeDestinationPreparation<'_>,
-) -> io::Result<ResumeJournal> {
+) -> io::Result<(ResumeJournal, BTreeSet<usize>)> {
     let ResumeDestinationPreparation {
         destination_root,
         manifest,
@@ -2385,6 +2387,16 @@ fn prepare_resume_destination(
         journal.save_atomic(destination_root)?;
     }
 
+    let mut effective_unchanged_file_ids = unchanged_file_ids.clone();
+
+    if !preserve_existing_final {
+        let completed_file_ids: BTreeSet<usize> = journal.completed_file_ids().collect();
+
+        validate_fresh_resume_committed_files(destination_root, manifest, &completed_file_ids)?;
+
+        effective_unchanged_file_ids.extend(completed_file_ids);
+    }
+
     let completed_stripes: BTreeSet<ResumeStripe> = journal.completed_stripes().collect();
 
     validate_resume_offer(transfer_plan, &completed_stripes)?;
@@ -2396,7 +2408,7 @@ fn prepare_resume_destination(
 
         let temporary_path = temporary_path(&final_path, file_id);
 
-        if unchanged_file_ids.contains(&file_id) {
+        if effective_unchanged_file_ids.contains(&file_id) {
             remove_file_if_present(&temporary_path)?;
             continue;
         }
@@ -2425,7 +2437,85 @@ fn prepare_resume_destination(
         }
     }
 
-    Ok(journal)
+    Ok((journal, effective_unchanged_file_ids))
+}
+
+fn validate_fresh_resume_committed_files(
+    destination_root: &Path,
+    manifest: &[ManifestEntry],
+    completed_file_ids: &BTreeSet<usize>,
+) -> io::Result<()> {
+    for &file_id in completed_file_ids {
+        let entry = manifest.get(file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("resume journal references unknown completed file ID {file_id}"),
+            )
+        })?;
+
+        if entry.class == FileClass::Tiny {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("resume journal marks tiny file {file_id} as a committed catalog file"),
+            ));
+        }
+
+        let final_path = destination_root.join(&entry.relative_path);
+
+        let metadata = fs::symlink_metadata(&final_path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "journaled committed file {file_id} is unavailable: {}: {error}",
+                    final_path.display(),
+                ),
+            )
+        })?;
+
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journaled committed file {file_id} is not a regular file: {}",
+                    final_path.display(),
+                ),
+            ));
+        }
+
+        if metadata.len() != entry.file_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journaled committed file {file_id} contains {} bytes, expected {}: {}",
+                    metadata.len(),
+                    entry.file_size,
+                    final_path.display(),
+                ),
+            ));
+        }
+
+        if metadata.last_write_time() != entry.last_write_time {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journaled committed file {file_id} has a different last-write time: {}",
+                    final_path.display(),
+                ),
+            ));
+        }
+
+        if metadata.file_attributes() != entry.file_attributes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journaled committed file {file_id} has different Windows attributes: {}",
+                    final_path.display(),
+                ),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn create_destination_parent(destination_root: &Path, entry: &ManifestEntry) -> io::Result<()> {
@@ -6902,7 +6992,7 @@ mod tests {
     use crate::session_cdc_catalog::CatalogLimits;
     use std::collections::BTreeSet;
     use std::env;
-    use std::fs::{self, File};
+    use std::fs::{self, File, OpenOptions};
     use std::io::{self, Cursor, Write};
     use std::net::{TcpListener, TcpStream};
     use std::os::windows::fs::MetadataExt;
@@ -8623,6 +8713,136 @@ mod tests {
             loaded.completed_file_ids().collect::<Vec<_>>(),
             vec![1, 3, 5],
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_resume_preserves_fast_validated_committed_file() {
+        let root = temporary_root("fresh-resume-preserves-committed");
+
+        let source_root = root.join("source");
+        let destination_root = root.join("destination");
+
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&destination_root).unwrap();
+
+        let source_path = source_root.join("basis.bin");
+        let destination_path = destination_root.join("basis.bin");
+
+        let contents = vec![0xA5_u8; 2 * 1024 * 1024];
+
+        fs::write(&source_path, &contents).unwrap();
+
+        let scan = crate::manifest_scan::run(&source_root, 1).unwrap();
+
+        assert_eq!(scan.manifest.len(), 1);
+
+        let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+
+        let entry = &scan.manifest[0];
+
+        assert_eq!(entry.class, FileClass::Medium);
+
+        fs::copy(&source_path, &destination_path).unwrap();
+
+        file_metadata::restore_file(
+            &destination_path,
+            entry.last_write_time,
+            entry.file_attributes,
+        )
+        .unwrap();
+
+        let transfer_plan = build_transfer_plan(&scan.manifest, 1).unwrap();
+
+        let mut journal = ResumeJournal::new(summary.fingerprint, 1).unwrap();
+
+        journal.mark_file_completed(0);
+        journal.save_atomic(&destination_root).unwrap();
+
+        let stale_temporary_path = temporary_path(&destination_path, 0);
+
+        fs::write(&stale_temporary_path, b"stale temporary data").unwrap();
+
+        let prepared = prepare_destination(
+            &destination_root,
+            &scan.manifest,
+            summary,
+            1,
+            &transfer_plan,
+            super::DestinationMode::Fresh,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepared.unchanged_file_ids,
+            std::collections::BTreeSet::from([0]),
+        );
+
+        assert_eq!(
+            prepared.journal.completed_file_ids().collect::<Vec<_>>(),
+            vec![0],
+        );
+
+        assert!(destination_path.exists());
+        assert!(!stale_temporary_path.exists());
+
+        assert_eq!(fs::read(&destination_path).unwrap(), contents,);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_resume_rejects_modified_committed_file() {
+        let root = temporary_root("fresh-resume-rejects-modified");
+
+        let source_root = root.join("source");
+        let destination_root = root.join("destination");
+
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&destination_root).unwrap();
+
+        let source_path = source_root.join("basis.bin");
+        let destination_path = destination_root.join("basis.bin");
+
+        fs::write(&source_path, vec![0x5A_u8; 2 * 1024 * 1024]).unwrap();
+
+        let scan = crate::manifest_scan::run(&source_root, 1).unwrap();
+
+        let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+
+        let transfer_plan = build_transfer_plan(&scan.manifest, 1).unwrap();
+
+        fs::copy(&source_path, &destination_path).unwrap();
+
+        let mut journal = ResumeJournal::new(summary.fingerprint, 1).unwrap();
+
+        journal.mark_file_completed(0);
+        journal.save_atomic(&destination_root).unwrap();
+
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&destination_path)
+            .unwrap();
+
+        file.set_len(1024).unwrap();
+        drop(file);
+
+        let error = prepare_destination(
+            &destination_root,
+            &scan.manifest,
+            summary,
+            1,
+            &transfer_plan,
+            super::DestinationMode::Fresh,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        assert!(error.to_string().contains("journaled committed file"),);
 
         fs::remove_dir_all(root).unwrap();
     }
