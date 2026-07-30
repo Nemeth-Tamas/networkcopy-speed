@@ -33,7 +33,7 @@ fn main() -> eframe::Result {
             .with_min_inner_size([680.0, 520.0]),
 
         centered: true,
-        renderer: eframe::Renderer::Glow,
+        renderer: eframe::Renderer::Wgpu,
 
         ..Default::default()
     };
