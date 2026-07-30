@@ -4094,19 +4094,27 @@ fn exact_reuse_plan_wire_bytes(entry_count: usize) -> io::Result<u64> {
         .ok_or_else(|| io::Error::other("exact-reuse plan size overflowed"))
 }
 
-fn planned_whole_file_ids(transfer_plan: &TransferPlan) -> BTreeSet<usize> {
-    transfer_plan
-        .lanes
-        .iter()
-        .flatten()
-        .filter_map(|task| {
-            let TransferTask::WholeFile { file_id } = task else {
-                return None;
-            };
+fn planned_exact_reuse_file_ids(transfer_plan: &TransferPlan) -> BTreeSet<usize> {
+    let mut file_ids = BTreeSet::new();
 
-            Some(*file_id)
-        })
-        .collect()
+    for task in transfer_plan.lanes.iter().flatten() {
+        match task {
+            TransferTask::WholeFile { file_id } => {
+                file_ids.insert(*file_id);
+            }
+
+            TransferTask::TinyPack {
+                file_ids: packed_file_ids,
+                ..
+            } => {
+                file_ids.extend(packed_file_ids.iter().copied());
+            }
+
+            TransferTask::Stripe { .. } => {}
+        }
+    }
+
+    file_ids
 }
 
 fn hash_exact_reuse_candidate(
@@ -4156,11 +4164,11 @@ fn build_fresh_exact_reuse_plan(
     transfer_plan: &TransferPlan,
     progress: Option<&ProgressCounter>,
 ) -> io::Result<ExactReusePlan> {
-    let whole_file_ids = planned_whole_file_ids(transfer_plan);
+    let candidate_file_ids = planned_exact_reuse_file_ids(transfer_plan);
 
     let mut by_size = BTreeMap::<u64, Vec<usize>>::new();
 
-    for file_id in whole_file_ids {
+    for file_id in candidate_file_ids {
         let entry = manifest.get(file_id).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -4168,10 +4176,10 @@ fn build_fresh_exact_reuse_plan(
             )
         })?;
 
-        if entry.class != FileClass::Medium {
+        if !matches!(entry.class, FileClass::Medium | FileClass::Tiny) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "whole-file task was not a medium file",
+                "exact-reuse candidate unexpectedly used a striped large file",
             ));
         }
 
@@ -4359,10 +4367,12 @@ fn apply_exact_reuse_plan(
             )
         })?;
 
-        if basis.class != FileClass::Medium || target.class != FileClass::Medium {
+        if basis.class != target.class
+            || !matches!(basis.class, FileClass::Medium | FileClass::Tiny)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "exact reuse currently requires medium files",
+                "exact reuse requires matching medium or tiny file classes",
             ));
         }
 
@@ -4397,25 +4407,46 @@ fn apply_exact_reuse_plan(
         ));
     }
 
-    let planned_whole_files = planned_whole_file_ids(transfer_plan);
+    let planned_file_ids = planned_exact_reuse_file_ids(transfer_plan);
 
     for file_id in basis_file_ids.iter().chain(target_file_ids.iter()) {
-        if !planned_whole_files.contains(file_id) {
+        if !planned_file_ids.contains(file_id) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("exact-reuse file {file_id} is not an active whole-file task",),
+                format!("exact-reuse file {file_id} is not an active medium or tiny transfer task"),
             ));
         }
     }
 
     for lane in &mut transfer_plan.lanes {
-        lane.retain(|task| {
-            let TransferTask::WholeFile { file_id } = task else {
-                return true;
-            };
+        let mut remaining_tasks = Vec::with_capacity(lane.len());
 
-            !target_file_ids.contains(file_id)
-        });
+        for task in lane.drain(..) {
+            match task {
+                TransferTask::WholeFile { file_id } if target_file_ids.contains(&file_id) => {}
+
+                TransferTask::TinyPack { mut file_ids, .. } => {
+                    file_ids.retain(|file_id| !target_file_ids.contains(file_id));
+
+                    if file_ids.is_empty() {
+                        continue;
+                    }
+
+                    let summary = summarize_tiny_pack(manifest, &file_ids)?;
+
+                    remaining_tasks.push(TransferTask::TinyPack {
+                        file_ids,
+                        total_bytes: summary.bytes,
+                    });
+                }
+
+                task => {
+                    remaining_tasks.push(task);
+                }
+            }
+        }
+
+        *lane = remaining_tasks;
     }
 
     let exact_reused_files = u64::try_from(plan.entries.len())
@@ -8959,6 +8990,80 @@ mod tests {
         );
 
         assert_eq!(fs::read(destination.join("unique.bin",),).unwrap(), unique,);
+
+        assert!(!destination.join(JOURNAL_FILE_NAME).exists(),);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_loopback_reuses_exact_tiny_duplicates() {
+        let root = temporary_directory("fresh-tiny-exact-reuse");
+
+        let source = root.join("source");
+        let destination = root.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        let shared = deterministic_test_bytes(32 * 1024, 0x1234_5678_90AB_CDEF);
+
+        let unique = deterministic_test_bytes(shared.len(), 0xCAFE_BABE_DEAD_BEEF);
+
+        fs::write(source.join("duplicate-a.bin"), &shared).unwrap();
+
+        fs::write(source.join("duplicate-b.bin"), &shared).unwrap();
+
+        fs::write(source.join("duplicate-c.bin"), &shared).unwrap();
+
+        fs::write(source.join("unique.bin"), &unique).unwrap();
+
+        let scan = manifest_scan::run(&source, 2).unwrap();
+
+        assert_eq!(scan.manifest.len(), 4);
+
+        assert!(
+            scan.manifest
+                .iter()
+                .all(|entry| { entry.class == FileClass::Tiny }),
+        );
+
+        let report = run(&source, &destination, 2, 2).unwrap();
+
+        assert_eq!(report.files_copied, 4);
+
+        assert_eq!(report.bytes_copied, (shared.len() * 4) as u64,);
+
+        assert_eq!(report.exact_reused_files, 2);
+
+        assert_eq!(report.exact_reused_bytes, (shared.len() * 2) as u64,);
+
+        assert!(report.exact_reuse_plan_wire_bytes > 0,);
+
+        assert!(report.exact_reuse_plan_wire_bytes < report.exact_reused_bytes,);
+
+        assert_eq!(report.tiny_files_packed, 2);
+
+        assert_eq!(
+            report.tiny_bytes_packed,
+            (shared.len() + unique.len()) as u64,
+        );
+
+        assert_eq!(
+            fs::read(destination.join("duplicate-a.bin"),).unwrap(),
+            shared,
+        );
+
+        assert_eq!(
+            fs::read(destination.join("duplicate-b.bin"),).unwrap(),
+            shared,
+        );
+
+        assert_eq!(
+            fs::read(destination.join("duplicate-c.bin"),).unwrap(),
+            shared,
+        );
+
+        assert_eq!(fs::read(destination.join("unique.bin"),).unwrap(), unique,);
 
         assert!(!destination.join(JOURNAL_FILE_NAME).exists(),);
 

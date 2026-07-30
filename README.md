@@ -74,7 +74,7 @@ The GUI includes:
 - [x] preserve and verify committed files during fresh-session restart;
 - [x] rebuild deterministic catalog state from a committed generation prefix;
 - [x] retain cross-file CDC reuse after interruption and restart;
-- [ ] extend exact reuse to tiny-file packs;
+- [x] extend exact reuse to tiny-file packs;
 - [ ] extend exact reuse to striped large files;
 - [ ] add repeated crash, corruption, and restart acceptance tests;
 - [ ] complete physical two-machine interruption acceptance.
