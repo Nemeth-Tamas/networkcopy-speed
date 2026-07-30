@@ -46,6 +46,9 @@ const MESSAGE_EXACT_REUSE_PLAN: u8 = 0x3D;
 const MESSAGE_GENERATION_COMMIT: u8 = 0x3E;
 const MESSAGE_GENERATION_END: u8 = 0x3F;
 
+const MESSAGE_FRESH_RESUME_VERIFY_REQUEST: u8 = 0x41;
+const MESSAGE_FRESH_RESUME_VERIFY_RESPONSE: u8 = 0x42;
+
 const NETWORK_BUFFER_BYTES: usize = 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const TINY_PACK_TARGET_BYTES: u64 = tiny_pack_codec::MAX_TINY_PACK_BYTES as u64;
@@ -1220,31 +1223,32 @@ fn send_internal(
         )
     })?;
 
+    if preparation_message == MESSAGE_FRESH_RESUME_VERIFY_REQUEST {
+        respond_to_verification_request(
+            &mut control_stream,
+            &source_root,
+            &manifest,
+            progress.as_ref(),
+            MESSAGE_FRESH_RESUME_VERIFY_RESPONSE,
+        )?;
+
+        preparation_message = read_u8(&mut control_stream).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("receiver disconnected after fresh-resume verification: {error}"),
+            )
+        })?;
+    }
+
     if preparation_message == MESSAGE_UPDATE_VERIFY_REQUEST {
         update_session = true;
-        let destination_digests = read_update_verification_request(&mut control_stream)?;
-
-        let candidate_file_ids: BTreeSet<usize> = destination_digests.keys().copied().collect();
-
-        validate_unchanged_offer(&manifest, &candidate_file_ids)?;
-
-        if let Some(progress) = &progress {
-            progress.check_cancelled()?;
-
-            progress.set_label("Verifying source files");
-
-            progress.set_completed(0);
-
-            progress.set_total(0);
-        }
-
-        let source_digests =
-            update_verification::hash_candidates(&source_root, &manifest, &candidate_file_ids)?;
-
-        let matching_file_ids =
-            update_verification::matching_candidates(&destination_digests, &source_digests)?;
-
-        write_update_verification_response(&mut control_stream, &matching_file_ids)?;
+        respond_to_verification_request(
+            &mut control_stream,
+            &source_root,
+            &manifest,
+            progress.as_ref(),
+            MESSAGE_UPDATE_VERIFY_RESPONSE,
+        )?;
 
         preparation_message = read_u8(&mut control_stream).map_err(|error| {
             io::Error::new(
@@ -1634,6 +1638,17 @@ fn run_server_with_mode(
     }
 
     let mut transfer_plan = build_transfer_plan(&manifest, data_stream_count)?;
+
+    if destination_mode == DestinationMode::Fresh {
+        negotiate_verified_fresh_resume_files(
+            &mut control_stream,
+            &destination_root,
+            &manifest,
+            summary,
+            data_stream_count,
+            progress.as_ref(),
+        )?;
+    }
 
     let verified_unchanged_file_ids = if destination_mode == DestinationMode::UpdateVerified {
         Some(negotiate_verified_unchanged_files(
@@ -2088,6 +2103,116 @@ fn accept_session(
     Ok((control_stream, ordered_streams, accepted_session))
 }
 
+fn respond_to_verification_request(
+    control_stream: &mut TcpStream,
+    source_root: &Path,
+    manifest: &[ManifestEntry],
+    progress: Option<&ProgressCounter>,
+    response_message: u8,
+) -> io::Result<()> {
+    let destination_digests = read_verification_request(control_stream)?;
+
+    let candidate_file_ids: BTreeSet<usize> = destination_digests.keys().copied().collect();
+
+    validate_unchanged_offer(manifest, &candidate_file_ids)?;
+
+    if let Some(progress) = progress {
+        progress.check_cancelled()?;
+        progress.set_label("Verifying source files");
+        progress.set_completed(0);
+        progress.set_total(0);
+    }
+
+    let source_digests =
+        update_verification::hash_candidates(source_root, manifest, &candidate_file_ids)?;
+
+    let matching_file_ids =
+        update_verification::matching_candidates(&destination_digests, &source_digests)?;
+
+    write_verification_response(control_stream, response_message, &matching_file_ids)
+}
+
+fn negotiate_verified_fresh_resume_files(
+    control_stream: &mut TcpStream,
+    destination_root: &Path,
+    manifest: &[ManifestEntry],
+    summary: ManifestSummary,
+    data_stream_count: usize,
+    progress: Option<&ProgressCounter>,
+) -> io::Result<()> {
+    if !destination_root.try_exists()? {
+        return Ok(());
+    }
+
+    let journal_path = destination_root.join(JOURNAL_FILE_NAME);
+
+    if !journal_path.try_exists()? {
+        return Ok(());
+    }
+
+    let journal =
+        ResumeJournal::load_existing(destination_root, summary.fingerprint, data_stream_count)?;
+
+    let completed_file_ids: BTreeSet<usize> = journal.completed_file_ids().collect();
+
+    if completed_file_ids.is_empty() {
+        return Ok(());
+    }
+
+    validate_fresh_resume_committed_files(destination_root, manifest, &completed_file_ids)?;
+
+    if let Some(progress) = progress {
+        progress.check_cancelled()?;
+        progress.set_label("Verifying interrupted transfer");
+        progress.set_completed(0);
+        progress.set_total(0);
+    }
+
+    let destination_digests =
+        update_verification::hash_candidates(destination_root, manifest, &completed_file_ids)?;
+
+    write_verification_request(
+        control_stream,
+        MESSAGE_FRESH_RESUME_VERIFY_REQUEST,
+        &destination_digests,
+    )?;
+
+    let matching_file_ids = read_verification_response(
+        control_stream,
+        MESSAGE_FRESH_RESUME_VERIFY_RESPONSE,
+        "fresh-resume verification",
+    )?;
+
+    if !matching_file_ids.is_subset(&completed_file_ids) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sender verified a fresh-resume file that was not journaled as completed",
+        ));
+    }
+
+    if matching_file_ids != completed_file_ids {
+        let failed_file_ids: Vec<usize> = completed_file_ids
+            .difference(&matching_file_ids)
+            .copied()
+            .collect();
+
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "BLAKE3 restart verification failed for journaled committed file IDs {failed_file_ids:?}"
+            ),
+        ));
+    }
+
+    if let Some(progress) = progress {
+        progress.check_cancelled()?;
+        progress.set_label("Transfer receive");
+        progress.set_completed(0);
+    }
+
+    Ok(())
+}
+
 fn negotiate_verified_unchanged_files(
     control_stream: &mut TcpStream,
     destination_root: &Path,
@@ -2118,9 +2243,17 @@ fn negotiate_verified_unchanged_files(
     let destination_digests =
         update_verification::hash_candidates(destination_root, manifest, &candidate_file_ids)?;
 
-    write_update_verification_request(control_stream, &destination_digests)?;
+    write_verification_request(
+        control_stream,
+        MESSAGE_UPDATE_VERIFY_REQUEST,
+        &destination_digests,
+    )?;
 
-    let matching_file_ids = read_update_verification_response(control_stream)?;
+    let matching_file_ids = read_verification_response(
+        control_stream,
+        MESSAGE_UPDATE_VERIFY_RESPONSE,
+        "update-verification",
+    )?;
 
     if !matching_file_ids.is_subset(&candidate_file_ids) {
         return Err(io::Error::new(
@@ -6447,8 +6580,9 @@ fn validate_tiny_pack_plan(report: &LaneReport, expected: TransferPlanStats) -> 
     Ok(())
 }
 
-fn write_update_verification_request(
+fn write_verification_request(
     writer: &mut impl Write,
+    message: u8,
     digests: &BTreeMap<usize, FileDigest>,
 ) -> io::Result<()> {
     let count = u32::try_from(digests.len()).map_err(|_| {
@@ -6465,7 +6599,7 @@ fn write_update_verification_request(
         ));
     }
 
-    write_u8(writer, MESSAGE_UPDATE_VERIFY_REQUEST)?;
+    write_u8(writer, message)?;
 
     write_u32(writer, count)?;
 
@@ -6486,9 +6620,7 @@ fn write_update_verification_request(
     writer.flush()
 }
 
-fn read_update_verification_request(
-    reader: &mut impl Read,
-) -> io::Result<BTreeMap<usize, FileDigest>> {
+fn read_verification_request(reader: &mut impl Read) -> io::Result<BTreeMap<usize, FileDigest>> {
     let count = read_u32(reader)?;
 
     if count > MAX_UNCHANGED_OFFER_FILES {
@@ -6518,8 +6650,9 @@ fn read_update_verification_request(
     Ok(digests)
 }
 
-fn write_update_verification_response(
+fn write_verification_response(
     writer: &mut impl Write,
+    message: u8,
     matching_file_ids: &BTreeSet<usize>,
 ) -> io::Result<()> {
     let count = u32::try_from(matching_file_ids.len()).map_err(|_| {
@@ -6529,7 +6662,7 @@ fn write_update_verification_response(
         )
     })?;
 
-    write_u8(writer, MESSAGE_UPDATE_VERIFY_RESPONSE)?;
+    write_u8(writer, message)?;
 
     write_u32(writer, count)?;
 
@@ -6548,13 +6681,17 @@ fn write_update_verification_response(
     writer.flush()
 }
 
-fn read_update_verification_response(reader: &mut impl Read) -> io::Result<BTreeSet<usize>> {
+fn read_verification_response(
+    reader: &mut impl Read,
+    expected_message: u8,
+    description: &str,
+) -> io::Result<BTreeSet<usize>> {
     let message = read_u8(reader)?;
 
-    if message != MESSAGE_UPDATE_VERIFY_RESPONSE {
+    if message != expected_message {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("expected update-verification response, received 0x{message:02X}"),
+            format!("expected {description} response, received 0x{message:02X}"),
         ));
     }
 
@@ -7306,17 +7443,19 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DestinationMode, GenerationCommit, LaneEnd, MESSAGE_GENERATION_COMMIT, ReceiverReady,
+        DestinationMode, GenerationCommit, LaneEnd, MESSAGE_FRESH_RESUME_VERIFY_REQUEST,
+        MESSAGE_FRESH_RESUME_VERIFY_RESPONSE, MESSAGE_GENERATION_COMMIT, ReceiverReady,
         TINY_PACK_TARGET_BYTES, TransferAck, TransferFault, TransferTask, accept_session,
         apply_fresh_resume_prefix, apply_resume_offer, build_fresh_generation_plan_with_limits,
         build_transfer_plan, catalog_task_file_id, connect_with_retry_config,
         expected_generation_commit, finalize_large_files, generation_commit_wire_bytes,
-        persist_generation_commit, prepare_destination, read_generation_commit, read_lane_end,
-        read_receiver_ready, read_transfer_ack, rebuild_fresh_generation_execution, receive_once,
-        run, run_update, run_update_with_fault, run_with_fault, send, temporary_path,
+        negotiate_verified_fresh_resume_files, persist_generation_commit, prepare_destination,
+        read_generation_commit, read_lane_end, read_receiver_ready, read_transfer_ack, read_u8,
+        read_verification_request, rebuild_fresh_generation_execution, receive_once, run,
+        run_update, run_update_with_fault, run_with_fault, send, temporary_path,
         tiny_pack_record_wire_bytes, validate_generation_commit, validate_resume_offer,
         validate_source_metadata, verify_content_digest, write_generation_commit, write_lane_end,
-        write_receiver_ready, write_transfer_ack,
+        write_receiver_ready, write_transfer_ack, write_verification_response,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::file_metadata;
@@ -9040,6 +9179,110 @@ mod tests {
         );
 
         assert!(!destination.join(JOURNAL_FILE_NAME).exists(),);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_resume_blake3_rejects_same_size_corruption() {
+        let root = temporary_directory("fresh-resume-blake3-corruption");
+
+        let source = root.join("source");
+        let destination = root.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+
+        let contents = deterministic_test_bytes(2 * 1024 * 1024, 0x1234_5678_90AB_CDEF);
+
+        fs::write(source.join("basis.bin"), &contents).unwrap();
+
+        let scan = manifest_scan::run(&source, 1).unwrap();
+
+        assert_eq!(scan.manifest.len(), 1);
+
+        let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+
+        let entry = &scan.manifest[0];
+
+        assert_eq!(entry.class, FileClass::Medium);
+
+        let mut corrupted = contents.clone();
+
+        let middle = corrupted.len() / 2;
+        corrupted[middle] ^= 0xFF;
+
+        assert_eq!(corrupted.len(), contents.len());
+
+        let destination_path = destination.join("basis.bin");
+
+        fs::write(&destination_path, &corrupted).unwrap();
+
+        file_metadata::restore_file(
+            &destination_path,
+            entry.last_write_time,
+            entry.file_attributes,
+        )
+        .unwrap();
+
+        let mut journal = ResumeJournal::new(summary.fingerprint, 1).unwrap();
+
+        journal.mark_file_completed(0);
+        journal.save_atomic(&destination).unwrap();
+
+        let expected_destination_digest = *blake3::hash(&corrupted).as_bytes();
+
+        let source_digest = *blake3::hash(&contents).as_bytes();
+
+        assert_ne!(expected_destination_digest, source_digest,);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let address = listener.local_addr().unwrap();
+
+        let sender = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+
+            let message = read_u8(&mut stream).unwrap();
+
+            assert_eq!(message, MESSAGE_FRESH_RESUME_VERIFY_REQUEST,);
+
+            let destination_digests = read_verification_request(&mut stream).unwrap();
+
+            assert_eq!(
+                destination_digests.get(&0),
+                Some(&expected_destination_digest),
+            );
+
+            write_verification_response(
+                &mut stream,
+                MESSAGE_FRESH_RESUME_VERIFY_RESPONSE,
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        });
+
+        let (mut control_stream, _) = listener.accept().unwrap();
+
+        let error = negotiate_verified_fresh_resume_files(
+            &mut control_stream,
+            &destination,
+            &scan.manifest,
+            summary,
+            1,
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+
+        assert!(error.to_string().contains("BLAKE3 restart verification"),);
+
+        sender.join().unwrap();
+
+        assert!(destination.join(JOURNAL_FILE_NAME).exists(),);
+
+        assert_eq!(fs::read(destination_path).unwrap(), corrupted,);
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -39,7 +39,11 @@ Its first milestone persists fully committed fresh-transfer files so a resumed
 session can safely rebuild the same bounded CDC catalog instead of retransmitting
 already completed generations.
 
-v2 uses protocol v10 and supports verified content reuse during both updates
+The stable v2.0 release uses protocol v10. Current v2.1 development builds use
+protocol v11, adding BLAKE3 verification of journaled fresh-transfer files
+before they may re-enter the resumed session CDC catalog.
+
+v2 supports verified content reuse during both updates
 and fresh folder transfers. Update mode reuses content from older receiver-side
 medium and large files. Fresh transfers use deterministic bounded catalog
 generations, explicit receiver commit acknowledgements, exact-file reuse, and
@@ -67,7 +71,7 @@ The GUI includes:
 ## v2.1 roadmap
 
 - [x] persist committed fresh-transfer file IDs in the resume journal;
-- [ ] preserve and verify committed files during fresh-session restart;
+- [x] preserve and verify committed files during fresh-session restart;
 - [x] rebuild deterministic catalog state from a committed generation prefix;
 - [x] retain cross-file CDC reuse after interruption and restart;
 - [ ] extend exact reuse to tiny-file packs;
@@ -94,7 +98,7 @@ Implementation order:
 - [x] deterministic bounded session catalog and generation planner;
 - [x] protocol-v10 generation barriers and receiver commit acknowledgements;
 - [x] session-scoped cross-file CDC using completed files as chunk bases;
-- [ ] interrupted-session catalog rebuild and retry behavior;
+- [x] interrupted-session catalog rebuild and retry behavior;
 - [x] GUI CDC telemetry and mixed-workload loopback acceptance;
 - [x] physical two-machine acceptance.
 
