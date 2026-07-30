@@ -9,7 +9,9 @@ use crate::destination_inventory;
 use crate::file_metadata;
 use crate::manifest_scan::{self, FileClass, ManifestEntry};
 use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
-use crate::session_cdc_catalog::{self, CatalogCandidate, CatalogLimits, CatalogPlan};
+use crate::session_cdc_catalog::{
+    self, CatalogCandidate, CatalogGeneration, CatalogLimits, CatalogPlan,
+};
 use crate::striped_file;
 use crate::tcp_connect;
 use crate::tiny_file_pool;
@@ -39,6 +41,8 @@ const MESSAGE_TINY_PACK_V2: u8 = 0x36;
 const MESSAGE_UPDATE_VERIFY_RESPONSE: u8 = 0x37;
 const MESSAGE_LARGE_CDC_BEGIN: u8 = 0x3C;
 const MESSAGE_EXACT_REUSE_PLAN: u8 = 0x3D;
+const MESSAGE_GENERATION_COMMIT: u8 = 0x3E;
+const MESSAGE_GENERATION_END: u8 = 0x3F;
 
 const NETWORK_BUFFER_BYTES: usize = 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
@@ -68,8 +72,13 @@ const CDC_PLAN_FIXED_WIRE_BYTES: u64 = 1 + 8 + 8;
 const EXACT_REUSE_PLAN_FIXED_WIRE_BYTES: u64 = 1 + 4;
 
 const EXACT_REUSE_RECORD_WIRE_BYTES: u64 = 8 + 8 + CONTENT_DIGEST_BYTES as u64;
+
+const GENERATION_COMMIT_FIXED_WIRE_BYTES: u64 = 1 + 8 + 4 + 4 + 4;
+const GENERATION_COMMIT_FILE_ID_WIRE_BYTES: u64 = 8;
+
 const MAX_RESUME_OFFER_STRIPES: u32 = 1_000_000;
 const MAX_UNCHANGED_OFFER_FILES: u32 = 1_000_000;
+const MAX_GENERATION_COMMIT_FILE_IDS: u32 = 1_000_000;
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -712,6 +721,20 @@ struct FreshGenerationPlan {
     trailing_lanes: Vec<Vec<TransferTask>>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct GenerationCommit {
+    generation_index: usize,
+    committed_file_ids: Vec<usize>,
+    published_file_ids: Vec<usize>,
+    evicted_file_ids: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaneEnd {
+    Generation(usize),
+    Stream,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct TransferPlanStats {
     tiny_pack_count: u64,
@@ -1168,7 +1191,7 @@ fn send_internal(
         !update_session,
     )?;
 
-    let _fresh_generation_plan = if update_session {
+    let fresh_generation_plan = if update_session {
         None
     } else {
         Some(build_fresh_generation_plan(&manifest, &transfer_plan)?)
@@ -1195,35 +1218,25 @@ fn send_internal(
 
     let source_root = Arc::new(source_root);
 
-    let sender_reports = thread::scope(|scope| -> io::Result<Vec<LaneReport>> {
-        let mut handles = Vec::with_capacity(data_stream_count);
-
-        for (stream, tasks) in data_streams.into_iter().zip(transfer_plan.lanes) {
-            let lane_root = Arc::clone(&source_root);
-
-            let lane_manifest = Arc::clone(&manifest);
-
-            let lane_progress = progress.clone();
-
-            handles.push(
-                thread::Builder::new()
-                    .name("networkcopy-data-sender".to_string())
-                    .spawn_scoped(scope, move || {
-                        send_lane(
-                            stream,
-                            lane_root.as_path(),
-                            &lane_manifest,
-                            &tasks,
-                            lane_progress,
-                        )
-                    })?,
-            );
-        }
-
-        join_lane_threads(handles)
-    })?;
-
-    let transferred_sender_report = merge_lane_reports(sender_reports)?;
+    let transferred_sender_report = if let Some(generation_plan) = &fresh_generation_plan {
+        send_fresh_generation_plan(
+            &mut control_stream,
+            &data_streams,
+            source_root.as_path(),
+            manifest.as_slice(),
+            generation_plan,
+            progress.clone(),
+        )?
+    } else {
+        send_lane_group(
+            &data_streams,
+            &transfer_plan.lanes,
+            source_root.as_path(),
+            manifest.as_slice(),
+            progress.clone(),
+            LaneEnd::Stream,
+        )?
+    };
 
     let sender_report = merge_lane_reports(vec![
         large_cdc_preflight.report,
@@ -1590,6 +1603,12 @@ fn run_server_with_mode(
         destination_mode == DestinationMode::Fresh,
     )?;
 
+    let fresh_generation_plan = if destination_mode == DestinationMode::Fresh {
+        Some(build_fresh_generation_plan(&manifest, &transfer_plan)?)
+    } else {
+        None
+    };
+
     let resume_journal = Arc::new(Mutex::new(resume_journal));
 
     let manifest = Arc::new(manifest);
@@ -1605,57 +1624,42 @@ fn run_server_with_mode(
 
     let tiny_materializer_handle = tiny_materializer.handle();
 
-    let lane_result = thread::scope(|scope| -> io::Result<Vec<LaneReport>> {
-        let mut handles = Vec::with_capacity(data_stream_count);
-
-        for (stream, tasks) in data_streams.into_iter().zip(transfer_plan.lanes) {
-            let lane_manifest = Arc::clone(&manifest);
-
-            let lane_destination = Arc::clone(&destination_root);
-
-            let lane_resume_journal = Arc::clone(&resume_journal);
-
-            let lane_fault_injection = Arc::clone(&fault_injection);
-
-            let lane_progress = progress.clone();
-
-            let lane_tiny_materializer = tiny_materializer_handle.clone();
-
-            handles.push(
-                thread::Builder::new()
-                    .name("networkcopy-data-receiver".to_string())
-                    .spawn_scoped(scope, move || {
-                        receive_lane(
-                            stream,
-                            &tasks,
-                            ReceiveLaneContext {
-                                destination_root: lane_destination.as_path(),
-                                manifest: lane_manifest.as_slice(),
-                                resume_journal: lane_resume_journal.as_ref(),
-                                fault_injection: lane_fault_injection.as_ref(),
-                                tiny_materializer: &lane_tiny_materializer,
-                                progress: lane_progress,
-                                cdc_enabled: destination_mode == DestinationMode::UpdateVerified,
-                            },
-                        )
-                    })?,
-            );
-        }
-
-        join_lane_threads(handles)
-    });
+    let lane_result = if let Some(generation_plan) = &fresh_generation_plan {
+        receive_fresh_generation_plan(
+            &mut control_stream,
+            &data_streams,
+            destination_root.as_path(),
+            manifest.as_slice(),
+            resume_journal.as_ref(),
+            fault_injection.as_ref(),
+            &tiny_materializer_handle,
+            progress.clone(),
+            generation_plan,
+        )
+    } else {
+        receive_lane_group(
+            &data_streams,
+            &transfer_plan.lanes,
+            destination_root.as_path(),
+            manifest.as_slice(),
+            resume_journal.as_ref(),
+            fault_injection.as_ref(),
+            &tiny_materializer_handle,
+            progress.clone(),
+            true,
+            LaneEnd::Stream,
+        )
+    };
 
     let materializer_result = tiny_materializer.finish();
 
-    let lane_reports = match (lane_result, materializer_result) {
-        (Ok(reports), Ok(())) => reports,
+    let transferred_report = match (lane_result, materializer_result) {
+        (Ok(report), Ok(())) => report,
 
         (Err(error), _) => return Err(error),
 
         (Ok(_), Err(error)) => return Err(error),
     };
-
-    let transferred_report = merge_lane_reports(lane_reports)?;
 
     let report = merge_lane_reports(vec![
         large_cdc_preflight.report,
@@ -4037,20 +4041,368 @@ fn apply_resume_offer(
     Ok(application)
 }
 
+fn write_lane_end(writer: &mut impl Write, lane_end: LaneEnd) -> io::Result<()> {
+    match lane_end {
+        LaneEnd::Generation(generation_index) => {
+            write_u8(writer, MESSAGE_GENERATION_END)?;
+
+            write_u64(
+                writer,
+                u64::try_from(generation_index).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "generation index cannot be represented",
+                    )
+                })?,
+            )
+        }
+
+        LaneEnd::Stream => write_u8(writer, MESSAGE_STREAM_END),
+    }
+}
+
+fn read_lane_end(reader: &mut impl Read, expected: LaneEnd) -> io::Result<()> {
+    let message = read_u8(reader)?;
+
+    match expected {
+        LaneEnd::Generation(expected_index) => {
+            if message != MESSAGE_GENERATION_END {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expected generation-end message, received 0x{message:02X}",),
+                ));
+            }
+
+            let actual_index = usize::try_from(read_u64(reader)?).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "received generation index cannot be represented",
+                )
+            })?;
+
+            if actual_index != expected_index {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "received generation-end index {actual_index}, expected {expected_index}",
+                    ),
+                ));
+            }
+
+            Ok(())
+        }
+
+        LaneEnd::Stream => {
+            if message != MESSAGE_STREAM_END {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expected stream-end message, received 0x{message:02X}",),
+                ));
+            }
+
+            Ok(())
+        }
+    }
+}
+
+fn send_lane_group(
+    data_streams: &[TcpStream],
+    lanes: &[Vec<TransferTask>],
+    source_root: &Path,
+    manifest: &[ManifestEntry],
+    progress: Option<ProgressCounter>,
+    lane_end: LaneEnd,
+) -> io::Result<LaneReport> {
+    if data_streams.len() != lanes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sender lane count differs from the connected data-stream count",
+        ));
+    }
+
+    let reports = thread::scope(|scope| -> io::Result<Vec<LaneReport>> {
+        let mut handles = Vec::with_capacity(data_streams.len());
+
+        for (stream, tasks) in data_streams.iter().zip(lanes) {
+            let lane_progress = progress.clone();
+
+            handles.push(
+                thread::Builder::new()
+                    .name("networkcopy-data-sender".to_string())
+                    .spawn_scoped(scope, move || {
+                        send_lane(
+                            stream,
+                            source_root,
+                            manifest,
+                            tasks,
+                            lane_progress,
+                            lane_end,
+                        )
+                    })?,
+            );
+        }
+
+        join_lane_threads(handles)
+    })?;
+
+    merge_lane_reports(reports)
+}
+
+fn send_fresh_generation_plan(
+    control_stream: &mut TcpStream,
+    data_streams: &[TcpStream],
+    source_root: &Path,
+    manifest: &[ManifestEntry],
+    plan: &FreshGenerationPlan,
+    progress: Option<ProgressCounter>,
+) -> io::Result<LaneReport> {
+    let report_capacity = plan
+        .catalog
+        .generations
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("fresh-generation report capacity overflowed"))?;
+
+    let mut reports = Vec::with_capacity(report_capacity);
+
+    for (generation, lanes) in plan.catalog.generations.iter().zip(&plan.generation_lanes) {
+        if let Some(progress) = &progress {
+            progress.check_cancelled()?;
+        }
+
+        let report = send_lane_group(
+            data_streams,
+            lanes,
+            source_root,
+            manifest,
+            progress.clone(),
+            LaneEnd::Generation(generation.index),
+        )?;
+
+        if let Some(progress) = &progress {
+            progress.check_cancelled()?;
+        }
+
+        let commit = read_generation_commit(control_stream)?;
+
+        validate_generation_commit(&commit, generation, manifest.len())?;
+
+        reports.push(report);
+    }
+
+    if let Some(progress) = &progress {
+        progress.check_cancelled()?;
+    }
+
+    reports.push(send_lane_group(
+        data_streams,
+        &plan.trailing_lanes,
+        source_root,
+        manifest,
+        progress,
+        LaneEnd::Stream,
+    )?);
+
+    merge_lane_reports(reports)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn receive_lane_group(
+    data_streams: &[TcpStream],
+    lanes: &[Vec<TransferTask>],
+    destination_root: &Path,
+    manifest: &[ManifestEntry],
+    resume_journal: &Mutex<ResumeJournal>,
+    fault_injection: &TransferFault,
+    tiny_materializer: &tiny_file_pool::TinyFileMaterializerHandle,
+    progress: Option<ProgressCounter>,
+    cdc_enabled: bool,
+    lane_end: LaneEnd,
+) -> io::Result<LaneReport> {
+    if data_streams.len() != lanes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "receiver lane count differs from the connected data-stream count",
+        ));
+    }
+
+    let reports = thread::scope(|scope| -> io::Result<Vec<LaneReport>> {
+        let mut handles = Vec::with_capacity(data_streams.len());
+
+        for (stream, tasks) in data_streams.iter().zip(lanes) {
+            let lane_progress = progress.clone();
+
+            let lane_tiny_materializer = tiny_materializer.clone();
+
+            handles.push(
+                thread::Builder::new()
+                    .name("networkcopy-data-receiver".to_string())
+                    .spawn_scoped(scope, move || {
+                        receive_lane(
+                            stream,
+                            tasks,
+                            ReceiveLaneContext {
+                                destination_root,
+                                manifest,
+                                resume_journal,
+                                fault_injection,
+                                tiny_materializer: &lane_tiny_materializer,
+                                progress: lane_progress,
+                                cdc_enabled,
+                            },
+                            lane_end,
+                        )
+                    })?,
+            );
+        }
+
+        join_lane_threads(handles)
+    })?;
+
+    merge_lane_reports(reports)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn receive_fresh_generation_plan(
+    control_stream: &mut TcpStream,
+    data_streams: &[TcpStream],
+    destination_root: &Path,
+    manifest: &[ManifestEntry],
+    resume_journal: &Mutex<ResumeJournal>,
+    fault_injection: &TransferFault,
+    tiny_materializer: &tiny_file_pool::TinyFileMaterializerHandle,
+    progress: Option<ProgressCounter>,
+    plan: &FreshGenerationPlan,
+) -> io::Result<LaneReport> {
+    let report_capacity = plan
+        .catalog
+        .generations
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("fresh-generation report capacity overflowed"))?;
+
+    let mut reports = Vec::with_capacity(report_capacity);
+
+    for (generation, lanes) in plan.catalog.generations.iter().zip(&plan.generation_lanes) {
+        if let Some(progress) = &progress {
+            progress.check_cancelled()?;
+        }
+
+        let report = receive_lane_group(
+            data_streams,
+            lanes,
+            destination_root,
+            manifest,
+            resume_journal,
+            fault_injection,
+            tiny_materializer,
+            progress.clone(),
+            false,
+            LaneEnd::Generation(generation.index),
+        )?;
+
+        if let Some(progress) = &progress {
+            progress.check_cancelled()?;
+        }
+
+        let commit =
+            commit_fresh_generation(destination_root, manifest, generation, progress.as_ref())?;
+
+        write_generation_commit(control_stream, &commit)?;
+
+        reports.push(report);
+    }
+
+    if let Some(progress) = &progress {
+        progress.check_cancelled()?;
+    }
+
+    reports.push(receive_lane_group(
+        data_streams,
+        &plan.trailing_lanes,
+        destination_root,
+        manifest,
+        resume_journal,
+        fault_injection,
+        tiny_materializer,
+        progress,
+        false,
+        LaneEnd::Stream,
+    )?);
+
+    merge_lane_reports(reports)
+}
+
+fn commit_fresh_generation(
+    destination_root: &Path,
+    manifest: &[ManifestEntry],
+    generation: &CatalogGeneration,
+    progress: Option<&ProgressCounter>,
+) -> io::Result<GenerationCommit> {
+    for candidate in &generation.transfer_files {
+        if let Some(progress) = progress {
+            progress.check_cancelled()?;
+        }
+
+        let file_id = candidate.file_id;
+
+        let entry = manifest.get(file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("fresh generation committed unknown file ID {file_id}",),
+            )
+        })?;
+
+        let final_path = destination_root.join(&entry.relative_path);
+
+        match entry.class {
+            FileClass::Large => {
+                finalize_large_file(destination_root, file_id, entry, DestinationMode::Fresh)?;
+            }
+
+            FileClass::Medium => {
+                validate_resume_file(&final_path, entry.file_size, "committed generation file")?;
+            }
+
+            FileClass::Tiny => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fresh catalog generation unexpectedly committed a tiny file",
+                ));
+            }
+        }
+
+        file_metadata::restore_file(&final_path, entry.last_write_time, entry.file_attributes)?;
+    }
+
+    if let Some(progress) = progress {
+        progress.check_cancelled()?;
+    }
+
+    let commit = expected_generation_commit(generation);
+
+    validate_generation_commit(&commit, generation, manifest.len())?;
+
+    Ok(commit)
+}
+
 fn send_lane(
-    stream: TcpStream,
+    stream: &TcpStream,
     source_root: &Path,
     manifest: &[ManifestEntry],
     tasks: &[TransferTask],
     progress: Option<ProgressCounter>,
+    lane_end: LaneEnd,
 ) -> io::Result<LaneReport> {
     let reader_stream = stream.try_clone()?;
+
+    let writer_stream = stream.try_clone()?;
 
     let buffered_reader = BufReader::with_capacity(NETWORK_BUFFER_BYTES, reader_stream);
 
     let mut reader = CountingReader::new(buffered_reader);
 
-    let buffered_writer = BufWriter::with_capacity(NETWORK_BUFFER_BYTES, stream);
+    let buffered_writer = BufWriter::with_capacity(NETWORK_BUFFER_BYTES, writer_stream);
 
     let mut writer = CountingWriter::new(buffered_writer);
 
@@ -4178,7 +4530,7 @@ fn send_lane(
         }
     }
 
-    write_u8(&mut writer, MESSAGE_STREAM_END)?;
+    write_lane_end(&mut writer, lane_end)?;
 
     writer.flush()?;
 
@@ -4640,9 +4992,10 @@ struct ReceiveLaneContext<'a> {
 }
 
 fn receive_lane(
-    stream: TcpStream,
+    stream: &TcpStream,
     tasks: &[TransferTask],
     context: ReceiveLaneContext<'_>,
+    lane_end: LaneEnd,
 ) -> io::Result<LaneReport> {
     let ReceiveLaneContext {
         destination_root,
@@ -4653,9 +5006,11 @@ fn receive_lane(
         progress,
         cdc_enabled,
     } = context;
+    let reader_stream = stream.try_clone()?;
+
     let writer_stream = stream.try_clone()?;
 
-    let buffered_reader = BufReader::with_capacity(NETWORK_BUFFER_BYTES, stream);
+    let buffered_reader = BufReader::with_capacity(NETWORK_BUFFER_BYTES, reader_stream);
 
     let mut reader = CountingReader::new(buffered_reader);
 
@@ -4859,14 +5214,7 @@ fn receive_lane(
         }
     }
 
-    let final_message = read_u8(&mut reader)?;
-
-    if final_message != MESSAGE_STREAM_END {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("expected stream-end message, received 0x{final_message:02X}"),
-        ));
-    }
+    read_lane_end(&mut reader, lane_end)?;
 
     report.data_wire_bytes = reader
         .bytes_read()
@@ -5197,54 +5545,72 @@ fn finalize_large_files(
             continue;
         }
 
-        let final_path = destination_root.join(&entry.relative_path);
+        finalize_large_file(destination_root, file_id, entry, destination_mode)?;
+    }
 
-        let temporary_path = temporary_path(&final_path, file_id);
+    Ok(())
+}
 
-        let final_exists = final_path.try_exists()?;
+fn finalize_large_file(
+    destination_root: &Path,
+    file_id: usize,
+    entry: &ManifestEntry,
+    destination_mode: DestinationMode,
+) -> io::Result<()> {
+    if entry.class != FileClass::Large {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "large-file finalization received a non-large file",
+        ));
+    }
 
-        let temporary_exists = temporary_path.try_exists()?;
+    let final_path = destination_root.join(&entry.relative_path);
 
-        match (final_exists, temporary_exists) {
-            (false, true) => {
-                validate_resume_file(&temporary_path, entry.file_size, "striped temporary file")?;
+    let temporary_path = temporary_path(&final_path, file_id);
 
-                windows_file_replace::replace(&temporary_path, &final_path)?;
-            }
+    let final_exists = final_path.try_exists()?;
 
-            (true, false) => {
-                validate_resume_file(&final_path, entry.file_size, "finalized striped file")?;
-            }
+    let temporary_exists = temporary_path.try_exists()?;
 
-            (true, true) if destination_mode == DestinationMode::UpdateVerified => {
-                validate_resume_file(
-                    &temporary_path,
-                    entry.file_size,
-                    "striped update temporary file",
-                )?;
+    match (final_exists, temporary_exists) {
+        (false, true) => {
+            validate_resume_file(&temporary_path, entry.file_size, "striped temporary file")?;
 
-                windows_file_replace::replace(&temporary_path, &final_path)?;
-            }
+            windows_file_replace::replace(&temporary_path, &final_path)?;
+        }
 
-            (true, true) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "both final and temporary striped files exist: {}",
-                        final_path.display(),
-                    ),
-                ));
-            }
+        (true, false) => {
+            validate_resume_file(&final_path, entry.file_size, "finalized striped file")?;
+        }
 
-            (false, false) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "striped temporary file is missing: {}",
-                        temporary_path.display()
-                    ),
-                ));
-            }
+        (true, true) if destination_mode == DestinationMode::UpdateVerified => {
+            validate_resume_file(
+                &temporary_path,
+                entry.file_size,
+                "striped update temporary file",
+            )?;
+
+            windows_file_replace::replace(&temporary_path, &final_path)?;
+        }
+
+        (true, true) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "both final and temporary striped files exist: {}",
+                    final_path.display(),
+                ),
+            ));
+        }
+
+        (false, false) => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "striped temporary file is missing: {}",
+                    temporary_path.display(),
+                ),
+            ));
         }
     }
 
@@ -5740,6 +6106,323 @@ fn read_receiver_ready_after_message(
     })
 }
 
+fn generation_commit_list_count(file_ids: &[usize], description: &str) -> io::Result<u32> {
+    let count = u32::try_from(file_ids.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} count cannot be represented"),
+        )
+    })?;
+
+    if count > MAX_GENERATION_COMMIT_FILE_IDS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{description} contains {count} file IDs, exceeding the supported limit",),
+        ));
+    }
+
+    Ok(count)
+}
+
+fn generation_commit_wire_bytes(commit: &GenerationCommit) -> io::Result<u64> {
+    let committed = u64::from(generation_commit_list_count(
+        &commit.committed_file_ids,
+        "generation committed-file list",
+    )?);
+
+    let published = u64::from(generation_commit_list_count(
+        &commit.published_file_ids,
+        "generation published-file list",
+    )?);
+
+    let evicted = u64::from(generation_commit_list_count(
+        &commit.evicted_file_ids,
+        "generation evicted-file list",
+    )?);
+
+    let total_file_ids = committed
+        .checked_add(published)
+        .and_then(|count| count.checked_add(evicted))
+        .ok_or_else(|| io::Error::other("generation-commit file-ID count overflowed"))?;
+
+    GENERATION_COMMIT_FIXED_WIRE_BYTES
+        .checked_add(
+            total_file_ids
+                .checked_mul(GENERATION_COMMIT_FILE_ID_WIRE_BYTES)
+                .ok_or_else(|| {
+                    io::Error::other("generation-commit file-ID wire size overflowed")
+                })?,
+        )
+        .ok_or_else(|| io::Error::other("generation-commit wire size overflowed"))
+}
+
+fn validate_generation_file_ids_for_write(file_ids: &[usize], description: &str) -> io::Result<()> {
+    generation_commit_list_count(file_ids, description)?;
+
+    let mut seen = BTreeSet::new();
+
+    for &file_id in file_ids {
+        if !seen.insert(file_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{description} contains duplicate file ID {file_id}"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn write_generation_file_ids(
+    writer: &mut impl Write,
+    file_ids: &[usize],
+    description: &str,
+) -> io::Result<()> {
+    let count = generation_commit_list_count(file_ids, description)?;
+
+    write_u32(writer, count)?;
+
+    for &file_id in file_ids {
+        write_u64(
+            writer,
+            u64::try_from(file_id).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{description} file ID cannot be represented",),
+                )
+            })?,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn read_generation_file_ids(reader: &mut impl Read, description: &str) -> io::Result<Vec<usize>> {
+    let count = read_u32(reader)?;
+
+    if count > MAX_GENERATION_COMMIT_FILE_IDS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description} contains {count} file IDs, exceeding the supported limit",),
+        ));
+    }
+
+    let capacity = usize::try_from(count).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description} count cannot be represented"),
+        )
+    })?;
+
+    let mut file_ids = Vec::with_capacity(capacity);
+
+    let mut seen = BTreeSet::new();
+
+    for _ in 0..count {
+        let file_id = read_file_id(reader)?;
+
+        if !seen.insert(file_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{description} contains duplicate file ID {file_id}",),
+            ));
+        }
+
+        file_ids.push(file_id);
+    }
+
+    Ok(file_ids)
+}
+
+fn write_generation_commit(writer: &mut impl Write, commit: &GenerationCommit) -> io::Result<()> {
+    validate_generation_file_ids_for_write(
+        &commit.committed_file_ids,
+        "generation committed-file list",
+    )?;
+
+    validate_generation_file_ids_for_write(
+        &commit.published_file_ids,
+        "generation published-file list",
+    )?;
+
+    validate_generation_file_ids_for_write(
+        &commit.evicted_file_ids,
+        "generation evicted-file list",
+    )?;
+
+    generation_commit_wire_bytes(commit)?;
+
+    write_u8(writer, MESSAGE_GENERATION_COMMIT)?;
+
+    write_u64(
+        writer,
+        u64::try_from(commit.generation_index).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "generation-commit index cannot be represented",
+            )
+        })?,
+    )?;
+
+    write_generation_file_ids(
+        writer,
+        &commit.committed_file_ids,
+        "generation committed-file list",
+    )?;
+
+    write_generation_file_ids(
+        writer,
+        &commit.published_file_ids,
+        "generation published-file list",
+    )?;
+
+    write_generation_file_ids(
+        writer,
+        &commit.evicted_file_ids,
+        "generation evicted-file list",
+    )?;
+
+    writer.flush()
+}
+
+fn read_generation_commit(reader: &mut impl Read) -> io::Result<GenerationCommit> {
+    let message = read_u8(reader)?;
+
+    if message != MESSAGE_GENERATION_COMMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected generation-commit message, received 0x{message:02X}",),
+        ));
+    }
+
+    let generation_index = usize::try_from(read_u64(reader)?).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "received generation-commit index cannot be represented",
+        )
+    })?;
+
+    let commit = GenerationCommit {
+        generation_index,
+
+        committed_file_ids: read_generation_file_ids(reader, "generation committed-file list")?,
+
+        published_file_ids: read_generation_file_ids(reader, "generation published-file list")?,
+
+        evicted_file_ids: read_generation_file_ids(reader, "generation evicted-file list")?,
+    };
+
+    generation_commit_wire_bytes(&commit).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("received generation commit has an invalid wire size: {error}",),
+        )
+    })?;
+
+    Ok(commit)
+}
+
+fn expected_generation_commit(generation: &CatalogGeneration) -> GenerationCommit {
+    GenerationCommit {
+        generation_index: generation.index,
+
+        committed_file_ids: generation
+            .transfer_files
+            .iter()
+            .map(|candidate| candidate.file_id)
+            .collect(),
+
+        published_file_ids: generation.published_file_ids.clone(),
+
+        evicted_file_ids: generation.evicted_file_ids.clone(),
+    }
+}
+
+fn validate_generation_commit_ids(
+    file_ids: &[usize],
+    manifest_entries: usize,
+    description: &str,
+) -> io::Result<()> {
+    let mut seen = BTreeSet::new();
+
+    for &file_id in file_ids {
+        if file_id >= manifest_entries {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{description} references unknown file ID {file_id}",),
+            ));
+        }
+
+        if !seen.insert(file_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{description} contains duplicate file ID {file_id}",),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_generation_commit(
+    commit: &GenerationCommit,
+    generation: &CatalogGeneration,
+    manifest_entries: usize,
+) -> io::Result<()> {
+    if commit.generation_index != generation.index {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "receiver committed generation {}, expected {}",
+                commit.generation_index, generation.index,
+            ),
+        ));
+    }
+
+    validate_generation_commit_ids(
+        &commit.committed_file_ids,
+        manifest_entries,
+        "generation committed-file list",
+    )?;
+
+    validate_generation_commit_ids(
+        &commit.published_file_ids,
+        manifest_entries,
+        "generation published-file list",
+    )?;
+
+    validate_generation_commit_ids(
+        &commit.evicted_file_ids,
+        manifest_entries,
+        "generation evicted-file list",
+    )?;
+
+    let expected = expected_generation_commit(generation);
+
+    if commit.committed_file_ids != expected.committed_file_ids {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "receiver generation committed-file list differs from the deterministic plan",
+        ));
+    }
+
+    if commit.published_file_ids != expected.published_file_ids {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "receiver generation published-file list differs from the deterministic plan",
+        ));
+    }
+
+    if commit.evicted_file_ids != expected.evicted_file_ids {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "receiver generation eviction list differs from the deterministic plan",
+        ));
+    }
+
+    Ok(())
+}
+
 fn write_transfer_ack(writer: &mut impl Write, ack: TransferAck) -> io::Result<()> {
     write_u8(writer, MESSAGE_TRANSFER_ACK)?;
 
@@ -5980,12 +6663,15 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DestinationMode, ReceiverReady, TINY_PACK_TARGET_BYTES, TransferAck, TransferFault,
-        TransferTask, accept_session, apply_resume_offer, build_fresh_generation_plan_with_limits,
-        build_transfer_plan, catalog_task_file_id, connect_with_retry_config, finalize_large_files,
-        prepare_destination, read_receiver_ready, read_transfer_ack, receive_once, run, run_update,
-        run_update_with_fault, run_with_fault, send, temporary_path, tiny_pack_record_wire_bytes,
-        validate_resume_offer, validate_source_metadata, verify_content_digest,
+        DestinationMode, GenerationCommit, LaneEnd, MESSAGE_GENERATION_COMMIT, ReceiverReady,
+        TINY_PACK_TARGET_BYTES, TransferAck, TransferFault, TransferTask, accept_session,
+        apply_resume_offer, build_fresh_generation_plan_with_limits, build_transfer_plan,
+        catalog_task_file_id, connect_with_retry_config, expected_generation_commit,
+        finalize_large_files, generation_commit_wire_bytes, prepare_destination,
+        read_generation_commit, read_lane_end, read_receiver_ready, read_transfer_ack,
+        receive_once, run, run_update, run_update_with_fault, run_with_fault, send, temporary_path,
+        tiny_pack_record_wire_bytes, validate_generation_commit, validate_resume_offer,
+        validate_source_metadata, verify_content_digest, write_generation_commit, write_lane_end,
         write_receiver_ready, write_transfer_ack,
     };
     use crate::control_plane::{self, ManifestSummary};
@@ -6192,6 +6878,250 @@ mod tests {
                 .flatten()
                 .all(|task| matches!(task, TransferTask::TinyPack { .. }))
         );
+    }
+
+    #[test]
+    fn generation_commit_round_trips() {
+        let expected = GenerationCommit {
+            generation_index: 7,
+            committed_file_ids: vec![2, 4, 6],
+            published_file_ids: vec![2, 6],
+            evicted_file_ids: vec![0, 1],
+        };
+
+        let expected_wire_bytes =
+            generation_commit_wire_bytes(&expected).unwrap();
+
+        let mut bytes = Vec::new();
+
+        write_generation_commit(&mut bytes, &expected).unwrap();
+
+        assert_eq!(
+            u64::try_from(bytes.len()).unwrap(),
+            expected_wire_bytes,
+        );
+
+        let actual =
+            read_generation_commit(&mut Cursor::new(bytes)).unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn generation_commit_rejects_duplicate_file_ids() {
+        let mut bytes = Vec::new();
+
+        bytes.push(MESSAGE_GENERATION_COMMIT);
+
+        bytes.extend_from_slice(&0_u64.to_be_bytes());
+
+        bytes.extend_from_slice(&2_u32.to_be_bytes());
+
+        bytes.extend_from_slice(&1_u64.to_be_bytes());
+
+        bytes.extend_from_slice(&1_u64.to_be_bytes());
+
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+
+        let error =
+            read_generation_commit(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate file ID 1"),
+        );
+    }
+
+    #[test]
+    fn generation_commit_must_match_the_deterministic_plan() {
+        let manifest = vec![
+            entry("medium-a.bin", 100, FileClass::Medium),
+            entry("medium-b.bin", 200, FileClass::Medium),
+        ];
+
+        let transfer_plan =
+            build_transfer_plan(&manifest, 2).unwrap();
+
+        let generation_plan =
+            build_fresh_generation_plan_with_limits(
+                &manifest,
+                &transfer_plan,
+                CatalogLimits {
+                    generation_target_bytes: 1_000,
+                    max_catalog_entries: 100,
+                },
+            )
+            .unwrap();
+
+        let generation = &generation_plan.catalog.generations[0];
+
+        let expected = expected_generation_commit(generation);
+
+        validate_generation_commit(
+            &expected,
+            generation,
+            manifest.len(),
+        )
+        .unwrap();
+
+        let mut wrong_index = expected.clone();
+
+        wrong_index.generation_index =
+            wrong_index.generation_index.checked_add(1).unwrap();
+
+        let error = validate_generation_commit(
+            &wrong_index,
+            generation,
+            manifest.len(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected"),
+        );
+
+        let mut unknown_file = expected.clone();
+
+        unknown_file.committed_file_ids[0] = manifest.len();
+
+        let error = validate_generation_commit(
+            &unknown_file,
+            generation,
+            manifest.len(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown file ID"),
+        );
+
+        let mut wrong_publication = expected.clone();
+
+        wrong_publication.published_file_ids.clear();
+
+        let error = validate_generation_commit(
+            &wrong_publication,
+            generation,
+            manifest.len(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("published-file list differs"),
+        );
+    }
+
+    #[test]
+    fn lane_generation_end_round_trips_and_validates_index() {
+        let mut generation_bytes = Vec::new();
+
+        write_lane_end(
+            &mut generation_bytes,
+            LaneEnd::Generation(4),
+        )
+        .unwrap();
+
+        read_lane_end(
+            &mut Cursor::new(generation_bytes.clone()),
+            LaneEnd::Generation(4),
+        )
+        .unwrap();
+
+        let error = read_lane_end(
+            &mut Cursor::new(generation_bytes),
+            LaneEnd::Generation(5),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected 5"),
+        );
+
+        let mut stream_bytes = Vec::new();
+
+        write_lane_end(
+            &mut stream_bytes,
+            LaneEnd::Stream,
+        )
+        .unwrap();
+
+        read_lane_end(
+            &mut Cursor::new(stream_bytes),
+            LaneEnd::Stream,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn loopback_tiny_only_transfer_uses_one_shot_lane_end() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let parent = env::temp_dir().join(format!(
+            "networkcopy-v10-tiny-only-{}-{unique}",
+            process::id(),
+        ));
+
+        let source = parent.join("source");
+
+        let destination = parent.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        fs::write(
+            source.join("tiny-a.txt"),
+            b"protocol v10 tiny file A",
+        )
+        .unwrap();
+
+        fs::write(
+            source.join("tiny-b.txt"),
+            b"protocol v10 tiny file B",
+        )
+        .unwrap();
+
+        let transfer_result = run(
+            &source,
+            &destination,
+            2,
+            2,
+        );
+
+        let cleanup_result = fs::remove_dir_all(&parent);
+
+        let report = transfer_result.unwrap();
+
+        cleanup_result.unwrap();
+
+        assert_eq!(report.files_copied, 2);
+
+        assert_eq!(
+            report.bytes_copied,
+            u64::try_from(
+                b"protocol v10 tiny file A".len()
+                    + b"protocol v10 tiny file B".len(),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(report.tiny_files_packed, 2);
     }
 
     #[test]

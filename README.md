@@ -28,13 +28,14 @@ Current development version:
 2.0.0-dev
 ```
 
-v1.4 is the current stable release. v2 now includes a protocol-v9 update path
-that reuses verified content from older receiver-side medium and large files,
+v1.4 is the current stable release. v2 now uses protocol v10. Its update path
+reuses verified content from older receiver-side medium and large files,
 transmitting reconstruction references plus changed literal bytes whenever CDC
-is profitable. Medium files retain ordinary whole-file fallback, while large
-files retain the existing multi-lane striped fallback. Fresh-transfer
-cross-file reuse and final physical two-machine acceptance remain under
-development.
+is profitable. Fresh transfers now execute through deterministic bounded
+catalog generations: every generation completes across all TCP lanes, the
+receiver commits its files, and an explicit commit acknowledgement is validated
+before the next generation begins. Actual cross-file chunk references and final
+physical two-machine acceptance remain under development.
 
 The GUI includes:
 
@@ -68,7 +69,7 @@ Implementation order:
 - [x] fresh-transfer exact reuse for repeated medium files;
 - [ ] extend exact reuse to tiny packs and striped large files;
 - [x] deterministic bounded session catalog and generation planner;
-- [ ] protocol-v10 generation barriers and receiver commit acknowledgements;
+- [x] protocol-v10 generation barriers and receiver commit acknowledgements;
 - [ ] session-scoped cross-file CDC using completed files as chunk bases;
 - [ ] interrupted-session catalog rebuild and retry behavior;
 - [x] GUI CDC telemetry and mixed-workload loopback acceptance;
