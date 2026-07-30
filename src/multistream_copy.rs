@@ -577,6 +577,8 @@ struct ResumeApplication {
 
 #[derive(Debug)]
 struct TransferFault {
+    catalog_limits: CatalogLimits,
+
     fail_after_checkpointed_stripes: Option<u64>,
 
     checkpointed_stripes: AtomicU64,
@@ -589,6 +591,8 @@ struct TransferFault {
 impl TransferFault {
     fn disabled() -> Self {
         Self {
+            catalog_limits: CatalogLimits::default(),
+
             fail_after_checkpointed_stripes: None,
 
             checkpointed_stripes: AtomicU64::new(0),
@@ -597,6 +601,16 @@ impl TransferFault {
 
             reconstructed_cdc_files: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(test)]
+    fn with_catalog_limits(catalog_limits: CatalogLimits) -> io::Result<Self> {
+        catalog_limits.validate()?;
+
+        Ok(Self {
+            catalog_limits,
+            ..Self::disabled()
+        })
     }
 
     #[cfg(test)]
@@ -609,6 +623,8 @@ impl TransferFault {
         }
 
         Ok(Self {
+            catalog_limits: CatalogLimits::default(),
+
             fail_after_checkpointed_stripes: Some(stripe_count),
 
             checkpointed_stripes: AtomicU64::new(0),
@@ -630,6 +646,8 @@ impl TransferFault {
         }
 
         Ok(Self {
+            catalog_limits: CatalogLimits::default(),
+
             fail_after_checkpointed_stripes: None,
 
             checkpointed_stripes: AtomicU64::new(0),
@@ -771,6 +789,12 @@ struct AcceptedSession {
     data_stream_count: usize,
 }
 
+struct SendInternalOptions {
+    server: Option<thread::JoinHandle<io::Result<ReceiveReport>>>,
+    progress: Option<ProgressCounter>,
+    catalog_limits: CatalogLimits,
+}
+
 pub fn run(
     source_root: &Path,
     destination_root: &Path,
@@ -825,6 +849,8 @@ fn run_update_with_fault(
 
     let server_destination = destination_root.to_path_buf();
 
+    let catalog_limits = fault_injection.catalog_limits;
+
     let server = thread::Builder::new()
         .name("networkcopy-update-server".to_string())
         .spawn(move || {
@@ -843,8 +869,11 @@ fn run_update_with_fault(
         worker_count,
         data_stream_count,
         memory_plan,
-        Some(server),
-        None,
+        SendInternalOptions {
+            server: Some(server),
+            progress: None,
+            catalog_limits,
+        },
     )
 }
 
@@ -872,6 +901,8 @@ fn run_with_fault(
 
     let server_destination = destination_root.to_path_buf();
 
+    let catalog_limits = fault_injection.catalog_limits;
+
     let server = thread::Builder::new()
         .name("networkcopy-transfer-server".to_string())
         .spawn(move || run_server(&listener, server_destination, fault_injection, None))?;
@@ -882,8 +913,11 @@ fn run_with_fault(
         worker_count,
         data_stream_count,
         memory_plan,
-        Some(server),
-        None,
+        SendInternalOptions {
+            server: Some(server),
+            progress: None,
+            catalog_limits,
+        },
     )
 }
 
@@ -942,8 +976,11 @@ fn send_configured(
         worker_count,
         data_stream_count,
         memory_plan,
-        None,
-        progress,
+        SendInternalOptions {
+            server: None,
+            progress,
+            catalog_limits: CatalogLimits::default(),
+        },
     )
 }
 
@@ -1001,9 +1038,14 @@ fn send_internal(
     worker_count: usize,
     data_stream_count: usize,
     memory_plan: transfer_memory::TransferMemoryPlan,
-    server: Option<thread::JoinHandle<io::Result<ReceiveReport>>>,
-    progress: Option<ProgressCounter>,
+    options: SendInternalOptions,
 ) -> io::Result<MultistreamCopyReport> {
+    let SendInternalOptions {
+        server,
+        progress,
+        catalog_limits,
+    } = options;
+
     let total_started = Instant::now();
 
     let process_buffer_bytes = if server.is_some() {
@@ -1195,7 +1237,11 @@ fn send_internal(
     let fresh_generation_plan = if update_session {
         None
     } else {
-        Some(build_fresh_generation_plan(&manifest, &transfer_plan)?)
+        Some(build_fresh_generation_plan_with_limits(
+            &manifest,
+            &transfer_plan,
+            catalog_limits,
+        )?)
     };
 
     let effective_plan_stats = summarize_transfer_plan(&transfer_plan)?;
@@ -1606,7 +1652,11 @@ fn run_server_with_mode(
     )?;
 
     let fresh_generation_plan = if destination_mode == DestinationMode::Fresh {
-        Some(build_fresh_generation_plan(&manifest, &transfer_plan)?)
+        Some(build_fresh_generation_plan_with_limits(
+            &manifest,
+            &transfer_plan,
+            fault_injection.catalog_limits,
+        )?)
     } else {
         None
     };
@@ -8052,6 +8102,76 @@ mod tests {
     }
 
     #[test]
+    fn fresh_loopback_uses_committed_medium_file_as_session_cdc_basis() {
+        let root = temporary_directory("fresh-session-cdc");
+
+        let source = root.join("source");
+
+        let destination = root.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        let basis = deterministic_test_bytes(8 * 1024 * 1024, 0x1234_5678_90AB_CDEF);
+
+        let insertion = deterministic_test_bytes(4097, 0xCAFE_BABE_DEAD_BEEF);
+
+        let insertion_offset = 4 * 1024 * 1024 + 123;
+
+        let mut target = Vec::with_capacity(basis.len() + insertion.len());
+
+        target.extend_from_slice(&basis[..insertion_offset]);
+
+        target.extend_from_slice(&insertion);
+
+        target.extend_from_slice(&basis[insertion_offset..]);
+
+        fs::write(source.join("00-basis.bin"), &basis).unwrap();
+
+        fs::write(source.join("01-target.bin"), &target).unwrap();
+
+        let catalog_limits = CatalogLimits {
+            generation_target_bytes: basis.len() as u64,
+            ..CatalogLimits::default()
+        };
+
+        let fault = TransferFault::with_catalog_limits(catalog_limits).unwrap();
+
+        let report = run_with_fault(&source, &destination, 2, 2, Arc::new(fault)).unwrap();
+
+        assert_eq!(report.files_copied, 2);
+
+        assert_eq!(report.bytes_copied, (basis.len() + target.len()) as u64,);
+
+        assert_eq!(report.exact_reused_files, 0);
+
+        assert_eq!(report.cdc_offered_files, 1);
+
+        assert_eq!(report.cdc_files, 1);
+
+        assert_eq!(report.cdc_fallback_files, 0);
+
+        assert_eq!(report.cdc_logical_bytes, target.len() as u64);
+
+        assert!(report.cdc_reused_bytes > target.len() as u64 * 90 / 100,);
+
+        assert!(report.cdc_literal_bytes < 1024 * 1024);
+
+        assert_eq!(report.cdc_index_wire_bytes, 0);
+
+        assert!(report.cdc_plan_wire_bytes > 0);
+
+        assert!(report.data_wire_bytes < report.bytes_copied * 3 / 4,);
+
+        assert_eq!(fs::read(destination.join("00-basis.bin")).unwrap(), basis,);
+
+        assert_eq!(fs::read(destination.join("01-target.bin")).unwrap(), target,);
+
+        assert!(!destination.join(JOURNAL_FILE_NAME).exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn loopback_session_copies_complete_directory() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -8139,6 +8259,22 @@ mod tests {
         );
 
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    fn deterministic_test_bytes(length: usize, mut state: u64) -> Vec<u8> {
+        let mut bytes = vec![0_u8; length];
+
+        for byte in &mut bytes {
+            state ^= state << 13;
+
+            state ^= state >> 7;
+
+            state ^= state << 17;
+
+            *byte = (state >> 24) as u8;
+        }
+
+        bytes
     }
 
     fn entry(path: &str, file_size: u64, class: FileClass) -> ManifestEntry {
