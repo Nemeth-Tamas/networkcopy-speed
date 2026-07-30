@@ -89,6 +89,7 @@ enum ConnectionChoice {
     Address,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum TransferOutcome {
     Completed(GuiTransferSummary),
 
@@ -216,6 +217,13 @@ struct Text {
     logical_data: &'static str,
     speed: &'static str,
     wire_savings: &'static str,
+
+    cdc_updates: &'static str,
+    cdc_fallbacks: &'static str,
+    cdc_data: &'static str,
+    cdc_wire: &'static str,
+    cdc_savings: &'static str,
+
     tiny_packs: &'static str,
     compressed_tiny_packs: &'static str,
     raw_tiny_packs: &'static str,
@@ -238,6 +246,7 @@ struct Text {
     transfer_diagnostic: &'static str,
     diagnostic_all_skipped: &'static str,
     diagnostic_tiny_files: &'static str,
+    diagnostic_cdc_effective: &'static str,
     diagnostic_compression_effective: &'static str,
     diagnostic_compression_bypassed: &'static str,
     diagnostic_balanced: &'static str,
@@ -279,7 +288,7 @@ impl Text {
 
         update_existing: "Meglévő célmappa frissítése",
 
-        update_existing_hint: "A változatlan fájlokat kihagyja. A módosult fájlokat csak sikeres ellenőrzés után cseréli le.",
+        update_existing_hint: "A változatlan fájlokat kihagyja. A módosult közepes fájloknál újra felhasználja a meglévő tartalmat, és csak az eltéréseket küldi át. A célfájlt csak sikeres ellenőrzés után cseréli le.",
 
         browse: "Tallózás…",
 
@@ -345,6 +354,16 @@ impl Text {
 
         wire_savings: "Hálózati megtakarítás",
 
+        cdc_updates: "CDC-frissítések (sikeres / felajánlott)",
+
+        cdc_fallbacks: "Teljes fájlra visszaváltás",
+
+        cdc_data: "CDC-adat (logikai / újrafelhasznált / új)",
+
+        cdc_wire: "CDC-hálózat (index / terv)",
+
+        cdc_savings: "CDC-megtakarítás",
+
         tiny_packs: "Aprófájl-csomagok",
 
         compressed_tiny_packs: "Tömörített csomagok",
@@ -387,7 +406,9 @@ impl Text {
 
         diagnostic_all_skipped: "Nincs átküldendő adat; minden fájl már naprakész volt.",
 
-        diagnostic_tiny_files: "Valószínű korlát: sok apró fájl kezelési költsége.",
+        diagnostic_tiny_files: "Valószínű korlát: fájlonkénti többletmunka a sok apró fájl miatt.",
+
+        diagnostic_cdc_effective: "A tartalomalapú újrafelhasználás jelentősen csökkentette a hálózati forgalmat.",
 
         diagnostic_compression_effective: "A tömörítés érdemben csökkentette a hálózati forgalmat.",
 
@@ -431,7 +452,7 @@ impl Text {
 
         update_existing: "Update existing destination",
 
-        update_existing_hint: "Skips unchanged files. Changed files are replaced only after the new data passes verification.",
+        update_existing_hint: "Skips unchanged files. For changed medium files, existing destination content is reused and only the differences are transferred. The destination is replaced only after verification succeeds.",
 
         browse: "Browse…",
 
@@ -497,6 +518,16 @@ impl Text {
 
         wire_savings: "Network savings",
 
+        cdc_updates: "CDC updates (completed / offered)",
+
+        cdc_fallbacks: "Whole-file fallbacks",
+
+        cdc_data: "CDC data (logical / reused / literal)",
+
+        cdc_wire: "CDC wire (index / plan)",
+
+        cdc_savings: "CDC savings",
+
         tiny_packs: "Tiny-file packs",
 
         compressed_tiny_packs: "Compressed packs",
@@ -540,6 +571,8 @@ impl Text {
         diagnostic_all_skipped: "No payload was required; every file was already current.",
 
         diagnostic_tiny_files: "Likely limiter: per-file overhead from a large number of tiny files.",
+
+        diagnostic_cdc_effective: "Content-defined reuse avoided retransmitting most of the changed-file data.",
 
         diagnostic_compression_effective: "Compression meaningfully reduced network traffic.",
 
@@ -1228,6 +1261,50 @@ impl NetworkCopyGui {
 
                     ui.end_row();
 
+                    if summary.cdc_offered_files > 0 {
+                        ui.label(text.cdc_updates);
+
+                        ui.strong(format!(
+                            "{} / {}",
+                            summary.cdc_files, summary.cdc_offered_files,
+                        ));
+
+                        ui.end_row();
+
+                        ui.label(text.cdc_fallbacks);
+
+                        ui.strong(summary.cdc_fallback_files.to_string());
+
+                        ui.end_row();
+
+                        ui.label(text.cdc_data);
+
+                        ui.strong(format!(
+                            "{} / {} / {}",
+                            format_bytes(summary.cdc_logical_bytes,),
+                            format_bytes(summary.cdc_reused_bytes,),
+                            format_bytes(summary.cdc_literal_bytes,),
+                        ));
+
+                        ui.end_row();
+
+                        ui.label(text.cdc_wire);
+
+                        ui.strong(format!(
+                            "{} / {}",
+                            format_bytes(summary.cdc_index_wire_bytes,),
+                            format_bytes(summary.cdc_plan_wire_bytes,),
+                        ));
+
+                        ui.end_row();
+
+                        ui.label(text.cdc_savings);
+
+                        ui.strong(format!("{:.2}%", summary.cdc_wire_savings_percent,));
+
+                        ui.end_row();
+                    }
+
                     ui.label(text.compression_strategy);
 
                     ui.strong(text.compression_strategy_adaptive);
@@ -1240,6 +1317,8 @@ impl NetworkCopyGui {
                         GuiTransferDiagnostic::AllFilesSkipped => text.diagnostic_all_skipped,
 
                         GuiTransferDiagnostic::TinyFileHeavy => text.diagnostic_tiny_files,
+
+                        GuiTransferDiagnostic::CdcEffective => text.diagnostic_cdc_effective,
 
                         GuiTransferDiagnostic::CompressionEffective => {
                             text.diagnostic_compression_effective

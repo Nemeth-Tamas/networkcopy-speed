@@ -30,9 +30,8 @@ Current development version:
 
 v1.4 is the current stable release. v2 now includes a protocol-v7 medium-file
 update path that reuses verified content from an older receiver-side file and
-transmits only reconstruction references plus changed literal bytes. Large
-striped-file deduplication, CDC-aware resume behavior, and final GUI telemetry
-remain under development.
+transmits only reconstruction references plus changed literal bytes. Large striped-file deduplication, CDC-aware resume behavior, and final
+two-machine v2 acceptance remain under development.
 
 The GUI includes:
 
@@ -60,7 +59,10 @@ Implementation order:
 - [x] receiver basis-file chunk index;
 - [x] deduplicated reconstruction prototype with final BLAKE3 verification;
 - [x] bounded-memory folder-level deduplication planning;
-- [ ] deduplicated transfer protocol, resume behavior, and telemetry.
+- [x] protocol-v7 medium-file CDC transfer and ordinary-transfer fallback;
+- [ ] large striped-file CDC integration;
+- [ ] CDC-aware interruption and resume behavior;
+- [ ] final GUI telemetry and two-machine acceptance.
 
 The first benchmark intentionally uses fixed boundaries from byte zero. It
 measures both same-position reuse and blocks found elsewhere in the basis file.
@@ -280,6 +282,43 @@ The first protocol-v7 loopback acceptance updated three medium files containing
 plans, CDC framing, and stream termination, the data lanes carried 140,722
 bytes for 99.33% savings. All reconstructed files passed receiver-side BLAKE3
 verification and independent SHA-256 comparison.
+
+### How the GUI activates CDC
+
+CDC does not require a separate sender option. The receiver controls the update
+policy by enabling **Update existing destination**.
+
+```mermaid
+flowchart TD
+    G["Receiver enables Update existing destination"]
+    U["Verified update mode"]
+    I["Compare source manifest with destination"]
+    S["Unchanged same-path files"]
+    C["Changed same-path files"]
+    K["Verify and skip"]
+    M{"Medium file of at least 1 MiB?"}
+    D["Protocol-v7 CDC negotiation"]
+    P{"Index plus plan beats full file?"}
+    R["Reconstruct, verify BLAKE3, replace"]
+    F["Ordinary whole-file or striped transfer"]
+
+    G --> U
+    U --> I
+    I --> S
+    I --> C
+    S --> K
+    C --> M
+    M -->|Yes| D
+    M -->|No| F
+    D --> P
+    P -->|Yes| R
+    P -->|No| F
+```
+
+The sender does not need to predict whether the receiver has a useful basis
+file. Each data lane receives either a compact basis index or an unavailable
+marker. CDC therefore remains automatic and safely falls back to the existing
+transfer engine.
 
 The `NCI1` prototype wire format uses a 24-byte header followed by one 44-byte
 record per chunk. The receiver builds and encodes the index once; the sender

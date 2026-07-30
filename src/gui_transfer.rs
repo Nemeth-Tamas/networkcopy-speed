@@ -95,6 +95,7 @@ impl Default for GuiTransferControl {
 pub enum GuiTransferDiagnostic {
     AllFilesSkipped,
     TinyFileHeavy,
+    CdcEffective,
     CompressionEffective,
     CompressionBypassed,
     Balanced,
@@ -105,6 +106,10 @@ struct DiagnosticInput {
     files: u64,
     logical_bytes: u64,
     wire_bytes: u64,
+
+    cdc_files: u64,
+    cdc_reused_bytes: u64,
+
     compressed_records: u64,
     skipped_files: u64,
     skipped_bytes: u64,
@@ -144,6 +149,19 @@ pub struct GuiTransferSummary {
 
     pub wire_savings_percent: f64,
 
+    pub cdc_offered_files: u64,
+    pub cdc_files: u64,
+    pub cdc_fallback_files: u64,
+
+    pub cdc_logical_bytes: u64,
+    pub cdc_reused_bytes: u64,
+    pub cdc_literal_bytes: u64,
+
+    pub cdc_index_wire_bytes: u64,
+    pub cdc_plan_wire_bytes: u64,
+    pub cdc_wire_bytes: u64,
+    pub cdc_wire_savings_percent: f64,
+
     pub tiny_pack_count: u64,
 
     pub compressed_tiny_pack_count: u64,
@@ -167,6 +185,9 @@ impl GuiTransferSummary {
             logical_bytes: self.logical_bytes,
 
             wire_bytes: self.wire_bytes,
+
+            cdc_files: self.cdc_files,
+            cdc_reused_bytes: self.cdc_reused_bytes,
 
             compressed_records: self.compressed_records,
 
@@ -194,6 +215,10 @@ fn diagnose_transfer(input: DiagnosticInput) -> GuiTransferDiagnostic {
 
     if input.tiny_files_packed >= 1_000 && average_file_bytes <= 64 * 1024 {
         return GuiTransferDiagnostic::TinyFileHeavy;
+    }
+
+    if input.cdc_files > 0 && input.cdc_reused_bytes > 0 {
+        return GuiTransferDiagnostic::CdcEffective;
     }
 
     let wire_savings_percent = 100.0 - input.wire_bytes as f64 / transferred_bytes as f64 * 100.0;
@@ -321,6 +346,10 @@ fn send_summary(report: CalibratedSendReport) -> GuiTransferSummary {
 
     let transfer = report.transfer;
 
+    let cdc_wire_bytes = transfer
+        .cdc_index_wire_bytes
+        .saturating_add(transfer.cdc_plan_wire_bytes);
+
     GuiTransferSummary {
         direction: GuiTransferDirection::Send,
 
@@ -352,6 +381,26 @@ fn send_summary(report: CalibratedSendReport) -> GuiTransferSummary {
 
         wire_savings_percent: wire_savings_percent(transfer.bytes_copied, transfer.data_wire_bytes),
 
+        cdc_offered_files: transfer.cdc_offered_files,
+
+        cdc_files: transfer.cdc_files,
+
+        cdc_fallback_files: transfer.cdc_fallback_files,
+
+        cdc_logical_bytes: transfer.cdc_logical_bytes,
+
+        cdc_reused_bytes: transfer.cdc_reused_bytes,
+
+        cdc_literal_bytes: transfer.cdc_literal_bytes,
+
+        cdc_index_wire_bytes: transfer.cdc_index_wire_bytes,
+
+        cdc_plan_wire_bytes: transfer.cdc_plan_wire_bytes,
+
+        cdc_wire_bytes,
+
+        cdc_wire_savings_percent: wire_savings_percent(transfer.cdc_logical_bytes, cdc_wire_bytes),
+
         tiny_pack_count: transfer.tiny_pack_count,
 
         compressed_tiny_pack_count: transfer.compressed_tiny_pack_count,
@@ -373,6 +422,10 @@ fn send_summary(report: CalibratedSendReport) -> GuiTransferSummary {
 
 fn receive_summary(report: CalibratedReceiveReport) -> GuiTransferSummary {
     let transfer = report.transfer;
+
+    let cdc_wire_bytes = transfer
+        .cdc_index_wire_bytes
+        .saturating_add(transfer.cdc_plan_wire_bytes);
 
     GuiTransferSummary {
         direction: GuiTransferDirection::Receive,
@@ -410,6 +463,26 @@ fn receive_summary(report: CalibratedReceiveReport) -> GuiTransferSummary {
             transfer.bytes_received,
             transfer.data_wire_bytes,
         ),
+
+        cdc_offered_files: transfer.cdc_offered_files,
+
+        cdc_files: transfer.cdc_files,
+
+        cdc_fallback_files: transfer.cdc_fallback_files,
+
+        cdc_logical_bytes: transfer.cdc_logical_bytes,
+
+        cdc_reused_bytes: transfer.cdc_reused_bytes,
+
+        cdc_literal_bytes: transfer.cdc_literal_bytes,
+
+        cdc_index_wire_bytes: transfer.cdc_index_wire_bytes,
+
+        cdc_plan_wire_bytes: transfer.cdc_plan_wire_bytes,
+
+        cdc_wire_bytes,
+
+        cdc_wire_savings_percent: wire_savings_percent(transfer.cdc_logical_bytes, cdc_wire_bytes),
 
         tiny_pack_count: transfer.tiny_pack_count,
 
@@ -471,6 +544,9 @@ mod tests {
 
                 wire_bytes: 0,
 
+                cdc_files: 0,
+                cdc_reused_bytes: 0,
+
                 compressed_records: 0,
 
                 skipped_files: 10_000,
@@ -494,6 +570,9 @@ mod tests {
 
                 wire_bytes: 1_200_000,
 
+                cdc_files: 0,
+                cdc_reused_bytes: 0,
+
                 compressed_records: 0,
 
                 skipped_files: 0,
@@ -509,6 +588,29 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_detects_effective_cdc() {
+        assert_eq!(
+            diagnose_transfer(DiagnosticInput {
+                files: 3,
+                logical_bytes: 20_990_976,
+                wire_bytes: 140_722,
+
+                cdc_files: 3,
+                cdc_reused_bytes: 20_864_841,
+
+                compressed_records: 0,
+
+                skipped_files: 0,
+                skipped_bytes: 0,
+
+                tiny_files_packed: 0,
+                raw_tiny_pack_count: 0,
+            },),
+            GuiTransferDiagnostic::CdcEffective,
+        );
+    }
+
+    #[test]
     fn diagnostic_detects_effective_compression() {
         assert_eq!(
             diagnose_transfer(DiagnosticInput {
@@ -516,6 +618,9 @@ mod tests {
                 logical_bytes: 100_000_000,
 
                 wire_bytes: 25_000_000,
+
+                cdc_files: 0,
+                cdc_reused_bytes: 0,
 
                 compressed_records: 4,
 
@@ -539,6 +644,9 @@ mod tests {
                 logical_bytes: 20_000_000,
 
                 wire_bytes: 20_100_000,
+
+                cdc_files: 0,
+                cdc_reused_bytes: 0,
 
                 compressed_records: 0,
 
@@ -778,6 +886,159 @@ mod tests {
         );
 
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn gui_update_transfer_reports_medium_file_cdc() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let parent =
+            env::temp_dir().join(format!("networkcopy-gui-cdc-{}-{unique}", process::id(),));
+
+        let source = parent.join("source");
+
+        let destination = parent.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        let basis = deterministic_bytes(2 * 1024 * 1024, 0x1234_5678_90AB_CDEF);
+
+        let source_path = source.join("medium.bin");
+
+        fs::write(&source_path, &basis).unwrap();
+
+        let first_address = available_address();
+
+        let first_destination = destination.clone();
+
+        let first_receiver = thread::spawn(move || {
+            run_gui_transfer(GuiTransferRequest::Receive {
+                connection: GuiConnectionMode::Address(first_address),
+
+                destination_root: first_destination,
+
+                update_existing: false,
+            })
+        });
+
+        run_gui_transfer(GuiTransferRequest::Send {
+            connection: GuiConnectionMode::Address(first_address),
+
+            source_root: source.clone(),
+
+            worker_count: 2,
+            calibration_mib: 1,
+        })
+        .unwrap();
+
+        first_receiver.join().unwrap().unwrap();
+
+        let insertion = deterministic_bytes(4097, 0xCAFE_BABE_DEAD_BEEF);
+
+        let insertion_offset = 1024 * 1024 + 123;
+
+        let mut candidate = Vec::with_capacity(basis.len() + insertion.len());
+
+        candidate.extend_from_slice(&basis[..insertion_offset]);
+
+        candidate.extend_from_slice(&insertion);
+
+        candidate.extend_from_slice(&basis[insertion_offset..]);
+
+        fs::write(&source_path, &candidate).unwrap();
+
+        let second_address = available_address();
+
+        let second_destination = destination.clone();
+
+        let second_receiver = thread::spawn(move || {
+            run_gui_transfer(GuiTransferRequest::Receive {
+                connection: GuiConnectionMode::Address(second_address),
+
+                destination_root: second_destination,
+
+                update_existing: true,
+            })
+        });
+
+        let sender_summary = run_gui_transfer(GuiTransferRequest::Send {
+            connection: GuiConnectionMode::Address(second_address),
+
+            source_root: source.clone(),
+
+            worker_count: 2,
+            calibration_mib: 1,
+        })
+        .unwrap();
+
+        let receiver_summary = second_receiver.join().unwrap().unwrap();
+
+        assert_eq!(sender_summary.cdc_offered_files, 1,);
+
+        assert_eq!(sender_summary.cdc_files, 1,);
+
+        assert_eq!(sender_summary.cdc_fallback_files, 0,);
+
+        assert!(sender_summary.cdc_reused_bytes > sender_summary.cdc_logical_bytes * 90 / 100,);
+
+        assert!(sender_summary.cdc_literal_bytes < 512 * 1024,);
+
+        assert!(sender_summary.cdc_wire_savings_percent > 90.0,);
+
+        assert_eq!(
+            sender_summary.cdc_offered_files,
+            receiver_summary.cdc_offered_files,
+        );
+
+        assert_eq!(sender_summary.cdc_files, receiver_summary.cdc_files,);
+
+        assert_eq!(
+            sender_summary.cdc_reused_bytes,
+            receiver_summary.cdc_reused_bytes,
+        );
+
+        assert_eq!(
+            sender_summary.cdc_literal_bytes,
+            receiver_summary.cdc_literal_bytes,
+        );
+
+        assert_eq!(
+            sender_summary.cdc_wire_bytes,
+            receiver_summary.cdc_wire_bytes,
+        );
+
+        assert_eq!(
+            sender_summary.diagnostic(),
+            GuiTransferDiagnostic::CdcEffective,
+        );
+
+        assert_eq!(
+            fs::read(destination.join("medium.bin",),).unwrap(),
+            candidate,
+        );
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    fn deterministic_bytes(length: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+
+        let mut bytes = Vec::with_capacity(length);
+
+        for _ in 0..length {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+
+            state = state.wrapping_mul(0x2545_F491_4F6C_DD1D_u64);
+
+            bytes.push(state as u8);
+        }
+
+        bytes
     }
 
     fn available_address() -> SocketAddr {
