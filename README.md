@@ -61,7 +61,7 @@ Implementation order:
 - [x] bounded-memory folder-level deduplication planning;
 - [x] protocol-v7 medium-file CDC transfer and ordinary-transfer fallback;
 - [ ] large striped-file CDC integration;
-- [ ] CDC-aware interruption and resume behavior;
+- [x] CDC-aware interruption and file-level retry behavior;
 - [x] GUI CDC telemetry and mixed-workload loopback acceptance;
 - [ ] physical two-machine acceptance.
 
@@ -320,6 +320,34 @@ The sender does not need to predict whether the receiver has a useful basis
 file. Each data lane receives either a compact basis index or an unavailable
 marker. CDC therefore remains automatic and safely falls back to the existing
 transfer engine.
+
+### CDC interruption and retry behavior
+
+Partial CDC plans are not persisted. The receiver reads and validates the complete
+`NCP1` plan before reconstruction begins, so a disconnect during plan transfer
+leaves the old destination file untouched. The next session rebuilds the basis
+index and retries that file from the beginning.
+
+```mermaid
+stateDiagram-v2
+    [*] --> OldDestination
+
+    OldDestination --> ReceivingPlan: Send NCI1 index
+    ReceivingPlan --> OldDestination: Disconnect or truncated NCP1
+    ReceivingPlan --> Reconstructing: Complete validated NCP1
+
+    Reconstructing --> OldDestination: Write or BLAKE3 failure
+    Reconstructing --> NewDestination: BLAKE3 match and atomic replacement
+
+    NewDestination --> VerifiedSkip: Session lost before final ACK
+    VerifiedSkip --> [*]: Next update verifies and skips file
+```
+
+After a successful reconstruction, the receiver restores that file's source
+metadata immediately. If the session then fails before the final transfer
+acknowledgement, the next verified update recognizes the completed file and
+skips it. Resume therefore occurs at file granularity for CDC updates; incomplete
+plans are safely discarded rather than checkpointed.
 
 The `NCI1` prototype wire format uses a 24-byte header followed by one 44-byte
 record per chunk. The receiver builds and encodes the index once; the sender

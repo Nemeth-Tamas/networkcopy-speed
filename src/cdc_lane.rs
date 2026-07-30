@@ -566,11 +566,11 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{receiver_negotiate, sender_negotiate};
+    use super::{MESSAGE_CDC_PLAN, receiver_negotiate, sender_negotiate};
     use crate::manifest_scan::{FileClass, ManifestEntry};
     use std::env;
     use std::fs;
-    use std::io::{BufReader, BufWriter};
+    use std::io::{BufReader, BufWriter, Cursor};
     use std::net::{TcpListener, TcpStream};
     use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
@@ -663,6 +663,124 @@ mod tests {
         assert_eq!(sender_decision.stats, receiver_decision.stats,);
 
         assert_eq!(fs::read(destination_path).unwrap(), candidate,);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn truncated_plan_keeps_basis_and_retry_succeeds() {
+        let root = temporary_root("truncated-plan");
+
+        let source_root = root.join("source");
+
+        let destination_root = root.join("destination");
+
+        fs::create_dir_all(&source_root).unwrap();
+
+        fs::create_dir_all(&destination_root).unwrap();
+
+        let basis = deterministic_bytes(2 * 1024 * 1024, 0x1357_2468_ABCD_EF01);
+
+        let insertion = deterministic_bytes(4097, 0xCAFE_1234_DEAD_5678);
+
+        let insertion_offset = 1024 * 1024 + 321;
+
+        let mut candidate = Vec::with_capacity(basis.len() + insertion.len());
+
+        candidate.extend_from_slice(&basis[..insertion_offset]);
+
+        candidate.extend_from_slice(&insertion);
+
+        candidate.extend_from_slice(&basis[insertion_offset..]);
+
+        let relative_path = PathBuf::from("file.bin");
+
+        let source_path = source_root.join(&relative_path);
+
+        let destination_path = destination_root.join(&relative_path);
+
+        fs::write(&source_path, &candidate).unwrap();
+
+        fs::write(&destination_path, &basis).unwrap();
+
+        let sender_entry = entry(&source_path, relative_path.clone());
+
+        let receiver_entry = entry(&source_path, relative_path);
+
+        let mut truncated_response = Vec::new();
+
+        truncated_response.push(MESSAGE_CDC_PLAN);
+
+        truncated_response.extend_from_slice(&0_u64.to_be_bytes());
+
+        truncated_response.extend_from_slice(&4096_u64.to_be_bytes());
+
+        truncated_response.extend_from_slice(&[0xA5_u8; 32]);
+
+        let mut reader = Cursor::new(truncated_response);
+
+        let mut index_offer = Vec::new();
+
+        let error = receiver_negotiate(
+            &mut reader,
+            &mut index_offer,
+            &destination_root,
+            0,
+            &receiver_entry,
+            true,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof,);
+
+        assert_eq!(fs::read(&destination_path,).unwrap(), basis,);
+
+        assert_eq!(fs::read_dir(&destination_root,).unwrap().count(), 1,);
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+
+        let address = listener.local_addr().unwrap();
+
+        let receiver_root = destination_root.clone();
+
+        let retry_receiver = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+
+            let reader_stream = stream.try_clone().unwrap();
+
+            let mut reader = BufReader::new(reader_stream);
+
+            let mut writer = BufWriter::new(stream);
+
+            receiver_negotiate(
+                &mut reader,
+                &mut writer,
+                &receiver_root,
+                0,
+                &receiver_entry,
+                true,
+            )
+            .unwrap()
+        });
+
+        let stream = TcpStream::connect(address).unwrap();
+
+        let reader_stream = stream.try_clone().unwrap();
+
+        let mut reader = BufReader::new(reader_stream);
+
+        let mut writer = BufWriter::new(stream);
+
+        let sender_decision =
+            sender_negotiate(&mut reader, &mut writer, &source_root, 0, &sender_entry).unwrap();
+
+        let receiver_decision = retry_receiver.join().unwrap();
+
+        assert!(sender_decision.completed,);
+
+        assert!(receiver_decision.completed,);
+
+        assert_eq!(fs::read(&destination_path,).unwrap(), candidate,);
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -479,6 +479,10 @@ struct TransferFault {
     fail_after_checkpointed_stripes: Option<u64>,
 
     checkpointed_stripes: AtomicU64,
+
+    fail_after_reconstructed_cdc_files: Option<u64>,
+
+    reconstructed_cdc_files: AtomicU64,
 }
 
 impl TransferFault {
@@ -487,6 +491,10 @@ impl TransferFault {
             fail_after_checkpointed_stripes: None,
 
             checkpointed_stripes: AtomicU64::new(0),
+
+            fail_after_reconstructed_cdc_files: None,
+
+            reconstructed_cdc_files: AtomicU64::new(0),
         }
     }
 
@@ -503,6 +511,31 @@ impl TransferFault {
             fail_after_checkpointed_stripes: Some(stripe_count),
 
             checkpointed_stripes: AtomicU64::new(0),
+
+            fail_after_reconstructed_cdc_files: None,
+
+            reconstructed_cdc_files: AtomicU64::new(0),
+        })
+    }
+
+    #[cfg(test)]
+    fn fail_after_reconstructed_cdc_files(file_count: u64) -> io::Result<Self> {
+        if file_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fault injection CDC file count \
+                 must not be zero",
+            ));
+        }
+
+        Ok(Self {
+            fail_after_checkpointed_stripes: None,
+
+            checkpointed_stripes: AtomicU64::new(0),
+
+            fail_after_reconstructed_cdc_files: Some(file_count),
+
+            reconstructed_cdc_files: AtomicU64::new(0),
         })
     }
 
@@ -525,6 +558,36 @@ impl TransferFault {
             io::ErrorKind::ConnectionAborted,
             format!(
                 "fault injection stopped the receiver after {completed} checkpointed stripe(s)"
+            ),
+        ))
+    }
+
+    fn after_reconstructed_cdc_file(&self) -> io::Result<()> {
+        let Some(failure_limit) = self.fail_after_reconstructed_cdc_files else {
+            return Ok(());
+        };
+
+        let completed = self
+            .reconstructed_cdc_files
+            .fetch_add(1, Ordering::SeqCst)
+            .checked_add(1)
+            .ok_or_else(|| {
+                io::Error::other(
+                    "fault-injection CDC file \
+                         count overflowed",
+                )
+            })?;
+
+        if completed < failure_limit {
+            return Ok(());
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!(
+                "fault injection stopped the \
+                 receiver after {completed} \
+                 reconstructed CDC file(s)",
             ),
         ))
     }
@@ -607,6 +670,22 @@ pub fn run_update(
     worker_count: usize,
     data_stream_count: usize,
 ) -> io::Result<MultistreamCopyReport> {
+    run_update_with_fault(
+        source_root,
+        destination_root,
+        worker_count,
+        data_stream_count,
+        Arc::new(TransferFault::disabled()),
+    )
+}
+
+fn run_update_with_fault(
+    source_root: &Path,
+    destination_root: &Path,
+    worker_count: usize,
+    data_stream_count: usize,
+    fault_injection: Arc<TransferFault>,
+) -> io::Result<MultistreamCopyReport> {
     manifest_scan::validate_worker_count(worker_count)?;
 
     control_plane::validate_data_stream_count(data_stream_count)?;
@@ -630,7 +709,7 @@ pub fn run_update(
             run_server_with_mode(
                 &listener,
                 server_destination,
-                Arc::new(TransferFault::disabled()),
+                fault_injection,
                 None,
                 DestinationMode::UpdateVerified,
             )
@@ -3155,9 +3234,19 @@ fn receive_lane(
                 report.cdc.merge(cdc_decision.stats)?;
 
                 if cdc_decision.completed {
+                    let completed_path = destination_root.join(&entry.relative_path);
+
+                    file_metadata::restore_file(
+                        &completed_path,
+                        entry.last_write_time,
+                        entry.file_attributes,
+                    )?;
+
                     add_lane_counts(&mut report, 1, entry.file_size, "receiver CDC")?;
 
                     add_progress(&progress, entry.file_size);
+
+                    fault_injection.after_reconstructed_cdc_file()?;
 
                     continue;
                 }
@@ -4415,9 +4504,9 @@ mod tests {
         DestinationMode, ReceiverReady, TINY_PACK_TARGET_BYTES, TransferAck, TransferFault,
         TransferTask, accept_session, apply_resume_offer, build_transfer_plan,
         connect_with_retry_config, finalize_large_files, prepare_destination, read_receiver_ready,
-        read_transfer_ack, receive_once, run, run_with_fault, send, temporary_path,
-        tiny_pack_record_wire_bytes, validate_resume_offer, validate_source_metadata,
-        verify_content_digest, write_receiver_ready, write_transfer_ack,
+        read_transfer_ack, receive_once, run, run_update, run_update_with_fault, run_with_fault,
+        send, temporary_path, tiny_pack_record_wire_bytes, validate_resume_offer,
+        validate_source_metadata, verify_content_digest, write_receiver_ready, write_transfer_ack,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::file_metadata;
@@ -5045,6 +5134,78 @@ mod tests {
         );
 
         assert!(!destination.join(JOURNAL_FILE_NAME).exists());
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn loopback_update_skips_cdc_file_completed_before_ack() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let parent = env::temp_dir().join(format!(
+            "networkcopy-cdc-interruption-{}-{unique}",
+            process::id(),
+        ));
+
+        let source = parent.join("source");
+
+        let destination = parent.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        fs::create_dir_all(&destination).unwrap();
+
+        let basis = vec![0x5A_u8; 8 * 1024 * 1024];
+
+        let insertion = vec![0xC3_u8; 4097];
+
+        let insertion_offset = 4 * 1024 * 1024 + 123;
+
+        let mut candidate = Vec::with_capacity(basis.len() + insertion.len());
+
+        candidate.extend_from_slice(&basis[..insertion_offset]);
+
+        candidate.extend_from_slice(&insertion);
+
+        candidate.extend_from_slice(&basis[insertion_offset..]);
+
+        let source_path = source.join("medium.bin");
+
+        let destination_path = destination.join("medium.bin");
+
+        fs::write(&source_path, &candidate).unwrap();
+
+        fs::write(&destination_path, &basis).unwrap();
+
+        let fault_injection =
+            Arc::new(TransferFault::fail_after_reconstructed_cdc_files(1).unwrap());
+
+        let interrupted = run_update_with_fault(&source, &destination, 2, 1, fault_injection);
+
+        assert!(interrupted.is_err(),);
+
+        assert!(destination.join(JOURNAL_FILE_NAME,).exists(),);
+
+        assert_eq!(fs::read(&destination_path,).unwrap(), candidate,);
+
+        let report = run_update(&source, &destination, 2, 1).unwrap();
+
+        assert_eq!(report.files_copied, 1,);
+
+        assert_eq!(report.skipped_files, 1,);
+
+        assert_eq!(report.skipped_bytes, candidate.len() as u64,);
+
+        assert_eq!(report.cdc_offered_files, 0,);
+
+        assert_eq!(report.cdc_files, 0,);
+
+        assert_eq!(fs::read(&destination_path,).unwrap(), candidate,);
+
+        assert!(!destination.join(JOURNAL_FILE_NAME,).exists(),);
 
         fs::remove_dir_all(parent).unwrap();
     }
