@@ -28,7 +28,7 @@ Current development version:
 2.0.0-dev
 ```
 
-v1.4 is the current stable release. v2 now includes a protocol-v8 update path
+v1.4 is the current stable release. v2 now includes a protocol-v9 update path
 that reuses verified content from older receiver-side medium and large files,
 transmitting reconstruction references plus changed literal bytes whenever CDC
 is profitable. Medium files retain ordinary whole-file fallback, while large
@@ -62,10 +62,11 @@ Implementation order:
 - [x] receiver basis-file chunk index;
 - [x] deduplicated reconstruction prototype with final BLAKE3 verification;
 - [x] bounded-memory folder-level deduplication planning;
-- [x] protocol-v8 medium-file CDC transfer and ordinary whole-file fallback;
+- [x] protocol-v9 medium-file CDC transfer and ordinary whole-file fallback;
 - [x] large-file CDC with retained multi-lane striped fallback;
 - [x] CDC-aware interruption and file-level retry behavior;
-- [ ] fresh-transfer exact-file reuse using previously committed files;
+- [x] fresh-transfer exact reuse for repeated medium files;
+- [ ] extend exact reuse to tiny packs and striped large files;
 - [ ] session-scoped rolling cross-file CDC using completed files as bases;
 - [ ] bounded chunk catalog with multi-lane generation barriers and retry support;
 - [x] GUI CDC telemetry and mixed-workload loopback acceptance;
@@ -304,7 +305,7 @@ flowchart TD
     C["Changed same-path files"]
     K["Verify and skip"]
     M{"Medium or large file of at least 1 MiB?"}
-    D["Protocol-v8 CDC negotiation"]
+    D["Protocol-v9 CDC negotiation"]
     P{"Index plus plan beats full file?"}
     R["Reconstruct, verify BLAKE3, replace"]
     F["Ordinary whole-file or multi-lane striped fallback"]

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // explicit protocol-version check instead of failing as invalid data.
 const PROTOCOL_MAGIC: [u8; 4] = *b"NCS4";
 
-const PROTOCOL_VERSION: u16 = 8;
+const PROTOCOL_VERSION: u16 = 9;
 
 const ROLE_CONTROL: u8 = 1;
 const ROLE_DATA: u8 = 2;
@@ -920,7 +920,7 @@ mod tests {
         let actual = read_handshake(&mut cursor).unwrap();
 
         assert_eq!(actual, expected);
-        assert_eq!(PROTOCOL_VERSION, 8);
+        assert_eq!(PROTOCOL_VERSION, 9);
     }
 
     #[test]
@@ -929,7 +929,7 @@ mod tests {
 
         bytes.extend_from_slice(&PROTOCOL_MAGIC);
 
-        bytes.extend_from_slice(&7_u16.to_be_bytes());
+        bytes.extend_from_slice(&8_u16.to_be_bytes());
 
         let error = read_handshake(&mut Cursor::new(bytes)).unwrap_err();
 
@@ -937,9 +937,9 @@ mod tests {
 
         let message = error.to_string();
 
-        assert!(message.contains("version 7"));
+        assert!(message.contains("version 8"),);
 
-        assert!(message.contains("requires version 8",),);
+        assert!(message.contains("requires version 9"),);
     }
 
     #[test]

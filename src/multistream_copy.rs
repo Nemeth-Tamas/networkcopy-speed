@@ -37,6 +37,7 @@ const MESSAGE_UPDATE_VERIFY_REQUEST: u8 = 0x35;
 const MESSAGE_TINY_PACK_V2: u8 = 0x36;
 const MESSAGE_UPDATE_VERIFY_RESPONSE: u8 = 0x37;
 const MESSAGE_LARGE_CDC_BEGIN: u8 = 0x3C;
+const MESSAGE_EXACT_REUSE_PLAN: u8 = 0x3D;
 
 const NETWORK_BUFFER_BYTES: usize = 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
@@ -62,6 +63,10 @@ const CDC_INDEX_FIXED_WIRE_BYTES: u64 = 1 + 8 + 8;
 const CDC_FALLBACK_WIRE_BYTES: u64 = 1 + 8;
 
 const CDC_PLAN_FIXED_WIRE_BYTES: u64 = 1 + 8 + 8;
+
+const EXACT_REUSE_PLAN_FIXED_WIRE_BYTES: u64 = 1 + 4;
+
+const EXACT_REUSE_RECORD_WIRE_BYTES: u64 = 8 + 8 + CONTENT_DIGEST_BYTES as u64;
 const MAX_RESUME_OFFER_STRIPES: u32 = 1_000_000;
 const MAX_UNCHANGED_OFFER_FILES: u32 = 1_000_000;
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -483,6 +488,18 @@ struct LargeCdcPreflight {
     completed_file_ids: BTreeSet<usize>,
 
     report: LaneReport,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExactFileReuse {
+    basis_file_id: usize,
+    target_file_id: usize,
+    digest: [u8; CONTENT_DIGEST_BYTES],
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ExactReusePlan {
+    entries: Vec<ExactFileReuse>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -975,6 +992,8 @@ fn send_internal(
 
     let data_started = Instant::now();
 
+    let mut update_session = false;
+
     let mut preparation_message = read_u8(&mut control_stream).map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -987,6 +1006,7 @@ fn send_internal(
     })?;
 
     if preparation_message == MESSAGE_UPDATE_VERIFY_REQUEST {
+        update_session = true;
         let destination_digests = read_update_verification_request(&mut control_stream)?;
 
         let candidate_file_ids: BTreeSet<usize> = destination_digests.keys().copied().collect();
@@ -1024,6 +1044,7 @@ fn send_internal(
     }
 
     let large_cdc_preflight = if preparation_message == MESSAGE_LARGE_CDC_BEGIN {
+        update_session = true;
         let mut control_reader = control_stream.try_clone()?;
 
         let preflight = negotiate_large_cdc_sender(
@@ -1071,12 +1092,28 @@ fn send_internal(
         &receiver_ready.unchanged_file_ids,
     )?;
 
+    let exact_reuse_plan = if update_session {
+        ExactReusePlan::default()
+    } else {
+        build_fresh_exact_reuse_plan(&source_root, &manifest, &transfer_plan, progress.as_ref())?
+    };
+
+    write_exact_reuse_plan(&mut control_stream, &exact_reuse_plan)?;
+
+    let exact_reuse_report = apply_exact_reuse_plan(
+        &mut transfer_plan,
+        &manifest,
+        &exact_reuse_plan,
+        !update_session,
+    )?;
+
     let effective_plan_stats = summarize_transfer_plan(&transfer_plan)?;
 
     let completed_before_transfer = large_cdc_preflight
         .report
         .bytes_copied
         .checked_add(resume_application.logical_report.bytes_copied)
+        .and_then(|bytes| bytes.checked_add(exact_reuse_report.bytes_copied))
         .ok_or_else(|| io::Error::other("initial transfer progress overflowed"))?;
 
     if let Some(progress) = &progress {
@@ -1124,6 +1161,7 @@ fn send_internal(
     let sender_report = merge_lane_reports(vec![
         large_cdc_preflight.report,
         resume_application.logical_report,
+        exact_reuse_report,
         transferred_sender_report,
     ])?;
 
@@ -1466,6 +1504,15 @@ fn run_server_with_mode(
 
     write_receiver_ready(&mut control_stream, &receiver_ready)?;
 
+    let exact_reuse_plan = read_exact_reuse_plan(&mut control_stream)?;
+
+    let exact_reuse_report = apply_exact_reuse_plan(
+        &mut transfer_plan,
+        &manifest,
+        &exact_reuse_plan,
+        destination_mode == DestinationMode::Fresh,
+    )?;
+
     let resume_journal = Arc::new(Mutex::new(resume_journal));
 
     let manifest = Arc::new(manifest);
@@ -1536,6 +1583,7 @@ fn run_server_with_mode(
     let report = merge_lane_reports(vec![
         large_cdc_preflight.report,
         resume_application.logical_report,
+        exact_reuse_report,
         transferred_report,
     ])?;
 
@@ -1550,6 +1598,13 @@ fn run_server_with_mode(
     }
 
     finalize_large_files(destination_root.as_path(), &manifest, destination_mode)?;
+
+    materialize_exact_reuse_files(
+        destination_root.as_path(),
+        &manifest,
+        &exact_reuse_plan,
+        progress.as_ref(),
+    )?;
 
     file_metadata::restore_manifest_files(destination_root.as_path(), &manifest)?;
 
@@ -2994,6 +3049,448 @@ fn apply_large_cdc_preflight(
              does not match the striped \
              transfer plan",
         ));
+    }
+
+    Ok(())
+}
+
+fn exact_reuse_plan_wire_bytes(entry_count: usize) -> io::Result<u64> {
+    let entry_count = u64::try_from(entry_count)
+        .map_err(|_| io::Error::other("exact-reuse entry count cannot be represented"))?;
+
+    EXACT_REUSE_PLAN_FIXED_WIRE_BYTES
+        .checked_add(
+            entry_count
+                .checked_mul(EXACT_REUSE_RECORD_WIRE_BYTES)
+                .ok_or_else(|| io::Error::other("exact-reuse record size overflowed"))?,
+        )
+        .ok_or_else(|| io::Error::other("exact-reuse plan size overflowed"))
+}
+
+fn planned_whole_file_ids(transfer_plan: &TransferPlan) -> BTreeSet<usize> {
+    transfer_plan
+        .lanes
+        .iter()
+        .flatten()
+        .filter_map(|task| {
+            let TransferTask::WholeFile { file_id } = task else {
+                return None;
+            };
+
+            Some(*file_id)
+        })
+        .collect()
+}
+
+fn hash_exact_reuse_candidate(
+    source_root: &Path,
+    file_id: usize,
+    entry: &ManifestEntry,
+) -> io::Result<[u8; CONTENT_DIGEST_BYTES]> {
+    let path = source_root.join(&entry.relative_path);
+
+    let report = content_hash::run(&path, content_hash::DEFAULT_BUFFER_MIB)?;
+
+    let metadata = fs::metadata(&path)?;
+
+    if metadata.len() != entry.file_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "source size changed while planning exact reuse: {}",
+                path.display(),
+            ),
+        ));
+    }
+
+    if metadata.last_write_time() != entry.last_write_time {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "source timestamp changed while planning exact reuse: {}",
+                path.display(),
+            ),
+        ));
+    }
+
+    if report.bytes_hashed != entry.file_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("exact-reuse hash length differs from manifest for file {file_id}",),
+        ));
+    }
+
+    Ok(report.digest)
+}
+
+fn build_fresh_exact_reuse_plan(
+    source_root: &Path,
+    manifest: &[ManifestEntry],
+    transfer_plan: &TransferPlan,
+    progress: Option<&ProgressCounter>,
+) -> io::Result<ExactReusePlan> {
+    let whole_file_ids = planned_whole_file_ids(transfer_plan);
+
+    let mut by_size = BTreeMap::<u64, Vec<usize>>::new();
+
+    for file_id in whole_file_ids {
+        let entry = manifest.get(file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact-reuse planner found an unknown file",
+            )
+        })?;
+
+        if entry.class != FileClass::Medium {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "whole-file task was not a medium file",
+            ));
+        }
+
+        if entry.file_size == 0 {
+            continue;
+        }
+
+        by_size.entry(entry.file_size).or_default().push(file_id);
+    }
+
+    if let Some(progress) = progress {
+        progress.check_cancelled()?;
+        progress.set_label("Finding exact duplicates");
+        progress.set_completed(0);
+        progress.set_total(0);
+    }
+
+    let mut entries = Vec::new();
+
+    for mut same_size_ids in by_size.into_values() {
+        if same_size_ids.len() < 2 {
+            continue;
+        }
+
+        same_size_ids.sort_unstable();
+
+        let mut by_digest = BTreeMap::<[u8; CONTENT_DIGEST_BYTES], Vec<usize>>::new();
+
+        for file_id in same_size_ids {
+            if let Some(progress) = progress {
+                progress.check_cancelled()?;
+            }
+
+            let entry = manifest.get(file_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "exact-reuse planner found an unknown candidate",
+                )
+            })?;
+
+            let digest = hash_exact_reuse_candidate(source_root, file_id, entry)?;
+
+            by_digest.entry(digest).or_default().push(file_id);
+        }
+
+        for (digest, mut identical_ids) in by_digest {
+            if identical_ids.len() < 2 {
+                continue;
+            }
+
+            identical_ids.sort_unstable();
+
+            let basis_file_id = identical_ids[0];
+
+            for &target_file_id in &identical_ids[1..] {
+                entries.push(ExactFileReuse {
+                    basis_file_id,
+                    target_file_id,
+                    digest,
+                });
+            }
+        }
+    }
+
+    entries.sort_unstable_by_key(|entry| (entry.basis_file_id, entry.target_file_id));
+
+    Ok(ExactReusePlan { entries })
+}
+
+fn write_exact_reuse_plan(writer: &mut impl Write, plan: &ExactReusePlan) -> io::Result<()> {
+    let count = u32::try_from(plan.entries.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "exact-reuse plan contains too many entries",
+        )
+    })?;
+
+    if count > MAX_UNCHANGED_OFFER_FILES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "exact-reuse plan exceeds the supported limit",
+        ));
+    }
+
+    write_u8(writer, MESSAGE_EXACT_REUSE_PLAN)?;
+    write_u32(writer, count)?;
+
+    for entry in &plan.entries {
+        write_u64(
+            writer,
+            u64::try_from(entry.basis_file_id).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "exact-reuse basis ID cannot be represented",
+                )
+            })?,
+        )?;
+
+        write_u64(
+            writer,
+            u64::try_from(entry.target_file_id).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "exact-reuse target ID cannot be represented",
+                )
+            })?,
+        )?;
+
+        write_digest(writer, &entry.digest)?;
+    }
+
+    writer.flush()
+}
+
+fn read_exact_reuse_plan(reader: &mut impl Read) -> io::Result<ExactReusePlan> {
+    let message = read_u8(reader)?;
+
+    if message != MESSAGE_EXACT_REUSE_PLAN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected exact-reuse plan, received 0x{message:02X}",),
+        ));
+    }
+
+    let count = read_u32(reader)?;
+
+    if count > MAX_UNCHANGED_OFFER_FILES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "exact-reuse plan exceeds the supported limit",
+        ));
+    }
+
+    let mut entries = Vec::with_capacity(count as usize);
+
+    for _ in 0..count {
+        entries.push(ExactFileReuse {
+            basis_file_id: read_file_id(reader)?,
+            target_file_id: read_file_id(reader)?,
+            digest: read_digest(reader)?,
+        });
+    }
+
+    Ok(ExactReusePlan { entries })
+}
+
+fn apply_exact_reuse_plan(
+    transfer_plan: &mut TransferPlan,
+    manifest: &[ManifestEntry],
+    plan: &ExactReusePlan,
+    allowed: bool,
+) -> io::Result<LaneReport> {
+    if !allowed && !plan.entries.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "exact reuse is currently allowed only for fresh transfers",
+        ));
+    }
+
+    let mut target_file_ids = BTreeSet::new();
+
+    let mut basis_file_ids = BTreeSet::new();
+
+    let mut logical_bytes = 0_u64;
+
+    for reuse in &plan.entries {
+        if reuse.basis_file_id == reuse.target_file_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact-reuse basis and target are the same file",
+            ));
+        }
+
+        let basis = manifest.get(reuse.basis_file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact-reuse basis references an unknown file",
+            )
+        })?;
+
+        let target = manifest.get(reuse.target_file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact-reuse target references an unknown file",
+            )
+        })?;
+
+        if basis.class != FileClass::Medium || target.class != FileClass::Medium {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact reuse currently requires medium files",
+            ));
+        }
+
+        if basis.file_size == 0 || basis.file_size != target.file_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact-reuse files have incompatible sizes",
+            ));
+        }
+
+        if !target_file_ids.insert(reuse.target_file_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact-reuse plan contains a duplicate target",
+            ));
+        }
+
+        basis_file_ids.insert(reuse.basis_file_id);
+
+        logical_bytes = logical_bytes
+            .checked_add(target.file_size)
+            .ok_or_else(|| io::Error::other("exact-reuse logical byte count overflowed"))?;
+    }
+
+    if basis_file_ids
+        .iter()
+        .any(|file_id| target_file_ids.contains(file_id))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "exact-reuse plan contains a dependency chain",
+        ));
+    }
+
+    let planned_whole_files = planned_whole_file_ids(transfer_plan);
+
+    for file_id in basis_file_ids.iter().chain(target_file_ids.iter()) {
+        if !planned_whole_files.contains(file_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("exact-reuse file {file_id} is not an active whole-file task",),
+            ));
+        }
+    }
+
+    for lane in &mut transfer_plan.lanes {
+        lane.retain(|task| {
+            let TransferTask::WholeFile { file_id } = task else {
+                return true;
+            };
+
+            !target_file_ids.contains(file_id)
+        });
+    }
+
+    Ok(LaneReport {
+        files_copied: u64::try_from(plan.entries.len())
+            .map_err(|_| io::Error::other("exact-reuse file count cannot be represented"))?,
+
+        bytes_copied: logical_bytes,
+
+        data_wire_bytes: exact_reuse_plan_wire_bytes(plan.entries.len())?,
+
+        ..LaneReport::default()
+    })
+}
+
+fn materialize_exact_reuse_files(
+    destination_root: &Path,
+    manifest: &[ManifestEntry],
+    plan: &ExactReusePlan,
+    progress: Option<&ProgressCounter>,
+) -> io::Result<()> {
+    for reuse in &plan.entries {
+        if let Some(progress) = progress {
+            progress.check_cancelled()?;
+        }
+
+        let basis = manifest.get(reuse.basis_file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact-reuse basis references an unknown file",
+            )
+        })?;
+
+        let target = manifest.get(reuse.target_file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact-reuse target references an unknown file",
+            )
+        })?;
+
+        let basis_path = destination_root.join(&basis.relative_path);
+
+        let target_path = destination_root.join(&target.relative_path);
+
+        let temporary_path = temporary_path(&target_path, reuse.target_file_id);
+
+        validate_resume_file(&basis_path, basis.file_size, "exact-reuse basis file")?;
+
+        if target_path.try_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "exact-reuse target already exists: {}",
+                    target_path.display(),
+                ),
+            ));
+        }
+
+        remove_file_if_present(&temporary_path)?;
+
+        let materialize_result = (|| -> io::Result<()> {
+            let copied = fs::copy(&basis_path, &temporary_path)?;
+
+            if copied != target.file_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "exact-reuse copy produced {copied} bytes, expected {}",
+                        target.file_size,
+                    ),
+                ));
+            }
+
+            let hash = content_hash::run(&temporary_path, content_hash::DEFAULT_BUFFER_MIB)?;
+
+            let context = format!(
+                "exact-reuse target {} ({})",
+                reuse.target_file_id,
+                target.relative_path.display(),
+            );
+
+            verify_content_digest(&context, &hash.digest, &reuse.digest)?;
+
+            windows_file_replace::replace(&temporary_path, &target_path)?;
+
+            file_metadata::restore_file(
+                &target_path,
+                target.last_write_time,
+                target.file_attributes,
+            )?;
+
+            Ok(())
+        })();
+
+        if let Err(error) = materialize_result {
+            let _ = fs::remove_file(&temporary_path);
+
+            return Err(error);
+        }
+
+        if let Some(progress) = progress {
+            progress.add(target.file_size);
+        }
     }
 
     Ok(())
@@ -6002,6 +6499,80 @@ mod tests {
         assert!(!large_temporary.exists());
 
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn fresh_loopback_reuses_exact_medium_duplicates() {
+        let root = temporary_directory("fresh-exact-reuse");
+
+        let source = root.join("source");
+
+        let destination = root.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        let mut shared = vec![0_u8; 2 * 1024 * 1024 + 137];
+
+        let mut state = 0x1234_5678_u32;
+
+        for byte in &mut shared {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+
+            *byte = state as u8;
+        }
+
+        let mut unique = vec![0_u8; shared.len()];
+
+        let mut state = 0xA5A5_5A5A_u32;
+
+        for byte in &mut unique {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+
+            *byte = state as u8;
+        }
+
+        fs::write(source.join("duplicate-a.bin"), &shared).unwrap();
+
+        fs::write(source.join("duplicate-b.bin"), &shared).unwrap();
+
+        fs::write(source.join("duplicate-c.bin"), &shared).unwrap();
+
+        fs::write(source.join("unique.bin"), &unique).unwrap();
+
+        let report = run(&source, &destination, 2, 2).unwrap();
+
+        assert_eq!(report.files_copied, 4,);
+
+        assert_eq!(report.bytes_copied, (shared.len() * 4) as u64,);
+
+        assert_eq!(report.cdc_offered_files, 0,);
+
+        assert!(report.data_wire_bytes < report.bytes_copied * 3 / 4,);
+
+        assert_eq!(
+            fs::read(destination.join("duplicate-a.bin",),).unwrap(),
+            shared,
+        );
+
+        assert_eq!(
+            fs::read(destination.join("duplicate-b.bin",),).unwrap(),
+            shared,
+        );
+
+        assert_eq!(
+            fs::read(destination.join("duplicate-c.bin",),).unwrap(),
+            shared,
+        );
+
+        assert_eq!(fs::read(destination.join("unique.bin",),).unwrap(), unique,);
+
+        assert!(!destination.join(JOURNAL_FILE_NAME).exists(),);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
