@@ -11,12 +11,11 @@ pub const DEFAULT_AVERAGE_KIB: usize = 64;
 const MIN_AVERAGE_KIB: usize = 4;
 const MAX_AVERAGE_KIB: usize = 4 * 1024;
 
-const ROLLING_WINDOW_BYTES: usize = 64;
+const BOUNDARY_HISTORY_BYTES: usize = u64::BITS as usize;
+
 const READ_BUFFER_BYTES: usize = 1024 * 1024;
 
-const ROLLING_WINDOW_ROTATION: u32 = (ROLLING_WINDOW_BYTES % u64::BITS as usize) as u32;
-
-const BUZHASH_TABLE: [u64; 256] = build_buzhash_table();
+const GEAR_TABLE: [u64; 256] = build_gear_table();
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ChunkKey {
@@ -67,7 +66,7 @@ pub struct ContentDefinedDedupReport {
     pub target_average_bytes: usize,
     pub minimum_chunk_bytes: usize,
     pub maximum_chunk_bytes: usize,
-    pub rolling_window_bytes: usize,
+    pub boundary_history_bytes: usize,
 
     pub basis_bytes: u64,
     pub basis_chunks: u64,
@@ -140,8 +139,8 @@ impl ContentDefinedDedupReport {
         );
 
         println!(
-            "  Rolling window:         {} bytes",
-            self.rolling_window_bytes,
+            "  Boundary history:       {} bytes",
+            self.boundary_history_bytes,
         );
 
         println!();
@@ -308,7 +307,7 @@ pub fn run(
         target_average_bytes: config.average_bytes,
         minimum_chunk_bytes: config.minimum_bytes,
         maximum_chunk_bytes: config.maximum_bytes,
-        rolling_window_bytes: ROLLING_WINDOW_BYTES,
+        boundary_history_bytes: BOUNDARY_HISTORY_BYTES,
 
         basis_bytes: basis.chunking.bytes,
         basis_chunks: basis.chunking.chunks,
@@ -401,7 +400,7 @@ fn chunk_reader(
 
     let mut stats = ChunkingStats::default();
 
-    let mut rolling = RollingWindow::new();
+    let mut boundary_hash = GearHash::new();
 
     let mut read_buffer = vec![0_u8; READ_BUFFER_BYTES];
 
@@ -423,13 +422,13 @@ fn chunk_reader(
         };
 
         for &byte in &read_buffer[..read] {
-            rolling.push(byte);
+            boundary_hash.push(byte);
             chunk.push(byte);
 
             let chunk_bytes = chunk.len();
 
             let boundary = chunk_bytes >= config.minimum_bytes
-                && (rolling.hash() & config.boundary_mask == 0
+                && (boundary_hash.value() & config.boundary_mask == 0
                     || chunk_bytes >= config.maximum_bytes);
 
             if boundary {
@@ -443,6 +442,7 @@ fn chunk_reader(
                     .ok_or_else(|| io::Error::other("content-defined chunk offset overflowed"))?;
 
                 chunk.clear();
+                boundary_hash.reset();
             }
         }
     }
@@ -540,54 +540,36 @@ fn percent(part: u64, total: u64) -> f64 {
     }
 }
 
-#[derive(Debug)]
-struct RollingWindow {
-    bytes: [u8; ROLLING_WINDOW_BYTES],
-    length: usize,
-    position: usize,
-    hash: u64,
+#[derive(Debug, Default)]
+struct GearHash {
+    value: u64,
 }
 
-impl RollingWindow {
+impl GearHash {
     fn new() -> Self {
-        Self {
-            bytes: [0_u8; ROLLING_WINDOW_BYTES],
-            length: 0,
-            position: 0,
-            hash: 0,
-        }
+        Self::default()
     }
 
+    #[inline]
     fn push(&mut self, byte: u8) {
-        let incoming = BUZHASH_TABLE[usize::from(byte)];
-
-        if self.length < ROLLING_WINDOW_BYTES {
-            self.bytes[self.length] = byte;
-            self.length += 1;
-
-            self.hash = self.hash.rotate_left(1) ^ incoming;
-
-            return;
-        }
-
-        let outgoing_byte = self.bytes[self.position];
-
-        self.bytes[self.position] = byte;
-
-        self.position = (self.position + 1) % ROLLING_WINDOW_BYTES;
-
-        let outgoing =
-            BUZHASH_TABLE[usize::from(outgoing_byte)].rotate_left(ROLLING_WINDOW_ROTATION);
-
-        self.hash = self.hash.rotate_left(1) ^ incoming ^ outgoing;
+        self.value = self
+            .value
+            .wrapping_shl(1)
+            .wrapping_add(GEAR_TABLE[usize::from(byte)]);
     }
 
-    fn hash(&self) -> u64 {
-        self.hash
+    #[inline]
+    fn value(&self) -> u64 {
+        self.value
+    }
+
+    #[inline]
+    fn reset(&mut self) {
+        self.value = 0;
     }
 }
 
-const fn build_buzhash_table() -> [u64; 256] {
+const fn build_gear_table() -> [u64; 256] {
     let mut table = [0_u64; 256];
 
     let mut state = 0x9E37_79B9_7F4A_7C15_u64;
@@ -609,7 +591,9 @@ const fn build_buzhash_table() -> [u64; 256] {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChunkConfig, chunk_reader, index_basis, scan_candidate, validate_average_kib};
+    use super::{
+        ChunkConfig, GearHash, chunk_reader, index_basis, scan_candidate, validate_average_kib,
+    };
     use std::io::Cursor;
 
     #[test]
@@ -622,6 +606,24 @@ mod tests {
         assert!(validate_average_kib(3).is_err());
         assert!(validate_average_kib(96).is_err());
         assert!(validate_average_kib(8192).is_err());
+    }
+
+    #[test]
+    fn gear_hash_forgets_old_prefix_after_64_bytes() {
+        let shared = deterministic_bytes(64, 0xCAFE_BABE_DEAD_BEEF);
+
+        let mut first = GearHash::new();
+        let mut second = GearHash::new();
+
+        first.push(0x11);
+        second.push(0xEE);
+
+        for byte in shared {
+            first.push(byte);
+            second.push(byte);
+        }
+
+        assert_eq!(first.value(), second.value());
     }
 
     #[test]

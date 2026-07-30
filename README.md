@@ -71,21 +71,22 @@ runs the fixed-block benchmark at 4, 16, 64, and 256 KiB so future
 content-defined chunking implementations can be evaluated against identical
 inputs.
 
-The first content-defined prototype uses a continuous 64-byte rolling Buzhash
-window. Chunk identities use full BLAKE3 digests; the rolling hash only selects
-boundaries. The default target is 64 KiB, with 32 KiB minimum and 128 KiB
-maximum chunks. Because boundary selection depends on nearby content rather
-than absolute file offsets, scanning can resynchronize after insertions or
-deletions.
+The content-defined prototype uses a 64-bit Gear hash for boundary selection.
+Each byte requires one table lookup, one shift, and one wrapping addition, and
+earlier bytes stop affecting the boundary state after 64 subsequent bytes.
+Chunk identities still use full BLAKE3 digests; the Gear hash selects boundaries
+only. The default target is 64 KiB, with 32 KiB minimum and 128 KiB maximum
+chunks.
 
 The comparison matrix evaluates fixed and content-defined boundaries at 4,
 16, 64, and 256 KiB. It reports reusable and literal bytes, estimated index
 payload, and total basis-indexing plus candidate-scanning throughput.
 
-On the first 64 KiB prototype corpus, an unaligned 4097-byte insertion improved
-from 14.98% fixed-block reuse to 98.68% content-defined reuse. The corresponding
-deletion improved from 14.99% to 98.80%. CDC reduced estimated literal payload
-from roughly 5.95 MB to 92,322 and 84,128 bytes respectively.
+On the 64 KiB mutation corpus, an unaligned 4097-byte insertion improved from
+14.98% fixed-block reuse to 99.41% Gear CDC reuse. The corresponding deletion
+improved from 14.99% to 99.52%. Estimated literal payload fell from roughly
+5.95 MB to 41,575 and 33,381 bytes respectively. Gear CDC analyzed the basis
+and candidate at approximately 1.17 to 1.20 GB/s on the acceptance machine.
 
 ## v1.4 highlights
 
