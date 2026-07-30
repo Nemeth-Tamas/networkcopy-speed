@@ -9,6 +9,7 @@ use crate::destination_inventory;
 use crate::file_metadata;
 use crate::manifest_scan::{self, FileClass, ManifestEntry};
 use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
+use crate::session_cdc_catalog::{self, CatalogCandidate, CatalogLimits, CatalogPlan};
 use crate::striped_file;
 use crate::tcp_connect;
 use crate::tiny_file_pool;
@@ -704,6 +705,13 @@ struct TransferPlan {
     lanes: Vec<Vec<TransferTask>>,
 }
 
+#[derive(Debug)]
+struct FreshGenerationPlan {
+    catalog: CatalogPlan,
+    generation_lanes: Vec<Vec<Vec<TransferTask>>>,
+    trailing_lanes: Vec<Vec<TransferTask>>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct TransferPlanStats {
     tiny_pack_count: u64,
@@ -1159,6 +1167,12 @@ fn send_internal(
         &exact_reuse_plan,
         !update_session,
     )?;
+
+    let _fresh_generation_plan = if update_session {
+        None
+    } else {
+        Some(build_fresh_generation_plan(&manifest, &transfer_plan)?)
+    };
 
     let effective_plan_stats = summarize_transfer_plan(&transfer_plan)?;
 
@@ -2524,6 +2538,308 @@ fn build_transfer_plan(
     }
 
     Ok(TransferPlan { lanes })
+}
+
+fn build_fresh_generation_plan(
+    manifest: &[ManifestEntry],
+    transfer_plan: &TransferPlan,
+) -> io::Result<FreshGenerationPlan> {
+    build_fresh_generation_plan_with_limits(manifest, transfer_plan, CatalogLimits::default())
+}
+
+fn build_fresh_generation_plan_with_limits(
+    manifest: &[ManifestEntry],
+    transfer_plan: &TransferPlan,
+    limits: CatalogLimits,
+) -> io::Result<FreshGenerationPlan> {
+    let candidates = collect_fresh_catalog_candidates(manifest, transfer_plan)?;
+
+    let catalog = session_cdc_catalog::plan(&candidates, limits)?;
+
+    let lane_count = transfer_plan.lanes.len();
+
+    let mut generation_by_file_id = BTreeMap::new();
+
+    for (generation_index, generation) in catalog.generations.iter().enumerate() {
+        if generation.index != generation_index {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fresh-transfer catalog generation index is not contiguous",
+            ));
+        }
+
+        for candidate in &generation.transfer_files {
+            if generation_by_file_id
+                .insert(candidate.file_id, generation_index)
+                .is_some()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fresh-transfer catalog schedules the same file in multiple generations",
+                ));
+            }
+        }
+    }
+
+    let mut generation_lanes: Vec<Vec<Vec<TransferTask>>> = (0..catalog.generations.len())
+        .map(|_| vec![Vec::new(); lane_count])
+        .collect();
+
+    let mut trailing_lanes = vec![Vec::new(); lane_count];
+
+    for (lane_id, lane) in transfer_plan.lanes.iter().enumerate() {
+        for task in lane {
+            let Some(file_id) = catalog_task_file_id(task) else {
+                trailing_lanes[lane_id].push(task.clone());
+
+                continue;
+            };
+
+            let generation_index = generation_by_file_id.get(&file_id).copied().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "fresh-transfer task for file {file_id} was not assigned to a catalog generation"
+                    ),
+                )
+            })?;
+
+            let generation = generation_lanes.get_mut(generation_index).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fresh-transfer generation index is outside the execution plan",
+                )
+            })?;
+
+            let lane = generation.get_mut(lane_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fresh-transfer lane index is outside the execution plan",
+                )
+            })?;
+
+            lane.push(task.clone());
+        }
+    }
+
+    let plan = FreshGenerationPlan {
+        catalog,
+        generation_lanes,
+        trailing_lanes,
+    };
+
+    validate_fresh_generation_plan(manifest, transfer_plan, &plan)?;
+
+    Ok(plan)
+}
+
+fn collect_fresh_catalog_candidates(
+    manifest: &[ManifestEntry],
+    transfer_plan: &TransferPlan,
+) -> io::Result<Vec<CatalogCandidate>> {
+    let mut file_ids = BTreeSet::new();
+
+    for task in transfer_plan.lanes.iter().flatten() {
+        let Some(file_id) = catalog_task_file_id(task) else {
+            continue;
+        };
+
+        let entry = manifest.get(file_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("fresh-transfer catalog task references unknown file ID {file_id}"),
+            )
+        })?;
+
+        match task {
+            TransferTask::WholeFile { .. } if entry.class != FileClass::Medium => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fresh-transfer catalog found a whole-file task that is not medium",
+                ));
+            }
+
+            TransferTask::Stripe { .. } if entry.class != FileClass::Large => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fresh-transfer catalog found a stripe task that is not large",
+                ));
+            }
+
+            TransferTask::WholeFile { .. } | TransferTask::Stripe { .. } => {}
+
+            TransferTask::TinyPack { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "tiny-pack task unexpectedly entered fresh-transfer catalog planning",
+                ));
+            }
+        }
+
+        file_ids.insert(file_id);
+    }
+
+    file_ids
+        .into_iter()
+        .map(|file_id| {
+            let entry = manifest.get(file_id).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fresh-transfer catalog candidate disappeared from the manifest",
+                )
+            })?;
+
+            CatalogCandidate::new(file_id, entry.file_size)
+        })
+        .collect()
+}
+
+fn catalog_task_file_id(task: &TransferTask) -> Option<usize> {
+    match task {
+        TransferTask::WholeFile { file_id } | TransferTask::Stripe { file_id, .. } => {
+            Some(*file_id)
+        }
+
+        TransferTask::TinyPack { .. } => None,
+    }
+}
+
+fn validate_fresh_generation_plan(
+    manifest: &[ManifestEntry],
+    transfer_plan: &TransferPlan,
+    plan: &FreshGenerationPlan,
+) -> io::Result<()> {
+    let lane_count = transfer_plan.lanes.len();
+
+    if plan.generation_lanes.len() != plan.catalog.generations.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fresh-transfer execution generation count differs from its catalog",
+        ));
+    }
+
+    if plan.trailing_lanes.len() != lane_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fresh-transfer trailing lane count differs from the transfer plan",
+        ));
+    }
+
+    let mut scheduled_file_ids = BTreeSet::new();
+
+    for (generation, lanes) in plan.catalog.generations.iter().zip(&plan.generation_lanes) {
+        if lanes.len() != lane_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fresh-transfer generation has an incorrect lane count",
+            ));
+        }
+
+        let expected_file_ids: BTreeSet<usize> = generation
+            .transfer_files
+            .iter()
+            .map(|candidate| candidate.file_id)
+            .collect();
+
+        let mut actual_file_ids = BTreeSet::new();
+
+        for task in lanes.iter().flatten() {
+            let file_id = catalog_task_file_id(task).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fresh-transfer catalog generation contains a trailing task",
+                )
+            })?;
+
+            if !expected_file_ids.contains(&file_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("fresh-transfer generation contains unexpected file ID {file_id}"),
+                ));
+            }
+
+            actual_file_ids.insert(file_id);
+        }
+
+        if actual_file_ids != expected_file_ids {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fresh-transfer generation tasks do not match its catalog files",
+            ));
+        }
+
+        for file_id in actual_file_ids {
+            if !scheduled_file_ids.insert(file_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fresh-transfer execution schedules the same file in multiple generations",
+                ));
+            }
+        }
+    }
+
+    for task in plan.trailing_lanes.iter().flatten() {
+        if catalog_task_file_id(task).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fresh-transfer trailing lanes contain a catalog-eligible task",
+            ));
+        }
+    }
+
+    let expected_file_ids: BTreeSet<usize> =
+        collect_fresh_catalog_candidates(manifest, transfer_plan)?
+            .into_iter()
+            .map(|candidate| candidate.file_id)
+            .collect();
+
+    if scheduled_file_ids != expected_file_ids {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fresh-transfer execution file set differs from its catalog candidates",
+        ));
+    }
+
+    let expected_task_count = transfer_plan
+        .lanes
+        .iter()
+        .try_fold(0_usize, |count, lane| {
+            count
+                .checked_add(lane.len())
+                .ok_or_else(|| io::Error::other("fresh-transfer task count overflowed"))
+        })?;
+
+    let generation_task_count = plan
+        .generation_lanes
+        .iter()
+        .flat_map(|generation| generation.iter())
+        .try_fold(0_usize, |count, lane| {
+            count
+                .checked_add(lane.len())
+                .ok_or_else(|| io::Error::other("generation task count overflowed"))
+        })?;
+
+    let trailing_task_count = plan
+        .trailing_lanes
+        .iter()
+        .try_fold(0_usize, |count, lane| {
+            count
+                .checked_add(lane.len())
+                .ok_or_else(|| io::Error::other("trailing task count overflowed"))
+        })?;
+
+    let actual_task_count = generation_task_count
+        .checked_add(trailing_task_count)
+        .ok_or_else(|| io::Error::other("fresh-transfer execution task count overflowed"))?;
+
+    if actual_task_count != expected_task_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fresh-transfer execution did not preserve every scheduled task",
+        ));
+    }
+
+    Ok(())
 }
 
 fn least_loaded_lane(lanes: &[Vec<TransferTask>], assigned_bytes: &[u64]) -> io::Result<usize> {
@@ -5665,16 +5981,18 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 mod tests {
     use super::{
         DestinationMode, ReceiverReady, TINY_PACK_TARGET_BYTES, TransferAck, TransferFault,
-        TransferTask, accept_session, apply_resume_offer, build_transfer_plan,
-        connect_with_retry_config, finalize_large_files, prepare_destination, read_receiver_ready,
-        read_transfer_ack, receive_once, run, run_update, run_update_with_fault, run_with_fault,
-        send, temporary_path, tiny_pack_record_wire_bytes, validate_resume_offer,
-        validate_source_metadata, verify_content_digest, write_receiver_ready, write_transfer_ack,
+        TransferTask, accept_session, apply_resume_offer, build_fresh_generation_plan_with_limits,
+        build_transfer_plan, catalog_task_file_id, connect_with_retry_config, finalize_large_files,
+        prepare_destination, read_receiver_ready, read_transfer_ack, receive_once, run, run_update,
+        run_update_with_fault, run_with_fault, send, temporary_path, tiny_pack_record_wire_bytes,
+        validate_resume_offer, validate_source_metadata, verify_content_digest,
+        write_receiver_ready, write_transfer_ack,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::file_metadata;
     use crate::manifest_scan::{self, FileClass, ManifestEntry};
     use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
+    use crate::session_cdc_catalog::CatalogLimits;
     use std::collections::BTreeSet;
     use std::env;
     use std::fs::{self, File};
@@ -5750,6 +6068,130 @@ mod tests {
         assert_eq!(whole_file_count, 1);
         assert_eq!(tiny_pack_count, 1);
         assert_eq!(tiny_file_count, 2);
+    }
+
+    #[test]
+    fn fresh_generation_plan_partitions_catalog_files_and_keeps_tiny_packs_trailing() {
+        let manifest = vec![
+            entry("large.bin", 300, FileClass::Large),
+            entry("medium.bin", 200, FileClass::Medium),
+            entry("tiny-a.bin", 10, FileClass::Tiny),
+            entry("tiny-b.bin", 20, FileClass::Tiny),
+        ];
+
+        let transfer_plan = build_transfer_plan(&manifest, 2).unwrap();
+
+        let generation_plan = build_fresh_generation_plan_with_limits(
+            &manifest,
+            &transfer_plan,
+            CatalogLimits {
+                generation_target_bytes: 250,
+                max_catalog_entries: 100,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(generation_plan.catalog.generations.len(), 2);
+        assert_eq!(generation_plan.generation_lanes.len(), 2);
+
+        assert!(
+            generation_plan.catalog.generations[0]
+                .basis_file_ids
+                .is_empty()
+        );
+
+        assert_eq!(
+            generation_plan.catalog.generations[0].published_file_ids,
+            vec![0],
+        );
+
+        assert_eq!(
+            generation_plan.catalog.generations[1].basis_file_ids,
+            vec![0],
+        );
+
+        assert_eq!(
+            generation_plan.catalog.generations[1].published_file_ids,
+            vec![1],
+        );
+
+        let first_generation_file_ids: BTreeSet<usize> = generation_plan.generation_lanes[0]
+            .iter()
+            .flatten()
+            .filter_map(catalog_task_file_id)
+            .collect();
+
+        let second_generation_file_ids: BTreeSet<usize> = generation_plan.generation_lanes[1]
+            .iter()
+            .flatten()
+            .filter_map(catalog_task_file_id)
+            .collect();
+
+        assert_eq!(first_generation_file_ids, BTreeSet::from([0]));
+        assert_eq!(second_generation_file_ids, BTreeSet::from([1]));
+
+        let trailing_tasks = generation_plan
+            .trailing_lanes
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        assert_eq!(trailing_tasks.len(), 1);
+
+        match trailing_tasks[0] {
+            TransferTask::TinyPack {
+                file_ids,
+                total_bytes,
+            } => {
+                assert_eq!(file_ids.as_slice(), &[2, 3]);
+                assert_eq!(*total_bytes, 30);
+            }
+
+            task => {
+                panic!("unexpected trailing task: {task:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_generation_plan_keeps_tiny_only_transfer_on_one_shot_lanes() {
+        let manifest = vec![
+            entry("tiny-a.bin", 10, FileClass::Tiny),
+            entry("tiny-b.bin", 20, FileClass::Tiny),
+        ];
+
+        let transfer_plan = build_transfer_plan(&manifest, 2).unwrap();
+
+        let expected_task_count = transfer_plan.lanes.iter().map(Vec::len).sum::<usize>();
+
+        let generation_plan = build_fresh_generation_plan_with_limits(
+            &manifest,
+            &transfer_plan,
+            CatalogLimits {
+                generation_target_bytes: 1,
+                max_catalog_entries: 100,
+            },
+        )
+        .unwrap();
+
+        assert!(generation_plan.catalog.generations.is_empty());
+        assert!(generation_plan.generation_lanes.is_empty());
+
+        let trailing_task_count = generation_plan
+            .trailing_lanes
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>();
+
+        assert_eq!(trailing_task_count, expected_task_count);
+
+        assert!(
+            generation_plan
+                .trailing_lanes
+                .iter()
+                .flatten()
+                .all(|task| matches!(task, TransferTask::TinyPack { .. }))
+        );
     }
 
     #[test]
