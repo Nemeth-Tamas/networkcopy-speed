@@ -2597,13 +2597,6 @@ fn build_transfer_plan(
     Ok(TransferPlan { lanes })
 }
 
-fn build_fresh_generation_plan(
-    manifest: &[ManifestEntry],
-    transfer_plan: &TransferPlan,
-) -> io::Result<FreshGenerationPlan> {
-    build_fresh_generation_plan_with_limits(manifest, transfer_plan, CatalogLimits::default())
-}
-
 fn build_fresh_generation_plan_with_limits(
     manifest: &[ManifestEntry],
     transfer_plan: &TransferPlan,
