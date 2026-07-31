@@ -25,13 +25,13 @@ The repository currently contains:
 Current stable release:
 
 ```text
-2.0.0
+2.1.0
 ```
 
 Current development version:
 
 ```text
-2.1.0-dev
+2.1.0
 ```
 
 v2.1 focuses on stronger interrupted-transfer recovery and broader local reuse.
@@ -39,9 +39,9 @@ Its first milestone persists fully committed fresh-transfer files so a resumed
 session can safely rebuild the same bounded CDC catalog instead of retransmitting
 already completed generations.
 
-The stable v2.0 release uses protocol v10. Current v2.1 development builds use
-protocol v11, adding BLAKE3 verification of journaled fresh-transfer files
-before they may re-enter the resumed session CDC catalog.
+The stable v2.1 release uses protocol v11. It adds BLAKE3 verification of
+journaled fresh-transfer files before they may re-enter the resumed session CDC
+catalog.
 
 v2 supports verified content reuse during both updates
 and fresh folder transfers. Update mode reuses content from older receiver-side
@@ -77,7 +77,32 @@ The GUI includes:
 - [x] extend exact reuse to tiny-file packs;
 - [x] extend exact reuse to striped large files;
 - [x] add repeated crash, corruption, and restart acceptance tests;
-- [ ] complete physical two-machine interruption acceptance.
+- [x] complete two-Windows-instance direct-link interruption acceptance.
+
+### v2.1 interruption acceptance
+
+The release candidate was tested between two independent Windows virtual
+machines using automatic Direct Link discovery over IPv6 link-local addresses.
+
+The receiver was forcibly terminated after the first 480 MiB generation had
+been committed and atomically journaled. After restart, NetworkCopy verified and
+skipped all eight committed files, then reconstructed eight related files using
+the preserved receiver-side catalog.
+
+The resumed session reported:
+
+- 8 skipped committed files / 503,316,480 bytes;
+- 8 completed CDC files and 0 fallbacks;
+- 501,686,315 reused bytes;
+- 1,630,165 literal bytes;
+- 0 CDC index wire bytes;
+- 99.84% total wire savings;
+- matching independent SHA-256 manifests;
+- successful resume-journal removal after completion.
+
+Physical network throughput and Direct Link discovery had already passed the
+v2.0 two-machine acceptance. The v2.1 run specifically validates the new
+interruption, verification, catalog reconstruction, and restart behavior.
 
 ### Automated v2.1 recovery torture
 
@@ -97,6 +122,62 @@ Use a smaller round count for a quick local smoke run:
 ```powershell
 .\scripts\run-v21-torture.ps1 -Rounds 2
 ```
+
+### Automated v2.1 release-candidate gate
+
+The release builder can run the complete local gate, execute the ignored
+recovery matrices, build the CLI and both GUI language variants, smoke-test the
+CLI version output, and generate SHA-256 checksums.
+
+While the package version remains `2.1.0-dev`, create a local release candidate
+with two torture rounds per matrix:
+
+```powershell
+.\scripts\Build-Release.ps1 `
+    -AllowDevelopmentVersion `
+    -TortureRounds 2
+```
+
+For the final pre-release local gate, use ten rounds:
+
+```powershell
+.\scripts\Build-Release.ps1 `
+    -AllowDevelopmentVersion `
+    -TortureRounds 10
+```
+
+The `-AllowDevelopmentVersion` switch must be removed after `Cargo.toml` is
+changed to the stable `2.1.0` version.
+
+## v2.2 roadmap — LAN management
+
+v2.2 will add a separate management interface that discovers NetworkCopy
+sender and receiver agents on the local network and remotely orchestrates
+transfers between them.
+
+The management computer will carry only commands, status, and progress data.
+File payloads will continue to travel directly from the selected sender to the
+selected receiver.
+
+Initial v2.2 scope:
+
+- [ ] add a persistent sender/receiver agent mode;
+- [ ] advertise and discover available agents on the LAN;
+- [ ] report machine name, addresses, capabilities, and current state;
+- [ ] remotely enumerate drives and folders on each endpoint;
+- [ ] select the source machine and source folder;
+- [ ] select the receiver machine and destination folder;
+- [ ] support Direct Link and explicit IP transfer modes;
+- [ ] start, cancel, resume, and inspect transfer jobs remotely;
+- [ ] keep active transfers running if the management UI disconnects;
+- [ ] add a separate WGPU management application;
+- [ ] test three-machine orchestration on a physical LAN.
+
+The first v2.2 management release will intentionally use a trusted-LAN model
+without authentication or encryption. It must only be used on a known,
+controlled network. Pairing, authenticated commands, encrypted management
+traffic, allowed-root policies, and stronger remote-filesystem protections are
+planned after the working management workflow has been field-tested.
 
 ## v2 roadmap
 

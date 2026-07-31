@@ -1,7 +1,11 @@
 [CmdletBinding()]
 param(
     [switch]$SkipChecks,
-    [switch]$AllowDevelopmentVersion
+
+    [switch]$AllowDevelopmentVersion,
+
+    [ValidateRange(0, 100)]
+    [int]$TortureRounds = 0
 )
 
 Set-StrictMode -Version Latest
@@ -45,6 +49,12 @@ $repoRoot = Resolve-RepositoryRoot
 $distRoot = Join-Path $repoRoot "dist"
 $releaseRoot = Join-Path $repoRoot "target\release"
 
+$hadPreviousTortureRounds =
+    Test-Path Env:NETWORKCOPY_TORTURE_ROUNDS
+
+$previousTortureRounds =
+    $env:NETWORKCOPY_TORTURE_ROUNDS
+
 Push-Location $repoRoot
 
 try {
@@ -83,6 +93,13 @@ try {
 
     if (-not $SkipChecks) {
         Invoke-Cargo @(
+            "fmt",
+            "--all",
+            "--",
+            "--check"
+        )
+
+        Invoke-Cargo @(
             "test",
             "--locked"
         )
@@ -96,9 +113,41 @@ try {
             "-D",
             "warnings"
         )
+
+        if ($TortureRounds -gt 0) {
+            $env:NETWORKCOPY_TORTURE_ROUNDS =
+                [string]$TortureRounds
+
+            Write-Host
+            Write-Host (
+                "Running v2.1 recovery torture: " +
+                "$TortureRounds round(s) per matrix"
+            ) -ForegroundColor Yellow
+
+            Invoke-Cargo @(
+                "test",
+                "--locked",
+                "--release",
+                "torture_matrix",
+                "--",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1"
+            )
+        }
+        else {
+            Write-Host
+            Write-Host (
+                "Recovery torture skipped. " +
+                "Use -TortureRounds N to enable it."
+            ) -ForegroundColor DarkYellow
+        }
     }
     else {
-        Write-Warning "Tests and Clippy were skipped."
+        Write-Warning (
+            "Formatting, tests, Clippy, and recovery " +
+            "torture were skipped."
+        )
     }
 
     if (Test-Path -LiteralPath $distRoot) {
@@ -224,5 +273,15 @@ try {
     Write-Host "  $distRoot"
 }
 finally {
+    if ($hadPreviousTortureRounds) {
+        $env:NETWORKCOPY_TORTURE_ROUNDS =
+            $previousTortureRounds
+    }
+    else {
+        Remove-Item `
+            Env:NETWORKCOPY_TORTURE_ROUNDS `
+            -ErrorAction SilentlyContinue
+    }
+
     Pop-Location
 }
