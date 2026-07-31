@@ -76,8 +76,27 @@ The GUI includes:
 - [x] retain cross-file CDC reuse after interruption and restart;
 - [x] extend exact reuse to tiny-file packs;
 - [x] extend exact reuse to striped large files;
-- [ ] add repeated crash, corruption, and restart acceptance tests;
+- [x] add repeated crash, corruption, and restart acceptance tests;
 - [ ] complete physical two-machine interruption acceptance.
+
+### Automated v2.1 recovery torture
+
+The long-running recovery matrices are ignored during ordinary `cargo test`
+runs. They repeatedly exercise fresh-generation crashes, multiple restarts,
+cross-file CDC catalog recovery, same-size corruption rejection, and large-file
+stripe checkpoint recovery.
+
+Run ten rounds of every matrix in release mode:
+
+```powershell
+.\scripts\run-v21-torture.ps1 -Rounds 10
+```
+
+Use a smaller round count for a quick local smoke run:
+
+```powershell
+.\scripts\run-v21-torture.ps1 -Rounds 2
+```
 
 ## v2 roadmap
 

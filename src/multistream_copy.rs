@@ -9365,6 +9365,435 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "long-running recovery torture suite"]
+    fn fresh_resume_generation_torture_matrix() {
+        let rounds = torture_round_count();
+
+        for round in 0..rounds {
+            println!("fresh generation torture round {}/{}", round + 1, rounds,);
+
+            let root = temporary_directory(&format!("fresh-generation-torture-{round}"));
+
+            let source = root.join("source");
+            let destination = root.join("destination");
+
+            fs::create_dir_all(&source).unwrap();
+
+            let round_seed = u64::try_from(round).unwrap();
+
+            let basis =
+                deterministic_test_bytes(8 * 1024 * 1024, 0x1234_5678_90AB_CDEF ^ round_seed);
+
+            let mut target_one = basis.clone();
+
+            for byte in &mut target_one[1024 * 1024..1024 * 1024 + 64 * 1024] {
+                *byte ^= 0x5A;
+            }
+
+            let mut target_two = basis.clone();
+
+            for byte in &mut target_two[5 * 1024 * 1024..5 * 1024 * 1024 + 64 * 1024] {
+                *byte ^= 0xA5;
+            }
+
+            fs::write(source.join("00-basis.bin"), &basis).unwrap();
+
+            fs::write(source.join("01-target.bin"), &target_one).unwrap();
+
+            fs::write(source.join("02-target.bin"), &target_two).unwrap();
+
+            let scan = manifest_scan::run(&source, 2).unwrap();
+
+            assert_eq!(scan.manifest.len(), 3);
+
+            assert!(
+                scan.manifest
+                    .iter()
+                    .all(|entry| { entry.class == FileClass::Medium }),
+            );
+
+            let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+
+            let basis_file_id = scan
+                .manifest
+                .iter()
+                .position(|entry| entry.relative_path == Path::new("00-basis.bin"))
+                .unwrap();
+
+            let target_one_file_id = scan
+                .manifest
+                .iter()
+                .position(|entry| entry.relative_path == Path::new("01-target.bin"))
+                .unwrap();
+
+            let catalog_limits = CatalogLimits {
+                generation_target_bytes: basis.len() as u64,
+
+                ..CatalogLimits::default()
+            };
+
+            let transfer_plan = build_transfer_plan(&scan.manifest, 2).unwrap();
+
+            let generation_plan = build_fresh_generation_plan_with_limits(
+                &scan.manifest,
+                &transfer_plan,
+                catalog_limits,
+            )
+            .unwrap();
+
+            assert_eq!(generation_plan.catalog.generations.len(), 3,);
+
+            assert!(
+                generation_plan
+                    .catalog
+                    .generations
+                    .iter()
+                    .all(|generation| { generation.transfer_files.len() == 1 }),
+            );
+
+            let first_fault = TransferFault::with_catalog_limits_and_persisted_generation_failure(
+                catalog_limits,
+                1,
+            )
+            .unwrap();
+
+            let first_result = run_with_fault(&source, &destination, 2, 2, Arc::new(first_fault));
+
+            assert!(
+                first_result.is_err(),
+                "round {round}: first injected crash unexpectedly succeeded",
+            );
+
+            let journal =
+                ResumeJournal::load_existing(&destination, summary.fingerprint, 2).unwrap();
+
+            assert_eq!(
+                journal.completed_file_ids().collect::<Vec<_>>(),
+                vec![basis_file_id],
+            );
+
+            assert_eq!(fs::read(destination.join("00-basis.bin"),).unwrap(), basis,);
+
+            let second_fault = TransferFault::with_catalog_limits_and_persisted_generation_failure(
+                catalog_limits,
+                1,
+            )
+            .unwrap();
+
+            let second_result = run_with_fault(&source, &destination, 2, 2, Arc::new(second_fault));
+
+            assert!(
+                second_result.is_err(),
+                "round {round}: second injected crash unexpectedly succeeded",
+            );
+
+            let journal =
+                ResumeJournal::load_existing(&destination, summary.fingerprint, 2).unwrap();
+
+            let mut expected_completed = vec![basis_file_id, target_one_file_id];
+
+            expected_completed.sort_unstable();
+
+            assert_eq!(
+                journal.completed_file_ids().collect::<Vec<_>>(),
+                expected_completed,
+            );
+
+            assert_eq!(
+                fs::read(destination.join("01-target.bin"),).unwrap(),
+                target_one,
+            );
+
+            let final_fault = TransferFault::with_catalog_limits(catalog_limits).unwrap();
+
+            let report =
+                run_with_fault(&source, &destination, 2, 2, Arc::new(final_fault)).unwrap();
+
+            assert_eq!(report.files_copied, 3);
+
+            assert_eq!(
+                report.bytes_copied,
+                (basis.len() + target_one.len() + target_two.len()) as u64,
+            );
+
+            assert_eq!(report.skipped_files, 2);
+
+            assert_eq!(
+                report.skipped_bytes,
+                (basis.len() + target_one.len()) as u64,
+            );
+
+            assert_eq!(report.exact_reused_files, 0);
+
+            assert_eq!(report.cdc_offered_files, 1);
+
+            assert_eq!(report.cdc_files, 1);
+
+            assert_eq!(report.cdc_fallback_files, 0,);
+
+            assert_eq!(report.cdc_logical_bytes, target_two.len() as u64,);
+
+            assert!(report.cdc_reused_bytes > target_two.len() as u64 * 90 / 100,);
+
+            assert!(report.cdc_literal_bytes < 1024 * 1024,);
+
+            assert_eq!(report.cdc_index_wire_bytes, 0,);
+
+            assert!(report.cdc_plan_wire_bytes > 0,);
+
+            assert_eq!(fs::read(destination.join("00-basis.bin"),).unwrap(), basis,);
+
+            assert_eq!(
+                fs::read(destination.join("01-target.bin"),).unwrap(),
+                target_one,
+            );
+
+            assert_eq!(
+                fs::read(destination.join("02-target.bin"),).unwrap(),
+                target_two,
+            );
+
+            assert!(!destination.join(JOURNAL_FILE_NAME).exists(),);
+
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "long-running recovery torture suite"]
+    fn fresh_resume_corruption_torture_matrix() {
+        let rounds = torture_round_count();
+
+        for round in 0..rounds {
+            println!("fresh corruption torture round {}/{}", round + 1, rounds,);
+
+            let root = temporary_directory(&format!("fresh-corruption-torture-{round}"));
+
+            let source = root.join("source");
+            let destination = root.join("destination");
+
+            fs::create_dir_all(&source).unwrap();
+
+            let round_seed = u64::try_from(round).unwrap();
+
+            let basis =
+                deterministic_test_bytes(8 * 1024 * 1024, 0xA1B2_C3D4_E5F6_0718 ^ round_seed);
+
+            let mut target = basis.clone();
+
+            for byte in &mut target[3 * 1024 * 1024..3 * 1024 * 1024 + 64 * 1024] {
+                *byte ^= 0x3C;
+            }
+
+            fs::write(source.join("00-basis.bin"), &basis).unwrap();
+
+            fs::write(source.join("01-target.bin"), &target).unwrap();
+
+            let scan = manifest_scan::run(&source, 2).unwrap();
+
+            let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+
+            let basis_file_id = scan
+                .manifest
+                .iter()
+                .position(|entry| entry.relative_path == Path::new("00-basis.bin"))
+                .unwrap();
+
+            let catalog_limits = CatalogLimits {
+                generation_target_bytes: basis.len() as u64,
+
+                ..CatalogLimits::default()
+            };
+
+            let fault = TransferFault::with_catalog_limits_and_persisted_generation_failure(
+                catalog_limits,
+                1,
+            )
+            .unwrap();
+
+            let interrupted = run_with_fault(&source, &destination, 2, 2, Arc::new(fault));
+
+            assert!(
+                interrupted.is_err(),
+                "round {round}: injected corruption setup crash unexpectedly succeeded",
+            );
+
+            let journal =
+                ResumeJournal::load_existing(&destination, summary.fingerprint, 2).unwrap();
+
+            assert_eq!(
+                journal.completed_file_ids().collect::<Vec<_>>(),
+                vec![basis_file_id],
+            );
+
+            let destination_basis = destination.join("00-basis.bin");
+
+            let mut corrupted = fs::read(&destination_basis).unwrap();
+
+            let corruption_offset = corrupted.len() / 2;
+
+            corrupted[corruption_offset] ^= 0xFF;
+
+            fs::write(&destination_basis, &corrupted).unwrap();
+
+            let basis_entry = &scan.manifest[basis_file_id];
+
+            file_metadata::restore_file(
+                &destination_basis,
+                basis_entry.last_write_time,
+                basis_entry.file_attributes,
+            )
+            .unwrap();
+
+            assert_eq!(
+                fs::metadata(&destination_basis).unwrap().len(),
+                basis_entry.file_size,
+            );
+
+            assert_eq!(
+                fs::metadata(&destination_basis).unwrap().last_write_time(),
+                basis_entry.last_write_time,
+            );
+
+            let restart_fault = TransferFault::with_catalog_limits(catalog_limits).unwrap();
+
+            let restart = run_with_fault(&source, &destination, 2, 2, Arc::new(restart_fault));
+
+            assert!(
+                restart.is_err(),
+                "round {round}: BLAKE3 accepted a same-size corrupted committed file",
+            );
+
+            assert!(destination.join(JOURNAL_FILE_NAME).exists(),);
+
+            let journal =
+                ResumeJournal::load_existing(&destination, summary.fingerprint, 2).unwrap();
+
+            assert_eq!(
+                journal.completed_file_ids().collect::<Vec<_>>(),
+                vec![basis_file_id],
+            );
+
+            assert_eq!(fs::read(&destination_basis).unwrap(), corrupted,);
+
+            assert_ne!(fs::read(source.join("00-basis.bin"),).unwrap(), corrupted,);
+
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "long-running recovery torture suite"]
+    fn stripe_resume_torture_matrix() {
+        let rounds = torture_round_count();
+
+        for round in 0..rounds {
+            println!("stripe resume torture round {}/{}", round + 1, rounds,);
+
+            let root = temporary_directory(&format!("stripe-resume-torture-{round}"));
+
+            let source = root.join("source");
+            let destination = root.join("destination");
+
+            fs::create_dir_all(&source).unwrap();
+
+            let file_sizes = [
+                64 * 1024 * 1024 + 137,
+                64 * 1024 * 1024 + 271,
+                64 * 1024 * 1024 + 4097,
+            ];
+
+            for (index, &file_size) in file_sizes.iter().enumerate() {
+                let round_seed = u64::try_from(round).unwrap();
+
+                let index_seed = u64::try_from(index).unwrap();
+
+                let contents = deterministic_test_bytes(
+                    file_size,
+                    0x0F1E_2D3C_4B5A_6978 ^ round_seed ^ index_seed.wrapping_mul(0x9E37_79B9),
+                );
+
+                fs::write(source.join(format!("{index:02}-large.bin")), contents).unwrap();
+            }
+
+            let scan = manifest_scan::run(&source, 2).unwrap();
+
+            assert_eq!(scan.manifest.len(), 3);
+
+            assert!(
+                scan.manifest
+                    .iter()
+                    .all(|entry| { entry.class == FileClass::Large }),
+            );
+
+            let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+
+            let first_fault = TransferFault::fail_after_checkpointed_stripes(1).unwrap();
+
+            let first_result = run_with_fault(&source, &destination, 2, 1, Arc::new(first_fault));
+
+            assert!(
+                first_result.is_err(),
+                "round {round}: first stripe crash unexpectedly succeeded",
+            );
+
+            let journal =
+                ResumeJournal::load_existing(&destination, summary.fingerprint, 1).unwrap();
+
+            assert_eq!(journal.completed_stripes().count(), 1,);
+
+            let second_fault = TransferFault::fail_after_checkpointed_stripes(1).unwrap();
+
+            let second_result = run_with_fault(&source, &destination, 2, 1, Arc::new(second_fault));
+
+            assert!(
+                second_result.is_err(),
+                "round {round}: second stripe crash unexpectedly succeeded",
+            );
+
+            let journal =
+                ResumeJournal::load_existing(&destination, summary.fingerprint, 1).unwrap();
+
+            assert_eq!(journal.completed_stripes().count(), 2,);
+
+            let report = run(&source, &destination, 2, 1).unwrap();
+
+            assert_eq!(report.files_copied, 3);
+
+            assert_eq!(
+                report.bytes_copied,
+                file_sizes.iter().map(|&bytes| bytes as u64).sum::<u64>(),
+            );
+
+            assert_eq!(report.resumed_stripes, 2);
+
+            assert_eq!(
+                report.resumed_bytes,
+                file_sizes[0] as u64 + file_sizes[1] as u64,
+            );
+
+            assert_eq!(report.exact_reused_files, 0);
+
+            for entry in &scan.manifest {
+                assert_eq!(
+                    fs::read(source.join(&entry.relative_path,),).unwrap(),
+                    fs::read(destination.join(&entry.relative_path,),).unwrap(),
+                );
+            }
+
+            assert!(!destination.join(JOURNAL_FILE_NAME).exists(),);
+
+            for (file_id, entry) in scan.manifest.iter().enumerate() {
+                let final_path = destination.join(&entry.relative_path);
+
+                assert!(!temporary_path(&final_path, file_id,).exists(),);
+            }
+
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
     fn fresh_resume_blake3_rejects_same_size_corruption() {
         let root = temporary_directory("fresh-resume-blake3-corruption");
 
@@ -9556,6 +9985,32 @@ mod tests {
         );
 
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    fn torture_round_count() -> usize {
+        const DEFAULT_ROUNDS: usize = 3;
+        const MAX_ROUNDS: usize = 100;
+
+        match env::var("NETWORKCOPY_TORTURE_ROUNDS") {
+            Ok(value) => {
+                let rounds = value.parse::<usize>().unwrap_or_else(|error| {
+                    panic!("NETWORKCOPY_TORTURE_ROUNDS must be an integer: {error}")
+                });
+
+                assert!(
+                    (1..=MAX_ROUNDS).contains(&rounds),
+                    "NETWORKCOPY_TORTURE_ROUNDS must be between 1 and {MAX_ROUNDS}",
+                );
+
+                rounds
+            }
+
+            Err(env::VarError::NotPresent) => DEFAULT_ROUNDS,
+
+            Err(error) => {
+                panic!("failed to read NETWORKCOPY_TORTURE_ROUNDS: {error}");
+            }
+        }
     }
 
     fn deterministic_test_bytes(length: usize, mut state: u64) -> Vec<u8> {
