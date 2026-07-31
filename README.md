@@ -31,7 +31,7 @@ Current stable release:
 Current development version:
 
 ```text
-2.1.0
+2.2.0-dev
 ```
 
 v2.1 focuses on stronger interrupted-transfer recovery and broader local reuse.

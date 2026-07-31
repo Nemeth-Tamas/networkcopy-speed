@@ -26,6 +26,7 @@ pub mod gui_transfer;
 mod iocp_copy;
 mod iocp_file_probe;
 mod iocp_probe;
+pub mod management_protocol;
 mod manifest_scan;
 mod multistream_copy;
 mod network_calibration;
