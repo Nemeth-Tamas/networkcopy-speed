@@ -123,6 +123,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         }
 
+        "management-list" => {
+            run_management_list(
+                &mut arguments,
+            )
+        }
+
         "direct-interfaces" => run_direct_interfaces(&mut arguments),
 
         "direct-address" => run_direct_address(&mut arguments),
@@ -191,6 +197,115 @@ fn run_management_agent(
     )?;
 
     management_discovery::run_agent()?;
+
+    Ok(())
+}
+
+fn run_management_list(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let endpoint =
+        parse_socket_address(
+            &required_argument(
+                arguments,
+                "management agent address",
+            )?,
+            "management agent address",
+        )?;
+
+    let remote_path =
+        required_argument(
+            arguments,
+            "remote directory path",
+        )?
+        .into_string()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "remote directory path must contain valid Unicode",
+            )
+        })?;
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    println!(
+        "NetworkCopy Speed Edition remote directory"
+    );
+
+    println!(
+        "  Agent:       {endpoint}"
+    );
+
+    println!(
+        "  Directory:   {remote_path}"
+    );
+
+    println!();
+
+    println!(
+        "WARNING: management mode is currently unauthenticated."
+    );
+
+    println!(
+        "Use it only on a known, trusted local network."
+    );
+
+    println!();
+
+    let entries =
+        management_control::list_directory(
+            endpoint,
+            &remote_path,
+        )?;
+
+    println!(
+        "Entries: {}",
+        entries.len(),
+    );
+
+    println!();
+
+    println!(
+        "  Type            Size        Modified  Name"
+    );
+
+    for entry in entries {
+        let size = match entry.kind {
+            management_directory::
+                ManagementEntryKind::File =>
+            {
+                entry.size.to_string()
+            }
+
+            _ => "-".to_string(),
+        };
+
+        let modified =
+            entry.modified_unix_seconds
+                .map(|value| {
+                    value.to_string()
+                })
+                .unwrap_or_else(|| {
+                    "-".to_string()
+                });
+
+        println!(
+            "  {:<6} {:>14} {:>15}  {}",
+            entry.kind.label(),
+            size,
+            modified,
+            entry.name,
+        );
+    }
 
     Ok(())
 }
@@ -2202,6 +2317,9 @@ fn print_usage(program: &OsStr) {
     println!("  {program} management-discover");
     println!("  {program} management-hello <agent-address>");
     println!("  {program} management-roots <agent-address>");
+    println!(
+        "  {program} management-list <agent-address> <remote-directory>"
+    );
     println!("  {program} direct-interfaces");
     println!("  {program} direct-address <interface-index>");
     println!("  {program} direct-discovery-receive <interface-index>");

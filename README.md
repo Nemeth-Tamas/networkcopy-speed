@@ -166,7 +166,7 @@ Initial v2.2 scope:
 - [x] advertise and discover available agents on the LAN;
 - [x] report machine name, reachable management address, capabilities, and current state;
 - [x] remotely enumerate Windows drive roots on each endpoint;
-- [ ] remotely enumerate folders and files on each endpoint;
+- [x] remotely enumerate folders and files on each endpoint;
 - [ ] select the source machine and source folder;
 - [ ] select the receiver machine and destination folder;
 - [ ] support Direct Link and explicit IP transfer modes;
@@ -200,6 +200,16 @@ Query the available Windows drive roots:
 ```powershell
 cargo run -- management-roots 127.0.0.1:7339
 ```
+
+Browse a remote directory:
+
+```powershell
+cargo run -- management-list 127.0.0.1:7339 "C:\Users"
+```
+
+The later WGPU management application will use this same protocol to provide
+discovered-machine cards and dual-pane remote folder browsers for selecting the
+source and destination without typing paths manually.
 
 ## v2 roadmap
 

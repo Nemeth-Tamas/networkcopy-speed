@@ -1,3 +1,4 @@
+use crate::management_directory;
 use crate::management_discovery::{AgentCapabilities, AgentState};
 use crate::management_filesystem;
 use crate::management_protocol::{
@@ -148,6 +149,25 @@ impl ManagementControlServer {
                 error_response(request.request_id, "ListRootsRequest payload must be empty")?
             }
 
+            ManagementMessageKind::ListDirectoryRequest => {
+                let result = management_directory::decode_request(&request.payload)
+                    .and_then(|path| management_directory::enumerate(&path))
+                    .and_then(|entries| management_directory::encode_response(&entries));
+
+                match result {
+                    Ok(payload) => ManagementFrame::new(
+                        request.request_id,
+                        ManagementMessageKind::ListDirectoryResponse,
+                        payload,
+                    )?,
+
+                    Err(error) => error_response(
+                        request.request_id,
+                        &format!("failed to enumerate remote directory: {error}"),
+                    )?,
+                }
+            }
+
             _ => error_response(
                 request.request_id,
                 "management command is not implemented yet",
@@ -186,6 +206,32 @@ pub fn hello(endpoint: SocketAddr) -> io::Result<ManagementHello> {
         unexpected => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("management agent returned unexpected message {unexpected:?} for HelloRequest"),
+        )),
+    }
+}
+
+pub fn list_directory(
+    endpoint: SocketAddr,
+    path: &str,
+) -> io::Result<Vec<management_directory::ManagementDirectoryEntry>> {
+    let payload = management_directory::encode_request(path)?;
+
+    let response = exchange(
+        endpoint,
+        ManagementMessageKind::ListDirectoryRequest,
+        payload,
+    )?;
+
+    match response.kind {
+        ManagementMessageKind::ListDirectoryResponse => {
+            management_directory::decode_response(&response.payload)
+        }
+
+        unexpected => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "management agent returned unexpected message {unexpected:?} for ListDirectoryRequest"
+            ),
         )),
     }
 }
@@ -613,14 +659,18 @@ mod tests {
     use super::{
         HELLO_PAYLOAD_VERSION, ManagementControlServer, ManagementRoot, decode_hello_payload,
         decode_roots_payload, encode_hello_payload, encode_roots_payload, hello,
-        list_roots as request_roots,
+        list_directory as request_directory, list_roots as request_roots,
     };
+    use crate::management_directory::ManagementEntryKind;
     use crate::management_discovery::{AgentCapabilities, AgentState};
     use crate::management_filesystem;
     use crate::management_protocol::MANAGEMENT_PROTOCOL_VERSION;
+    use std::fs;
     use std::io;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::process;
     use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn loopback_hello_round_trips() {
@@ -699,6 +749,55 @@ mod tests {
                 .map(|path| { ManagementRoot { path } })
                 .collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn loopback_lists_remote_directory() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let root = std::env::temp_dir().join(format!(
+            "networkcopy-management-control-{}-{unique}",
+            process::id(),
+        ));
+
+        fs::create_dir_all(root.join("Folder")).unwrap();
+
+        fs::write(root.join("file.bin"), [1_u8, 2, 3]).unwrap();
+
+        let server = ManagementControlServer::bind_at(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            "LOOPBACK-PC".to_string(),
+            AgentState::Idle,
+            AgentCapabilities::SEND_RECEIVE,
+        )
+        .unwrap();
+
+        let endpoint = server.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            server.serve_one().unwrap();
+        });
+
+        let entries = request_directory(endpoint, root.to_str().unwrap()).unwrap();
+
+        server_thread.join().unwrap();
+
+        assert_eq!(entries.len(), 2);
+
+        assert_eq!(entries[0].name, "Folder",);
+
+        assert_eq!(entries[0].kind, ManagementEntryKind::Directory,);
+
+        assert_eq!(entries[1].name, "file.bin",);
+
+        assert_eq!(entries[1].kind, ManagementEntryKind::File,);
+
+        assert_eq!(entries[1].size, 3);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
