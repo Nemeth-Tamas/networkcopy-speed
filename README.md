@@ -171,6 +171,8 @@ Initial v2.2 scope:
 - [x] select the receiver machine and destination folder;
 - [ ] support Direct Link and explicit IP transfer modes;
 - [x] start sender and receiver transfer jobs remotely;
+- [x] expose live managed-job progress for GUI polling;
+- [x] retain the most recent completed, cancelled, or failed job result;
 - [ ] resume complete transfer jobs remotely;
 - [x] keep active transfers running if the management UI disconnects;
 - [ ] add a separate WGPU management application;
@@ -286,6 +288,18 @@ have been accepted.
 
 If sender startup fails, the manager automatically cancels the prepared receiver
 job so the receiver is not left busy or listening indefinitely.
+
+Poll an endpoint for GUI-ready progress and its latest retained result:
+
+```powershell
+networkcopy-speed.exe management-snapshot 192.168.1.10:7339
+```
+
+The snapshot contains the active job role, progress phase, completed and total
+bytes, cancellation state, and the latest terminal result. Completed sender
+results include logical and wire byte counts; receiver results include received
+file and logical-byte counts. Failed and cancelled jobs retain their diagnostic
+message after the endpoint returns to idle.
 
 ## v2 roadmap
 

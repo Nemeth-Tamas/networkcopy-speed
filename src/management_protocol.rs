@@ -34,6 +34,9 @@ pub enum ManagementMessageKind {
     JobStatusRequest = 0x26,
     JobStatusResponse = 0x27,
 
+    AgentSnapshotRequest = 0x28,
+    AgentSnapshotResponse = 0x29,
+
     ErrorResponse = 0xFF,
 }
 
@@ -62,6 +65,9 @@ impl TryFrom<u8> for ManagementMessageKind {
 
             0x26 => Self::JobStatusRequest,
             0x27 => Self::JobStatusResponse,
+
+            0x28 => Self::AgentSnapshotRequest,
+            0x29 => Self::AgentSnapshotResponse,
 
             0xFF => Self::ErrorResponse,
 

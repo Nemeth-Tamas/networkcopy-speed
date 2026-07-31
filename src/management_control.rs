@@ -9,6 +9,7 @@ use crate::management_protocol::{
     MANAGEMENT_CONTROL_PORT, MANAGEMENT_PROTOCOL_VERSION, ManagementFrame, ManagementMessageKind,
     read_frame, write_frame,
 };
+use crate::management_snapshot::ManagementAgentSnapshot;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::process;
@@ -279,6 +280,31 @@ impl ManagementControlServer {
                 error_response(request.request_id, "JobStatusRequest payload must be empty")?
             }
 
+            ManagementMessageKind::AgentSnapshotRequest if request.payload.is_empty() => {
+                let payload = self
+                    .jobs
+                    .snapshot()
+                    .and_then(|snapshot| crate::management_snapshot::encode_snapshot(&snapshot));
+
+                match payload {
+                    Ok(payload) => ManagementFrame::new(
+                        request.request_id,
+                        ManagementMessageKind::AgentSnapshotResponse,
+                        payload,
+                    )?,
+
+                    Err(error) => error_response(
+                        request.request_id,
+                        &format!("failed to read management agent snapshot: {error}"),
+                    )?,
+                }
+            }
+
+            ManagementMessageKind::AgentSnapshotRequest => error_response(
+                request.request_id,
+                "AgentSnapshotRequest payload must be empty",
+            )?,
+
             ManagementMessageKind::CancelJobRequest => {
                 let result = crate::management_jobs::decode_cancel_request(&request.payload)
                     .and_then(|job_id| self.jobs.cancel(job_id))
@@ -393,6 +419,27 @@ pub fn start_send(
             io::ErrorKind::InvalidData,
             format!(
                 "management agent returned unexpected message {unexpected:?} for StartSendRequest"
+            ),
+        )),
+    }
+}
+
+pub fn agent_snapshot(endpoint: SocketAddr) -> io::Result<ManagementAgentSnapshot> {
+    let response = exchange(
+        endpoint,
+        ManagementMessageKind::AgentSnapshotRequest,
+        Vec::new(),
+    )?;
+
+    match response.kind {
+        ManagementMessageKind::AgentSnapshotResponse => {
+            crate::management_snapshot::decode_snapshot(&response.payload)
+        }
+
+        unexpected => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "management agent returned unexpected message {unexpected:?} for AgentSnapshotRequest"
             ),
         )),
     }
@@ -885,7 +932,7 @@ fn create_request_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        HELLO_PAYLOAD_VERSION, ManagementControlServer, ManagementRoot, cancel_job,
+        HELLO_PAYLOAD_VERSION, ManagementControlServer, ManagementRoot, agent_snapshot, cancel_job,
         decode_hello_payload, decode_roots_payload, encode_hello_payload, encode_roots_payload,
         hello, job_status, list_directory as request_directory, list_roots as request_roots,
         prepare_receive, start_send,
@@ -1294,6 +1341,30 @@ mod tests {
         );
 
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn loopback_reads_empty_agent_snapshot() {
+        let server = ManagementControlServer::bind_at(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            "LOOPBACK-PC".to_string(),
+            AgentCapabilities::SEND_RECEIVE,
+        )
+        .unwrap();
+
+        let endpoint = server.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            server.serve_one().unwrap();
+        });
+
+        let snapshot = agent_snapshot(endpoint).unwrap();
+
+        server_thread.join().unwrap();
+
+        assert!(snapshot.active.is_none());
+
+        assert!(snapshot.latest_result.is_none(),);
     }
 
     #[test]

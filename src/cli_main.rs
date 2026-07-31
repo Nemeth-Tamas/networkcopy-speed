@@ -147,6 +147,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         }
 
+        "management-snapshot" => {
+            run_management_snapshot(
+                &mut arguments,
+            )
+        }
+
         "management-job-status" => {
             run_management_job_status(
                 &mut arguments,
@@ -674,6 +680,166 @@ fn run_management_prepare_receive(
     println!(
         "  State:         receiver waiting for sender"
     );
+
+    Ok(())
+}
+
+fn run_management_snapshot(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let endpoint =
+        parse_socket_address(
+            &required_argument(
+                arguments,
+                "management agent address",
+            )?,
+            "management agent address",
+        )?;
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    let snapshot =
+        management_control::
+            agent_snapshot(endpoint)?;
+
+    println!(
+        "NetworkCopy Speed Edition agent snapshot"
+    );
+
+    println!(
+        "  Agent:         {endpoint}"
+    );
+
+    println!();
+
+    match snapshot.active {
+        Some(active) => {
+            println!("Active job");
+
+            println!(
+                "  Role:          {}",
+                active.role.label(),
+            );
+
+            println!(
+                "  Job ID:        {}",
+                active.job_id,
+            );
+
+            println!(
+                "  Phase:         {}",
+                active.phase,
+            );
+
+            println!(
+                "  Completed:     {} bytes",
+                active.completed,
+            );
+
+            if active.total == 0 {
+                println!(
+                    "  Total:         unknown"
+                );
+            } else {
+                let percent =
+                    active.completed
+                        .min(active.total)
+                        as f64
+                        / active.total
+                            as f64
+                        * 100.0;
+
+                println!(
+                    "  Total:         {} bytes",
+                    active.total,
+                );
+
+                println!(
+                    "  Progress:      {percent:.2}%"
+                );
+            }
+
+            println!(
+                "  Cancelling:    {}",
+                if active.cancel_requested {
+                    "yes"
+                } else {
+                    "no"
+                },
+            );
+        }
+
+        None => {
+            println!(
+                "Active job:      none"
+            );
+        }
+    }
+
+    println!();
+
+    match snapshot.latest_result {
+        Some(result) => {
+            println!("Latest result");
+
+            println!(
+                "  Role:          {}",
+                result.role.label(),
+            );
+
+            println!(
+                "  Job ID:        {}",
+                result.job_id,
+            );
+
+            println!(
+                "  Outcome:       {}",
+                result.outcome.label(),
+            );
+
+            println!(
+                "  Files:         {}",
+                result.files,
+            );
+
+            println!(
+                "  Logical data:  {} bytes",
+                result.logical_bytes,
+            );
+
+            println!(
+                "  Wire data:     {} bytes",
+                result.wire_bytes,
+            );
+
+            println!(
+                "  Data streams:  {}",
+                result.data_stream_count,
+            );
+
+            if !result.message.is_empty() {
+                println!(
+                    "  Message:       {}",
+                    result.message,
+                );
+            }
+        }
+
+        None => {
+            println!(
+                "Latest result:   none"
+            );
+        }
+    }
 
     Ok(())
 }
@@ -2950,6 +3116,9 @@ fn print_usage(program: &OsStr) {
     println!(
         "  {program} management-start-send <sender-agent> \
          <receiver-address> <source-root> [workers] [calibration-mib]"
+    );
+    println!(
+        "  {program} management-snapshot <agent-address>"
     );
     println!(
         "  {program} management-job-status <agent-address>"

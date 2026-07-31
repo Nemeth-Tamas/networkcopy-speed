@@ -1,5 +1,9 @@
 use crate::calibrated_transfer;
-use crate::console_progress::ProgressCounter;
+use crate::console_progress::{ProgressCounter, ProgressSnapshot};
+use crate::management_snapshot::{
+    ManagementActiveJobSnapshot, ManagementAgentSnapshot, ManagementJobOutcome,
+    ManagementJobResult, ManagementJobRole,
+};
 use crate::manifest_scan;
 use crate::multistream_copy::DestinationMode;
 use crate::network_calibration;
@@ -146,6 +150,8 @@ struct JobRegistryInner {
     active_receive: Option<ActiveReceiveJob>,
 
     active_send: Option<ActiveSendJob>,
+
+    latest_result: Option<ManagementJobResult>,
 }
 
 fn active_job_id(inner: &JobRegistryInner) -> Option<u64> {
@@ -279,7 +285,9 @@ impl ManagementJobRegistry {
                     destination_mode,
                 );
 
-                if let Err(error) = worker_registry.finish_receive(job_id) {
+                let terminal_result = build_receive_result(job_id, &result);
+
+                if let Err(error) = worker_registry.finish_receive(job_id, terminal_result) {
                     eprintln!("failed to finalize managed receiver job {job_id}: {error}");
                 }
 
@@ -303,7 +311,7 @@ impl ManagementJobRegistry {
             });
 
         if let Err(error) = spawn_result {
-            let _ = self.finish_receive(job_id);
+            let _ = self.clear_receive(job_id);
 
             return Err(error);
         }
@@ -400,7 +408,9 @@ impl ManagementJobRegistry {
                     worker_progress,
                 );
 
-                if let Err(error) = worker_registry.finish_send(job_id) {
+                let terminal_result = build_send_result(job_id, &result);
+
+                if let Err(error) = worker_registry.finish_send(job_id, terminal_result) {
                     eprintln!("failed to finalize managed sender job {job_id}: {error}");
                 }
 
@@ -426,12 +436,38 @@ impl ManagementJobRegistry {
             });
 
         if let Err(error) = spawn_result {
-            let _ = self.finish_send(job_id);
+            let _ = self.clear_send(job_id);
 
             return Err(error);
         }
 
         Ok(job)
+    }
+
+    pub(crate) fn snapshot(&self) -> io::Result<ManagementAgentSnapshot> {
+        let inner = self.lock_inner()?;
+
+        let active = if let Some(active) = &inner.active_receive {
+            Some(build_active_snapshot(
+                ManagementJobRole::Receiver,
+                active.job.job_id,
+                &active.progress,
+            ))
+        } else {
+            inner.active_send.as_ref().map(|active| {
+                build_active_snapshot(
+                    ManagementJobRole::Sender,
+                    active.job.job_id,
+                    &active.progress,
+                )
+            })
+        };
+
+        Ok(ManagementAgentSnapshot {
+            active,
+
+            latest_result: inner.latest_result.clone(),
+        })
     }
 
     pub(crate) fn status(&self) -> io::Result<ManagementJobStatus> {
@@ -507,15 +543,35 @@ impl ManagementJobRegistry {
                 ));
             }
 
-            if let Some(active) = inner.active_receive.take() {
-                active.progress
+            let (progress, role) = if let Some(active) = inner.active_receive.take() {
+                (active.progress, ManagementJobRole::Receiver)
             } else if let Some(active) = inner.active_send.take() {
-                active.progress
+                (active.progress, ManagementJobRole::Sender)
             } else {
                 return Err(io::Error::other(
                     "active management job disappeared during cancellation",
                 ));
-            }
+            };
+
+            inner.latest_result = Some(ManagementJobResult {
+                role,
+
+                outcome: ManagementJobOutcome::Cancelled,
+
+                job_id,
+
+                files: 0,
+
+                logical_bytes: 0,
+
+                wire_bytes: 0,
+
+                data_stream_count: 0,
+
+                message: "cancelled by management request".to_string(),
+            });
+
+            progress
         };
 
         progress.cancel();
@@ -523,7 +579,41 @@ impl ManagementJobRegistry {
         Ok(job_id)
     }
 
-    fn finish_receive(&self, job_id: u64) -> io::Result<()> {
+    fn finish_receive(&self, job_id: u64, result: ManagementJobResult) -> io::Result<()> {
+        let mut inner = self.lock_inner()?;
+
+        let matches_job = inner
+            .active_receive
+            .as_ref()
+            .is_some_and(|active| active.job.job_id == job_id);
+
+        if matches_job {
+            inner.active_receive.take();
+
+            inner.latest_result = Some(result);
+        }
+
+        Ok(())
+    }
+
+    fn finish_send(&self, job_id: u64, result: ManagementJobResult) -> io::Result<()> {
+        let mut inner = self.lock_inner()?;
+
+        let matches_job = inner
+            .active_send
+            .as_ref()
+            .is_some_and(|active| active.job.job_id == job_id);
+
+        if matches_job {
+            inner.active_send.take();
+
+            inner.latest_result = Some(result);
+        }
+
+        Ok(())
+    }
+
+    fn clear_receive(&self, job_id: u64) -> io::Result<()> {
         let mut inner = self.lock_inner()?;
 
         let matches_job = inner
@@ -538,7 +628,7 @@ impl ManagementJobRegistry {
         Ok(())
     }
 
-    fn finish_send(&self, job_id: u64) -> io::Result<()> {
+    fn clear_send(&self, job_id: u64) -> io::Result<()> {
         let mut inner = self.lock_inner()?;
 
         let matches_job = inner
@@ -558,6 +648,120 @@ impl ManagementJobRegistry {
             .lock()
             .map_err(|_| io::Error::other("management job registry lock was poisoned"))
     }
+}
+
+fn build_active_snapshot(
+    role: ManagementJobRole,
+    job_id: u64,
+    progress: &ProgressCounter,
+) -> ManagementActiveJobSnapshot {
+    let ProgressSnapshot {
+        label,
+        completed,
+        total,
+    } = progress.snapshot();
+
+    ManagementActiveJobSnapshot {
+        role,
+
+        job_id,
+
+        phase: label,
+
+        completed,
+
+        total,
+
+        cancel_requested: progress.is_cancelled(),
+    }
+}
+
+fn build_receive_result(
+    job_id: u64,
+    result: &io::Result<calibrated_transfer::CalibratedReceiveReport>,
+) -> ManagementJobResult {
+    match result {
+        Ok(report) => ManagementJobResult {
+            role: ManagementJobRole::Receiver,
+
+            outcome: ManagementJobOutcome::Completed,
+
+            job_id,
+
+            files: report.transfer.files_received,
+
+            logical_bytes: report.transfer.bytes_received,
+
+            wire_bytes: 0,
+
+            data_stream_count: stream_count_u32(report.transfer.data_stream_count),
+
+            message: String::new(),
+        },
+
+        Err(error) => build_error_result(ManagementJobRole::Receiver, job_id, error),
+    }
+}
+
+fn build_send_result(
+    job_id: u64,
+    result: &io::Result<calibrated_transfer::CalibratedSendReport>,
+) -> ManagementJobResult {
+    match result {
+        Ok(report) => ManagementJobResult {
+            role: ManagementJobRole::Sender,
+
+            outcome: ManagementJobOutcome::Completed,
+
+            job_id,
+
+            files: report.transfer.files_copied,
+
+            logical_bytes: report.transfer.bytes_copied,
+
+            wire_bytes: report.transfer.data_wire_bytes,
+
+            data_stream_count: stream_count_u32(report.transfer.data_stream_count),
+
+            message: String::new(),
+        },
+
+        Err(error) => build_error_result(ManagementJobRole::Sender, job_id, error),
+    }
+}
+
+fn build_error_result(
+    role: ManagementJobRole,
+    job_id: u64,
+    error: &io::Error,
+) -> ManagementJobResult {
+    let outcome = if error.kind() == io::ErrorKind::Interrupted {
+        ManagementJobOutcome::Cancelled
+    } else {
+        ManagementJobOutcome::Failed
+    };
+
+    ManagementJobResult {
+        role,
+
+        outcome,
+
+        job_id,
+
+        files: 0,
+
+        logical_bytes: 0,
+
+        wire_bytes: 0,
+
+        data_stream_count: 0,
+
+        message: error.to_string(),
+    }
+}
+
+fn stream_count_u32(stream_count: usize) -> u32 {
+    u32::try_from(stream_count).unwrap_or(u32::MAX)
 }
 
 pub(crate) fn encode_prepare_request(
@@ -1550,6 +1754,7 @@ mod tests {
         encode_prepared_response, encode_start_send_request, encode_started_send_response,
         encode_status,
     };
+    use crate::management_snapshot::{ManagementJobOutcome, ManagementJobRole};
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::process;
@@ -1619,6 +1824,18 @@ mod tests {
         assert_eq!(cancelled, job.job_id,);
 
         assert!(!registry.is_busy().unwrap());
+
+        let snapshot = registry.snapshot().unwrap();
+
+        assert!(snapshot.active.is_none());
+
+        let result = snapshot.latest_result.expect("cancelled receiver result");
+
+        assert_eq!(result.job_id, job.job_id,);
+
+        assert_eq!(result.role, ManagementJobRole::Receiver,);
+
+        assert_eq!(result.outcome, ManagementJobOutcome::Cancelled,);
 
         thread::sleep(Duration::from_millis(100));
 
