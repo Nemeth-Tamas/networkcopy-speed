@@ -135,6 +135,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         }
 
+        "management-transfer" => {
+            run_management_transfer(
+                &mut arguments,
+            )
+        }
+
         "management-start-send" => {
             run_management_start_send(
                 &mut arguments,
@@ -231,6 +237,207 @@ fn run_management_agent(
     )?;
 
     management_discovery::run_agent()?;
+
+    Ok(())
+}
+
+fn run_management_transfer(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let sender_agent =
+        parse_socket_address(
+            &required_argument(
+                arguments,
+                "sender management agent address",
+            )?,
+            "sender management agent address",
+        )?;
+
+    let receiver_agent =
+        parse_socket_address(
+            &required_argument(
+                arguments,
+                "receiver management agent address",
+            )?,
+            "receiver management agent address",
+        )?;
+
+    let source_root =
+        required_argument(
+            arguments,
+            "sender source directory",
+        )?
+        .into_string()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sender source must contain valid Unicode",
+            )
+        })?;
+
+    let destination_root =
+        required_argument(
+            arguments,
+            "receiver destination directory",
+        )?
+        .into_string()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "receiver destination must contain valid Unicode",
+            )
+        })?;
+
+    let mut optional_arguments =
+        arguments.collect::<Vec<_>>();
+
+    let update_existing =
+        optional_arguments
+            .last()
+            .is_some_and(|value| {
+                value == "--update"
+                    || value == "update"
+            });
+
+    if update_existing {
+        optional_arguments.pop();
+    }
+
+    if let Some(extra) =
+        optional_arguments.get(2)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    let worker_count =
+        match optional_arguments.first() {
+            Some(value) => {
+                parse_usize_count(
+                    value,
+                    "scan worker count",
+                )?
+            }
+
+            None => {
+                manifest_scan::
+                    default_worker_count()
+            }
+        };
+
+    let calibration_mib =
+        match optional_arguments.get(1) {
+            Some(value) => {
+                parse_u64_count(
+                    value,
+                    "calibration MiB",
+                )?
+            }
+
+            None => {
+                calibrated_transfer::
+                    DEFAULT_CALIBRATION_MIB
+            }
+        };
+
+    let record =
+        crate::management_orchestration::
+            start_transfer(
+                crate::management_orchestration::
+                    ManagedTransferRequest {
+                        sender_agent,
+
+                        receiver_agent,
+
+                        source_root,
+
+                        destination_root,
+
+                        update_existing,
+
+                        worker_count,
+
+                        calibration_mib,
+                    },
+            )?;
+
+    println!(
+        "NetworkCopy Speed Edition managed transfer started"
+    );
+
+    println!();
+
+    println!(
+        "  Sender agent:       {}",
+        record.sender_agent,
+    );
+
+    println!(
+        "  Sender job ID:      {}",
+        record.sender_job_id,
+    );
+
+    println!(
+        "  Source:             {}",
+        record.source_root,
+    );
+
+    println!();
+
+    println!(
+        "  Receiver agent:     {}",
+        record.receiver_agent,
+    );
+
+    println!(
+        "  Receiver job ID:    {}",
+        record.receiver_job_id,
+    );
+
+    println!(
+        "  Payload endpoint:   {}",
+        record.receiver_payload,
+    );
+
+    println!(
+        "  Destination:        {}",
+        record.destination_root,
+    );
+
+    println!();
+
+    println!(
+        "  Update mode:        {}",
+        if record.update_existing {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+
+    println!(
+        "  Scan workers:       {}",
+        record.worker_count,
+    );
+
+    println!(
+        "  Calibration:        {} MiB per matrix run",
+        record.calibration_mib,
+    );
+
+    println!(
+        "  Manager required:   no"
+    );
+
+    println!(
+        "  State:              endpoints running independently"
+    );
 
     Ok(())
 }
@@ -2734,6 +2941,11 @@ fn print_usage(program: &OsStr) {
     );
     println!(
         "  {program} management-prepare-receive <agent-address> <destination-root> [--update]"
+    );
+    println!(
+        "  {program} management-transfer <sender-agent> \
+         <receiver-agent> <source-root> <destination-root> \
+         [workers] [calibration-mib] [--update]"
     );
     println!(
         "  {program} management-start-send <sender-agent> \

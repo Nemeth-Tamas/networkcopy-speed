@@ -31,6 +31,7 @@ pub mod management_directory;
 pub mod management_discovery;
 mod management_filesystem;
 pub mod management_jobs;
+pub mod management_orchestration;
 pub mod management_protocol;
 mod manifest_scan;
 mod multistream_copy;

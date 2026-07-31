@@ -895,6 +895,7 @@ mod tests {
     use crate::management_discovery::{AgentCapabilities, AgentState};
     use crate::management_filesystem;
     use crate::management_jobs::{ManagementJobPhase, ManagementJobRegistry};
+    use crate::management_orchestration::{self, ManagedTransferRequest};
     use crate::management_protocol::MANAGEMENT_PROTOCOL_VERSION;
     use std::fs;
     use std::io;
@@ -1186,6 +1187,110 @@ mod tests {
         assert_eq!(
             fs::read(destination.join("payload.bin"),).unwrap(),
             vec![0xA5_u8; 256 * 1024],
+        );
+
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn loopback_orchestrates_two_agents() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let parent = std::env::temp_dir().join(format!(
+            "networkcopy-orchestration-{}-{unique}",
+            process::id(),
+        ));
+
+        let source = parent.join("source");
+
+        let destination = parent.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        fs::write(source.join("hello.txt"), b"paired orchestration alive").unwrap();
+
+        fs::write(source.join("payload.bin"), vec![0x5A_u8; 256 * 1024]).unwrap();
+
+        let sender_jobs = Arc::new(ManagementJobRegistry::new());
+
+        let receiver_jobs = Arc::new(ManagementJobRegistry::new());
+
+        let sender_server = ManagementControlServer::bind_at_with_receiver(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            "SENDER-PC".to_string(),
+            AgentCapabilities::SEND_RECEIVE,
+            Arc::clone(&sender_jobs),
+        )
+        .unwrap();
+
+        let receiver_server = ManagementControlServer::bind_at_with_receiver(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            "RECEIVER-PC".to_string(),
+            AgentCapabilities::SEND_RECEIVE,
+            Arc::clone(&receiver_jobs),
+        )
+        .unwrap();
+
+        let sender_endpoint = sender_server.local_addr().unwrap();
+
+        let receiver_endpoint = receiver_server.local_addr().unwrap();
+
+        let sender_control = thread::spawn(move || {
+            sender_server.serve_one().unwrap();
+        });
+
+        let receiver_control = thread::spawn(move || {
+            receiver_server.serve_one().unwrap();
+        });
+
+        let record = management_orchestration::start_transfer(ManagedTransferRequest {
+            sender_agent: sender_endpoint,
+
+            receiver_agent: receiver_endpoint,
+
+            source_root: source.to_str().unwrap().to_string(),
+
+            destination_root: destination.to_str().unwrap().to_string(),
+
+            update_existing: false,
+
+            worker_count: 2,
+
+            calibration_mib: 1,
+        })
+        .unwrap();
+
+        sender_control.join().unwrap();
+        receiver_control.join().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        while sender_jobs.is_busy().unwrap() || receiver_jobs.is_busy().unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "paired managed transfer did not return both agents to idle",
+            );
+
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        assert!(record.sender_job_id > 0,);
+
+        assert!(record.receiver_job_id > 0,);
+
+        assert_eq!(
+            fs::read(destination.join("hello.txt"),).unwrap(),
+            b"paired orchestration alive",
+        );
+
+        assert_eq!(
+            fs::read(destination.join("payload.bin"),).unwrap(),
+            vec![0x5A_u8; 256 * 1024],
         );
 
         fs::remove_dir_all(parent).unwrap();

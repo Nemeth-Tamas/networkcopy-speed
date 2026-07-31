@@ -167,12 +167,12 @@ Initial v2.2 scope:
 - [x] report machine name, reachable management address, capabilities, and current state;
 - [x] remotely enumerate Windows drive roots on each endpoint;
 - [x] remotely enumerate folders and files on each endpoint;
-- [ ] select the source machine and source folder;
-- [ ] select the receiver machine and destination folder;
+- [x] select the source machine and source folder;
+- [x] select the receiver machine and destination folder;
 - [ ] support Direct Link and explicit IP transfer modes;
 - [x] start sender and receiver transfer jobs remotely;
 - [ ] resume complete transfer jobs remotely;
-- [ ] keep active transfers running if the management UI disconnects;
+- [x] keep active transfers running if the management UI disconnects;
 - [ ] add a separate WGPU management application;
 - [ ] test three-machine orchestration on a physical LAN.
 
@@ -262,6 +262,30 @@ The command returns immediately after the sender job has been accepted. The
 sender agent performs calibration and transfer in a background worker, reports
 itself as busy through discovery and management hello, and returns to idle when
 the job completes, fails, or is cancelled.
+
+Orchestrate both endpoints from one manager command:
+
+```powershell
+networkcopy-speed.exe management-transfer `
+    192.168.1.10:7339 `
+    192.168.1.20:7339 `
+    "D:\TransferSource" `
+    "E:\TransferDestination" `
+    4 `
+    8 `
+    --update
+```
+
+The manager first prepares the receiver, derives its payload endpoint from the
+receiver management address, and then starts the sender. IPv6 flow and scope
+information are preserved when deriving link-local payload endpoints.
+
+The command returns a paired record containing both endpoint job IDs. The
+manager process is not involved in the payload path and may exit after both jobs
+have been accepted.
+
+If sender startup fails, the manager automatically cancels the prepared receiver
+job so the receiver is not left busy or listening indefinitely.
 
 ## v2 roadmap
 
