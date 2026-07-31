@@ -75,7 +75,7 @@ The GUI includes:
 - [x] rebuild deterministic catalog state from a committed generation prefix;
 - [x] retain cross-file CDC reuse after interruption and restart;
 - [x] extend exact reuse to tiny-file packs;
-- [ ] extend exact reuse to striped large files;
+- [x] extend exact reuse to striped large files;
 - [ ] add repeated crash, corruption, and restart acceptance tests;
 - [ ] complete physical two-machine interruption acceptance.
 
@@ -94,7 +94,7 @@ Implementation order:
 - [x] large-file CDC with retained multi-lane striped fallback;
 - [x] CDC-aware interruption and file-level retry behavior;
 - [x] fresh-transfer exact reuse for repeated medium files;
-- [ ] extend exact reuse to tiny packs and striped large files;
+- [x] extend exact reuse to tiny packs and striped large files;
 - [x] deterministic bounded session catalog and generation planner;
 - [x] protocol-v10 generation barriers and receiver commit acknowledgements;
 - [x] session-scoped cross-file CDC using completed files as chunk bases;

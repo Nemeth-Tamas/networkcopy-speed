@@ -1845,7 +1845,14 @@ fn run_server_with_mode(
         progress.set_total(0);
     }
 
-    finalize_large_files(destination_root.as_path(), &manifest, destination_mode)?;
+    let exact_reuse_targets = exact_reuse_target_file_ids(&exact_reuse_plan);
+
+    finalize_large_files(
+        destination_root.as_path(),
+        &manifest,
+        destination_mode,
+        &exact_reuse_targets,
+    )?;
 
     materialize_exact_reuse_files(
         destination_root.as_path(),
@@ -4110,7 +4117,9 @@ fn planned_exact_reuse_file_ids(transfer_plan: &TransferPlan) -> BTreeSet<usize>
                 file_ids.extend(packed_file_ids.iter().copied());
             }
 
-            TransferTask::Stripe { .. } => {}
+            TransferTask::Stripe { file_id, .. } => {
+                file_ids.insert(*file_id);
+            }
         }
     }
 
@@ -4175,13 +4184,6 @@ fn build_fresh_exact_reuse_plan(
                 "exact-reuse planner found an unknown file",
             )
         })?;
-
-        if !matches!(entry.class, FileClass::Medium | FileClass::Tiny) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "exact-reuse candidate unexpectedly used a striped large file",
-            ));
-        }
 
         if entry.file_size == 0 {
             continue;
@@ -4367,12 +4369,10 @@ fn apply_exact_reuse_plan(
             )
         })?;
 
-        if basis.class != target.class
-            || !matches!(basis.class, FileClass::Medium | FileClass::Tiny)
-        {
+        if basis.class != target.class {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "exact reuse requires matching medium or tiny file classes",
+                "exact reuse requires matching file classes",
             ));
         }
 
@@ -4413,7 +4413,7 @@ fn apply_exact_reuse_plan(
         if !planned_file_ids.contains(file_id) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("exact-reuse file {file_id} is not an active medium or tiny transfer task"),
+                format!("exact-reuse file {file_id} is not an active transfer task"),
             ));
         }
     }
@@ -4424,6 +4424,8 @@ fn apply_exact_reuse_plan(
         for task in lane.drain(..) {
             match task {
                 TransferTask::WholeFile { file_id } if target_file_ids.contains(&file_id) => {}
+
+                TransferTask::Stripe { file_id, .. } if target_file_ids.contains(&file_id) => {}
 
                 TransferTask::TinyPack { mut file_ids, .. } => {
                     file_ids.retain(|file_id| !target_file_ids.contains(file_id));
@@ -4473,6 +4475,13 @@ fn apply_exact_reuse_plan(
 
         ..LaneReport::default()
     })
+}
+
+fn exact_reuse_target_file_ids(plan: &ExactReusePlan) -> BTreeSet<usize> {
+    plan.entries
+        .iter()
+        .map(|reuse| reuse.target_file_id)
+        .collect()
 }
 
 fn materialize_exact_reuse_files(
@@ -6346,9 +6355,10 @@ fn finalize_large_files(
     destination_root: &Path,
     manifest: &[ManifestEntry],
     destination_mode: DestinationMode,
+    excluded_file_ids: &BTreeSet<usize>,
 ) -> io::Result<()> {
     for (file_id, entry) in manifest.iter().enumerate() {
-        if entry.class != FileClass::Large {
+        if entry.class != FileClass::Large || excluded_file_ids.contains(&file_id) {
             continue;
         }
 
@@ -9071,6 +9081,72 @@ mod tests {
     }
 
     #[test]
+    fn fresh_loopback_reuses_exact_striped_large_duplicate() {
+        let root = temporary_directory("fresh-large-exact-reuse");
+
+        let source = root.join("source");
+        let destination = root.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        let shared = deterministic_test_bytes(64 * 1024 * 1024 + 137, 0x1234_5678_90AB_CDEF);
+
+        fs::write(source.join("duplicate-a.bin"), &shared).unwrap();
+
+        fs::write(source.join("duplicate-b.bin"), &shared).unwrap();
+
+        let scan = manifest_scan::run(&source, 2).unwrap();
+
+        assert_eq!(scan.manifest.len(), 2);
+
+        assert!(
+            scan.manifest
+                .iter()
+                .all(|entry| { entry.class == FileClass::Large }),
+        );
+
+        let report = run(&source, &destination, 2, 2).unwrap();
+
+        assert_eq!(report.files_copied, 2);
+
+        assert_eq!(report.bytes_copied, (shared.len() * 2) as u64,);
+
+        assert_eq!(report.exact_reused_files, 1);
+
+        assert_eq!(report.exact_reused_bytes, shared.len() as u64,);
+
+        assert!(report.exact_reuse_plan_wire_bytes > 0,);
+
+        assert!(report.exact_reuse_plan_wire_bytes < report.exact_reused_bytes,);
+
+        assert_eq!(report.resumed_stripes, 0);
+
+        assert_eq!(report.cdc_offered_files, 0);
+
+        assert!(report.data_wire_bytes < report.bytes_copied * 3 / 4,);
+
+        assert_eq!(
+            fs::read(destination.join("duplicate-a.bin"),).unwrap(),
+            shared,
+        );
+
+        assert_eq!(
+            fs::read(destination.join("duplicate-b.bin"),).unwrap(),
+            shared,
+        );
+
+        for (file_id, entry) in scan.manifest.iter().enumerate() {
+            let final_path = destination.join(&entry.relative_path);
+
+            assert!(!temporary_path(&final_path, file_id).exists(),);
+        }
+
+        assert!(!destination.join(JOURNAL_FILE_NAME).exists(),);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn fresh_loopback_uses_committed_medium_file_as_session_cdc_basis() {
         let root = temporary_directory("fresh-session-cdc");
 
@@ -9652,7 +9728,13 @@ mod tests {
 
         fs::write(&temporary_path, b"new-data").unwrap();
 
-        finalize_large_files(&root, &manifest, DestinationMode::UpdateVerified).unwrap();
+        finalize_large_files(
+            &root,
+            &manifest,
+            DestinationMode::UpdateVerified,
+            &BTreeSet::new(),
+        )
+        .unwrap();
 
         assert_eq!(fs::read(&final_path).unwrap(), b"new-data",);
 
@@ -9677,7 +9759,9 @@ mod tests {
 
         fs::write(&temporary_path, b"new-data").unwrap();
 
-        let error = finalize_large_files(&root, &manifest, DestinationMode::Fresh).unwrap_err();
+        let error =
+            finalize_large_files(&root, &manifest, DestinationMode::Fresh, &BTreeSet::new())
+                .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
 
