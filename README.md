@@ -165,7 +165,8 @@ Initial v2.2 scope:
 - [ ] connect the agent to sender and receiver job control;
 - [x] advertise and discover available agents on the LAN;
 - [x] report machine name, reachable management address, capabilities, and current state;
-- [ ] remotely enumerate drives and folders on each endpoint;
+- [x] remotely enumerate Windows drive roots on each endpoint;
+- [ ] remotely enumerate folders and files on each endpoint;
 - [ ] select the source machine and source folder;
 - [ ] select the receiver machine and destination folder;
 - [ ] support Direct Link and explicit IP transfer modes;
@@ -194,8 +195,11 @@ Discover agents from another computer on the same LAN:
 cargo run -- management-discover
 ```
 
-The discovery prototype advertises TCP port 7339, but the management control
-listener is introduced in the next implementation slice.
+Query the available Windows drive roots:
+
+```powershell
+cargo run -- management-roots 127.0.0.1:7339
+```
 
 ## v2 roadmap
 

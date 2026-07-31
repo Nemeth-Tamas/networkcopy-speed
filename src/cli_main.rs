@@ -117,6 +117,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         }
 
+        "management-roots" => {
+            run_management_roots(
+                &mut arguments,
+            )
+        }
+
         "direct-interfaces" => run_direct_interfaces(&mut arguments),
 
         "direct-address" => run_direct_address(&mut arguments),
@@ -185,6 +191,65 @@ fn run_management_agent(
     )?;
 
     management_discovery::run_agent()?;
+
+    Ok(())
+}
+
+fn run_management_roots(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let endpoint =
+        parse_socket_address(
+            &required_argument(
+                arguments,
+                "management agent address",
+            )?,
+            "management agent address",
+        )?;
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    println!(
+        "NetworkCopy Speed Edition remote roots"
+    );
+
+    println!();
+
+    println!(
+        "WARNING: management mode is currently unauthenticated."
+    );
+
+    println!(
+        "Use it only on a known, trusted local network."
+    );
+
+    println!();
+
+    let roots =
+        management_control::list_roots(
+            endpoint,
+        )?;
+
+    println!(
+        "Available roots: {}",
+        roots.len(),
+    );
+
+    for root in roots {
+        println!(
+            "  {}",
+            root.path,
+        );
+    }
 
     Ok(())
 }
@@ -2136,6 +2201,7 @@ fn print_usage(program: &OsStr) {
     println!("  {program} management-agent");
     println!("  {program} management-discover");
     println!("  {program} management-hello <agent-address>");
+    println!("  {program} management-roots <agent-address>");
     println!("  {program} direct-interfaces");
     println!("  {program} direct-address <interface-index>");
     println!("  {program} direct-discovery-receive <interface-index>");

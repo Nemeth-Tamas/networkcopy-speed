@@ -28,6 +28,7 @@ mod iocp_file_probe;
 mod iocp_probe;
 pub mod management_control;
 pub mod management_discovery;
+mod management_filesystem;
 pub mod management_protocol;
 mod manifest_scan;
 mod multistream_copy;

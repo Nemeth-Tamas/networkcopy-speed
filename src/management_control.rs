@@ -1,4 +1,5 @@
 use crate::management_discovery::{AgentCapabilities, AgentState};
+use crate::management_filesystem;
 use crate::management_protocol::{
     MANAGEMENT_CONTROL_PORT, MANAGEMENT_PROTOCOL_VERSION, ManagementFrame, ManagementMessageKind,
     read_frame, write_frame,
@@ -12,6 +13,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const HELLO_PAYLOAD_VERSION: u16 = 1;
 const HELLO_HEADER_BYTES: usize = 8;
+
+const ROOTS_PAYLOAD_VERSION: u16 = 1;
+const ROOTS_HEADER_BYTES: usize = 4;
+
+const MAX_ROOTS: usize = 26;
+const MAX_ROOT_PATH_BYTES: usize = 1024;
 
 const MAX_HOSTNAME_BYTES: usize = 255;
 const MAX_APPLICATION_VERSION_BYTES: usize = 64;
@@ -31,6 +38,11 @@ pub struct ManagementHello {
     pub state: AgentState,
 
     pub capabilities: AgentCapabilities,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagementRoot {
+    pub path: String,
 }
 
 struct ManagementControlServer {
@@ -115,6 +127,27 @@ impl ManagementControlServer {
                 error_response(request.request_id, "HelloRequest payload must be empty")?
             }
 
+            ManagementMessageKind::ListRootsRequest if request.payload.is_empty() => {
+                match management_filesystem::list_roots()
+                    .and_then(|roots| encode_roots_payload(&roots))
+                {
+                    Ok(payload) => ManagementFrame::new(
+                        request.request_id,
+                        ManagementMessageKind::ListRootsResponse,
+                        payload,
+                    )?,
+
+                    Err(error) => error_response(
+                        request.request_id,
+                        &format!("failed to enumerate Windows drive roots: {error}"),
+                    )?,
+                }
+            }
+
+            ManagementMessageKind::ListRootsRequest => {
+                error_response(request.request_id, "ListRootsRequest payload must be empty")?
+            }
+
             _ => error_response(
                 request.request_id,
                 "management command is not implemented yet",
@@ -145,6 +178,42 @@ pub(crate) fn spawn(
 }
 
 pub fn hello(endpoint: SocketAddr) -> io::Result<ManagementHello> {
+    let response = exchange(endpoint, ManagementMessageKind::HelloRequest, Vec::new())?;
+
+    match response.kind {
+        ManagementMessageKind::HelloResponse => decode_hello_payload(&response.payload),
+
+        unexpected => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("management agent returned unexpected message {unexpected:?} for HelloRequest"),
+        )),
+    }
+}
+
+pub fn list_roots(endpoint: SocketAddr) -> io::Result<Vec<ManagementRoot>> {
+    let response = exchange(
+        endpoint,
+        ManagementMessageKind::ListRootsRequest,
+        Vec::new(),
+    )?;
+
+    match response.kind {
+        ManagementMessageKind::ListRootsResponse => decode_roots_payload(&response.payload),
+
+        unexpected => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "management agent returned unexpected message {unexpected:?} for ListRootsRequest"
+            ),
+        )),
+    }
+}
+
+fn exchange(
+    endpoint: SocketAddr,
+    request_kind: ManagementMessageKind,
+    payload: Vec<u8>,
+) -> io::Result<ManagementFrame> {
     let mut stream = TcpStream::connect_timeout(&endpoint, CONTROL_IO_TIMEOUT)?;
 
     stream.set_read_timeout(Some(CONTROL_IO_TIMEOUT))?;
@@ -153,8 +222,7 @@ pub fn hello(endpoint: SocketAddr) -> io::Result<ManagementHello> {
 
     let request_id = create_request_id();
 
-    let request =
-        ManagementFrame::new(request_id, ManagementMessageKind::HelloRequest, Vec::new())?;
+    let request = ManagementFrame::new(request_id, request_kind, payload)?;
 
     write_frame(&mut stream, &request)?;
 
@@ -170,22 +238,177 @@ pub fn hello(endpoint: SocketAddr) -> io::Result<ManagementHello> {
         ));
     }
 
-    match response.kind {
-        ManagementMessageKind::HelloResponse => decode_hello_payload(&response.payload),
+    if response.kind == ManagementMessageKind::ErrorResponse {
+        let message = String::from_utf8_lossy(&response.payload);
 
-        ManagementMessageKind::ErrorResponse => {
-            let message = String::from_utf8_lossy(&response.payload);
+        return Err(io::Error::other(format!(
+            "management agent rejected {request_kind:?}: {message}"
+        )));
+    }
 
-            Err(io::Error::other(format!(
-                "management agent rejected HelloRequest: {message}"
-            )))
+    Ok(response)
+}
+
+fn encode_roots_payload(roots: &[String]) -> io::Result<Vec<u8>> {
+    if roots.len() > MAX_ROOTS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "management root list contains {} entries, exceeding the {MAX_ROOTS} entry limit",
+                roots.len(),
+            ),
+        ));
+    }
+
+    let root_count = u16::try_from(roots.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "management root count cannot be represented",
+        )
+    })?;
+
+    let mut payload_length = ROOTS_HEADER_BYTES;
+
+    for root in roots {
+        validate_text(root, MAX_ROOT_PATH_BYTES, "management root path")?;
+
+        payload_length = payload_length
+            .checked_add(2)
+            .and_then(|length| length.checked_add(root.len()))
+            .ok_or_else(|| io::Error::other("management roots payload length overflowed"))?;
+    }
+
+    let mut payload = Vec::with_capacity(payload_length);
+
+    payload.extend_from_slice(&ROOTS_PAYLOAD_VERSION.to_le_bytes());
+
+    payload.extend_from_slice(&root_count.to_le_bytes());
+
+    for root in roots {
+        let root_length = u16::try_from(root.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "management root path length cannot be represented",
+            )
+        })?;
+
+        payload.extend_from_slice(&root_length.to_le_bytes());
+
+        payload.extend_from_slice(root.as_bytes());
+    }
+
+    Ok(payload)
+}
+
+fn decode_roots_payload(payload: &[u8]) -> io::Result<Vec<ManagementRoot>> {
+    if payload.len() < ROOTS_HEADER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "management roots payload has {} bytes, expected at least {ROOTS_HEADER_BYTES}",
+                payload.len(),
+            ),
+        ));
+    }
+
+    let payload_version = u16::from_le_bytes(payload[0..2].try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "management roots version was malformed",
+        )
+    })?);
+
+    if payload_version != ROOTS_PAYLOAD_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported management roots payload version {payload_version}"),
+        ));
+    }
+
+    let root_count = usize::from(u16::from_le_bytes(payload[2..4].try_into().map_err(
+        |_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "management root count was malformed",
+            )
+        },
+    )?));
+
+    if root_count > MAX_ROOTS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "management root list contains {root_count} entries, exceeding the {MAX_ROOTS} entry limit"
+            ),
+        ));
+    }
+
+    let mut roots = Vec::with_capacity(root_count);
+
+    let mut cursor = ROOTS_HEADER_BYTES;
+
+    for _ in 0..root_count {
+        let length_end = cursor.checked_add(2).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "management root length position overflowed",
+            )
+        })?;
+
+        if length_end > payload.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "management roots payload ended before a root length",
+            ));
         }
 
-        unexpected => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("management agent returned unexpected message {unexpected:?}"),
-        )),
+        let root_length = usize::from(u16::from_le_bytes(
+            payload[cursor..length_end].try_into().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "management root length was malformed",
+                )
+            })?,
+        ));
+
+        cursor = length_end;
+
+        let root_end = cursor.checked_add(root_length).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "management root position overflowed",
+            )
+        })?;
+
+        if root_end > payload.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "management roots payload ended inside a root path",
+            ));
+        }
+
+        let path = decode_text(
+            &payload[cursor..root_end],
+            MAX_ROOT_PATH_BYTES,
+            "management root path",
+        )?;
+
+        roots.push(ManagementRoot { path });
+
+        cursor = root_end;
     }
+
+    if cursor != payload.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "management roots payload contains {} trailing bytes",
+                payload.len() - cursor,
+            ),
+        ));
+    }
+
+    Ok(roots)
 }
 
 fn error_response(request_id: u64, message: &str) -> io::Result<ManagementFrame> {
@@ -388,10 +611,12 @@ fn create_request_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        HELLO_PAYLOAD_VERSION, ManagementControlServer, decode_hello_payload, encode_hello_payload,
-        hello,
+        HELLO_PAYLOAD_VERSION, ManagementControlServer, ManagementRoot, decode_hello_payload,
+        decode_roots_payload, encode_hello_payload, encode_roots_payload, hello,
+        list_roots as request_roots,
     };
     use crate::management_discovery::{AgentCapabilities, AgentState};
+    use crate::management_filesystem;
     use crate::management_protocol::MANAGEMENT_PROTOCOL_VERSION;
     use std::io;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -428,6 +653,52 @@ mod tests {
         assert!(response.capabilities.can_send(),);
 
         assert!(response.capabilities.can_receive(),);
+    }
+
+    #[test]
+    fn loopback_lists_windows_roots() {
+        let server = ManagementControlServer::bind_at(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            "LOOPBACK-PC".to_string(),
+            AgentState::Idle,
+            AgentCapabilities::SEND_RECEIVE,
+        )
+        .unwrap();
+
+        let endpoint = server.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            server.serve_one().unwrap();
+        });
+
+        let actual = request_roots(endpoint).unwrap();
+
+        server_thread.join().unwrap();
+
+        let expected = management_filesystem::list_roots()
+            .unwrap()
+            .into_iter()
+            .map(|path| ManagementRoot { path })
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn roots_payload_round_trips() {
+        let expected = vec!["C:\\".to_string(), "D:\\".to_string(), "Z:\\".to_string()];
+
+        let encoded = encode_roots_payload(&expected).unwrap();
+
+        let decoded = decode_roots_payload(&encoded).unwrap();
+
+        assert_eq!(
+            decoded,
+            expected
+                .into_iter()
+                .map(|path| { ManagementRoot { path } })
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]
