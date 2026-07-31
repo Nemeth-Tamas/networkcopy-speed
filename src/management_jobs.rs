@@ -1,14 +1,19 @@
+use crate::calibrated_transfer;
+use crate::console_progress::ProgressCounter;
+use crate::multistream_copy::DestinationMode;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::net::{SocketAddr, TcpListener};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
 
 const PREPARE_REQUEST_VERSION: u16 = 1;
 const PREPARE_REQUEST_HEADER_BYTES: usize = 8;
 
-const JOB_STATUS_VERSION: u16 = 1;
-const JOB_STATUS_HEADER_BYTES: usize = 16;
+const JOB_STATUS_VERSION: u16 = 2;
+const JOB_STATUS_HEADER_BYTES: usize = 20;
 
 const CANCEL_REQUEST_VERSION: u16 = 1;
 const CANCEL_REQUEST_BYTES: usize = 12;
@@ -30,7 +35,7 @@ impl ManagementJobPhase {
         match self {
             Self::Idle => "idle",
 
-            Self::ReceiverPrepared => "receiver prepared",
+            Self::ReceiverPrepared => "receiver waiting for sender",
         }
     }
 }
@@ -56,6 +61,8 @@ impl TryFrom<u8> for ManagementJobPhase {
 pub struct PreparedReceiveJob {
     pub job_id: u64,
 
+    pub transfer_port: u16,
+
     pub destination_root: String,
 
     pub update_existing: bool,
@@ -66,6 +73,8 @@ pub struct ManagementJobStatus {
     pub phase: ManagementJobPhase,
 
     pub job_id: Option<u64>,
+
+    pub transfer_port: Option<u16>,
 
     pub destination_root: Option<String>,
 
@@ -79,9 +88,16 @@ pub(crate) struct PrepareReceiveRequest {
     pub(crate) update_existing: bool,
 }
 
+#[derive(Clone, Debug)]
+struct ActiveReceiveJob {
+    job: PreparedReceiveJob,
+
+    progress: ProgressCounter,
+}
+
 #[derive(Debug, Default)]
 struct JobRegistryInner {
-    active_receive: Option<PreparedReceiveJob>,
+    active_receive: Option<ActiveReceiveJob>,
 }
 
 #[derive(Debug)]
@@ -104,32 +120,44 @@ impl ManagementJobRegistry {
         Ok(self.lock_inner()?.active_receive.is_some())
     }
 
-    pub(crate) fn prepare_receive(
-        &self,
+    pub(crate) fn prepare_receive_on(
+        self: &Arc<Self>,
         destination_root: &str,
         update_existing: bool,
+        bind_address: SocketAddr,
     ) -> io::Result<PreparedReceiveJob> {
         validate_destination_path(destination_root)?;
 
-        let mut inner = self.lock_inner()?;
-
-        if let Some(active) = &inner.active_receive {
+        if let Some(active) = &self.lock_inner()?.active_receive {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                format!("management agent already has active job {}", active.job_id,),
+                format!(
+                    "management agent already has active job {}",
+                    active.job.job_id,
+                ),
             ));
         }
 
-        let path = Path::new(destination_root);
+        let destination_path = Path::new(destination_root);
 
-        fs::create_dir_all(path)?;
+        fs::create_dir_all(destination_path)?;
 
-        let metadata = fs::metadata(path)?;
+        let metadata = fs::metadata(destination_path)?;
 
         if !metadata.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "receiver destination does not identify a directory",
+            ));
+        }
+
+        let listener = TcpListener::bind(bind_address)?;
+
+        let transfer_port = listener.local_addr()?.port();
+
+        if transfer_port == 0 {
+            return Err(io::Error::other(
+                "managed receiver obtained transfer port zero",
             ));
         }
 
@@ -144,12 +172,85 @@ impl ManagementJobRegistry {
         let job = PreparedReceiveJob {
             job_id,
 
+            transfer_port,
+
             destination_root: destination_root.to_owned(),
 
             update_existing,
         };
 
-        inner.active_receive = Some(job.clone());
+        let progress = ProgressCounter::new("Waiting for managed sender", 0);
+
+        {
+            let mut inner = self.lock_inner()?;
+
+            if let Some(active) = &inner.active_receive {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "management agent already has active job {}",
+                        active.job.job_id,
+                    ),
+                ));
+            }
+
+            inner.active_receive = Some(ActiveReceiveJob {
+                job: job.clone(),
+
+                progress: progress.clone(),
+            });
+        }
+
+        let worker_registry = Arc::clone(self);
+
+        let worker_progress = progress;
+
+        let worker_destination = PathBuf::from(destination_root);
+
+        let destination_mode = if update_existing {
+            DestinationMode::UpdateVerified
+        } else {
+            DestinationMode::Fresh
+        };
+
+        let spawn_result = thread::Builder::new()
+            .name(format!("networkcopy-managed-receiver-{job_id}"))
+            .spawn(move || {
+                let result = calibrated_transfer::receive_once_with_progress_and_mode(
+                    listener,
+                    &worker_destination,
+                    worker_progress,
+                    destination_mode,
+                );
+
+                if let Err(error) = worker_registry.finish_receive(job_id) {
+                    eprintln!("failed to finalize managed receiver job {job_id}: {error}");
+                }
+
+                match result {
+                    Ok(report) => {
+                        println!("Managed receiver job {job_id} complete");
+
+                        println!("  Files received: {}", report.transfer.files_received,);
+
+                        println!("  Bytes received: {}", report.transfer.bytes_received,);
+                    }
+
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                        println!("Managed receiver job {job_id} cancelled");
+                    }
+
+                    Err(error) => {
+                        eprintln!("Managed receiver job {job_id} failed: {error}");
+                    }
+                }
+            });
+
+        if let Err(error) = spawn_result {
+            let _ = self.finish_receive(job_id);
+
+            return Err(error);
+        }
 
         Ok(job)
     }
@@ -158,20 +259,28 @@ impl ManagementJobRegistry {
         let inner = self.lock_inner()?;
 
         match &inner.active_receive {
-            Some(job) => Ok(ManagementJobStatus {
-                phase: ManagementJobPhase::ReceiverPrepared,
+            Some(active) => {
+                let job = &active.job;
 
-                job_id: Some(job.job_id),
+                Ok(ManagementJobStatus {
+                    phase: ManagementJobPhase::ReceiverPrepared,
 
-                destination_root: Some(job.destination_root.clone()),
+                    job_id: Some(job.job_id),
 
-                update_existing: job.update_existing,
-            }),
+                    transfer_port: Some(job.transfer_port),
+
+                    destination_root: Some(job.destination_root.clone()),
+
+                    update_existing: job.update_existing,
+                })
+            }
 
             None => Ok(ManagementJobStatus {
                 phase: ManagementJobPhase::Idle,
 
                 job_id: None,
+
+                transfer_port: None,
 
                 destination_root: None,
 
@@ -188,28 +297,49 @@ impl ManagementJobRegistry {
             ));
         }
 
-        let mut inner = self.lock_inner()?;
+        let active = {
+            let mut inner = self.lock_inner()?;
 
-        let Some(active) = &inner.active_receive else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "management agent has no active job",
-            ));
+            let Some(active) = &inner.active_receive else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "management agent has no active job",
+                ));
+            };
+
+            if active.job.job_id != job_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "management agent has active job {}, not requested job {job_id}",
+                        active.job.job_id,
+                    ),
+                ));
+            }
+
+            inner.active_receive.take().ok_or_else(|| {
+                io::Error::other("active management job disappeared during cancellation")
+            })?
         };
 
-        if active.job_id != job_id {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "management agent has active job {}, not requested job {job_id}",
-                    active.job_id,
-                ),
-            ));
+        active.progress.cancel();
+
+        Ok(active.job)
+    }
+
+    fn finish_receive(&self, job_id: u64) -> io::Result<()> {
+        let mut inner = self.lock_inner()?;
+
+        let matches_job = inner
+            .active_receive
+            .as_ref()
+            .is_some_and(|active| active.job.job_id == job_id);
+
+        if matches_job {
+            inner.active_receive.take();
         }
 
-        inner.active_receive.take().ok_or_else(|| {
-            io::Error::other("active management job disappeared during cancellation")
-        })
+        Ok(())
     }
 
     fn lock_inner(&self) -> io::Result<MutexGuard<'_, JobRegistryInner>> {
@@ -333,6 +463,8 @@ pub(crate) fn encode_prepared_response(job: &PreparedReceiveJob) -> io::Result<V
 
         job_id: Some(job.job_id),
 
+        transfer_port: Some(job.transfer_port),
+
         destination_root: Some(job.destination_root.clone()),
 
         update_existing: job.update_existing,
@@ -357,6 +489,13 @@ pub(crate) fn decode_prepared_response(payload: &[u8]) -> io::Result<PreparedRec
             )
         })?,
 
+        transfer_port: status.transfer_port.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "prepared receiver response omitted its transfer port",
+            )
+        })?,
+
         destination_root: status.destination_root.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -369,9 +508,10 @@ pub(crate) fn decode_prepared_response(payload: &[u8]) -> io::Result<PreparedRec
 }
 
 pub(crate) fn encode_status(status: &ManagementJobStatus) -> io::Result<Vec<u8>> {
-    let (job_id, destination_root) = match status.phase {
+    let (job_id, transfer_port, destination_root) = match status.phase {
         ManagementJobPhase::Idle => {
             if status.job_id.is_some()
+                || status.transfer_port.is_some()
                 || status.destination_root.is_some()
                 || status.update_existing
             {
@@ -381,7 +521,7 @@ pub(crate) fn encode_status(status: &ManagementJobStatus) -> io::Result<Vec<u8>>
                 ));
             }
 
-            (0_u64, "")
+            (0_u64, 0_u16, "")
         }
 
         ManagementJobPhase::ReceiverPrepared => {
@@ -399,6 +539,20 @@ pub(crate) fn encode_status(status: &ManagementJobStatus) -> io::Result<Vec<u8>>
                 ));
             }
 
+            let transfer_port = status.transfer_port.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "prepared receiver status omitted its transfer port",
+                )
+            })?;
+
+            if transfer_port == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "prepared receiver status used transfer port zero",
+                ));
+            }
+
             let destination_root = status.destination_root.as_deref().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -408,7 +562,7 @@ pub(crate) fn encode_status(status: &ManagementJobStatus) -> io::Result<Vec<u8>>
 
             validate_destination_path(destination_root)?;
 
-            (job_id, destination_root)
+            (job_id, transfer_port, destination_root)
         }
     };
 
@@ -432,6 +586,10 @@ pub(crate) fn encode_status(status: &ManagementJobStatus) -> io::Result<Vec<u8>>
     payload.push(encode_job_flags(status.update_existing));
 
     payload.extend_from_slice(&job_id.to_le_bytes());
+
+    payload.extend_from_slice(&transfer_port.to_le_bytes());
+
+    payload.extend_from_slice(&0_u16.to_le_bytes());
 
     payload.extend_from_slice(&path_length.to_le_bytes());
 
@@ -476,7 +634,28 @@ pub(crate) fn decode_status(payload: &[u8]) -> io::Result<ManagementJobStatus> {
         )
     })?);
 
-    let path_length = usize::try_from(u32::from_le_bytes(payload[12..16].try_into().map_err(
+    let transfer_port = u16::from_le_bytes(payload[12..14].try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "management transfer port was malformed",
+        )
+    })?);
+
+    let reserved = u16::from_le_bytes(payload[14..16].try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "management job reserved field was malformed",
+        )
+    })?);
+
+    if reserved != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "management job reserved field was not zero",
+        ));
+    }
+
+    let path_length = usize::try_from(u32::from_le_bytes(payload[16..20].try_into().map_err(
         |_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -512,7 +691,7 @@ pub(crate) fn decode_status(payload: &[u8]) -> io::Result<ManagementJobStatus> {
 
     match phase {
         ManagementJobPhase::Idle => {
-            if job_id != 0 || path_length != 0 || update_existing {
+            if job_id != 0 || transfer_port != 0 || path_length != 0 || update_existing {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "idle management job status contained active-job fields",
@@ -523,6 +702,8 @@ pub(crate) fn decode_status(payload: &[u8]) -> io::Result<ManagementJobStatus> {
                 phase,
 
                 job_id: None,
+
+                transfer_port: None,
 
                 destination_root: None,
 
@@ -538,12 +719,21 @@ pub(crate) fn decode_status(payload: &[u8]) -> io::Result<ManagementJobStatus> {
                 ));
             }
 
+            if transfer_port == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "prepared receiver status used transfer port zero",
+                ));
+            }
+
             let destination_root = decode_destination_path(&payload[JOB_STATUS_HEADER_BYTES..])?;
 
             Ok(ManagementJobStatus {
                 phase,
 
                 job_id: Some(job_id),
+
+                transfer_port: Some(transfer_port),
 
                 destination_root: Some(destination_root),
 
@@ -697,8 +887,11 @@ mod tests {
         encode_status,
     };
     use std::fs;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::process;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn prepare_request_round_trips() {
@@ -725,9 +918,15 @@ mod tests {
 
         let destination_text = destination.to_str().unwrap();
 
-        let registry = ManagementJobRegistry::new();
+        let registry = Arc::new(ManagementJobRegistry::new());
 
-        let job = registry.prepare_receive(destination_text, true).unwrap();
+        let job = registry
+            .prepare_receive_on(
+                destination_text,
+                true,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
+            .unwrap();
 
         assert!(registry.is_busy().unwrap());
 
@@ -737,7 +936,19 @@ mod tests {
 
         assert_eq!(status.job_id, Some(job.job_id),);
 
-        assert!(registry.prepare_receive(destination_text, false,).is_err(),);
+        assert_eq!(status.transfer_port, Some(job.transfer_port),);
+
+        assert!(job.transfer_port > 0);
+
+        assert!(
+            registry
+                .prepare_receive_on(
+                    destination_text,
+                    false,
+                    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0,),),
+                )
+                .is_err(),
+        );
 
         let cancelled = registry.cancel(job.job_id).unwrap();
 
@@ -745,12 +956,14 @@ mod tests {
 
         assert!(!registry.is_busy().unwrap());
 
+        thread::sleep(Duration::from_millis(100));
+
         fs::remove_dir_all(destination).unwrap();
     }
 
     #[test]
     fn prepared_response_round_trips() {
-        let registry = ManagementJobRegistry::new();
+        let registry = Arc::new(ManagementJobRegistry::new());
 
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -763,7 +976,11 @@ mod tests {
         ));
 
         let job = registry
-            .prepare_receive(destination.to_str().unwrap(), false)
+            .prepare_receive_on(
+                destination.to_str().unwrap(),
+                false,
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            )
             .unwrap();
 
         let encoded = encode_prepared_response(&job).unwrap();
@@ -773,6 +990,8 @@ mod tests {
         assert_eq!(decoded, job);
 
         registry.cancel(job.job_id).unwrap();
+
+        thread::sleep(Duration::from_millis(100));
 
         fs::remove_dir_all(destination).unwrap();
     }

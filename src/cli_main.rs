@@ -209,6 +209,16 @@ fn run_management_agent(
         ),
     )?;
 
+    windows_setup::prepare_receiver(
+        SocketAddr::V4(
+            SocketAddrV4::new(
+                Ipv4Addr::UNSPECIFIED,
+                direct_address::
+                    DIRECT_TRANSFER_PORT,
+            ),
+        ),
+    )?;
+
     windows_setup::prepare_discovery_receiver(
         management_protocol::
             MANAGEMENT_DISCOVERY_PORT,
@@ -303,6 +313,14 @@ fn run_management_prepare_receive(
     );
 
     println!(
+        "  Receiver:      {}",
+        SocketAddr::new(
+            endpoint.ip(),
+            job.transfer_port,
+        ),
+    );
+
+    println!(
         "  Destination:   {}",
         job.destination_root,
     );
@@ -317,7 +335,7 @@ fn run_management_prepare_receive(
     );
 
     println!(
-        "  State:         receiver prepared"
+        "  State:         receiver waiting for sender"
     );
 
     Ok(())
@@ -371,6 +389,18 @@ fn run_management_job_status(
     {
         println!(
             "  Job ID:        {job_id}"
+        );
+    }
+
+    if let Some(transfer_port) =
+        status.transfer_port
+    {
+        println!(
+            "  Receiver:      {}",
+            SocketAddr::new(
+                endpoint.ip(),
+                transfer_port,
+            ),
         );
     }
 

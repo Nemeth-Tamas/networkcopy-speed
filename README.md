@@ -229,6 +229,23 @@ Cancel a prepared management job:
 cargo run -- management-cancel 127.0.0.1:7339 1
 ```
 
+A prepared receiver now binds the production transfer listener on TCP port 7337
+and immediately begins waiting for the calibration matrix and folder transfer.
+
+Until remote sender startup is implemented, the existing `send-auto` command can
+be used to exercise the managed receiver:
+
+```powershell
+networkcopy-speed.exe send-auto `
+    127.0.0.1:7337 `
+    "C:\TransferSource" `
+    4 `
+    8
+```
+
+After a successful transfer, the receiver job automatically leaves the active
+registry and the agent returns to the idle state.
+
 ## v2 roadmap
 
 Implementation order:

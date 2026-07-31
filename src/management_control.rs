@@ -1,3 +1,4 @@
+use crate::direct_address::DIRECT_TRANSFER_PORT;
 use crate::management_directory;
 use crate::management_discovery::{AgentCapabilities, AgentState};
 use crate::management_filesystem;
@@ -51,6 +52,8 @@ pub struct ManagementRoot {
 struct ManagementControlServer {
     listener: TcpListener,
 
+    receiver_bind_address: SocketAddr,
+
     hostname: String,
 
     capabilities: AgentCapabilities,
@@ -64,10 +67,14 @@ impl ManagementControlServer {
         capabilities: AgentCapabilities,
         jobs: Arc<ManagementJobRegistry>,
     ) -> io::Result<Self> {
-        Self::bind_at_with_jobs(
+        Self::bind_at_with_receiver(
             SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::UNSPECIFIED,
                 MANAGEMENT_CONTROL_PORT,
+            )),
+            SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::UNSPECIFIED,
+                DIRECT_TRANSFER_PORT,
             )),
             hostname,
             capabilities,
@@ -81,16 +88,18 @@ impl ManagementControlServer {
         hostname: String,
         capabilities: AgentCapabilities,
     ) -> io::Result<Self> {
-        Self::bind_at_with_jobs(
+        Self::bind_at_with_receiver(
             address,
+            SocketAddr::new(address.ip(), 0),
             hostname,
             capabilities,
             Arc::new(ManagementJobRegistry::new()),
         )
     }
 
-    fn bind_at_with_jobs(
+    fn bind_at_with_receiver(
         address: SocketAddr,
+        receiver_bind_address: SocketAddr,
         hostname: String,
         capabilities: AgentCapabilities,
         jobs: Arc<ManagementJobRegistry>,
@@ -101,6 +110,7 @@ impl ManagementControlServer {
 
         Ok(Self {
             listener,
+            receiver_bind_address,
             hostname,
             capabilities,
             jobs,
@@ -195,8 +205,11 @@ impl ManagementControlServer {
             ManagementMessageKind::PrepareReceiveRequest => {
                 let result = crate::management_jobs::decode_prepare_request(&request.payload)
                     .and_then(|prepared| {
-                        self.jobs
-                            .prepare_receive(&prepared.destination_root, prepared.update_existing)
+                        self.jobs.prepare_receive_on(
+                            &prepared.destination_root,
+                            prepared.update_existing,
+                            self.receiver_bind_address,
+                        )
                     })
                     .and_then(|job| crate::management_jobs::encode_prepared_response(&job));
 
@@ -973,7 +986,8 @@ mod tests {
 
         let jobs = Arc::new(ManagementJobRegistry::new());
 
-        let server = ManagementControlServer::bind_at_with_jobs(
+        let server = ManagementControlServer::bind_at_with_receiver(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
             "LOOPBACK-PC".to_string(),
             AgentCapabilities::SEND_RECEIVE,
@@ -1000,6 +1014,10 @@ mod tests {
         assert_eq!(prepared_status.phase, ManagementJobPhase::ReceiverPrepared,);
 
         assert_eq!(prepared_status.job_id, Some(prepared.job_id),);
+
+        assert_eq!(prepared_status.transfer_port, Some(prepared.transfer_port),);
+
+        assert!(prepared.transfer_port > 0);
 
         assert_eq!(
             prepared_status.destination_root.as_deref(),
