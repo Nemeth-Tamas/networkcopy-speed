@@ -175,7 +175,9 @@ Initial v2.2 scope:
 - [x] retain the most recent completed, cancelled, or failed job result;
 - [ ] resume complete transfer jobs remotely;
 - [x] keep active transfers running if the management UI disconnects;
-- [ ] add a separate WGPU management application;
+- [x] add an initial separate WGPU management application;
+- [ ] add remote dual-pane folder browsing to the management application;
+- [ ] add paired transfer history and richer diagnostics to the management application;
 - [ ] test three-machine orchestration on a physical LAN.
 
 The first v2.2 management release will intentionally use a trusted-LAN model
@@ -300,6 +302,39 @@ bytes, cancellation state, and the latest terminal result. Completed sender
 results include logical and wire byte counts; receiver results include received
 file and logical-byte counts. Failed and cancelled jobs retain their diagnostic
 message after the endpoint returns to idle.
+
+## Management GUI
+
+Build the initial WGPU manager:
+
+```powershell
+cargo build `
+    --release `
+    --bin networkcopy-manager
+```
+
+Start management agents on the sender and receiver machines:
+
+```powershell
+networkcopy-speed.exe management-agent
+```
+
+Then open the manager on any machine on the trusted LAN:
+
+```powershell
+networkcopy-manager.exe
+```
+
+The initial manager discovers LAN agents, assigns sender and receiver roles,
+accepts remote source and destination paths, starts a paired transfer, polls both
+endpoint snapshots, displays live progress and retained terminal results, and
+cancels both endpoint jobs from one window.
+
+The manager is not part of the payload path. Closing it does not terminate a
+transfer that has already been accepted by both endpoint agents.
+
+Management traffic remains unauthenticated during the current trusted-LAN
+development phase.
 
 ## v2 roadmap
 
