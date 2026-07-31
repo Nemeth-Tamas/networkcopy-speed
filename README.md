@@ -161,9 +161,10 @@ selected receiver.
 
 Initial v2.2 scope:
 
-- [ ] add a persistent sender/receiver agent mode;
-- [ ] advertise and discover available agents on the LAN;
-- [ ] report machine name, addresses, capabilities, and current state;
+- [x] add a persistent LAN-visible agent process;
+- [ ] connect the agent to sender and receiver job control;
+- [x] advertise and discover available agents on the LAN;
+- [x] report machine name, reachable management address, capabilities, and current state;
 - [ ] remotely enumerate drives and folders on each endpoint;
 - [ ] select the source machine and source folder;
 - [ ] select the receiver machine and destination folder;
@@ -178,6 +179,23 @@ without authentication or encryption. It must only be used on a known,
 controlled network. Pairing, authenticated commands, encrypted management
 traffic, allowed-root policies, and stronger remote-filesystem protections are
 planned after the working management workflow has been field-tested.
+
+### Management discovery prototype
+
+Start an agent from an elevated terminal:
+
+```powershell
+cargo run -- management-agent
+```
+
+Discover agents from another computer on the same LAN:
+
+```powershell
+cargo run -- management-discover
+```
+
+The discovery prototype advertises TCP port 7339, but the management control
+listener is introduced in the next implementation slice.
 
 ## v2 roadmap
 

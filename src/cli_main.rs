@@ -92,6 +92,18 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         }
 
+        "management-agent" => {
+            run_management_agent(
+                &mut arguments,
+            )
+        }
+
+        "management-discover" => {
+            run_management_discover(
+                &mut arguments,
+            )
+        }
+
         "direct-interfaces" => run_direct_interfaces(&mut arguments),
 
         "direct-address" => run_direct_address(&mut arguments),
@@ -128,6 +140,117 @@ fn run() -> Result<(), Box<dyn Error>> {
         )
         .into()),
     }
+}
+
+fn run_management_agent(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    windows_setup::prepare_discovery_receiver(
+        management_protocol::
+            MANAGEMENT_DISCOVERY_PORT,
+    )?;
+
+    management_discovery::run_agent()?;
+
+    Ok(())
+}
+
+fn run_management_discover(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    println!(
+        "NetworkCopy Speed Edition management discovery"
+    );
+
+    println!();
+
+    println!(
+        "WARNING: management mode is currently unauthenticated."
+    );
+
+    println!(
+        "Use it only on a known, trusted local network."
+    );
+
+    println!();
+
+    let agents =
+        management_discovery::discover()?;
+
+    println!(
+        "Discovered agents: {}",
+        agents.len(),
+    );
+
+    for agent in agents {
+        let capabilities =
+            match (
+                agent.capabilities.can_send(),
+                agent.capabilities.can_receive(),
+            ) {
+                (true, true) => {
+                    "sender, receiver"
+                }
+
+                (true, false) => "sender",
+
+                (false, true) => "receiver",
+
+                (false, false) => {
+                    "none"
+                }
+            };
+
+        println!();
+
+        println!(
+            "  Computer:      {}",
+            agent.hostname,
+        );
+
+        println!(
+            "  Control:       {}",
+            agent.endpoint,
+        );
+
+        println!(
+            "  Protocol:      {}",
+            agent.protocol_version,
+        );
+
+        println!(
+            "  State:         {}",
+            agent.state.label(),
+        );
+
+        println!(
+            "  Capabilities:  {capabilities}"
+        );
+    }
+
+    Ok(())
 }
 
 fn run_direct_receive(
@@ -1896,6 +2019,8 @@ fn print_usage(program: &OsStr) {
     println!();
     println!("Usage:");
     println!("  {program} --version");
+    println!("  {program} management-agent");
+    println!("  {program} management-discover");
     println!("  {program} direct-interfaces");
     println!("  {program} direct-address <interface-index>");
     println!("  {program} direct-discovery-receive <interface-index>");
