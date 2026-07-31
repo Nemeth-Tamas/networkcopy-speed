@@ -1,3 +1,4 @@
+use crate::management_control;
 use crate::management_protocol::{
     MANAGEMENT_CONTROL_PORT, MANAGEMENT_DISCOVERY_PORT, MANAGEMENT_PROTOCOL_VERSION,
 };
@@ -86,11 +87,11 @@ impl AgentCapabilities {
         self.bits & Self::RECEIVE_BIT != 0
     }
 
-    const fn bits(self) -> u8 {
+    pub(crate) const fn bits(self) -> u8 {
         self.bits
     }
 
-    fn from_bits(bits: u8) -> io::Result<Self> {
+    pub(crate) fn from_bits(bits: u8) -> io::Result<Self> {
         if bits == 0 || bits & !Self::KNOWN_BITS != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -367,6 +368,12 @@ pub fn run_agent() -> io::Result<()> {
         Ipv4Addr::UNSPECIFIED,
         MANAGEMENT_DISCOVERY_PORT,
     ))?;
+
+    management_control::spawn(
+        descriptor.hostname.clone(),
+        descriptor.state,
+        descriptor.capabilities,
+    )?;
 
     println!("NetworkCopy Speed Edition management agent");
 

@@ -2,7 +2,14 @@ use std::env;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener};
+use std::net::{
+    Ipv4Addr,
+    Ipv6Addr,
+    SocketAddr,
+    SocketAddrV4,
+    SocketAddrV6,
+    TcpListener,
+};
 use std::path::PathBuf;
 
 pub fn run_cli() {
@@ -104,6 +111,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         }
 
+        "management-hello" => {
+            run_management_hello(
+                &mut arguments,
+            )
+        }
+
         "direct-interfaces" => run_direct_interfaces(&mut arguments),
 
         "direct-address" => run_direct_address(&mut arguments),
@@ -156,12 +169,113 @@ fn run_management_agent(
         .into());
     }
 
+    windows_setup::prepare_receiver(
+        SocketAddr::V4(
+            SocketAddrV4::new(
+                Ipv4Addr::UNSPECIFIED,
+                management_protocol::
+                    MANAGEMENT_CONTROL_PORT,
+            ),
+        ),
+    )?;
+
     windows_setup::prepare_discovery_receiver(
         management_protocol::
             MANAGEMENT_DISCOVERY_PORT,
     )?;
 
     management_discovery::run_agent()?;
+
+    Ok(())
+}
+
+fn run_management_hello(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let endpoint =
+        parse_socket_address(
+            &required_argument(
+                arguments,
+                "management agent address",
+            )?,
+            "management agent address",
+        )?;
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    println!(
+        "NetworkCopy Speed Edition management hello"
+    );
+
+    println!();
+
+    println!(
+        "WARNING: management mode is currently unauthenticated."
+    );
+
+    println!(
+        "Use it only on a known, trusted local network."
+    );
+
+    println!();
+
+    let response =
+        management_control::hello(
+            endpoint,
+        )?;
+
+    let capabilities =
+        match (
+            response.capabilities.can_send(),
+            response.capabilities.can_receive(),
+        ) {
+            (true, true) => {
+                "sender, receiver"
+            }
+
+            (true, false) => "sender",
+
+            (false, true) => "receiver",
+
+            (false, false) => "none",
+        };
+
+    println!(
+        "Management agent replied"
+    );
+
+    println!(
+        "  Computer:      {}",
+        response.hostname,
+    );
+
+    println!(
+        "  Application:   {}",
+        response.application_version,
+    );
+
+    println!(
+        "  Protocol:      {}",
+        response.protocol_version,
+    );
+
+    println!(
+        "  State:         {}",
+        response.state.label(),
+    );
+
+    println!(
+        "  Capabilities:  {capabilities}"
+    );
 
     Ok(())
 }
@@ -2021,6 +2135,7 @@ fn print_usage(program: &OsStr) {
     println!("  {program} --version");
     println!("  {program} management-agent");
     println!("  {program} management-discover");
+    println!("  {program} management-hello <agent-address>");
     println!("  {program} direct-interfaces");
     println!("  {program} direct-address <interface-index>");
     println!("  {program} direct-discovery-receive <interface-index>");
