@@ -170,7 +170,8 @@ Initial v2.2 scope:
 - [ ] select the source machine and source folder;
 - [ ] select the receiver machine and destination folder;
 - [ ] support Direct Link and explicit IP transfer modes;
-- [ ] start, cancel, resume, and inspect transfer jobs remotely;
+- [x] start sender and receiver transfer jobs remotely;
+- [ ] resume complete transfer jobs remotely;
 - [ ] keep active transfers running if the management UI disconnects;
 - [ ] add a separate WGPU management application;
 - [ ] test three-machine orchestration on a physical LAN.
@@ -245,6 +246,22 @@ networkcopy-speed.exe send-auto `
 
 After a successful transfer, the receiver job automatically leaves the active
 registry and the agent returns to the idle state.
+
+Start a sender job through its management agent:
+
+```powershell
+networkcopy-speed.exe management-start-send `
+    192.168.1.10:7339 `
+    192.168.1.20:7337 `
+    "D:\TransferSource" `
+    4 `
+    8
+```
+
+The command returns immediately after the sender job has been accepted. The
+sender agent performs calibration and transfer in a background worker, reports
+itself as busy through discovery and management hello, and returns to idle when
+the job completes, fails, or is cancelled.
 
 ## v2 roadmap
 

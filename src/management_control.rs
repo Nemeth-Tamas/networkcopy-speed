@@ -2,7 +2,9 @@ use crate::direct_address::DIRECT_TRANSFER_PORT;
 use crate::management_directory;
 use crate::management_discovery::{AgentCapabilities, AgentState};
 use crate::management_filesystem;
-use crate::management_jobs::{ManagementJobRegistry, ManagementJobStatus, PreparedReceiveJob};
+use crate::management_jobs::{
+    ManagementJobRegistry, ManagementJobStatus, PreparedReceiveJob, StartedSendJob,
+};
 use crate::management_protocol::{
     MANAGEMENT_CONTROL_PORT, MANAGEMENT_PROTOCOL_VERSION, ManagementFrame, ManagementMessageKind,
     read_frame, write_frame,
@@ -227,6 +229,32 @@ impl ManagementControlServer {
                 }
             }
 
+            ManagementMessageKind::StartSendRequest => {
+                let result = crate::management_jobs::decode_start_send_request(&request.payload)
+                    .and_then(|started| {
+                        self.jobs.start_send(
+                            started.receiver_address,
+                            &started.source_root,
+                            started.worker_count,
+                            started.calibration_mib,
+                        )
+                    })
+                    .and_then(|job| crate::management_jobs::encode_started_send_response(&job));
+
+                match result {
+                    Ok(payload) => ManagementFrame::new(
+                        request.request_id,
+                        ManagementMessageKind::StartSendResponse,
+                        payload,
+                    )?,
+
+                    Err(error) => error_response(
+                        request.request_id,
+                        &format!("failed to start sender job: {error}"),
+                    )?,
+                }
+            }
+
             ManagementMessageKind::JobStatusRequest if request.payload.is_empty() => {
                 let payload = self
                     .jobs
@@ -254,7 +282,7 @@ impl ManagementControlServer {
             ManagementMessageKind::CancelJobRequest => {
                 let result = crate::management_jobs::decode_cancel_request(&request.payload)
                     .and_then(|job_id| self.jobs.cancel(job_id))
-                    .and_then(|job| crate::management_jobs::encode_cancel_request(job.job_id));
+                    .and_then(crate::management_jobs::encode_cancel_request);
 
                 match result {
                     Ok(payload) => ManagementFrame::new(
@@ -335,6 +363,36 @@ pub fn prepare_receive(
             io::ErrorKind::InvalidData,
             format!(
                 "management agent returned unexpected message {unexpected:?} for PrepareReceiveRequest"
+            ),
+        )),
+    }
+}
+
+pub fn start_send(
+    endpoint: SocketAddr,
+    receiver_address: SocketAddr,
+    source_root: &str,
+    worker_count: usize,
+    calibration_mib: u64,
+) -> io::Result<StartedSendJob> {
+    let payload = crate::management_jobs::encode_start_send_request(
+        receiver_address,
+        source_root,
+        worker_count,
+        calibration_mib,
+    )?;
+
+    let response = exchange(endpoint, ManagementMessageKind::StartSendRequest, payload)?;
+
+    match response.kind {
+        ManagementMessageKind::StartSendResponse => {
+            crate::management_jobs::decode_started_send_response(&response.payload)
+        }
+
+        unexpected => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "management agent returned unexpected message {unexpected:?} for StartSendRequest"
             ),
         )),
     }
@@ -830,8 +888,9 @@ mod tests {
         HELLO_PAYLOAD_VERSION, ManagementControlServer, ManagementRoot, cancel_job,
         decode_hello_payload, decode_roots_payload, encode_hello_payload, encode_roots_payload,
         hello, job_status, list_directory as request_directory, list_roots as request_roots,
-        prepare_receive,
+        prepare_receive, start_send,
     };
+    use crate::calibrated_transfer;
     use crate::management_directory::ManagementEntryKind;
     use crate::management_discovery::{AgentCapabilities, AgentState};
     use crate::management_filesystem;
@@ -839,11 +898,11 @@ mod tests {
     use crate::management_protocol::MANAGEMENT_PROTOCOL_VERSION;
     use std::fs;
     use std::io;
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
     use std::process;
     use std::sync::Arc;
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn loopback_hello_round_trips() {
@@ -1041,6 +1100,95 @@ mod tests {
         server_thread.join().unwrap();
 
         fs::remove_dir_all(destination).unwrap();
+    }
+
+    #[test]
+    fn loopback_starts_managed_sender() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let parent = std::env::temp_dir().join(format!(
+            "networkcopy-managed-sender-{}-{unique}",
+            process::id(),
+        ));
+
+        let source = parent.join("source");
+
+        let destination = parent.join("destination");
+
+        fs::create_dir_all(&source).unwrap();
+
+        fs::write(source.join("hello.txt"), b"managed sender alive").unwrap();
+
+        fs::write(source.join("payload.bin"), vec![0xA5_u8; 256 * 1024]).unwrap();
+
+        let receiver_listener =
+            TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+
+        let receiver_address = receiver_listener.local_addr().unwrap();
+
+        let receiver_destination = destination.clone();
+
+        let receiver_thread = thread::spawn(move || {
+            calibrated_transfer::receive_once(receiver_listener, &receiver_destination)
+        });
+
+        let jobs = Arc::new(ManagementJobRegistry::new());
+
+        let server = ManagementControlServer::bind_at_with_receiver(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            "LOOPBACK-PC".to_string(),
+            AgentCapabilities::SEND_RECEIVE,
+            Arc::clone(&jobs),
+        )
+        .unwrap();
+
+        let endpoint = server.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            server.serve_one().unwrap();
+        });
+
+        let started =
+            start_send(endpoint, receiver_address, source.to_str().unwrap(), 2, 1).unwrap();
+
+        server_thread.join().unwrap();
+
+        let receiver_report = receiver_thread.join().unwrap().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        while jobs.is_busy().unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "managed sender did not return to idle",
+            );
+
+            thread::sleep(Duration::from_millis(25));
+        }
+
+        assert_eq!(started.receiver_address, receiver_address,);
+
+        assert_eq!(started.worker_count, 2,);
+
+        assert_eq!(started.calibration_mib, 1,);
+
+        assert_eq!(receiver_report.transfer.files_received, 2,);
+
+        assert_eq!(
+            fs::read(destination.join("hello.txt"),).unwrap(),
+            b"managed sender alive",
+        );
+
+        assert_eq!(
+            fs::read(destination.join("payload.bin"),).unwrap(),
+            vec![0xA5_u8; 256 * 1024],
+        );
+
+        fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]

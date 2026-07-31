@@ -135,6 +135,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         }
 
+        "management-start-send" => {
+            run_management_start_send(
+                &mut arguments,
+            )
+        }
+
         "management-job-status" => {
             run_management_job_status(
                 &mut arguments,
@@ -225,6 +231,130 @@ fn run_management_agent(
     )?;
 
     management_discovery::run_agent()?;
+
+    Ok(())
+}
+
+fn run_management_start_send(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let endpoint =
+        parse_socket_address(
+            &required_argument(
+                arguments,
+                "sender management agent address",
+            )?,
+            "sender management agent address",
+        )?;
+
+    let receiver_address =
+        parse_socket_address(
+            &required_argument(
+                arguments,
+                "receiver payload address",
+            )?,
+            "receiver payload address",
+        )?;
+
+    let source_root =
+        required_argument(
+            arguments,
+            "sender source directory",
+        )?
+        .into_string()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sender source must contain valid Unicode",
+            )
+        })?;
+
+    let worker_count =
+        match arguments.next() {
+            Some(value) => {
+                parse_usize_count(
+                    &value,
+                    "scan worker count",
+                )?
+            }
+
+            None => {
+                manifest_scan::
+                    default_worker_count()
+            }
+        };
+
+    let calibration_mib =
+        match arguments.next() {
+            Some(value) => {
+                parse_u64_count(
+                    &value,
+                    "calibration MiB",
+                )?
+            }
+
+            None => {
+                calibrated_transfer::
+                    DEFAULT_CALIBRATION_MIB
+            }
+        };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    let job =
+        management_control::start_send(
+            endpoint,
+            receiver_address,
+            &source_root,
+            worker_count,
+            calibration_mib,
+        )?;
+
+    println!(
+        "NetworkCopy Speed Edition sender started"
+    );
+
+    println!(
+        "  Agent:         {endpoint}"
+    );
+
+    println!(
+        "  Job ID:        {}",
+        job.job_id,
+    );
+
+    println!(
+        "  Receiver:      {}",
+        job.receiver_address,
+    );
+
+    println!(
+        "  Source:        {}",
+        job.source_root,
+    );
+
+    println!(
+        "  Scan workers:  {}",
+        job.worker_count,
+    );
+
+    println!(
+        "  Calibration:   {} MiB per matrix run",
+        job.calibration_mib,
+    );
+
+    println!(
+        "  State:         sender running"
+    );
 
     Ok(())
 }
@@ -2604,6 +2734,10 @@ fn print_usage(program: &OsStr) {
     );
     println!(
         "  {program} management-prepare-receive <agent-address> <destination-root> [--update]"
+    );
+    println!(
+        "  {program} management-start-send <sender-agent> \
+         <receiver-address> <source-root> [workers] [calibration-mib]"
     );
     println!(
         "  {program} management-job-status <agent-address>"

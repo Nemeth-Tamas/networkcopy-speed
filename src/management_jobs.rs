@@ -1,6 +1,8 @@
 use crate::calibrated_transfer;
 use crate::console_progress::ProgressCounter;
+use crate::manifest_scan;
 use crate::multistream_copy::DestinationMode;
+use crate::network_calibration;
 use std::fs;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
@@ -12,7 +14,13 @@ use std::thread;
 const PREPARE_REQUEST_VERSION: u16 = 1;
 const PREPARE_REQUEST_HEADER_BYTES: usize = 8;
 
-const JOB_STATUS_VERSION: u16 = 2;
+const START_SEND_REQUEST_VERSION: u16 = 1;
+const START_SEND_REQUEST_HEADER_BYTES: usize = 24;
+
+const START_SEND_RESPONSE_VERSION: u16 = 1;
+const START_SEND_RESPONSE_HEADER_BYTES: usize = 12;
+
+const JOB_STATUS_VERSION: u16 = 3;
 const JOB_STATUS_HEADER_BYTES: usize = 20;
 
 const CANCEL_REQUEST_VERSION: u16 = 1;
@@ -22,12 +30,15 @@ const UPDATE_EXISTING_FLAG: u8 = 0x01;
 const KNOWN_JOB_FLAGS: u8 = UPDATE_EXISTING_FLAG;
 
 const MAX_DESTINATION_PATH_BYTES: usize = 32 * 1024;
+const MAX_SOURCE_PATH_BYTES: usize = 32 * 1024;
+const MAX_RECEIVER_ENDPOINT_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum ManagementJobPhase {
     Idle = 0,
     ReceiverPrepared = 1,
+    SenderRunning = 2,
 }
 
 impl ManagementJobPhase {
@@ -36,6 +47,8 @@ impl ManagementJobPhase {
             Self::Idle => "idle",
 
             Self::ReceiverPrepared => "receiver waiting for sender",
+
+            Self::SenderRunning => "sender running",
         }
     }
 }
@@ -48,6 +61,8 @@ impl TryFrom<u8> for ManagementJobPhase {
             0 => Ok(Self::Idle),
 
             1 => Ok(Self::ReceiverPrepared),
+
+            2 => Ok(Self::SenderRunning),
 
             unknown => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -66,6 +81,19 @@ pub struct PreparedReceiveJob {
     pub destination_root: String,
 
     pub update_existing: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartedSendJob {
+    pub job_id: u64,
+
+    pub receiver_address: SocketAddr,
+
+    pub source_root: String,
+
+    pub worker_count: usize,
+
+    pub calibration_mib: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +116,17 @@ pub(crate) struct PrepareReceiveRequest {
     pub(crate) update_existing: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StartSendRequest {
+    pub(crate) receiver_address: SocketAddr,
+
+    pub(crate) source_root: String,
+
+    pub(crate) worker_count: usize,
+
+    pub(crate) calibration_mib: u64,
+}
+
 #[derive(Clone, Debug)]
 struct ActiveReceiveJob {
     job: PreparedReceiveJob,
@@ -95,9 +134,26 @@ struct ActiveReceiveJob {
     progress: ProgressCounter,
 }
 
+#[derive(Clone, Debug)]
+struct ActiveSendJob {
+    job: StartedSendJob,
+
+    progress: ProgressCounter,
+}
+
 #[derive(Debug, Default)]
 struct JobRegistryInner {
     active_receive: Option<ActiveReceiveJob>,
+
+    active_send: Option<ActiveSendJob>,
+}
+
+fn active_job_id(inner: &JobRegistryInner) -> Option<u64> {
+    inner
+        .active_receive
+        .as_ref()
+        .map(|active| active.job.job_id)
+        .or_else(|| inner.active_send.as_ref().map(|active| active.job.job_id))
 }
 
 #[derive(Debug)]
@@ -117,7 +173,9 @@ impl ManagementJobRegistry {
     }
 
     pub(crate) fn is_busy(&self) -> io::Result<bool> {
-        Ok(self.lock_inner()?.active_receive.is_some())
+        let inner = self.lock_inner()?;
+
+        Ok(active_job_id(&inner).is_some())
     }
 
     pub(crate) fn prepare_receive_on(
@@ -128,14 +186,15 @@ impl ManagementJobRegistry {
     ) -> io::Result<PreparedReceiveJob> {
         validate_destination_path(destination_root)?;
 
-        if let Some(active) = &self.lock_inner()?.active_receive {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!(
-                    "management agent already has active job {}",
-                    active.job.job_id,
-                ),
-            ));
+        {
+            let inner = self.lock_inner()?;
+
+            if let Some(existing_job_id) = active_job_id(&inner) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("management agent already has active job {existing_job_id}"),
+                ));
+            }
         }
 
         let destination_path = Path::new(destination_root);
@@ -184,13 +243,10 @@ impl ManagementJobRegistry {
         {
             let mut inner = self.lock_inner()?;
 
-            if let Some(active) = &inner.active_receive {
+            if let Some(existing_job_id) = active_job_id(&inner) {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    format!(
-                        "management agent already has active job {}",
-                        active.job.job_id,
-                    ),
+                    format!("management agent already has active job {existing_job_id}"),
                 ));
             }
 
@@ -255,41 +311,176 @@ impl ManagementJobRegistry {
         Ok(job)
     }
 
+    pub(crate) fn start_send(
+        self: &Arc<Self>,
+        receiver_address: SocketAddr,
+        source_root: &str,
+        worker_count: usize,
+        calibration_mib: u64,
+    ) -> io::Result<StartedSendJob> {
+        validate_send_parameters(receiver_address, source_root, worker_count, calibration_mib)?;
+
+        let calibration_bytes = network_calibration::bytes_from_mib(calibration_mib)?;
+
+        {
+            let inner = self.lock_inner()?;
+
+            if let Some(existing_job_id) = active_job_id(&inner) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("management agent already has active job {existing_job_id}"),
+                ));
+            }
+        }
+
+        let source_path = Path::new(source_root);
+
+        let metadata = fs::metadata(source_path)?;
+
+        if !metadata.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sender source does not identify a directory",
+            ));
+        }
+
+        let job_id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
+
+        if job_id == 0 {
+            return Err(io::Error::other(
+                "management job ID counter wrapped to zero",
+            ));
+        }
+
+        let job = StartedSendJob {
+            job_id,
+
+            receiver_address,
+
+            source_root: source_root.to_owned(),
+
+            worker_count,
+
+            calibration_mib,
+        };
+
+        let progress = ProgressCounter::new("Starting managed sender", 0);
+
+        {
+            let mut inner = self.lock_inner()?;
+
+            if let Some(existing_job_id) = active_job_id(&inner) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("management agent already has active job {existing_job_id}"),
+                ));
+            }
+
+            inner.active_send = Some(ActiveSendJob {
+                job: job.clone(),
+
+                progress: progress.clone(),
+            });
+        }
+
+        let worker_registry = Arc::clone(self);
+
+        let worker_progress = progress;
+
+        let worker_source = PathBuf::from(source_root);
+
+        let spawn_result = thread::Builder::new()
+            .name(format!("networkcopy-managed-sender-{job_id}"))
+            .spawn(move || {
+                let result = calibrated_transfer::send_with_progress(
+                    receiver_address,
+                    &worker_source,
+                    worker_count,
+                    calibration_bytes,
+                    worker_progress,
+                );
+
+                if let Err(error) = worker_registry.finish_send(job_id) {
+                    eprintln!("failed to finalize managed sender job {job_id}: {error}");
+                }
+
+                match result {
+                    Ok(report) => {
+                        println!("Managed sender job {job_id} complete");
+
+                        println!("  Files sent: {}", report.transfer.files_copied,);
+
+                        println!("  Bytes sent: {}", report.transfer.bytes_copied,);
+
+                        println!("  Data streams: {}", report.transfer.data_stream_count,);
+                    }
+
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                        println!("Managed sender job {job_id} cancelled");
+                    }
+
+                    Err(error) => {
+                        eprintln!("Managed sender job {job_id} failed: {error}");
+                    }
+                }
+            });
+
+        if let Err(error) = spawn_result {
+            let _ = self.finish_send(job_id);
+
+            return Err(error);
+        }
+
+        Ok(job)
+    }
+
     pub(crate) fn status(&self) -> io::Result<ManagementJobStatus> {
         let inner = self.lock_inner()?;
 
-        match &inner.active_receive {
-            Some(active) => {
-                let job = &active.job;
+        if let Some(active) = &inner.active_receive {
+            let job = &active.job;
 
-                Ok(ManagementJobStatus {
-                    phase: ManagementJobPhase::ReceiverPrepared,
+            return Ok(ManagementJobStatus {
+                phase: ManagementJobPhase::ReceiverPrepared,
 
-                    job_id: Some(job.job_id),
+                job_id: Some(job.job_id),
 
-                    transfer_port: Some(job.transfer_port),
+                transfer_port: Some(job.transfer_port),
 
-                    destination_root: Some(job.destination_root.clone()),
+                destination_root: Some(job.destination_root.clone()),
 
-                    update_existing: job.update_existing,
-                })
-            }
+                update_existing: job.update_existing,
+            });
+        }
 
-            None => Ok(ManagementJobStatus {
-                phase: ManagementJobPhase::Idle,
+        if let Some(active) = &inner.active_send {
+            return Ok(ManagementJobStatus {
+                phase: ManagementJobPhase::SenderRunning,
 
-                job_id: None,
+                job_id: Some(active.job.job_id),
 
                 transfer_port: None,
 
                 destination_root: None,
 
                 update_existing: false,
-            }),
+            });
         }
+
+        Ok(ManagementJobStatus {
+            phase: ManagementJobPhase::Idle,
+
+            job_id: None,
+
+            transfer_port: None,
+
+            destination_root: None,
+
+            update_existing: false,
+        })
     }
 
-    pub(crate) fn cancel(&self, job_id: u64) -> io::Result<PreparedReceiveJob> {
+    pub(crate) fn cancel(&self, job_id: u64) -> io::Result<u64> {
         if job_id == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -297,34 +488,39 @@ impl ManagementJobRegistry {
             ));
         }
 
-        let active = {
+        let progress = {
             let mut inner = self.lock_inner()?;
 
-            let Some(active) = &inner.active_receive else {
-                return Err(io::Error::new(
+            let existing_job_id = active_job_id(&inner).ok_or_else(|| {
+                io::Error::new(
                     io::ErrorKind::NotFound,
                     "management agent has no active job",
-                ));
-            };
+                )
+            })?;
 
-            if active.job.job_id != job_id {
+            if existing_job_id != job_id {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!(
-                        "management agent has active job {}, not requested job {job_id}",
-                        active.job.job_id,
+                        "management agent has active job {existing_job_id}, not requested job {job_id}"
                     ),
                 ));
             }
 
-            inner.active_receive.take().ok_or_else(|| {
-                io::Error::other("active management job disappeared during cancellation")
-            })?
+            if let Some(active) = inner.active_receive.take() {
+                active.progress
+            } else if let Some(active) = inner.active_send.take() {
+                active.progress
+            } else {
+                return Err(io::Error::other(
+                    "active management job disappeared during cancellation",
+                ));
+            }
         };
 
-        active.progress.cancel();
+        progress.cancel();
 
-        Ok(active.job)
+        Ok(job_id)
     }
 
     fn finish_receive(&self, job_id: u64) -> io::Result<()> {
@@ -337,6 +533,21 @@ impl ManagementJobRegistry {
 
         if matches_job {
             inner.active_receive.take();
+        }
+
+        Ok(())
+    }
+
+    fn finish_send(&self, job_id: u64) -> io::Result<()> {
+        let mut inner = self.lock_inner()?;
+
+        let matches_job = inner
+            .active_send
+            .as_ref()
+            .is_some_and(|active| active.job.job_id == job_id);
+
+        if matches_job {
+            inner.active_send.take();
         }
 
         Ok(())
@@ -457,6 +668,339 @@ pub(crate) fn decode_prepare_request(payload: &[u8]) -> io::Result<PrepareReceiv
     })
 }
 
+pub(crate) fn encode_start_send_request(
+    receiver_address: SocketAddr,
+    source_root: &str,
+    worker_count: usize,
+    calibration_mib: u64,
+) -> io::Result<Vec<u8>> {
+    validate_send_parameters(receiver_address, source_root, worker_count, calibration_mib)?;
+
+    let receiver_text = receiver_address.to_string();
+
+    let receiver_length = u16::try_from(receiver_text.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "receiver endpoint length cannot be represented",
+        )
+    })?;
+
+    let source_length = u32::try_from(source_root.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sender source length cannot be represented",
+        )
+    })?;
+
+    let worker_count = u32::try_from(worker_count).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sender worker count cannot be represented",
+        )
+    })?;
+
+    let total_length = START_SEND_REQUEST_HEADER_BYTES
+        .checked_add(receiver_text.len())
+        .and_then(|length| length.checked_add(source_root.len()))
+        .ok_or_else(|| io::Error::other("start-send request length overflowed"))?;
+
+    let mut payload = Vec::with_capacity(total_length);
+
+    payload.extend_from_slice(&START_SEND_REQUEST_VERSION.to_le_bytes());
+
+    payload.extend_from_slice(&0_u16.to_le_bytes());
+
+    payload.extend_from_slice(&worker_count.to_le_bytes());
+
+    payload.extend_from_slice(&calibration_mib.to_le_bytes());
+
+    payload.extend_from_slice(&receiver_length.to_le_bytes());
+
+    payload.extend_from_slice(&0_u16.to_le_bytes());
+
+    payload.extend_from_slice(&source_length.to_le_bytes());
+
+    payload.extend_from_slice(receiver_text.as_bytes());
+
+    payload.extend_from_slice(source_root.as_bytes());
+
+    Ok(payload)
+}
+
+pub(crate) fn decode_start_send_request(payload: &[u8]) -> io::Result<StartSendRequest> {
+    if payload.len() < START_SEND_REQUEST_HEADER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "start-send request has {} bytes, expected at least {START_SEND_REQUEST_HEADER_BYTES}",
+                payload.len(),
+            ),
+        ));
+    }
+
+    let version = u16::from_le_bytes(payload[0..2].try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send version was malformed",
+        )
+    })?);
+
+    if version != START_SEND_REQUEST_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported start-send request version {version}"),
+        ));
+    }
+
+    let reserved = u16::from_le_bytes(payload[2..4].try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send reserved field was malformed",
+        )
+    })?);
+
+    if reserved != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send reserved field was not zero",
+        ));
+    }
+
+    let worker_count = usize::try_from(u32::from_le_bytes(payload[4..8].try_into().map_err(
+        |_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "start-send worker count was malformed",
+            )
+        },
+    )?))
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send worker count cannot be represented",
+        )
+    })?;
+
+    let calibration_mib = u64::from_le_bytes(payload[8..16].try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send calibration size was malformed",
+        )
+    })?);
+
+    let receiver_length = usize::from(u16::from_le_bytes(payload[16..18].try_into().map_err(
+        |_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "start-send receiver length was malformed",
+            )
+        },
+    )?));
+
+    let second_reserved = u16::from_le_bytes(payload[18..20].try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send secondary reserved field was malformed",
+        )
+    })?);
+
+    if second_reserved != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send secondary reserved field was not zero",
+        ));
+    }
+
+    let source_length = usize::try_from(u32::from_le_bytes(payload[20..24].try_into().map_err(
+        |_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "start-send source length was malformed",
+            )
+        },
+    )?))
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send source length cannot be represented",
+        )
+    })?;
+
+    let receiver_end = START_SEND_REQUEST_HEADER_BYTES
+        .checked_add(receiver_length)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "start-send receiver position overflowed",
+            )
+        })?;
+
+    let expected_length = receiver_end.checked_add(source_length).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send request length overflowed",
+        )
+    })?;
+
+    if payload.len() != expected_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "start-send request has {} bytes, expected {expected_length}",
+                payload.len(),
+            ),
+        ));
+    }
+
+    let receiver_text = std::str::from_utf8(
+        &payload[START_SEND_REQUEST_HEADER_BYTES..receiver_end],
+    )
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("receiver endpoint was not valid UTF-8: {error}"),
+        )
+    })?;
+
+    if receiver_text.is_empty() || receiver_text.len() > MAX_RECEIVER_ENDPOINT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "receiver endpoint length was invalid",
+        ));
+    }
+
+    let receiver_address = receiver_text.parse::<SocketAddr>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("receiver endpoint was invalid: {error}"),
+        )
+    })?;
+
+    let source_root = std::str::from_utf8(&payload[receiver_end..])
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("sender source was not valid UTF-8: {error}"),
+            )
+        })?
+        .to_owned();
+
+    validate_send_parameters(
+        receiver_address,
+        &source_root,
+        worker_count,
+        calibration_mib,
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+
+    Ok(StartSendRequest {
+        receiver_address,
+        source_root,
+        worker_count,
+        calibration_mib,
+    })
+}
+
+pub(crate) fn encode_started_send_response(job: &StartedSendJob) -> io::Result<Vec<u8>> {
+    if job.job_id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "started sender response used job ID zero",
+        ));
+    }
+
+    let request = encode_start_send_request(
+        job.receiver_address,
+        &job.source_root,
+        job.worker_count,
+        job.calibration_mib,
+    )?;
+
+    let total_length = START_SEND_RESPONSE_HEADER_BYTES
+        .checked_add(request.len())
+        .ok_or_else(|| io::Error::other("start-send response length overflowed"))?;
+
+    let mut payload = Vec::with_capacity(total_length);
+
+    payload.extend_from_slice(&START_SEND_RESPONSE_VERSION.to_le_bytes());
+
+    payload.extend_from_slice(&0_u16.to_le_bytes());
+
+    payload.extend_from_slice(&job.job_id.to_le_bytes());
+
+    payload.extend_from_slice(&request);
+
+    Ok(payload)
+}
+
+pub(crate) fn decode_started_send_response(payload: &[u8]) -> io::Result<StartedSendJob> {
+    if payload.len() < START_SEND_RESPONSE_HEADER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "start-send response has {} bytes, expected at least {START_SEND_RESPONSE_HEADER_BYTES}",
+                payload.len(),
+            ),
+        ));
+    }
+
+    let version = u16::from_le_bytes(payload[0..2].try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send response version was malformed",
+        )
+    })?);
+
+    if version != START_SEND_RESPONSE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported start-send response version {version}"),
+        ));
+    }
+
+    let reserved = u16::from_le_bytes(payload[2..4].try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send response reserved field was malformed",
+        )
+    })?);
+
+    if reserved != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send response reserved field was not zero",
+        ));
+    }
+
+    let job_id = u64::from_le_bytes(payload[4..12].try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send response job ID was malformed",
+        )
+    })?);
+
+    if job_id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send response used job ID zero",
+        ));
+    }
+
+    let request = decode_start_send_request(&payload[START_SEND_RESPONSE_HEADER_BYTES..])?;
+
+    Ok(StartedSendJob {
+        job_id,
+
+        receiver_address: request.receiver_address,
+
+        source_root: request.source_root,
+
+        worker_count: request.worker_count,
+
+        calibration_mib: request.calibration_mib,
+    })
+}
+
 pub(crate) fn encode_prepared_response(job: &PreparedReceiveJob) -> io::Result<Vec<u8>> {
     encode_status(&ManagementJobStatus {
         phase: ManagementJobPhase::ReceiverPrepared,
@@ -563,6 +1107,34 @@ pub(crate) fn encode_status(status: &ManagementJobStatus) -> io::Result<Vec<u8>>
             validate_destination_path(destination_root)?;
 
             (job_id, transfer_port, destination_root)
+        }
+
+        ManagementJobPhase::SenderRunning => {
+            let job_id = status.job_id.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sender status omitted its job ID",
+                )
+            })?;
+
+            if job_id == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sender status used job ID zero",
+                ));
+            }
+
+            if status.transfer_port.is_some()
+                || status.destination_root.is_some()
+                || status.update_existing
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "sender status contained receiver-only fields",
+                ));
+            }
+
+            (job_id, 0_u16, "")
         }
     };
 
@@ -740,6 +1312,34 @@ pub(crate) fn decode_status(payload: &[u8]) -> io::Result<ManagementJobStatus> {
                 update_existing,
             })
         }
+
+        ManagementJobPhase::SenderRunning => {
+            if job_id == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sender status used job ID zero",
+                ));
+            }
+
+            if transfer_port != 0 || path_length != 0 || update_existing {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "sender status contained receiver-only fields",
+                ));
+            }
+
+            Ok(ManagementJobStatus {
+                phase,
+
+                job_id: Some(job_id),
+
+                transfer_port: None,
+
+                destination_root: None,
+
+                update_existing: false,
+            })
+        }
     }
 }
 
@@ -835,6 +1435,68 @@ fn decode_job_flags(flags: u8) -> io::Result<bool> {
     Ok(flags & UPDATE_EXISTING_FLAG != 0)
 }
 
+fn validate_send_parameters(
+    receiver_address: SocketAddr,
+    source_root: &str,
+    worker_count: usize,
+    calibration_mib: u64,
+) -> io::Result<()> {
+    if receiver_address.port() == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "receiver endpoint must not use port zero",
+        ));
+    }
+
+    let receiver_text = receiver_address.to_string();
+
+    if receiver_text.len() > MAX_RECEIVER_ENDPOINT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "receiver endpoint contains {} bytes, exceeding the {MAX_RECEIVER_ENDPOINT_BYTES} byte limit",
+                receiver_text.len(),
+            ),
+        ));
+    }
+
+    validate_source_path(source_root)?;
+
+    manifest_scan::validate_worker_count(worker_count)?;
+
+    network_calibration::bytes_from_mib(calibration_mib)?;
+
+    Ok(())
+}
+
+fn validate_source_path(source_root: &str) -> io::Result<()> {
+    if source_root.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sender source must not be empty",
+        ));
+    }
+
+    if source_root.len() > MAX_SOURCE_PATH_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "sender source contains {} bytes, exceeding the {MAX_SOURCE_PATH_BYTES} byte limit",
+                source_root.len(),
+            ),
+        ));
+    }
+
+    if !Path::new(source_root).is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sender source must be an absolute path",
+        ));
+    }
+
+    Ok(())
+}
+
 fn decode_destination_path(bytes: &[u8]) -> io::Result<String> {
     let path = std::str::from_utf8(bytes)
         .map_err(|error| {
@@ -882,8 +1544,10 @@ fn validate_destination_path(destination_root: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ManagementJobPhase, ManagementJobRegistry, decode_prepare_request,
-        decode_prepared_response, decode_status, encode_prepare_request, encode_prepared_response,
+        ManagementJobPhase, ManagementJobRegistry, ManagementJobStatus, StartedSendJob,
+        decode_prepare_request, decode_prepared_response, decode_start_send_request,
+        decode_started_send_response, decode_status, encode_prepare_request,
+        encode_prepared_response, encode_start_send_request, encode_started_send_response,
         encode_status,
     };
     use std::fs;
@@ -952,7 +1616,7 @@ mod tests {
 
         let cancelled = registry.cancel(job.job_id).unwrap();
 
-        assert_eq!(cancelled, job);
+        assert_eq!(cancelled, job.job_id,);
 
         assert!(!registry.is_busy().unwrap());
 
@@ -994,6 +1658,65 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
 
         fs::remove_dir_all(destination).unwrap();
+    }
+
+    #[test]
+    fn start_send_request_round_trips() {
+        let receiver = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7337));
+
+        let encoded = encode_start_send_request(receiver, r"C:\Source", 4, 8).unwrap();
+
+        let decoded = decode_start_send_request(&encoded).unwrap();
+
+        assert_eq!(decoded.receiver_address, receiver,);
+
+        assert_eq!(decoded.source_root, r"C:\Source",);
+
+        assert_eq!(decoded.worker_count, 4,);
+
+        assert_eq!(decoded.calibration_mib, 8,);
+    }
+
+    #[test]
+    fn started_send_response_round_trips() {
+        let expected = StartedSendJob {
+            job_id: 42,
+
+            receiver_address: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7337)),
+
+            source_root: r"C:\Source".to_string(),
+
+            worker_count: 4,
+
+            calibration_mib: 8,
+        };
+
+        let encoded = encode_started_send_response(&expected).unwrap();
+
+        let decoded = decode_started_send_response(&encoded).unwrap();
+
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn sender_status_round_trips() {
+        let expected = ManagementJobStatus {
+            phase: ManagementJobPhase::SenderRunning,
+
+            job_id: Some(99),
+
+            transfer_port: None,
+
+            destination_root: None,
+
+            update_existing: false,
+        };
+
+        let encoded = encode_status(&expected).unwrap();
+
+        let decoded = decode_status(&encoded).unwrap();
+
+        assert_eq!(decoded, expected);
     }
 
     #[test]
