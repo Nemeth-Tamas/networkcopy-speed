@@ -78,6 +78,7 @@ impl ManagementControlServer {
         })
     }
 
+    #[cfg(test)]
     fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
     }
