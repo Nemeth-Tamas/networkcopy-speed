@@ -1,4 +1,5 @@
 use crate::management_control;
+use crate::management_jobs::ManagementJobRegistry;
 use crate::management_protocol::{
     MANAGEMENT_CONTROL_PORT, MANAGEMENT_DISCOVERY_PORT, MANAGEMENT_PROTOCOL_VERSION,
 };
@@ -6,6 +7,7 @@ use std::env;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::process;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -122,8 +124,6 @@ struct LocalAgentDescriptor {
 
     control_port: u16,
 
-    state: AgentState,
-
     capabilities: AgentCapabilities,
 }
 
@@ -133,8 +133,6 @@ impl LocalAgentDescriptor {
             hostname: local_hostname()?,
 
             control_port: MANAGEMENT_CONTROL_PORT,
-
-            state: AgentState::Idle,
 
             capabilities: AgentCapabilities::SEND_RECEIVE,
         })
@@ -364,6 +362,8 @@ impl DiscoveryPacket {
 pub fn run_agent() -> io::Result<()> {
     let descriptor = LocalAgentDescriptor::local()?;
 
+    let jobs = Arc::new(ManagementJobRegistry::new());
+
     let socket = UdpSocket::bind(SocketAddrV4::new(
         Ipv4Addr::UNSPECIFIED,
         MANAGEMENT_DISCOVERY_PORT,
@@ -371,8 +371,8 @@ pub fn run_agent() -> io::Result<()> {
 
     management_control::spawn(
         descriptor.hostname.clone(),
-        descriptor.state,
         descriptor.capabilities,
+        Arc::clone(&jobs),
     )?;
 
     println!("NetworkCopy Speed Edition management agent");
@@ -387,7 +387,15 @@ pub fn run_agent() -> io::Result<()> {
 
     println!("  Capabilities:   sender, receiver");
 
-    println!("  State:          {}", descriptor.state.label(),);
+    println!(
+        "  State:          {}",
+        if jobs.is_busy()? {
+            AgentState::Busy
+        } else {
+            AgentState::Idle
+        }
+        .label(),
+    );
 
     println!();
 
@@ -400,7 +408,7 @@ pub fn run_agent() -> io::Result<()> {
     println!("Waiting for management discovery probes...");
 
     loop {
-        if let Some(source) = respond_once(&socket, &descriptor)? {
+        if let Some(source) = respond_once(&socket, &descriptor, &jobs)? {
             println!("  Advertised to {source}");
         }
     }
@@ -531,6 +539,7 @@ fn discover_target(target: SocketAddr, timeout: Duration) -> io::Result<Vec<Disc
 fn respond_once(
     socket: &UdpSocket,
     descriptor: &LocalAgentDescriptor,
+    jobs: &ManagementJobRegistry,
 ) -> io::Result<Option<SocketAddr>> {
     let mut buffer = [0_u8; 512];
 
@@ -549,7 +558,11 @@ fn respond_once(
 
         control_port: descriptor.control_port,
 
-        state: descriptor.state,
+        state: if jobs.is_busy()? {
+            AgentState::Busy
+        } else {
+            AgentState::Idle
+        },
 
         capabilities: descriptor.capabilities,
 
@@ -617,9 +630,11 @@ mod tests {
         AgentCapabilities, AgentState, DiscoveryPacket, LocalAgentDescriptor, discover_target,
         respond_once,
     };
+    use crate::management_jobs::ManagementJobRegistry;
     use crate::management_protocol::{MANAGEMENT_CONTROL_PORT, MANAGEMENT_PROTOCOL_VERSION};
     use std::io;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
 
@@ -704,13 +719,15 @@ mod tests {
 
             control_port: MANAGEMENT_CONTROL_PORT,
 
-            state: AgentState::Idle,
-
             capabilities: AgentCapabilities::SEND_RECEIVE,
         };
 
+        let jobs = Arc::new(ManagementJobRegistry::new());
+
+        let server_jobs = Arc::clone(&jobs);
+
         let server = thread::spawn(move || {
-            respond_once(&agent_socket, &descriptor).unwrap();
+            respond_once(&agent_socket, &descriptor, &server_jobs).unwrap();
         });
 
         let agents = discover_target(target, Duration::from_millis(500)).unwrap();

@@ -129,6 +129,24 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         }
 
+        "management-prepare-receive" => {
+            run_management_prepare_receive(
+                &mut arguments,
+            )
+        }
+
+        "management-job-status" => {
+            run_management_job_status(
+                &mut arguments,
+            )
+        }
+
+        "management-cancel" => {
+            run_management_cancel(
+                &mut arguments,
+            )
+        }
+
         "direct-interfaces" => run_direct_interfaces(&mut arguments),
 
         "direct-address" => run_direct_address(&mut arguments),
@@ -197,6 +215,240 @@ fn run_management_agent(
     )?;
 
     management_discovery::run_agent()?;
+
+    Ok(())
+}
+
+fn run_management_prepare_receive(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let endpoint =
+        parse_socket_address(
+            &required_argument(
+                arguments,
+                "management agent address",
+            )?,
+            "management agent address",
+        )?;
+
+    let destination_root =
+        required_argument(
+            arguments,
+            "receiver destination directory",
+        )?
+        .into_string()
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "receiver destination must contain valid Unicode",
+            )
+        })?;
+
+    let update_existing =
+        match arguments.next() {
+            None => false,
+
+            Some(value)
+                if value == "--update"
+                    || value == "update" =>
+            {
+                true
+            }
+
+            Some(value) => {
+                return Err(
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "unexpected argument: {}",
+                            value.to_string_lossy(),
+                        ),
+                    )
+                    .into(),
+                );
+            }
+        };
+
+    if let Some(extra) = arguments.next() {
+        return Err(
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unexpected extra argument: {}",
+                    extra.to_string_lossy(),
+                ),
+            )
+            .into(),
+        );
+    }
+
+    let job =
+        management_control::prepare_receive(
+            endpoint,
+            &destination_root,
+            update_existing,
+        )?;
+
+    println!(
+        "NetworkCopy Speed Edition receiver prepared"
+    );
+
+    println!(
+        "  Agent:         {endpoint}"
+    );
+
+    println!(
+        "  Job ID:        {}",
+        job.job_id,
+    );
+
+    println!(
+        "  Destination:   {}",
+        job.destination_root,
+    );
+
+    println!(
+        "  Update mode:   {}",
+        if job.update_existing {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+
+    println!(
+        "  State:         receiver prepared"
+    );
+
+    Ok(())
+}
+
+fn run_management_job_status(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let endpoint =
+        parse_socket_address(
+            &required_argument(
+                arguments,
+                "management agent address",
+            )?,
+            "management agent address",
+        )?;
+
+    if let Some(extra) = arguments.next() {
+        return Err(
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unexpected extra argument: {}",
+                    extra.to_string_lossy(),
+                ),
+            )
+            .into(),
+        );
+    }
+
+    let status =
+        management_control::job_status(
+            endpoint,
+        )?;
+
+    println!(
+        "NetworkCopy Speed Edition management job status"
+    );
+
+    println!(
+        "  Agent:         {endpoint}"
+    );
+
+    println!(
+        "  State:         {}",
+        status.phase.label(),
+    );
+
+    if let Some(job_id) =
+        status.job_id
+    {
+        println!(
+            "  Job ID:        {job_id}"
+        );
+    }
+
+    if let Some(destination) =
+        status.destination_root
+    {
+        println!(
+            "  Destination:   {destination}"
+        );
+
+        println!(
+            "  Update mode:   {}",
+            if status.update_existing {
+                "enabled"
+            } else {
+                "disabled"
+            },
+        );
+    }
+
+    Ok(())
+}
+
+fn run_management_cancel(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let endpoint =
+        parse_socket_address(
+            &required_argument(
+                arguments,
+                "management agent address",
+            )?,
+            "management agent address",
+        )?;
+
+    let job_id =
+        parse_u64_count(
+            &required_argument(
+                arguments,
+                "management job ID",
+            )?,
+            "management job ID",
+        )?;
+
+    if let Some(extra) = arguments.next() {
+        return Err(
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unexpected extra argument: {}",
+                    extra.to_string_lossy(),
+                ),
+            )
+            .into(),
+        );
+    }
+
+    let cancelled =
+        management_control::cancel_job(
+            endpoint,
+            job_id,
+        )?;
+
+    println!(
+        "NetworkCopy Speed Edition management job cancelled"
+    );
+
+    println!(
+        "  Agent:         {endpoint}"
+    );
+
+    println!(
+        "  Job ID:        {cancelled}"
+    );
+
+    println!(
+        "  State:         idle"
+    );
 
     Ok(())
 }
@@ -2319,6 +2571,15 @@ fn print_usage(program: &OsStr) {
     println!("  {program} management-roots <agent-address>");
     println!(
         "  {program} management-list <agent-address> <remote-directory>"
+    );
+    println!(
+        "  {program} management-prepare-receive <agent-address> <destination-root> [--update]"
+    );
+    println!(
+        "  {program} management-job-status <agent-address>"
+    );
+    println!(
+        "  {program} management-cancel <agent-address> <job-id>"
     );
     println!("  {program} direct-interfaces");
     println!("  {program} direct-address <interface-index>");

@@ -1,6 +1,7 @@
 use crate::management_directory;
 use crate::management_discovery::{AgentCapabilities, AgentState};
 use crate::management_filesystem;
+use crate::management_jobs::{ManagementJobRegistry, ManagementJobStatus, PreparedReceiveJob};
 use crate::management_protocol::{
     MANAGEMENT_CONTROL_PORT, MANAGEMENT_PROTOCOL_VERSION, ManagementFrame, ManagementMessageKind,
     read_frame, write_frame,
@@ -8,6 +9,7 @@ use crate::management_protocol::{
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::process;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -51,33 +53,47 @@ struct ManagementControlServer {
 
     hostname: String,
 
-    state: AgentState,
-
     capabilities: AgentCapabilities,
+
+    jobs: Arc<ManagementJobRegistry>,
 }
 
 impl ManagementControlServer {
     fn bind(
         hostname: String,
-        state: AgentState,
         capabilities: AgentCapabilities,
+        jobs: Arc<ManagementJobRegistry>,
     ) -> io::Result<Self> {
-        Self::bind_at(
+        Self::bind_at_with_jobs(
             SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::UNSPECIFIED,
                 MANAGEMENT_CONTROL_PORT,
             )),
             hostname,
-            state,
             capabilities,
+            jobs,
         )
     }
 
+    #[cfg(test)]
     fn bind_at(
         address: SocketAddr,
         hostname: String,
-        state: AgentState,
         capabilities: AgentCapabilities,
+    ) -> io::Result<Self> {
+        Self::bind_at_with_jobs(
+            address,
+            hostname,
+            capabilities,
+            Arc::new(ManagementJobRegistry::new()),
+        )
+    }
+
+    fn bind_at_with_jobs(
+        address: SocketAddr,
+        hostname: String,
+        capabilities: AgentCapabilities,
+        jobs: Arc<ManagementJobRegistry>,
     ) -> io::Result<Self> {
         validate_text(&hostname, MAX_HOSTNAME_BYTES, "management hostname")?;
 
@@ -86,8 +102,8 @@ impl ManagementControlServer {
         Ok(Self {
             listener,
             hostname,
-            state,
             capabilities,
+            jobs,
         })
     }
 
@@ -120,7 +136,15 @@ impl ManagementControlServer {
                 ManagementFrame::new(
                     request.request_id,
                     ManagementMessageKind::HelloResponse,
-                    encode_hello_payload(&self.hostname, self.state, self.capabilities)?,
+                    encode_hello_payload(
+                        &self.hostname,
+                        if self.jobs.is_busy()? {
+                            AgentState::Busy
+                        } else {
+                            AgentState::Idle
+                        },
+                        self.capabilities,
+                    )?,
                 )?
             }
 
@@ -168,6 +192,71 @@ impl ManagementControlServer {
                 }
             }
 
+            ManagementMessageKind::PrepareReceiveRequest => {
+                let result = crate::management_jobs::decode_prepare_request(&request.payload)
+                    .and_then(|prepared| {
+                        self.jobs
+                            .prepare_receive(&prepared.destination_root, prepared.update_existing)
+                    })
+                    .and_then(|job| crate::management_jobs::encode_prepared_response(&job));
+
+                match result {
+                    Ok(payload) => ManagementFrame::new(
+                        request.request_id,
+                        ManagementMessageKind::PrepareReceiveResponse,
+                        payload,
+                    )?,
+
+                    Err(error) => error_response(
+                        request.request_id,
+                        &format!("failed to prepare receiver job: {error}"),
+                    )?,
+                }
+            }
+
+            ManagementMessageKind::JobStatusRequest if request.payload.is_empty() => {
+                let payload = self
+                    .jobs
+                    .status()
+                    .and_then(|status| crate::management_jobs::encode_status(&status));
+
+                match payload {
+                    Ok(payload) => ManagementFrame::new(
+                        request.request_id,
+                        ManagementMessageKind::JobStatusResponse,
+                        payload,
+                    )?,
+
+                    Err(error) => error_response(
+                        request.request_id,
+                        &format!("failed to read management job status: {error}"),
+                    )?,
+                }
+            }
+
+            ManagementMessageKind::JobStatusRequest => {
+                error_response(request.request_id, "JobStatusRequest payload must be empty")?
+            }
+
+            ManagementMessageKind::CancelJobRequest => {
+                let result = crate::management_jobs::decode_cancel_request(&request.payload)
+                    .and_then(|job_id| self.jobs.cancel(job_id))
+                    .and_then(|job| crate::management_jobs::encode_cancel_request(job.job_id));
+
+                match result {
+                    Ok(payload) => ManagementFrame::new(
+                        request.request_id,
+                        ManagementMessageKind::CancelJobResponse,
+                        payload,
+                    )?,
+
+                    Err(error) => error_response(
+                        request.request_id,
+                        &format!("failed to cancel management job: {error}"),
+                    )?,
+                }
+            }
+
             _ => error_response(
                 request.request_id,
                 "management command is not implemented yet",
@@ -180,10 +269,10 @@ impl ManagementControlServer {
 
 pub(crate) fn spawn(
     hostname: String,
-    state: AgentState,
     capabilities: AgentCapabilities,
+    jobs: Arc<ManagementJobRegistry>,
 ) -> io::Result<()> {
-    let server = ManagementControlServer::bind(hostname, state, capabilities)?;
+    let server = ManagementControlServer::bind(hostname, capabilities, jobs)?;
 
     thread::Builder::new()
         .name("networkcopy-management-control".to_string())
@@ -206,6 +295,74 @@ pub fn hello(endpoint: SocketAddr) -> io::Result<ManagementHello> {
         unexpected => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("management agent returned unexpected message {unexpected:?} for HelloRequest"),
+        )),
+    }
+}
+
+pub fn prepare_receive(
+    endpoint: SocketAddr,
+    destination_root: &str,
+    update_existing: bool,
+) -> io::Result<PreparedReceiveJob> {
+    let payload =
+        crate::management_jobs::encode_prepare_request(destination_root, update_existing)?;
+
+    let response = exchange(
+        endpoint,
+        ManagementMessageKind::PrepareReceiveRequest,
+        payload,
+    )?;
+
+    match response.kind {
+        ManagementMessageKind::PrepareReceiveResponse => {
+            crate::management_jobs::decode_prepared_response(&response.payload)
+        }
+
+        unexpected => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "management agent returned unexpected message {unexpected:?} for PrepareReceiveRequest"
+            ),
+        )),
+    }
+}
+
+pub fn job_status(endpoint: SocketAddr) -> io::Result<ManagementJobStatus> {
+    let response = exchange(
+        endpoint,
+        ManagementMessageKind::JobStatusRequest,
+        Vec::new(),
+    )?;
+
+    match response.kind {
+        ManagementMessageKind::JobStatusResponse => {
+            crate::management_jobs::decode_status(&response.payload)
+        }
+
+        unexpected => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "management agent returned unexpected message {unexpected:?} for JobStatusRequest"
+            ),
+        )),
+    }
+}
+
+pub fn cancel_job(endpoint: SocketAddr, job_id: u64) -> io::Result<u64> {
+    let payload = crate::management_jobs::encode_cancel_request(job_id)?;
+
+    let response = exchange(endpoint, ManagementMessageKind::CancelJobRequest, payload)?;
+
+    match response.kind {
+        ManagementMessageKind::CancelJobResponse => {
+            crate::management_jobs::decode_cancel_request(&response.payload)
+        }
+
+        unexpected => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "management agent returned unexpected message {unexpected:?} for CancelJobRequest"
+            ),
         )),
     }
 }
@@ -657,18 +814,21 @@ fn create_request_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        HELLO_PAYLOAD_VERSION, ManagementControlServer, ManagementRoot, decode_hello_payload,
-        decode_roots_payload, encode_hello_payload, encode_roots_payload, hello,
-        list_directory as request_directory, list_roots as request_roots,
+        HELLO_PAYLOAD_VERSION, ManagementControlServer, ManagementRoot, cancel_job,
+        decode_hello_payload, decode_roots_payload, encode_hello_payload, encode_roots_payload,
+        hello, job_status, list_directory as request_directory, list_roots as request_roots,
+        prepare_receive,
     };
     use crate::management_directory::ManagementEntryKind;
     use crate::management_discovery::{AgentCapabilities, AgentState};
     use crate::management_filesystem;
+    use crate::management_jobs::{ManagementJobPhase, ManagementJobRegistry};
     use crate::management_protocol::MANAGEMENT_PROTOCOL_VERSION;
     use std::fs;
     use std::io;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::process;
+    use std::sync::Arc;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -677,7 +837,6 @@ mod tests {
         let server = ManagementControlServer::bind_at(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
             "LOOPBACK-PC".to_string(),
-            AgentState::Idle,
             AgentCapabilities::SEND_RECEIVE,
         )
         .unwrap();
@@ -710,7 +869,6 @@ mod tests {
         let server = ManagementControlServer::bind_at(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
             "LOOPBACK-PC".to_string(),
-            AgentState::Idle,
             AgentCapabilities::SEND_RECEIVE,
         )
         .unwrap();
@@ -770,7 +928,6 @@ mod tests {
         let server = ManagementControlServer::bind_at(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
             "LOOPBACK-PC".to_string(),
-            AgentState::Idle,
             AgentCapabilities::SEND_RECEIVE,
         )
         .unwrap();
@@ -798,6 +955,74 @@ mod tests {
         assert_eq!(entries[1].size, 3);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loopback_prepares_reports_and_cancels_receiver() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let destination = std::env::temp_dir().join(format!(
+            "networkcopy-management-receiver-{}-{unique}",
+            process::id(),
+        ));
+
+        let destination_text = destination.to_str().unwrap().to_owned();
+
+        let jobs = Arc::new(ManagementJobRegistry::new());
+
+        let server = ManagementControlServer::bind_at_with_jobs(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            "LOOPBACK-PC".to_string(),
+            AgentCapabilities::SEND_RECEIVE,
+            Arc::clone(&jobs),
+        )
+        .unwrap();
+
+        let endpoint = server.local_addr().unwrap();
+
+        let server_thread = thread::spawn(move || {
+            for _ in 0..6 {
+                server.serve_one().unwrap();
+            }
+        });
+
+        let prepared = prepare_receive(endpoint, &destination_text, true).unwrap();
+
+        let busy_hello = hello(endpoint).unwrap();
+
+        assert_eq!(busy_hello.state, AgentState::Busy,);
+
+        let prepared_status = job_status(endpoint).unwrap();
+
+        assert_eq!(prepared_status.phase, ManagementJobPhase::ReceiverPrepared,);
+
+        assert_eq!(prepared_status.job_id, Some(prepared.job_id),);
+
+        assert_eq!(
+            prepared_status.destination_root.as_deref(),
+            Some(destination_text.as_str(),),
+        );
+
+        assert!(prepared_status.update_existing,);
+
+        let cancelled = cancel_job(endpoint, prepared.job_id).unwrap();
+
+        assert_eq!(cancelled, prepared.job_id,);
+
+        let idle_status = job_status(endpoint).unwrap();
+
+        assert_eq!(idle_status.phase, ManagementJobPhase::Idle,);
+
+        let idle_hello = hello(endpoint).unwrap();
+
+        assert_eq!(idle_hello.state, AgentState::Idle,);
+
+        server_thread.join().unwrap();
+
+        fs::remove_dir_all(destination).unwrap();
     }
 
     #[test]

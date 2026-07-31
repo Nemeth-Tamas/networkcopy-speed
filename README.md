@@ -211,6 +211,24 @@ The later WGPU management application will use this same protocol to provide
 discovered-machine cards and dual-pane remote folder browsers for selecting the
 source and destination without typing paths manually.
 
+Prepare a receiver destination on another computer:
+
+```powershell
+cargo run -- management-prepare-receive 127.0.0.1:7339 "C:\Transfers\Corpus" --update
+```
+
+Inspect active management job state:
+
+```powershell
+cargo run -- management-job-status 127.0.0.1:7339
+```
+
+Cancel a prepared management job:
+
+```powershell
+cargo run -- management-cancel 127.0.0.1:7339 1
+```
+
 ## v2 roadmap
 
 Implementation order:
