@@ -10,7 +10,10 @@ use networkcopy_speed::management_discovery::{self, DiscoveredAgent};
 use networkcopy_speed::management_orchestration::{
     self, ManagedTransferRecord, ManagedTransferRequest,
 };
-use networkcopy_speed::management_snapshot::ManagementAgentSnapshot;
+use networkcopy_speed::management_snapshot::{
+    ManagementAgentSnapshot, ManagementJobOutcome, ManagementJobResult,
+};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -24,6 +27,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 
 const REMOTE_BROWSER_HEIGHT: f32 = 460.0;
+
+const MAX_TRANSFER_HISTORY: usize = 20;
 
 type DiscoveryResult = Result<Vec<DiscoveredAgent>, String>;
 
@@ -39,6 +44,43 @@ struct CancelResponse {
     sender: Result<u64, String>,
 
     receiver: Result<u64, String>,
+}
+
+#[derive(Clone, Debug)]
+struct PairedTransferHistoryEntry {
+    transfer: ManagedTransferRecord,
+
+    sender_result: ManagementJobResult,
+
+    receiver_result: ManagementJobResult,
+}
+
+impl PairedTransferHistoryEntry {
+    fn outcome(&self) -> ManagementJobOutcome {
+        paired_outcome(&self.sender_result, &self.receiver_result)
+    }
+
+    fn files(&self) -> u64 {
+        self.sender_result.files.max(self.receiver_result.files)
+    }
+
+    fn logical_bytes(&self) -> u64 {
+        self.sender_result
+            .logical_bytes
+            .max(self.receiver_result.logical_bytes)
+    }
+
+    fn wire_bytes(&self) -> u64 {
+        self.sender_result
+            .wire_bytes
+            .max(self.receiver_result.wire_bytes)
+    }
+
+    fn data_stream_count(&self) -> u32 {
+        self.sender_result
+            .data_stream_count
+            .max(self.receiver_result.data_stream_count)
+    }
 }
 
 enum BrowserPayload {
@@ -246,6 +288,8 @@ struct NetworkCopyManager {
 
     receiver_snapshot: Option<ManagementAgentSnapshot>,
 
+    history: VecDeque<PairedTransferHistoryEntry>,
+
     monitoring_complete: bool,
 
     last_poll: Instant,
@@ -291,6 +335,8 @@ impl NetworkCopyManager {
             sender_snapshot: None,
 
             receiver_snapshot: None,
+
+            history: VecDeque::new(),
 
             monitoring_complete: false,
 
@@ -609,7 +655,7 @@ impl NetworkCopyManager {
                     self.error = errors.join(" ");
                 }
 
-                if let Some(transfer) = &self.transfer {
+                let monitoring_complete = self.transfer.as_ref().is_some_and(|transfer| {
                     let sender_complete =
                         snapshot_is_terminal(self.sender_snapshot.as_ref(), transfer.sender_job_id);
 
@@ -618,11 +664,15 @@ impl NetworkCopyManager {
                         transfer.receiver_job_id,
                     );
 
-                    self.monitoring_complete = sender_complete && receiver_complete;
+                    sender_complete && receiver_complete
+                });
 
-                    if self.monitoring_complete {
-                        self.notice = "Both endpoint jobs reached a terminal state.".to_string();
-                    }
+                self.monitoring_complete = monitoring_complete;
+
+                if monitoring_complete {
+                    self.archive_terminal_transfer();
+
+                    self.notice = "Both endpoint jobs reached a terminal state.".to_string();
                 }
             }
 
@@ -634,6 +684,35 @@ impl NetworkCopyManager {
 
             Err(TryRecvError::Empty) => {}
         }
+    }
+
+    fn archive_terminal_transfer(&mut self) {
+        let Some(transfer) = self.transfer.clone() else {
+            return;
+        };
+
+        let Some(sender_result) =
+            terminal_result_for(self.sender_snapshot.as_ref(), transfer.sender_job_id).cloned()
+        else {
+            return;
+        };
+
+        let Some(receiver_result) =
+            terminal_result_for(self.receiver_snapshot.as_ref(), transfer.receiver_job_id).cloned()
+        else {
+            return;
+        };
+
+        remember_history(
+            &mut self.history,
+            PairedTransferHistoryEntry {
+                transfer,
+
+                sender_result,
+
+                receiver_result,
+            },
+        );
     }
 
     fn process_cancel_message(&mut self) {
@@ -947,6 +1026,183 @@ impl NetworkCopyManager {
             }
         });
     }
+
+    fn render_history(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("Transfer history");
+
+            ui.label(format!(
+                "{} / {} retained",
+                self.history.len(),
+                MAX_TRANSFER_HISTORY,
+            ));
+
+            if ui
+                .add_enabled(!self.history.is_empty(), egui::Button::new("Clear history"))
+                .clicked()
+            {
+                self.history.clear();
+
+                self.notice = "Transfer history cleared.".to_string();
+            }
+        });
+
+        ui.label(
+            "Completed, cancelled, and failed paired jobs remain here after the current card is cleared.",
+        );
+
+        ui.add_space(6.0);
+
+        if self.history.is_empty() {
+            ui.label("No terminal paired transfers have been recorded in this manager session.");
+
+            return;
+        }
+
+        let entries = self.history.iter().cloned().collect::<Vec<_>>();
+
+        let mut reuse = None::<ManagedTransferRecord>;
+
+        for entry in entries {
+            ui.group(|ui| {
+                ui.set_min_width(ui.available_width());
+
+                let outcome = entry.outcome();
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(
+                        egui::RichText::new(format!("Result: {}", outcome.label(),))
+                            .color(outcome_color(outcome)),
+                    );
+
+                    ui.separator();
+
+                    ui.label(format!("Sender job {}", entry.transfer.sender_job_id,));
+
+                    ui.label(format!("Receiver job {}", entry.transfer.receiver_job_id,));
+                });
+
+                ui.add_space(6.0);
+
+                ui.label(format!(
+                    "{}  →  {}",
+                    entry.transfer.source_root, entry.transfer.destination_root,
+                ));
+
+                ui.label(format!(
+                    "{}  →  {}",
+                    entry.transfer.sender_agent, entry.transfer.receiver_agent,
+                ));
+
+                ui.add_space(8.0);
+
+                egui::Grid::new(format!(
+                    "history-{}-{}",
+                    entry.transfer.sender_job_id, entry.transfer.receiver_job_id,
+                ))
+                .num_columns(2)
+                .spacing([24.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Files");
+
+                    ui.strong(entry.files().to_string());
+
+                    ui.end_row();
+
+                    ui.label("Logical data");
+
+                    ui.strong(format_bytes(entry.logical_bytes()));
+
+                    ui.end_row();
+
+                    ui.label("Wire data");
+
+                    ui.strong(format_bytes(entry.wire_bytes()));
+
+                    ui.end_row();
+
+                    if let Some(savings) =
+                        wire_savings_percent(entry.logical_bytes(), entry.wire_bytes())
+                    {
+                        ui.label("Wire savings");
+
+                        ui.strong(format!("{savings:.2}%"));
+
+                        ui.end_row();
+                    }
+
+                    ui.label("Data streams");
+
+                    ui.strong(entry.data_stream_count().to_string());
+
+                    ui.end_row();
+
+                    ui.label("Update mode");
+
+                    ui.strong(if entry.transfer.update_existing {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    });
+
+                    ui.end_row();
+
+                    ui.label("Scanner workers");
+
+                    ui.strong(entry.transfer.worker_count.to_string());
+
+                    ui.end_row();
+
+                    ui.label("Calibration");
+
+                    ui.strong(format!("{} MiB", entry.transfer.calibration_mib,));
+
+                    ui.end_row();
+                });
+
+                if !entry.sender_result.message.is_empty() {
+                    ui.add_space(6.0);
+
+                    ui.label(format!("Sender: {}", entry.sender_result.message,));
+                }
+
+                if !entry.receiver_result.message.is_empty()
+                    && entry.receiver_result.message != entry.sender_result.message
+                {
+                    ui.add_space(4.0);
+
+                    ui.label(format!("Receiver: {}", entry.receiver_result.message,));
+                }
+
+                ui.add_space(8.0);
+
+                if ui.button("Use this setup again").clicked() {
+                    reuse = Some(entry.transfer.clone());
+                }
+            });
+
+            ui.add_space(8.0);
+        }
+
+        if let Some(transfer) = reuse {
+            self.sender_agent = transfer.sender_agent.to_string();
+
+            self.receiver_agent = transfer.receiver_agent.to_string();
+
+            self.source_root = transfer.source_root;
+
+            self.destination_root = transfer.destination_root;
+
+            self.update_existing = transfer.update_existing;
+
+            self.worker_count = transfer.worker_count;
+
+            self.calibration_mib = transfer.calibration_mib;
+
+            self.notice =
+                "The selected history entry was copied into the transfer setup.".to_string();
+        }
+    }
 }
 
 impl eframe::App for NetworkCopyManager {
@@ -1014,6 +1270,14 @@ impl eframe::App for NetworkCopyManager {
 
                         self.render_transfer(ui);
 
+                        ui.add_space(12.0);
+
+                        ui.separator();
+
+                        ui.add_space(12.0);
+
+                        self.render_history(ui);
+
                         if !self.notice.is_empty() {
                             ui.add_space(12.0);
 
@@ -1043,6 +1307,74 @@ impl eframe::App for NetworkCopyManager {
                         ui.add_space(16.0);
                     });
             });
+    }
+}
+
+fn terminal_result_for(
+    snapshot: Option<&ManagementAgentSnapshot>,
+    job_id: u64,
+) -> Option<&ManagementJobResult> {
+    snapshot?
+        .latest_result
+        .as_ref()
+        .filter(|result| result.job_id == job_id)
+}
+
+fn paired_outcome(
+    sender: &ManagementJobResult,
+    receiver: &ManagementJobResult,
+) -> ManagementJobOutcome {
+    if sender.outcome == ManagementJobOutcome::Failed
+        || receiver.outcome == ManagementJobOutcome::Failed
+    {
+        ManagementJobOutcome::Failed
+    } else if sender.outcome == ManagementJobOutcome::Cancelled
+        || receiver.outcome == ManagementJobOutcome::Cancelled
+    {
+        ManagementJobOutcome::Cancelled
+    } else {
+        ManagementJobOutcome::Completed
+    }
+}
+
+fn same_transfer_identity(left: &ManagedTransferRecord, right: &ManagedTransferRecord) -> bool {
+    left.sender_agent == right.sender_agent
+        && left.sender_job_id == right.sender_job_id
+        && left.receiver_agent == right.receiver_agent
+        && left.receiver_job_id == right.receiver_job_id
+}
+
+fn remember_history(
+    history: &mut VecDeque<PairedTransferHistoryEntry>,
+    entry: PairedTransferHistoryEntry,
+) {
+    if history
+        .iter()
+        .any(|existing| same_transfer_identity(&existing.transfer, &entry.transfer))
+    {
+        return;
+    }
+
+    history.push_front(entry);
+
+    history.truncate(MAX_TRANSFER_HISTORY);
+}
+
+fn wire_savings_percent(logical_bytes: u64, wire_bytes: u64) -> Option<f64> {
+    if logical_bytes == 0 {
+        return None;
+    }
+
+    Some(100.0 - wire_bytes as f64 / logical_bytes as f64 * 100.0)
+}
+
+fn outcome_color(outcome: ManagementJobOutcome) -> egui::Color32 {
+    match outcome {
+        ManagementJobOutcome::Completed => egui::Color32::from_rgb(126, 230, 64),
+
+        ManagementJobOutcome::Cancelled => egui::Color32::from_rgb(255, 190, 82),
+
+        ManagementJobOutcome::Failed => egui::Color32::from_rgb(255, 112, 120),
     }
 }
 
@@ -1433,7 +1765,15 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{join_remote_path, parent_remote_path};
+    use super::{
+        MAX_TRANSFER_HISTORY, PairedTransferHistoryEntry, join_remote_path, paired_outcome,
+        parent_remote_path, remember_history,
+    };
+    use networkcopy_speed::management_orchestration::ManagedTransferRecord;
+    use networkcopy_speed::management_snapshot::{
+        ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
+    };
+    use std::collections::VecDeque;
 
     #[test]
     fn remote_path_navigation_works() {
@@ -1448,5 +1788,130 @@ mod tests {
     #[test]
     fn drive_root_has_no_browser_parent() {
         assert_eq!(parent_remote_path(r"C:\"), None,);
+    }
+
+    fn history_entry(sequence: u64, outcome: ManagementJobOutcome) -> PairedTransferHistoryEntry {
+        let sender_agent = "127.0.0.1:7339".parse().unwrap();
+
+        let receiver_agent = "127.0.0.1:7340".parse().unwrap();
+
+        let sender_job_id = sequence.saturating_mul(2).saturating_add(1);
+
+        let receiver_job_id = sequence.saturating_mul(2).saturating_add(2);
+
+        PairedTransferHistoryEntry {
+            transfer: ManagedTransferRecord {
+                sender_agent,
+
+                sender_job_id,
+
+                receiver_agent,
+
+                receiver_job_id,
+
+                receiver_payload: "127.0.0.1:7337".parse().unwrap(),
+
+                source_root: format!(r"C:\Source-{sequence}"),
+
+                destination_root: format!(r"D:\Destination-{sequence}"),
+
+                update_existing: false,
+
+                worker_count: 4,
+
+                calibration_mib: 8,
+            },
+
+            sender_result: ManagementJobResult {
+                role: ManagementJobRole::Sender,
+
+                outcome,
+
+                job_id: sender_job_id,
+
+                files: 10,
+
+                logical_bytes: 1_000_000,
+
+                wire_bytes: 750_000,
+
+                data_stream_count: 4,
+
+                message: String::new(),
+            },
+
+            receiver_result: ManagementJobResult {
+                role: ManagementJobRole::Receiver,
+
+                outcome,
+
+                job_id: receiver_job_id,
+
+                files: 10,
+
+                logical_bytes: 1_000_000,
+
+                wire_bytes: 0,
+
+                data_stream_count: 4,
+
+                message: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn paired_outcome_uses_worst_endpoint_result() {
+        let completed = history_entry(1, ManagementJobOutcome::Completed);
+
+        assert_eq!(
+            paired_outcome(&completed.sender_result, &completed.receiver_result,),
+            ManagementJobOutcome::Completed,
+        );
+
+        let mut cancelled = completed.clone();
+
+        cancelled.receiver_result.outcome = ManagementJobOutcome::Cancelled;
+
+        assert_eq!(
+            paired_outcome(&cancelled.sender_result, &cancelled.receiver_result,),
+            ManagementJobOutcome::Cancelled,
+        );
+
+        cancelled.sender_result.outcome = ManagementJobOutcome::Failed;
+
+        assert_eq!(
+            paired_outcome(&cancelled.sender_result, &cancelled.receiver_result,),
+            ManagementJobOutcome::Failed,
+        );
+    }
+
+    #[test]
+    fn history_is_deduplicated_and_bounded() {
+        let mut history = VecDeque::new();
+
+        let first = history_entry(1, ManagementJobOutcome::Completed);
+
+        remember_history(&mut history, first.clone());
+
+        remember_history(&mut history, first);
+
+        assert_eq!(history.len(), 1);
+
+        for sequence in 2..=(MAX_TRANSFER_HISTORY as u64 + 5) {
+            remember_history(
+                &mut history,
+                history_entry(sequence, ManagementJobOutcome::Completed),
+            );
+        }
+
+        assert_eq!(history.len(), MAX_TRANSFER_HISTORY,);
+
+        assert_eq!(
+            history.front().unwrap().transfer.sender_job_id,
+            (MAX_TRANSFER_HISTORY as u64 + 5)
+                .saturating_mul(2)
+                .saturating_add(1),
+        );
     }
 }
