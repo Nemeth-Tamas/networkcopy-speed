@@ -1,10 +1,14 @@
 use crate::management_protocol::MAX_MANAGEMENT_PAYLOAD_BYTES;
 use std::io;
+use std::net::SocketAddr;
 
-const SNAPSHOT_VERSION: u16 = 1;
+const SNAPSHOT_VERSION: u16 = 2;
 const SNAPSHOT_HEADER_BYTES: usize = 4;
 
-const ACTIVE_HEADER_BYTES: usize = 28;
+const ACTIVE_HEADER_BYTES: usize = 32;
+const SENDER_DETAIL_HEADER_BYTES: usize = 20;
+const RECEIVER_DETAIL_HEADER_BYTES: usize = 8;
+
 const RESULT_HEADER_BYTES: usize = 40;
 
 const ACTIVE_PRESENT_FLAG: u8 = 0x01;
@@ -13,6 +17,13 @@ const KNOWN_FLAGS: u8 = ACTIVE_PRESENT_FLAG | RESULT_PRESENT_FLAG;
 
 const MAX_PHASE_BYTES: usize = 1024;
 const MAX_MESSAGE_BYTES: usize = 4096;
+
+const MAX_ACTIVE_PATH_BYTES: usize = 32 * 1024;
+
+const MAX_RECEIVER_ENDPOINT_BYTES: usize = 128;
+
+const UPDATE_EXISTING_FLAG: u8 = 0x01;
+const KNOWN_RECEIVER_FLAGS: u8 = UPDATE_EXISTING_FLAG;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -44,6 +55,27 @@ impl TryFrom<u8> for ManagementJobRole {
             )),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManagementActiveJobDetails {
+    Sender {
+        receiver_address: SocketAddr,
+
+        source_root: String,
+
+        worker_count: usize,
+
+        calibration_mib: u64,
+    },
+
+    Receiver {
+        transfer_port: u16,
+
+        destination_root: String,
+
+        update_existing: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,6 +126,8 @@ pub struct ManagementActiveJobSnapshot {
     pub total: u64,
 
     pub cancel_requested: bool,
+
+    pub details: ManagementActiveJobDetails,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -249,6 +283,15 @@ fn encode_active(active: &ManagementActiveJobSnapshot, payload: &mut Vec<u8>) ->
         )
     })?;
 
+    let details = encode_active_details(active.role, &active.details)?;
+
+    let details_length = u32::try_from(details.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "active management details length cannot be represented",
+        )
+    })?;
+
     payload.push(active.role as u8);
 
     payload.push(u8::from(active.cancel_requested));
@@ -261,7 +304,11 @@ fn encode_active(active: &ManagementActiveJobSnapshot, payload: &mut Vec<u8>) ->
 
     payload.extend_from_slice(&active.total.to_le_bytes());
 
+    payload.extend_from_slice(&details_length.to_le_bytes());
+
     payload.extend_from_slice(active.phase.as_bytes());
+
+    payload.extend_from_slice(&details);
 
     Ok(())
 }
@@ -320,6 +367,21 @@ fn decode_active(payload: &[u8], cursor: &mut usize) -> io::Result<ManagementAct
         )
     })?);
 
+    let details_length = usize::try_from(u32::from_le_bytes(header[28..32].try_into().map_err(
+        |_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "active details length was malformed",
+            )
+        },
+    )?))
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "active details length cannot be represented",
+        )
+    })?;
+
     let phase_bytes = take_bytes(payload, cursor, phase_length, "active management phase")?;
 
     let phase = decode_text(
@@ -329,14 +391,417 @@ fn decode_active(payload: &[u8], cursor: &mut usize) -> io::Result<ManagementAct
         false,
     )?;
 
+    let details_bytes = take_bytes(payload, cursor, details_length, "active management details")?;
+
+    let details = decode_active_details(role, details_bytes)?;
+
     Ok(ManagementActiveJobSnapshot {
         role,
+
         job_id,
+
         phase,
+
         completed,
+
         total,
+
         cancel_requested,
+
+        details,
     })
+}
+
+fn encode_active_details(
+    role: ManagementJobRole,
+    details: &ManagementActiveJobDetails,
+) -> io::Result<Vec<u8>> {
+    match (role, details) {
+        (
+            ManagementJobRole::Sender,
+            ManagementActiveJobDetails::Sender {
+                receiver_address,
+                source_root,
+                worker_count,
+                calibration_mib,
+            },
+        ) => {
+            if receiver_address.port() == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "active sender receiver address used port zero",
+                ));
+            }
+
+            if *worker_count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "active sender worker count must not be zero",
+                ));
+            }
+
+            if *calibration_mib == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "active sender calibration size must not be zero",
+                ));
+            }
+
+            validate_text(
+                source_root,
+                MAX_ACTIVE_PATH_BYTES,
+                "active sender source path",
+                false,
+            )?;
+
+            let receiver_text = receiver_address.to_string();
+
+            validate_text(
+                &receiver_text,
+                MAX_RECEIVER_ENDPOINT_BYTES,
+                "active sender receiver endpoint",
+                false,
+            )?;
+
+            let receiver_length = u16::try_from(receiver_text.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "active sender receiver endpoint length cannot be represented",
+                )
+            })?;
+
+            let source_length = u32::try_from(source_root.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "active sender source path length cannot be represented",
+                )
+            })?;
+
+            let worker_count = u32::try_from(*worker_count).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "active sender worker count cannot be represented",
+                )
+            })?;
+
+            let mut encoded = Vec::with_capacity(
+                SENDER_DETAIL_HEADER_BYTES + receiver_text.len() + source_root.len(),
+            );
+
+            encoded.extend_from_slice(&worker_count.to_le_bytes());
+
+            encoded.extend_from_slice(&calibration_mib.to_le_bytes());
+
+            encoded.extend_from_slice(&receiver_length.to_le_bytes());
+
+            encoded.extend_from_slice(&0_u16.to_le_bytes());
+
+            encoded.extend_from_slice(&source_length.to_le_bytes());
+
+            encoded.extend_from_slice(receiver_text.as_bytes());
+
+            encoded.extend_from_slice(source_root.as_bytes());
+
+            Ok(encoded)
+        }
+
+        (
+            ManagementJobRole::Receiver,
+            ManagementActiveJobDetails::Receiver {
+                transfer_port,
+                destination_root,
+                update_existing,
+            },
+        ) => {
+            if *transfer_port == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "active receiver transfer port must not be zero",
+                ));
+            }
+
+            validate_text(
+                destination_root,
+                MAX_ACTIVE_PATH_BYTES,
+                "active receiver destination path",
+                false,
+            )?;
+
+            let destination_length = u32::try_from(destination_root.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "active receiver destination length cannot be represented",
+                )
+            })?;
+
+            let flags = if *update_existing {
+                UPDATE_EXISTING_FLAG
+            } else {
+                0
+            };
+
+            let mut encoded =
+                Vec::with_capacity(RECEIVER_DETAIL_HEADER_BYTES + destination_root.len());
+
+            encoded.extend_from_slice(&transfer_port.to_le_bytes());
+
+            encoded.push(flags);
+            encoded.push(0);
+
+            encoded.extend_from_slice(&destination_length.to_le_bytes());
+
+            encoded.extend_from_slice(destination_root.as_bytes());
+
+            Ok(encoded)
+        }
+
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "active management role did not match its detail payload",
+        )),
+    }
+}
+
+fn decode_active_details(
+    role: ManagementJobRole,
+    payload: &[u8],
+) -> io::Result<ManagementActiveJobDetails> {
+    match role {
+        ManagementJobRole::Sender => {
+            if payload.len() < SENDER_DETAIL_HEADER_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "active sender details ended inside its header",
+                ));
+            }
+
+            let worker_count = usize::try_from(u32::from_le_bytes(
+                payload[0..4].try_into().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "active sender worker count was malformed",
+                    )
+                })?,
+            ))
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active sender worker count cannot be represented",
+                )
+            })?;
+
+            if worker_count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active sender worker count was zero",
+                ));
+            }
+
+            let calibration_mib = u64::from_le_bytes(payload[4..12].try_into().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active sender calibration size was malformed",
+                )
+            })?);
+
+            if calibration_mib == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active sender calibration size was zero",
+                ));
+            }
+
+            let receiver_length = usize::from(u16::from_le_bytes(
+                payload[12..14].try_into().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "active sender receiver length was malformed",
+                    )
+                })?,
+            ));
+
+            let reserved = u16::from_le_bytes(payload[14..16].try_into().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active sender reserved field was malformed",
+                )
+            })?);
+
+            if reserved != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active sender reserved field was not zero",
+                ));
+            }
+
+            let source_length = usize::try_from(u32::from_le_bytes(
+                payload[16..20].try_into().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "active sender source length was malformed",
+                    )
+                })?,
+            ))
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active sender source length cannot be represented",
+                )
+            })?;
+
+            let receiver_end = SENDER_DETAIL_HEADER_BYTES
+                .checked_add(receiver_length)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "active sender receiver position overflowed",
+                    )
+                })?;
+
+            let expected_length = receiver_end.checked_add(source_length).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active sender detail length overflowed",
+                )
+            })?;
+
+            if payload.len() != expected_length {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "active sender details contain {} bytes, expected {expected_length}",
+                        payload.len(),
+                    ),
+                ));
+            }
+
+            let receiver_text = decode_text(
+                &payload[SENDER_DETAIL_HEADER_BYTES..receiver_end],
+                MAX_RECEIVER_ENDPOINT_BYTES,
+                "active sender receiver endpoint",
+                false,
+            )?;
+
+            let receiver_address = receiver_text.parse::<SocketAddr>().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("active sender receiver endpoint was invalid: {error}"),
+                )
+            })?;
+
+            if receiver_address.port() == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active sender receiver endpoint used port zero",
+                ));
+            }
+
+            let source_root = decode_text(
+                &payload[receiver_end..],
+                MAX_ACTIVE_PATH_BYTES,
+                "active sender source path",
+                false,
+            )?;
+
+            Ok(ManagementActiveJobDetails::Sender {
+                receiver_address,
+
+                source_root,
+
+                worker_count,
+
+                calibration_mib,
+            })
+        }
+
+        ManagementJobRole::Receiver => {
+            if payload.len() < RECEIVER_DETAIL_HEADER_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "active receiver details ended inside its header",
+                ));
+            }
+
+            let transfer_port = u16::from_le_bytes(payload[0..2].try_into().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active receiver transfer port was malformed",
+                )
+            })?);
+
+            if transfer_port == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active receiver transfer port was zero",
+                ));
+            }
+
+            let flags = payload[2];
+
+            if flags & !KNOWN_RECEIVER_FLAGS != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("active receiver flags contained unknown bits 0x{flags:02X}"),
+                ));
+            }
+
+            if payload[3] != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active receiver reserved byte was not zero",
+                ));
+            }
+
+            let destination_length = usize::try_from(u32::from_le_bytes(
+                payload[4..8].try_into().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "active receiver destination length was malformed",
+                    )
+                })?,
+            ))
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active receiver destination length cannot be represented",
+                )
+            })?;
+
+            let expected_length = RECEIVER_DETAIL_HEADER_BYTES
+                .checked_add(destination_length)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "active receiver detail length overflowed",
+                    )
+                })?;
+
+            if payload.len() != expected_length {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "active receiver details contain {} bytes, expected {expected_length}",
+                        payload.len(),
+                    ),
+                ));
+            }
+
+            let destination_root = decode_text(
+                &payload[RECEIVER_DETAIL_HEADER_BYTES..],
+                MAX_ACTIVE_PATH_BYTES,
+                "active receiver destination path",
+                false,
+            )?;
+
+            Ok(ManagementActiveJobDetails::Receiver {
+                transfer_port,
+
+                destination_root,
+
+                update_existing: flags & UPDATE_EXISTING_FLAG != 0,
+            })
+        }
+    }
 }
 
 fn encode_result(result: &ManagementJobResult, payload: &mut Vec<u8>) -> io::Result<()> {
@@ -546,8 +1011,9 @@ fn invalid_data(error: io::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        ManagementActiveJobSnapshot, ManagementAgentSnapshot, ManagementJobOutcome,
-        ManagementJobResult, ManagementJobRole, decode_snapshot, encode_snapshot,
+        ManagementActiveJobDetails, ManagementActiveJobSnapshot, ManagementAgentSnapshot,
+        ManagementJobOutcome, ManagementJobResult, ManagementJobRole, decode_snapshot,
+        encode_snapshot,
     };
 
     #[test]
@@ -565,6 +1031,16 @@ mod tests {
                 total: 1024 * 1024,
 
                 cancel_requested: false,
+
+                details: ManagementActiveJobDetails::Sender {
+                    receiver_address: "127.0.0.1:7337".parse().unwrap(),
+
+                    source_root: r"C:\Source".to_string(),
+
+                    worker_count: 4,
+
+                    calibration_mib: 8,
+                },
             }),
 
             latest_result: Some(ManagementJobResult {

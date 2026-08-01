@@ -10,6 +10,7 @@ use networkcopy_speed::management_discovery::{self, DiscoveredAgent};
 use networkcopy_speed::management_orchestration::{
     self, ManagedTransferRecord, ManagedTransferRequest,
 };
+use networkcopy_speed::management_reconnect;
 use networkcopy_speed::management_snapshot::{
     ManagementAgentSnapshot, ManagementJobOutcome, ManagementJobResult,
 };
@@ -33,6 +34,15 @@ const MAX_TRANSFER_HISTORY: usize = 20;
 type DiscoveryResult = Result<Vec<DiscoveredAgent>, String>;
 
 type StartResult = Result<ManagedTransferRecord, String>;
+
+type AttachResult = Result<
+    (
+        ManagedTransferRecord,
+        ManagementAgentSnapshot,
+        ManagementAgentSnapshot,
+    ),
+    String,
+>;
 
 struct PollResponse {
     sender: Result<ManagementAgentSnapshot, String>,
@@ -278,6 +288,8 @@ struct NetworkCopyManager {
 
     start_receiver: Option<Receiver<StartResult>>,
 
+    attach_receiver: Option<Receiver<AttachResult>>,
+
     poll_receiver: Option<Receiver<PollResponse>>,
 
     cancel_receiver: Option<Receiver<CancelResponse>>,
@@ -325,6 +337,8 @@ impl NetworkCopyManager {
             discovery_receiver: None,
 
             start_receiver: None,
+
+            attach_receiver: None,
 
             poll_receiver: None,
 
@@ -455,6 +469,67 @@ impl NetworkCopyManager {
         });
     }
 
+    fn begin_attach(&mut self) {
+        if self.attach_receiver.is_some() {
+            return;
+        }
+
+        self.error.clear();
+
+        let sender_agent = match parse_endpoint(&self.sender_agent, "sender management agent") {
+            Ok(endpoint) => endpoint,
+
+            Err(error) => {
+                self.error = error;
+                return;
+            }
+        };
+
+        let receiver_agent = match parse_endpoint(&self.receiver_agent, "receiver management agent")
+        {
+            Ok(endpoint) => endpoint,
+
+            Err(error) => {
+                self.error = error;
+                return;
+            }
+        };
+
+        if sender_agent == receiver_agent {
+            self.error = "Sender and receiver must be different management agents.".to_string();
+
+            return;
+        }
+
+        self.notice = "Reading active jobs from both endpoints...".to_string();
+
+        let (sender, receiver) = mpsc::channel();
+
+        self.attach_receiver = Some(receiver);
+
+        thread::spawn(move || {
+            let result = (|| {
+                let sender_snapshot = management_control::agent_snapshot(sender_agent)
+                    .map_err(|error| format!("Sender snapshot failed: {error}"))?;
+
+                let receiver_snapshot = management_control::agent_snapshot(receiver_agent)
+                    .map_err(|error| format!("Receiver snapshot failed: {error}"))?;
+
+                let transfer = management_reconnect::reconstruct_active_transfer(
+                    sender_agent,
+                    receiver_agent,
+                    &sender_snapshot,
+                    &receiver_snapshot,
+                )
+                .map_err(|error| format!("Active jobs could not be paired: {error}"))?;
+
+                Ok((transfer, sender_snapshot, receiver_snapshot))
+            })();
+
+            let _ = sender.send(result);
+        });
+    }
+
     fn begin_poll(&mut self) {
         if self.monitoring_complete
             || self.poll_receiver.is_some()
@@ -526,6 +601,8 @@ impl NetworkCopyManager {
         self.process_discovery_message();
 
         self.process_start_message();
+
+        self.process_attach_message();
 
         self.process_poll_message();
 
@@ -607,6 +684,65 @@ impl NetworkCopyManager {
                 self.start_receiver = None;
 
                 self.error = "Transfer startup worker disconnected.".to_string();
+
+                self.notice.clear();
+            }
+
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    fn process_attach_message(&mut self) {
+        let message = self
+            .attach_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
+
+        match message {
+            Some(Ok(Ok((transfer, sender_snapshot, receiver_snapshot)))) => {
+                self.attach_receiver = None;
+
+                self.sender_agent = transfer.sender_agent.to_string();
+
+                self.receiver_agent = transfer.receiver_agent.to_string();
+
+                self.source_root = transfer.source_root.clone();
+
+                self.destination_root = transfer.destination_root.clone();
+
+                self.worker_count = transfer.worker_count;
+
+                self.calibration_mib = transfer.calibration_mib;
+
+                self.update_existing = transfer.update_existing;
+
+                self.sender_snapshot = Some(sender_snapshot);
+
+                self.receiver_snapshot = Some(receiver_snapshot);
+
+                self.transfer = Some(transfer);
+
+                self.monitoring_complete = false;
+
+                self.last_poll = Instant::now();
+
+                self.notice = "Attached to the active paired transfer.".to_string();
+
+                self.error.clear();
+            }
+
+            Some(Ok(Err(error))) => {
+                self.attach_receiver = None;
+
+                self.error = error;
+
+                self.notice.clear();
+            }
+
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.attach_receiver = None;
+
+                self.error = "Active-job attachment worker disconnected.".to_string();
 
                 self.notice.clear();
             }
@@ -763,6 +899,7 @@ impl NetworkCopyManager {
     fn has_background_work(&self) -> bool {
         self.discovery_receiver.is_some()
             || self.start_receiver.is_some()
+            || self.attach_receiver.is_some()
             || self.poll_receiver.is_some()
             || self.cancel_receiver.is_some()
             || self.sender_browser.is_loading()
@@ -931,11 +1068,19 @@ impl NetworkCopyManager {
         let transfer_active = self.transfer.is_some() && !self.monitoring_complete;
 
         let can_start = self.start_receiver.is_none()
+            && self.attach_receiver.is_none()
             && !transfer_active
             && !self.sender_agent.trim().is_empty()
             && !self.receiver_agent.trim().is_empty()
             && !self.source_root.trim().is_empty()
             && !self.destination_root.trim().is_empty()
+            && self.sender_agent != self.receiver_agent;
+
+        let can_attach = self.attach_receiver.is_none()
+            && self.start_receiver.is_none()
+            && !transfer_active
+            && !self.sender_agent.trim().is_empty()
+            && !self.receiver_agent.trim().is_empty()
             && self.sender_agent != self.receiver_agent;
 
         ui.horizontal(|ui| {
@@ -946,10 +1091,23 @@ impl NetworkCopyManager {
                 self.begin_transfer();
             }
 
+            if ui
+                .add_enabled(can_attach, egui::Button::new("Attach to active jobs"))
+                .clicked()
+            {
+                self.begin_attach();
+            }
+
             if self.start_receiver.is_some() {
                 ui.spinner();
 
                 ui.label("Starting endpoints...");
+            }
+
+            if self.attach_receiver.is_some() {
+                ui.spinner();
+
+                ui.label("Reading active jobs...");
             }
         });
     }

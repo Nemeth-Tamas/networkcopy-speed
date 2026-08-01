@@ -33,6 +33,7 @@ mod management_filesystem;
 pub mod management_jobs;
 pub mod management_orchestration;
 pub mod management_protocol;
+pub mod management_reconnect;
 pub mod management_snapshot;
 mod manifest_scan;
 mod multistream_copy;

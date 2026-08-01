@@ -1,8 +1,8 @@
 use crate::calibrated_transfer;
 use crate::console_progress::{ProgressCounter, ProgressSnapshot};
 use crate::management_snapshot::{
-    ManagementActiveJobSnapshot, ManagementAgentSnapshot, ManagementJobOutcome,
-    ManagementJobResult, ManagementJobRole,
+    ManagementActiveJobDetails, ManagementActiveJobSnapshot, ManagementAgentSnapshot,
+    ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
 };
 use crate::manifest_scan;
 use crate::multistream_copy::DestinationMode;
@@ -452,6 +452,13 @@ impl ManagementJobRegistry {
                 ManagementJobRole::Receiver,
                 active.job.job_id,
                 &active.progress,
+                ManagementActiveJobDetails::Receiver {
+                    transfer_port: active.job.transfer_port,
+
+                    destination_root: active.job.destination_root.clone(),
+
+                    update_existing: active.job.update_existing,
+                },
             ))
         } else {
             inner.active_send.as_ref().map(|active| {
@@ -459,6 +466,15 @@ impl ManagementJobRegistry {
                     ManagementJobRole::Sender,
                     active.job.job_id,
                     &active.progress,
+                    ManagementActiveJobDetails::Sender {
+                        receiver_address: active.job.receiver_address,
+
+                        source_root: active.job.source_root.clone(),
+
+                        worker_count: active.job.worker_count,
+
+                        calibration_mib: active.job.calibration_mib,
+                    },
                 )
             })
         };
@@ -654,6 +670,7 @@ fn build_active_snapshot(
     role: ManagementJobRole,
     job_id: u64,
     progress: &ProgressCounter,
+    details: ManagementActiveJobDetails,
 ) -> ManagementActiveJobSnapshot {
     let ProgressSnapshot {
         label,
@@ -673,6 +690,8 @@ fn build_active_snapshot(
         total,
 
         cancel_requested: progress.is_cancelled(),
+
+        details,
     }
 }
 
