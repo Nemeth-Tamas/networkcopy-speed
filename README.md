@@ -14,11 +14,13 @@ NetworkCopy can transfer folders across a normal local network or directly
 between two computers connected by an Ethernet cable. Direct Link Mode does
 not require a router, switch, DHCP server, or manually assigned IP addresses.
 
-The repository currently contains:
+The repository contains:
 
-- the v2.0 command-line transfer engine;
-- the v2.0 desktop GUI;
-- one shared networking and transfer implementation used by both front ends.
+- high-performance command-line and desktop transfer front ends;
+- automatic LAN, Direct Link, and manual IP transfer modes;
+- a dedicated self-elevating endpoint agent;
+- a WGPU management application for remote browsing and orchestration;
+- one shared networking and transfer engine used by every front end.
 
 ## Current status
 
@@ -31,17 +33,17 @@ Current stable release:
 Current development version:
 
 ```text
-2.2.0
+2.3.0-dev
 ```
 
-v2.1 focuses on stronger interrupted-transfer recovery and broader local reuse.
-Its first milestone persists fully committed fresh-transfer files so a resumed
-session can safely rebuild the same bounded CDC catalog instead of retransmitting
-already completed generations.
+v2.2 introduced persistent LAN-visible endpoint agents, automatic discovery,
+remote filesystem browsing, sender-to-receiver orchestration, live progress,
+cancellation, paired failure cleanup, manager reconnection, managed resume,
+persistent history, and dedicated Manager and Agent executables.
 
-The stable v2.1 release uses protocol v11. It adds BLAKE3 verification of
-journaled fresh-transfer files before they may re-enter the resumed session CDC
-catalog.
+v2.3 development focuses on effortless queued orchestration: select several
+independent source and destination pairs, start the queue, and leave the
+machines to complete the work automatically.
 
 v2 supports verified content reuse during both updates
 and fresh folder transfers. Update mode reuses content from older receiver-side
@@ -68,6 +70,7 @@ The GUI includes:
 - persistent interrupted-transfer records;
 - one-click transfer restart and stripe resume;
 - automatic administrator elevation when Receive requires firewall setup;
+
 ## v2.1 roadmap
 
 - [x] persist committed fresh-transfer file IDs in the resume journal;
@@ -151,13 +154,12 @@ changed to the stable `2.1.0` version.
 
 ## v2.2 release — LAN management
 
-v2.2 adds a separate management interface that discovers NetworkCopy sender and
-receiver agents on the local network and remotely orchestrates transfers
+v2.2 ships a separate management interface that discovers NetworkCopy sender
+and receiver agents on the local network and remotely orchestrates transfers
 between them.
 
-The management computer will carry only commands, status, and progress data.
-File payloads will continue to travel directly from the selected sender to the
-selected receiver.
+The management computer carries only commands, status, and progress data.
+File payloads travel directly from the selected sender to the selected receiver.
 
 Released v2.2 scope and follow-ups:
 
@@ -212,24 +214,53 @@ orchestration is planned for v2.3.
 Management traffic remains unauthenticated and unencrypted in v2.2. Use the
 management agent only on a known and controlled local network.
 
-## v2.3 roadmap — queued orchestration
+## v2.3 development roadmap — effortless queued transfers
 
-The next management milestone will add a persistent manager-side transfer queue.
-Endpoint agents will remain one-job-at-a-time, while the manager will schedule
-queued transfers whenever their required sender and receiver agents are idle.
+v2.3 centers on a persistent manager-side transfer queue. Endpoint agents remain
+simple one-job-at-a-time executors, while the manager owns ordering, persistence,
+conflict detection, failure handling, resume, and automatic start-next behavior.
 
-Planned queue features:
+The primary workflow is:
 
-- persistent queued transfer requests;
-- reorder and remove queued items;
-- automatic start-next behavior;
-- endpoint conflict and busy-state checks;
-- pause after the current transfer;
-- queued resume operations;
-- recovery of the queue after a manager restart;
-- optional concurrent execution for transfers using completely disjoint agents.
+1. select the sender and receiver;
+2. add several source and destination pairs;
+3. start the queue;
+4. leave the machines alone while the transfers run in sequence.
 
-### Management discovery prototype
+### Planned v2.3 scope
+
+- [ ] add stable-ID queued transfer requests;
+- [ ] persist queue order and state across manager restarts;
+- [ ] add, reorder, remove, and clear queue entries;
+- [ ] show the current, next, and remaining transfers;
+- [ ] start the next eligible transfer automatically;
+- [ ] detect unavailable, busy, and conflicting endpoints;
+- [ ] support pausing after the current transfer;
+- [ ] retain failed work and require an explicit retry, skip, or continuation;
+- [ ] queue journal-backed resume operations with their original stream count;
+- [ ] reconnect a restarted manager to the correct active queue item;
+- [ ] expose Automatic LAN, Direct Link, and Explicit IP manager route modes;
+- [ ] add useful Windows completion, failure, pause, and action-required notifications;
+- [ ] add a small endpoint-agent tray control surface;
+- [ ] check GitHub Releases for newer stable versions and open the download flow;
+- [ ] complete physical three-machine and queued-transfer acceptance testing.
+
+Sequential reliability comes before concurrent execution. Transfers using fully
+disjoint endpoint pairs may run concurrently later if doing so does not make the
+queue harder to understand or recover.
+
+### Deliberately deferred
+
+- pairing, authentication, encryption, and other security hardening;
+- automatic agent startup with Windows;
+- major diagnostics expansion;
+- transfer-history export;
+- ZIP-based release deployment;
+- automatic in-place executable replacement.
+
+Management traffic remains intended for known and controlled local networks.
+
+### Management agent and command-line tools
 
 Start an agent from an elevated terminal:
 
@@ -266,9 +297,9 @@ Browse a remote directory:
 cargo run -- management-list 127.0.0.1:7339 "C:\Users"
 ```
 
-The later WGPU management application will use this same protocol to provide
-discovered-machine cards and dual-pane remote folder browsers for selecting the
-source and destination without typing paths manually.
+The WGPU management application uses this protocol to provide discovered-machine
+cards and dual-pane remote folder browsers for selecting the source and
+destination without typing paths manually.
 
 Prepare a receiver destination on another computer:
 
@@ -291,16 +322,9 @@ cargo run -- management-cancel 127.0.0.1:7339 1
 A prepared receiver now binds the production transfer listener on TCP port 7337
 and immediately begins waiting for the calibration matrix and folder transfer.
 
-Until remote sender startup is implemented, the existing `send-auto` command can
-be used to exercise the managed receiver:
-
-```powershell
-networkcopy-speed.exe send-auto `
-    127.0.0.1:7337 `
-    "C:\TransferSource" `
-    4 `
-    8
-```
+Remote sender startup is implemented through the management protocol. A sender
+job may be started directly, or both endpoints may be prepared and started
+together through the paired orchestration command below.
 
 After a successful transfer, the receiver job automatically leaves the active
 registry and the agent returns to the idle state.
@@ -359,7 +383,7 @@ message after the endpoint returns to idle.
 
 ## Management GUI
 
-Build the initial WGPU manager:
+Build the WGPU manager:
 
 ```powershell
 cargo build `
@@ -367,11 +391,15 @@ cargo build `
     --bin networkcopy-manager
 ```
 
-Start management agents on the sender and receiver machines:
+Start the dedicated agent on the sender and receiver machines. It requests
+administrator elevation automatically:
 
 ```powershell
-networkcopy-speed.exe management-agent
+networkcopy-agent.exe
 ```
+
+The older `networkcopy-speed.exe management-agent` command remains available
+for command-line and development use.
 
 Then open the manager on any machine on the trusted LAN:
 
@@ -379,8 +407,8 @@ Then open the manager on any machine on the trusted LAN:
 networkcopy-manager.exe
 ```
 
-The initial manager discovers LAN agents, assigns sender and receiver roles,
-accepts remote source and destination paths, starts a paired transfer, polls both
+The manager discovers LAN agents, assigns sender and receiver roles, accepts
+remote source and destination paths, starts a paired transfer, polls both
 endpoint snapshots, displays live progress and retained terminal results, and
 cancels both endpoint jobs from one window.
 
@@ -394,9 +422,9 @@ loads the selected endpoint's Windows drive roots, navigates directories,
 refreshes the current folder, moves to the parent folder, and copies the current
 remote path into the paired transfer configuration.
 
-The manager retains the 20 most recent paired terminal transfers for the current
-application session. History cards combine sender and receiver results, show the
-paired outcome, logical and wire data, wire savings, stream count, endpoint
+The manager retains the 20 most recent paired terminal transfers across
+application restarts. History cards combine sender and receiver results, show
+the paired outcome, logical and wire data, wire savings, stream count, endpoint
 errors, and can restore the previous transfer setup for another run.
 
 Cancelled and failed managed transfers expose a resume action when the receiver
