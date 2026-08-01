@@ -339,6 +339,14 @@ struct NetworkCopyManager {
 
     update_existing: bool,
 
+    show_agents: bool,
+
+    show_setup: bool,
+
+    show_browsers: bool,
+
+    show_history: bool,
+
     discovery_receiver: Option<Receiver<DiscoveryResult>>,
 
     start_receiver: Option<Receiver<StartResult>>,
@@ -402,6 +410,14 @@ impl NetworkCopyManager {
             calibration_mib: 8,
 
             update_existing: false,
+
+            show_agents: true,
+
+            show_setup: true,
+
+            show_browsers: false,
+
+            show_history: false,
 
             discovery_receiver: None,
 
@@ -753,6 +769,8 @@ impl NetworkCopyManager {
             "Preparing resume with the journal's original {data_stream_count} TCP stream(s)..."
         );
 
+        self.show_setup = false;
+
         let (sender, receiver) = mpsc::channel();
 
         self.start_receiver = Some(receiver);
@@ -1023,6 +1041,8 @@ impl NetworkCopyManager {
                 self.last_poll = Instant::now();
 
                 self.monitoring_complete = false;
+
+                self.show_setup = false;
             }
 
             Some(Ok(Err(error))) => {
@@ -1080,6 +1100,8 @@ impl NetworkCopyManager {
                 self.peer_cleanup_attempted = false;
 
                 self.monitoring_complete = false;
+
+                self.show_setup = false;
 
                 self.last_poll = Instant::now();
 
@@ -1208,6 +1230,8 @@ impl NetworkCopyManager {
                 receiver_result,
             },
         );
+
+        self.show_history = true;
     }
 
     fn process_cancel_message(&mut self) {
@@ -1327,10 +1351,130 @@ impl NetworkCopyManager {
             || (self.transfer.is_some() && !self.monitoring_complete)
     }
 
-    fn render_discovery(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("LAN agents");
+    fn manager_status(&self) -> (&'static str, egui::Color32) {
+        if self.peer_cleanup_receiver.is_some() {
+            (
+                "Cleaning up paired endpoint",
+                egui::Color32::from_rgb(255, 190, 82),
+            )
+        } else if self.cancel_receiver.is_some() {
+            ("Cancelling transfer", egui::Color32::from_rgb(255, 190, 82))
+        } else if self.start_receiver.is_some() {
+            ("Starting transfer", egui::Color32::from_rgb(95, 194, 255))
+        } else if self.attach_receiver.is_some() {
+            (
+                "Attaching to active jobs",
+                egui::Color32::from_rgb(95, 194, 255),
+            )
+        } else if self.transfer.is_some() && !self.monitoring_complete {
+            ("Transfer active", egui::Color32::from_rgb(126, 230, 64))
+        } else if self.monitoring_complete {
+            ("Transfer finished", egui::Color32::from_rgb(95, 194, 255))
+        } else if self.discovery_receiver.is_some() {
+            ("Discovering agents", egui::Color32::from_rgb(95, 194, 255))
+        } else {
+            ("Ready", egui::Color32::from_rgb(126, 230, 64))
+        }
+    }
 
+    fn render_app_header(&self, ui: &mut egui::Ui) {
+        let (status, status_color) = self.manager_status();
+
+        ui.horizontal_wrapped(|ui| {
+            ui.heading(APP_NAME);
+
+            ui.separator();
+
+            status_label(ui, status, status_color);
+
+            ui.separator();
+
+            ui.label(format!("v{}", env!("CARGO_PKG_VERSION"),));
+        });
+
+        ui.label("Remote LAN orchestration with direct sender-to-receiver payload transfer.");
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("{} agent(s) discovered", self.agents.len(),));
+
+            ui.separator();
+
+            ui.label(format!("{} retained transfer(s)", self.history.len(),));
+
+            ui.separator();
+
+            ui.label("Trusted LAN · management traffic is not yet encrypted");
+        });
+    }
+
+    fn render_messages(&mut self, ui: &mut egui::Ui) {
+        if !self.notice.is_empty() {
+            let mut dismiss = false;
+
+            ui.group(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    status_label(ui, "Information", egui::Color32::from_rgb(95, 194, 255));
+
+                    ui.label(&self.notice);
+
+                    if ui.button("Dismiss").clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+
+            if dismiss {
+                self.notice.clear();
+            }
+        }
+
+        if !self.error.is_empty() {
+            let mut dismiss = false;
+
+            ui.group(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    status_label(ui, "Action needed", egui::Color32::from_rgb(255, 112, 120));
+
+                    ui.label(&self.error);
+
+                    if ui.button("Dismiss").clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+
+            if dismiss {
+                self.error.clear();
+            }
+        }
+
+        if !self.persistence_error.is_empty() {
+            let mut dismiss = false;
+
+            ui.group(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    status_label(
+                        ui,
+                        "State persistence",
+                        egui::Color32::from_rgb(255, 190, 82),
+                    );
+
+                    ui.label(&self.persistence_error);
+
+                    if ui.button("Dismiss").clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+
+            if dismiss {
+                self.persistence_error.clear();
+            }
+        }
+    }
+
+    fn render_discovery(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
             let discovering = self.discovery_receiver.is_some();
 
             if ui
@@ -1343,16 +1487,16 @@ impl NetworkCopyManager {
             if discovering {
                 ui.spinner();
 
-                ui.label("Searching...");
+                ui.label("Searching LAN...");
             }
-        });
 
-        ui.label("Run networkcopy-speed.exe management-agent on each endpoint machine.");
+            ui.label("Run networkcopy-speed.exe management-agent on each endpoint.");
+        });
 
         ui.add_space(6.0);
 
         if self.agents.is_empty() {
-            ui.label("No agents discovered yet. Manual IP addresses can still be entered below.");
+            ui.label("No agents discovered. Manual addresses remain available in Transfer setup.");
 
             return;
         }
@@ -1360,44 +1504,88 @@ impl NetworkCopyManager {
         let agents = self.agents.clone();
 
         for agent in agents {
+            let endpoint_text = agent.endpoint.to_string();
+
+            let sender_selected = self.sender_agent == endpoint_text;
+
+            let receiver_selected = self.receiver_agent == endpoint_text;
+
+            let sender_enabled = agent.capabilities.can_send();
+
+            let receiver_enabled = agent.capabilities.can_receive();
+
             ui.group(|ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    status_label(
+                        ui,
+                        agent.state.label(),
+                        agent_state_color(agent.state.label()),
+                    );
+
                     ui.strong(&agent.hostname);
 
-                    ui.label(agent.endpoint.to_string());
-
-                    ui.label(agent.state.label());
-                });
-
-                ui.horizontal(|ui| {
-                    let sender_enabled = agent.capabilities.can_send();
-
-                    let receiver_enabled = agent.capabilities.can_receive();
-
-                    if ui
-                        .add_enabled(sender_enabled, egui::Button::new("Use as sender"))
-                        .clicked()
-                    {
-                        self.sender_agent = agent.endpoint.to_string();
-                    }
-
-                    if ui
-                        .add_enabled(receiver_enabled, egui::Button::new("Use as receiver"))
-                        .clicked()
-                    {
-                        self.receiver_agent = agent.endpoint.to_string();
-                    }
+                    ui.label(egui::RichText::new(&endpoint_text).monospace());
 
                     ui.label(format!("Protocol {}", agent.protocol_version,));
+
+                    if sender_selected {
+                        status_label(ui, "Sender", egui::Color32::from_rgb(95, 194, 255));
+                    }
+
+                    if receiver_selected {
+                        status_label(ui, "Receiver", egui::Color32::from_rgb(182, 134, 255));
+                    }
+                });
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            sender_enabled && !sender_selected,
+                            egui::Button::new(if sender_selected {
+                                "Sender selected"
+                            } else {
+                                "Use as sender"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.sender_agent = endpoint_text.clone();
+                    }
+
+                    if ui
+                        .add_enabled(
+                            receiver_enabled && !receiver_selected,
+                            egui::Button::new(if receiver_selected {
+                                "Receiver selected"
+                            } else {
+                                "Use as receiver"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.receiver_agent = endpoint_text.clone();
+                    }
+
+                    let capability = match (sender_enabled, receiver_enabled) {
+                        (true, true) => "send + receive",
+
+                        (true, false) => "send",
+
+                        (false, true) => "receive",
+
+                        (false, false) => "none",
+                    };
+
+                    ui.label(format!("Capabilities: {capability}"));
                 });
             });
+
+            ui.add_space(6.0);
         }
     }
 
     fn render_configuration(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Transfer setup");
-
-        ui.label("The following paths are evaluated on the selected remote machines.");
+        ui.label("Paths are evaluated on the selected remote endpoint machines.");
 
         ui.add_space(6.0);
 
@@ -1449,35 +1637,49 @@ impl NetworkCopyManager {
 
         ui.add_space(12.0);
 
-        ui.heading("Remote folder browser");
+        ui.horizontal_wrapped(|ui| {
+            let label = if self.show_browsers {
+                "Hide remote browser"
+            } else {
+                "Browse remote folders"
+            };
 
-        ui.label("Browse both endpoint machines without opening their desktops.");
+            if ui.button(label).clicked() {
+                self.show_browsers = !self.show_browsers;
+            }
 
-        ui.add_space(6.0);
-
-        let sender_agent = self.sender_agent.clone();
-
-        let receiver_agent = self.receiver_agent.clone();
-
-        ui.columns(2, |columns| {
-            let (left, right) = columns.split_at_mut(1);
-
-            render_remote_browser(
-                &mut left[0],
-                "Sender folders",
-                &sender_agent,
-                &mut self.source_root,
-                &mut self.sender_browser,
-            );
-
-            render_remote_browser(
-                &mut right[0],
-                "Receiver folders",
-                &receiver_agent,
-                &mut self.destination_root,
-                &mut self.receiver_browser,
-            );
+            if !self.show_browsers {
+                ui.label("The source and destination paths can also be entered manually above.");
+            }
         });
+
+        if self.show_browsers {
+            ui.add_space(8.0);
+
+            let sender_agent = self.sender_agent.clone();
+
+            let receiver_agent = self.receiver_agent.clone();
+
+            ui.columns(2, |columns| {
+                let (left, right) = columns.split_at_mut(1);
+
+                render_remote_browser(
+                    &mut left[0],
+                    "Sender folders",
+                    &sender_agent,
+                    &mut self.source_root,
+                    &mut self.sender_browser,
+                );
+
+                render_remote_browser(
+                    &mut right[0],
+                    "Receiver folders",
+                    &receiver_agent,
+                    &mut self.destination_root,
+                    &mut self.receiver_browser,
+                );
+            });
+        }
 
         if !self.sender_agent.is_empty() && self.sender_agent == self.receiver_agent {
             ui.label("Sender and receiver cannot be the same agent.");
@@ -1505,14 +1707,20 @@ impl NetworkCopyManager {
 
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(can_start, egui::Button::new("Start managed transfer"))
+                .add_enabled(
+                    can_start,
+                    egui::Button::new(egui::RichText::new("Start managed transfer").strong()),
+                )
                 .clicked()
             {
                 self.begin_transfer();
             }
 
             if ui
-                .add_enabled(can_attach, egui::Button::new("Attach to active jobs"))
+                .add_enabled(
+                    can_attach,
+                    egui::Button::new(egui::RichText::new("Attach to active jobs").strong()),
+                )
                 .clicked()
             {
                 self.begin_attach();
@@ -1533,10 +1741,18 @@ impl NetworkCopyManager {
     }
 
     fn render_transfer(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Current transfer");
+        let (status, status_color) = self.manager_status();
+
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("Current transfer");
+
+            status_label(ui, status, status_color);
+        });
 
         let Some(transfer) = self.transfer.clone() else {
-            ui.label("No managed transfer has been started from this window.");
+            ui.label(
+                "No active transfer. Select two endpoint agents and configure a source and destination.",
+            );
 
             return;
         };
@@ -1618,14 +1834,10 @@ impl NetworkCopyManager {
     }
 
     fn render_history(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("Transfer history");
-
-            ui.label(format!(
-                "{} / {} retained",
-                self.history.len(),
-                MAX_TRANSFER_HISTORY,
-            ));
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                "Completed, cancelled, and failed paired transfers are retained across manager restarts.",
+            );
 
             if ui
                 .add_enabled(!self.history.is_empty(), egui::Button::new("Clear history"))
@@ -1633,13 +1845,11 @@ impl NetworkCopyManager {
             {
                 self.history.clear();
 
+                self.show_history = false;
+
                 self.notice = "Transfer history cleared.".to_string();
             }
         });
-
-        ui.label(
-            "Completed, cancelled, and failed paired jobs remain here after the current card is cleared.",
-        );
 
         ui.add_space(6.0);
 
@@ -1816,6 +2026,8 @@ impl NetworkCopyManager {
 
             self.calibration_mib = transfer.calibration_mib;
 
+            self.show_setup = true;
+
             self.notice =
                 "The selected history entry was copied into the transfer setup.".to_string();
         }
@@ -1832,116 +2044,149 @@ impl eframe::App for NetworkCopyManager {
             ui.ctx().request_repaint_after(REPAINT_INTERVAL);
         }
 
-        egui::CentralPanel::default()
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([
-                        false,
-                        false,
-                    ])
-                    .show(ui, |ui| {
-                        ui.set_width(
-                            ui.available_width(),
-                        );
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
 
-                        ui.horizontal(|ui| {
-                            ui.heading(APP_NAME);
+                    self.render_app_header(ui);
 
-                            ui.separator();
+                    ui.add_space(10.0);
 
-                            ui.label(format!(
-                                "NetworkCopy Speed Edition {}",
-                                env!(
-                                    "CARGO_PKG_VERSION"
-                                ),
-                            ));
-                        });
+                    self.render_messages(ui);
 
-                        ui.label(
-                            "Trusted-LAN development mode — management traffic is currently unauthenticated.",
-                        );
+                    ui.add_space(12.0);
 
-                        if let Some(path) = &self.state_path {
-                            ui.label(format!("Manager state: {}", path.display(),));
-                        }
-
-                        ui.add_space(12.0);
-
-                        ui.separator();
-
-                        ui.add_space(12.0);
-
-                        self.render_discovery(ui);
-
-                        ui.add_space(12.0);
-
-                        ui.separator();
-
-                        ui.add_space(12.0);
-
-                        self.render_configuration(
-                            ui,
-                        );
-
-                        ui.add_space(12.0);
-
-                        ui.separator();
-
-                        ui.add_space(12.0);
+                    ui.group(|ui| {
+                        ui.set_min_width(ui.available_width());
 
                         self.render_transfer(ui);
-
-                        ui.add_space(12.0);
-
-                        ui.separator();
-
-                        ui.add_space(12.0);
-
-                        self.render_history(ui);
-
-                        if !self.notice.is_empty() {
-                            ui.add_space(12.0);
-
-                            ui.separator();
-
-                            ui.add_space(8.0);
-
-                            ui.label(
-                                &self.notice,
-                            );
-                        }
-
-                        if !self.error.is_empty() {
-                            ui.add_space(12.0);
-
-                            ui.separator();
-
-                            ui.add_space(8.0);
-
-                            ui.strong("Error");
-
-                            ui.label(
-                                &self.error,
-                            );
-                        }
-
-                        if !self.persistence_error.is_empty() {
-                            ui.add_space(12.0);
-
-                            ui.separator();
-
-                            ui.add_space(8.0);
-
-                            ui.strong("State persistence");
-
-                            ui.label(&self.persistence_error);
-                        }
-
-                        ui.add_space(16.0);
                     });
-            });
+
+                    ui.add_space(10.0);
+
+                    let agent_summary = format!("{} discovered", self.agents.len());
+
+                    ui.group(|ui| {
+                        ui.set_min_width(ui.available_width());
+
+                        render_section_toggle(
+                            ui,
+                            "LAN agents",
+                            &agent_summary,
+                            &mut self.show_agents,
+                        );
+
+                        if self.show_agents {
+                            ui.add_space(8.0);
+
+                            self.render_discovery(ui);
+                        }
+                    });
+
+                    ui.add_space(10.0);
+
+                    let setup_summary = if self.sender_agent.trim().is_empty()
+                        || self.receiver_agent.trim().is_empty()
+                    {
+                        "Choose sender and receiver".to_string()
+                    } else if self.source_root.trim().is_empty()
+                        || self.destination_root.trim().is_empty()
+                    {
+                        "Choose source and destination".to_string()
+                    } else {
+                        "Endpoints and paths selected".to_string()
+                    };
+
+                    ui.group(|ui| {
+                        ui.set_min_width(ui.available_width());
+
+                        render_section_toggle(
+                            ui,
+                            "Transfer setup",
+                            &setup_summary,
+                            &mut self.show_setup,
+                        );
+
+                        if self.show_setup {
+                            ui.add_space(8.0);
+
+                            self.render_configuration(ui);
+                        }
+                    });
+
+                    ui.add_space(10.0);
+
+                    let history_summary =
+                        format!("{} / {} retained", self.history.len(), MAX_TRANSFER_HISTORY,);
+
+                    ui.group(|ui| {
+                        ui.set_min_width(ui.available_width());
+
+                        render_section_toggle(
+                            ui,
+                            "Transfer history",
+                            &history_summary,
+                            &mut self.show_history,
+                        );
+
+                        if self.show_history {
+                            ui.add_space(8.0);
+
+                            self.render_history(ui);
+                        }
+                    });
+
+                    ui.add_space(10.0);
+
+                    if let Some(path) = &self.state_path {
+                        ui.label(
+                            egui::RichText::new(format!("Manager state: {}", path.display(),))
+                                .small()
+                                .monospace(),
+                        );
+                    }
+
+                    ui.add_space(16.0);
+                });
+        });
 
         self.persist_state_if_needed(ui.ctx());
+    }
+}
+
+fn render_section_toggle(ui: &mut egui::Ui, title: &str, summary: &str, open: &mut bool) {
+    ui.horizontal_wrapped(|ui| {
+        let arrow = if *open { "▼" } else { "▶" };
+
+        if ui.button(arrow).clicked() {
+            *open = !*open;
+        }
+
+        ui.heading(title);
+
+        if !summary.is_empty() {
+            ui.label(summary);
+        }
+    });
+}
+
+fn status_label(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    ui.label(
+        egui::RichText::new(format!("● {text}"))
+            .color(color)
+            .strong(),
+    );
+}
+
+fn agent_state_color(state: &str) -> egui::Color32 {
+    match state {
+        "idle" => egui::Color32::from_rgb(126, 230, 64),
+
+        "busy" => egui::Color32::from_rgb(255, 190, 82),
+
+        _ => egui::Color32::from_rgb(160, 170, 184),
     }
 }
 
@@ -2264,7 +2509,11 @@ fn render_endpoint_snapshot(
         if let Some(result) = result {
             ui.separator();
 
-            ui.strong(format!("Result: {}", result.outcome.label(),));
+            status_label(
+                ui,
+                &format!("Result: {}", result.outcome.label(),),
+                outcome_color(result.outcome),
+            );
 
             ui.label(format!("Files: {}", result.files,));
 
@@ -2437,8 +2686,8 @@ fn configure_style(context: &egui::Context) {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1040.0, 820.0])
-            .with_min_inner_size([760.0, 600.0]),
+            .with_inner_size([1180.0, 900.0])
+            .with_min_inner_size([860.0, 640.0]),
 
         centered: true,
 

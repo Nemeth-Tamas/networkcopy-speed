@@ -181,6 +181,7 @@ Initial v2.2 scope:
 - [x] add remote dual-pane folder browsing to the management application;
 - [x] add paired session history and richer diagnostics to the management application;
 - [x] persist management configuration and transfer history across manager restarts;
+- [x] polish the management workflow with compact status, collapsible setup, and collapsible history;
 - [ ] test three-machine orchestration on a physical LAN.
 
 The first v2.2 management release will intentionally use a trusted-LAN model
@@ -332,6 +333,11 @@ The initial manager discovers LAN agents, assigns sender and receiver roles,
 accepts remote source and destination paths, starts a paired transfer, polls both
 endpoint snapshots, displays live progress and retained terminal results, and
 cancels both endpoint jobs from one window.
+
+The manager structures its workflow into collapsible group cards for LAN agents,
+transfer setup, remote folder browsers, and transfer history. Starting,
+attaching, or resuming a transfer automatically collapses the setup section,
+while archiving a completed or failed transfer automatically opens history.
 
 The manager includes independent sender and receiver folder browsers. Each pane
 loads the selected endpoint's Windows drive roots, navigates directories,
