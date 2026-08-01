@@ -3,10 +3,8 @@ use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::net::{
-    Ipv4Addr,
     Ipv6Addr,
     SocketAddr,
-    SocketAddrV4,
     SocketAddrV6,
     TcpListener,
 };

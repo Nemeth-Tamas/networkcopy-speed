@@ -120,7 +120,7 @@ try {
 
             Write-Host
             Write-Host (
-                "Running v2.1 recovery torture: " +
+                "Running recovery torture: " +
                 "$TortureRounds round(s) per matrix"
             ) -ForegroundColor Yellow
 

@@ -25,13 +25,13 @@ The repository currently contains:
 Current stable release:
 
 ```text
-2.1.0
+2.2.0
 ```
 
 Current development version:
 
 ```text
-2.2.0-dev
+2.2.0
 ```
 
 v2.1 focuses on stronger interrupted-transfer recovery and broader local reuse.
@@ -149,17 +149,17 @@ For the final pre-release local gate, use ten rounds:
 The `-AllowDevelopmentVersion` switch must be removed after `Cargo.toml` is
 changed to the stable `2.1.0` version.
 
-## v2.2 roadmap — LAN management
+## v2.2 release — LAN management
 
-v2.2 will add a separate management interface that discovers NetworkCopy
-sender and receiver agents on the local network and remotely orchestrates
-transfers between them.
+v2.2 adds a separate management interface that discovers NetworkCopy sender and
+receiver agents on the local network and remotely orchestrates transfers
+between them.
 
 The management computer will carry only commands, status, and progress data.
 File payloads will continue to travel directly from the selected sender to the
 selected receiver.
 
-Initial v2.2 scope:
+Released v2.2 scope and follow-ups:
 
 - [x] add a persistent LAN-visible agent process;
 - [x] connect the agent to sender and receiver job control;
@@ -190,6 +190,27 @@ without authentication or encryption. It must only be used on a known,
 controlled network. Pairing, authenticated commands, encrypted management
 traffic, allowed-root policies, and stronger remote-filesystem protections are
 planned after the working management workflow has been field-tested.
+
+### v2.2 release highlights
+
+- dedicated double-clickable endpoint agent with automatic UAC elevation;
+- safe idle-agent restart without interrupting active transfers;
+- LAN discovery with manual management-address fallback;
+- remote Windows drive and directory browsing;
+- independent sender and receiver selection;
+- direct sender-to-receiver payload transfer;
+- remote start, status polling, cancellation, and paired failure cleanup;
+- manager disconnect and active-transfer reconnection;
+- persistent transfer configuration and result history;
+- journal-backed retry of cancelled and failed transfers;
+- polished collapsible WGPU management interface;
+- packaged manager, agent, CLI, and Hungarian/English GUI executables.
+
+The v2.2 manager schedules one paired transfer at a time. Persistent queued
+orchestration is planned for v2.3.
+
+Management traffic remains unauthenticated and unencrypted in v2.2. Use the
+management agent only on a known and controlled local network.
 
 ## v2.3 roadmap — queued orchestration
 
