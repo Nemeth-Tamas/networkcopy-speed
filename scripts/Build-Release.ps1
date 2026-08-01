@@ -161,10 +161,18 @@ try {
     $cliName = "NetworkCopy-Speed-v$version-CLI-Windows-x64.exe"
     $guiHuName = "NetworkCopy-Speed-v$version-GUI-HU-Windows-x64.exe"
     $guiEnName = "NetworkCopy-Speed-v$version-GUI-EN-Windows-x64.exe"
+    $managerName =
+        "NetworkCopy-Speed-v$version-Manager-Windows-x64.exe"
+    $agentName =
+        "NetworkCopy-Speed-v$version-Agent-Windows-x64.exe"
 
     $cliOutput = Join-Path $distRoot $cliName
     $guiHuOutput = Join-Path $distRoot $guiHuName
     $guiEnOutput = Join-Path $distRoot $guiEnName
+    $managerOutput =
+        Join-Path $distRoot $managerName
+    $agentOutput =
+        Join-Path $distRoot $agentName
 
     Invoke-Cargo @(
         "build",
@@ -181,6 +189,52 @@ try {
     }
 
     Copy-Item -LiteralPath $builtCli -Destination $cliOutput -Force
+
+    Write-Host
+    Write-Host "Building dedicated endpoint agent..." -ForegroundColor Yellow
+
+    Invoke-Cargo @(
+        "build",
+        "--locked",
+        "--release",
+        "--bin",
+        "networkcopy-agent"
+    )
+
+    $builtAgent =
+        Join-Path $releaseRoot "networkcopy-agent.exe"
+
+    if (-not (Test-Path -LiteralPath $builtAgent)) {
+        throw "Agent build completed, but $builtAgent was not found."
+    }
+
+    Copy-Item `
+        -LiteralPath $builtAgent `
+        -Destination $agentOutput `
+        -Force
+
+    Write-Host
+    Write-Host "Building management application..." -ForegroundColor Yellow
+
+    Invoke-Cargo @(
+        "build",
+        "--locked",
+        "--release",
+        "--bin",
+        "networkcopy-manager"
+    )
+
+    $builtManager =
+        Join-Path $releaseRoot "networkcopy-manager.exe"
+
+    if (-not (Test-Path -LiteralPath $builtManager)) {
+        throw "Manager build completed, but $builtManager was not found."
+    }
+
+    Copy-Item `
+        -LiteralPath $builtManager `
+        -Destination $managerOutput `
+        -Force
 
     Write-Host
     Write-Host "Building Hungarian-default GUI..." -ForegroundColor Yellow
@@ -238,6 +292,8 @@ try {
     }
 
     $artifacts = @(
+        Get-Item -LiteralPath $managerOutput
+        Get-Item -LiteralPath $agentOutput
         Get-Item -LiteralPath $guiHuOutput
         Get-Item -LiteralPath $guiEnOutput
         Get-Item -LiteralPath $cliOutput

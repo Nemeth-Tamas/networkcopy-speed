@@ -217,32 +217,7 @@ fn run_management_agent(
         .into());
     }
 
-    windows_setup::prepare_receiver(
-        SocketAddr::V4(
-            SocketAddrV4::new(
-                Ipv4Addr::UNSPECIFIED,
-                management_protocol::
-                    MANAGEMENT_CONTROL_PORT,
-            ),
-        ),
-    )?;
-
-    windows_setup::prepare_receiver(
-        SocketAddr::V4(
-            SocketAddrV4::new(
-                Ipv4Addr::UNSPECIFIED,
-                direct_address::
-                    DIRECT_TRANSFER_PORT,
-            ),
-        ),
-    )?;
-
-    windows_setup::prepare_discovery_receiver(
-        management_protocol::
-            MANAGEMENT_DISCOVERY_PORT,
-    )?;
-
-    management_discovery::run_agent()?;
+    crate::management_agent::run()?;
 
     Ok(())
 }

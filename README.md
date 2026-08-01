@@ -182,6 +182,7 @@ Initial v2.2 scope:
 - [x] add paired session history and richer diagnostics to the management application;
 - [x] persist management configuration and transfer history across manager restarts;
 - [x] polish the management workflow with compact status, collapsible setup, and collapsible history;
+- [x] provide a double-clickable, self-elevating endpoint agent executable;
 - [ ] test three-machine orchestration on a physical LAN.
 
 The first v2.2 management release will intentionally use a trusted-LAN model
@@ -190,6 +191,23 @@ controlled network. Pairing, authenticated commands, encrypted management
 traffic, allowed-root policies, and stronger remote-filesystem protections are
 planned after the working management workflow has been field-tested.
 
+## v2.3 roadmap — queued orchestration
+
+The next management milestone will add a persistent manager-side transfer queue.
+Endpoint agents will remain one-job-at-a-time, while the manager will schedule
+queued transfers whenever their required sender and receiver agents are idle.
+
+Planned queue features:
+
+- persistent queued transfer requests;
+- reorder and remove queued items;
+- automatic start-next behavior;
+- endpoint conflict and busy-state checks;
+- pause after the current transfer;
+- queued resume operations;
+- recovery of the queue after a manager restart;
+- optional concurrent execution for transfers using completely disjoint agents.
+
 ### Management discovery prototype
 
 Start an agent from an elevated terminal:
@@ -197,6 +215,17 @@ Start an agent from an elevated terminal:
 ```powershell
 cargo run -- management-agent
 ```
+
+For normal endpoint use, build or download the dedicated
+`networkcopy-agent.exe` application and double-click it. The executable requests
+administrator permission automatically and keeps a visible terminal open while
+the agent is running.
+
+Double-clicking the executable again restarts an idle dedicated agent. If the
+existing agent has an active transfer, restart is refused and the running
+transfer is left untouched. An agent started through the older
+`networkcopy-speed.exe management-agent` command must be closed manually before
+switching to the dedicated executable.
 
 Discover agents from another computer on the same LAN:
 

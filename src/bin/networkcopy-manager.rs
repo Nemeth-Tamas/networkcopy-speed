@@ -1412,6 +1412,8 @@ impl NetworkCopyManager {
             let mut dismiss = false;
 
             ui.group(|ui| {
+                ui.set_min_width(ui.available_width());
+
                 ui.horizontal_wrapped(|ui| {
                     status_label(ui, "Information", egui::Color32::from_rgb(95, 194, 255));
 
@@ -1432,6 +1434,8 @@ impl NetworkCopyManager {
             let mut dismiss = false;
 
             ui.group(|ui| {
+                ui.set_min_width(ui.available_width());
+
                 ui.horizontal_wrapped(|ui| {
                     status_label(ui, "Action needed", egui::Color32::from_rgb(255, 112, 120));
 
@@ -1452,6 +1456,8 @@ impl NetworkCopyManager {
             let mut dismiss = false;
 
             ui.group(|ui| {
+                ui.set_min_width(ui.available_width());
+
                 ui.horizontal_wrapped(|ui| {
                     status_label(
                         ui,
@@ -1587,53 +1593,86 @@ impl NetworkCopyManager {
     fn render_configuration(&mut self, ui: &mut egui::Ui) {
         ui.label("Paths are evaluated on the selected remote endpoint machines.");
 
-        ui.add_space(6.0);
+        ui.add_space(8.0);
 
-        egui::Grid::new("manager-transfer-grid")
-            .num_columns(2)
-            .spacing([12.0, 8.0])
-            .show(ui, |ui| {
-                ui.label("Sender management agent");
+        ui.columns(2, |columns| {
+            let (sender_column, receiver_column) = columns.split_at_mut(1);
 
-                ui.text_edit_singleline(&mut self.sender_agent);
+            sender_column[0].group(|ui| {
+                ui.set_min_width(ui.available_width());
 
-                ui.end_row();
+                status_label(ui, "Sender endpoint", egui::Color32::from_rgb(95, 194, 255));
 
-                ui.label("Source path on sender");
+                ui.add_space(4.0);
 
-                ui.text_edit_singleline(&mut self.source_root);
+                ui.label("Management agent");
 
-                ui.end_row();
+                let width = ui.available_width();
 
-                ui.label("Receiver management agent");
+                ui.add(egui::TextEdit::singleline(&mut self.sender_agent).desired_width(width));
 
-                ui.text_edit_singleline(&mut self.receiver_agent);
+                ui.label("Source folder");
 
-                ui.end_row();
+                let width = ui.available_width();
 
-                ui.label("Destination path on receiver");
+                ui.add(egui::TextEdit::singleline(&mut self.source_root).desired_width(width));
+            });
 
-                ui.text_edit_singleline(&mut self.destination_root);
+            receiver_column[0].group(|ui| {
+                ui.set_min_width(ui.available_width());
 
-                ui.end_row();
+                status_label(
+                    ui,
+                    "Receiver endpoint",
+                    egui::Color32::from_rgb(182, 134, 255),
+                );
+
+                ui.add_space(4.0);
+
+                ui.label("Management agent");
+
+                let width = ui.available_width();
+
+                ui.add(egui::TextEdit::singleline(&mut self.receiver_agent).desired_width(width));
+
+                ui.label("Destination folder");
+
+                let width = ui.available_width();
+
+                ui.add(egui::TextEdit::singleline(&mut self.destination_root).desired_width(width));
+            });
+        });
+
+        ui.add_space(8.0);
+
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Transfer options");
+
+                ui.separator();
 
                 ui.label("Scanner workers");
 
                 ui.add(egui::DragValue::new(&mut self.worker_count).range(1..=64));
 
-                ui.end_row();
+                ui.separator();
 
-                ui.label("Calibration size (MiB)");
+                ui.label("Calibration");
 
                 ui.add(egui::DragValue::new(&mut self.calibration_mib).range(1..=4096));
 
-                ui.end_row();
-            });
+                ui.label("MiB");
 
-        ui.checkbox(
-            &mut self.update_existing,
-            "Update and verify an existing destination",
-        );
+                ui.separator();
+
+                ui.checkbox(
+                    &mut self.update_existing,
+                    "Update and verify existing destination",
+                );
+            });
+        });
 
         ui.add_space(12.0);
 
@@ -1709,7 +1748,8 @@ impl NetworkCopyManager {
             if ui
                 .add_enabled(
                     can_start,
-                    egui::Button::new(egui::RichText::new("Start managed transfer").strong()),
+                    egui::Button::new(egui::RichText::new("Start managed transfer").strong())
+                        .fill(egui::Color32::from_rgb(0, 112, 170)),
                 )
                 .clicked()
             {
@@ -1719,7 +1759,8 @@ impl NetworkCopyManager {
             if ui
                 .add_enabled(
                     can_attach,
-                    egui::Button::new(egui::RichText::new("Attach to active jobs").strong()),
+                    egui::Button::new(egui::RichText::new("Attach to active jobs").strong())
+                        .fill(egui::Color32::from_rgb(42, 58, 78)),
                 )
                 .clicked()
             {
@@ -2056,15 +2097,25 @@ impl eframe::App for NetworkCopyManager {
 
                     self.render_messages(ui);
 
-                    ui.add_space(12.0);
+                    let show_transfer_panel = self.transfer.is_some()
+                        || self.start_receiver.is_some()
+                        || self.attach_receiver.is_some()
+                        || self.cancel_receiver.is_some()
+                        || self.peer_cleanup_receiver.is_some();
 
-                    ui.group(|ui| {
-                        ui.set_min_width(ui.available_width());
+                    if show_transfer_panel {
+                        ui.add_space(12.0);
 
-                        self.render_transfer(ui);
-                    });
+                        ui.group(|ui| {
+                            ui.set_min_width(ui.available_width());
 
-                    ui.add_space(10.0);
+                            self.render_transfer(ui);
+                        });
+
+                        ui.add_space(10.0);
+                    } else {
+                        ui.add_space(8.0);
+                    }
 
                     let agent_summary = format!("{} discovered", self.agents.len());
 
@@ -2158,9 +2209,9 @@ impl eframe::App for NetworkCopyManager {
 
 fn render_section_toggle(ui: &mut egui::Ui, title: &str, summary: &str, open: &mut bool) {
     ui.horizontal_wrapped(|ui| {
-        let arrow = if *open { "▼" } else { "▶" };
+        let toggle = if *open { "-" } else { "+" };
 
-        if ui.button(arrow).clicked() {
+        if ui.small_button(toggle).clicked() {
             *open = !*open;
         }
 
@@ -2174,7 +2225,7 @@ fn render_section_toggle(ui: &mut egui::Ui, title: &str, summary: &str, open: &m
 
 fn status_label(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
     ui.label(
-        egui::RichText::new(format!("● {text}"))
+        egui::RichText::new(text.to_ascii_uppercase())
             .color(color)
             .strong(),
     );
@@ -2394,7 +2445,7 @@ fn render_remote_browser(
                 for entry in entries {
                     match entry.kind {
                         ManagementEntryKind::Directory => {
-                            let label = format!("[DIR] {}", entry.name,);
+                            let label = format!("DIR  {}", entry.name,);
 
                             if ui.button(label).clicked() {
                                 request_directory =
@@ -2416,7 +2467,7 @@ fn render_remote_browser(
                         }
 
                         ManagementEntryKind::Other => {
-                            ui.label(format!("[OTHER] {}", entry.name,));
+                            ui.label(format!("OTHER  {}", entry.name,));
                         }
                     }
                 }
