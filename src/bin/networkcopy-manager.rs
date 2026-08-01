@@ -11,7 +11,9 @@ use networkcopy_speed::management_orchestration::{
     self, ManagedTransferRecord, ManagedTransferRequest,
 };
 use networkcopy_speed::management_persistence::{self, ManagerHistoryEntry, ManagerPersistedState};
-use networkcopy_speed::management_queue::TransferQueue;
+use networkcopy_speed::management_queue::{
+    QueuedTransferId, QueuedTransferKind, QueuedTransferRequest, QueuedTransferState, TransferQueue,
+};
 use networkcopy_speed::management_reconnect;
 use networkcopy_speed::management_snapshot::{
     ManagementAgentSnapshot, ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
@@ -346,6 +348,8 @@ struct NetworkCopyManager {
 
     show_browsers: bool,
 
+    show_queue: bool,
+
     show_history: bool,
 
     discovery_receiver: Option<Receiver<DiscoveryResult>>,
@@ -419,6 +423,8 @@ impl NetworkCopyManager {
             show_setup: true,
 
             show_browsers: false,
+
+            show_queue: true,
 
             show_history: false,
 
@@ -597,6 +603,70 @@ impl NetworkCopyManager {
                 self.persistence_error = format!("Failed to save {}: {error}", path.display(),);
 
                 context.request_repaint_after(STATE_SAVE_INTERVAL);
+            }
+        }
+    }
+
+    fn queued_request_from_configuration(&self) -> Result<QueuedTransferRequest, String> {
+        let sender_agent = parse_endpoint(&self.sender_agent, "sender management agent")?;
+
+        let receiver_agent = parse_endpoint(&self.receiver_agent, "receiver management agent")?;
+
+        if sender_agent == receiver_agent {
+            return Err("Sender and receiver must be different management agents.".to_string());
+        }
+
+        if self.source_root.trim().is_empty() {
+            return Err("Enter the source path on the sender machine.".to_string());
+        }
+
+        if self.destination_root.trim().is_empty() {
+            return Err("Enter the destination path on the receiver machine.".to_string());
+        }
+
+        Ok(QueuedTransferRequest {
+            sender_agent,
+
+            receiver_agent,
+
+            source_root: self.source_root.clone(),
+
+            destination_root: self.destination_root.clone(),
+
+            update_existing: self.update_existing,
+
+            worker_count: self.worker_count,
+
+            calibration_mib: self.calibration_mib,
+
+            kind: QueuedTransferKind::Fresh,
+        })
+    }
+
+    fn add_current_to_queue(&mut self) {
+        self.error.clear();
+
+        let request = match self.queued_request_from_configuration() {
+            Ok(request) => request,
+
+            Err(error) => {
+                self.error = error;
+
+                return;
+            }
+        };
+
+        let source_root = request.source_root.clone();
+
+        match self.queue.add(request) {
+            Ok(id) => {
+                self.show_queue = true;
+
+                self.notice = format!("Added queued transfer #{id}: {source_root}",);
+            }
+
+            Err(error) => {
+                self.error = format!("Failed to add transfer to queue: {error}");
             }
         }
     }
@@ -1408,6 +1478,10 @@ impl NetworkCopyManager {
 
             ui.separator();
 
+            ui.label(format!("{} queued transfer(s)", self.queue.len(),));
+
+            ui.separator();
+
             ui.label(format!("{} retained transfer(s)", self.history.len(),));
 
             ui.separator();
@@ -1737,14 +1811,18 @@ impl NetworkCopyManager {
 
         let transfer_active = self.transfer.is_some() && !self.monitoring_complete;
 
-        let can_start = self.start_receiver.is_none()
-            && self.attach_receiver.is_none()
-            && !transfer_active
-            && !self.sender_agent.trim().is_empty()
+        let configuration_ready = !self.sender_agent.trim().is_empty()
             && !self.receiver_agent.trim().is_empty()
             && !self.source_root.trim().is_empty()
             && !self.destination_root.trim().is_empty()
             && self.sender_agent != self.receiver_agent;
+
+        let can_start = self.start_receiver.is_none()
+            && self.attach_receiver.is_none()
+            && !transfer_active
+            && configuration_ready;
+
+        let can_queue = configuration_ready;
 
         let can_attach = self.attach_receiver.is_none()
             && self.start_receiver.is_none()
@@ -1763,6 +1841,17 @@ impl NetworkCopyManager {
                 .clicked()
             {
                 self.begin_transfer();
+            }
+
+            if ui
+                .add_enabled(
+                    can_queue,
+                    egui::Button::new(egui::RichText::new("Add to queue").strong())
+                        .fill(egui::Color32::from_rgb(42, 78, 72)),
+                )
+                .clicked()
+            {
+                self.add_current_to_queue();
             }
 
             if ui
@@ -1881,6 +1970,176 @@ impl NetworkCopyManager {
                 self.monitoring_complete = false;
             }
         });
+    }
+
+    fn render_queue(&mut self, ui: &mut egui::Ui) {
+        let mut paused_after_current = self.queue.paused_after_current();
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                "Queued transfers are retained across manager restarts and run in their displayed order.",
+            );
+
+            if ui
+                .checkbox(
+                    &mut paused_after_current,
+                    "Pause after current transfer",
+                )
+                .changed()
+            {
+                self.queue
+                    .set_paused_after_current(paused_after_current);
+            }
+
+            if ui
+                .add_enabled(
+                    self.queue
+                        .items()
+                        .iter()
+                        .any(|item| item.state == QueuedTransferState::Completed),
+                    egui::Button::new("Clear completed"),
+                )
+                .clicked()
+            {
+                let removed = self.queue.clear_completed();
+
+                self.notice = format!(
+                    "Removed {removed} completed queued transfer(s).",
+                );
+            }
+        });
+
+        ui.add_space(6.0);
+
+        if self.queue.is_empty() {
+            ui.label("The queue is empty. Configure a transfer and click Add to queue.");
+
+            return;
+        }
+
+        let items = self.queue.items().to_vec();
+
+        let mut move_up = None::<QueuedTransferId>;
+
+        let mut move_down = None::<QueuedTransferId>;
+
+        let mut remove = None::<QueuedTransferId>;
+
+        for (index, item) in items.iter().enumerate() {
+            let previous_running = index
+                .checked_sub(1)
+                .is_some_and(|previous| items[previous].state == QueuedTransferState::Running);
+
+            let next_running = items
+                .get(index + 1)
+                .is_some_and(|next| next.state == QueuedTransferState::Running);
+
+            let item_running = item.state == QueuedTransferState::Running;
+
+            let can_move_up = index > 0 && !item_running && !previous_running;
+
+            let can_move_down = index + 1 < items.len() && !item_running && !next_running;
+
+            ui.group(|ui| {
+                ui.set_min_width(ui.available_width());
+
+                ui.horizontal_wrapped(|ui| {
+                    status_label(
+                        ui,
+                        queued_transfer_state_label(item.state),
+                        queued_transfer_state_color(item.state),
+                    );
+
+                    ui.strong(format!(
+                        "#{} · {}",
+                        item.id,
+                        queued_transfer_kind_label(item.request.kind),
+                    ));
+                });
+
+                ui.add_space(4.0);
+
+                ui.label(format!(
+                    "{}  →  {}",
+                    item.request.source_root, item.request.destination_root,
+                ));
+
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}  →  {}",
+                        item.request.sender_agent, item.request.receiver_agent,
+                    ))
+                    .monospace(),
+                );
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("{} worker(s)", item.request.worker_count,));
+
+                    ui.separator();
+
+                    ui.label(format!("{} MiB calibration", item.request.calibration_mib,));
+
+                    ui.separator();
+
+                    ui.label(if item.request.update_existing {
+                        "Update mode"
+                    } else {
+                        "Fresh destination mode"
+                    });
+                });
+
+                if !item.status_message.is_empty() {
+                    ui.add_space(4.0);
+
+                    ui.label(&item.status_message);
+                }
+
+                ui.add_space(6.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(can_move_up, egui::Button::new("Move up"))
+                        .clicked()
+                    {
+                        move_up = Some(item.id);
+                    }
+
+                    if ui
+                        .add_enabled(can_move_down, egui::Button::new("Move down"))
+                        .clicked()
+                    {
+                        move_down = Some(item.id);
+                    }
+
+                    if ui
+                        .add_enabled(!item_running, egui::Button::new("Remove"))
+                        .clicked()
+                    {
+                        remove = Some(item.id);
+                    }
+
+                    if item_running {
+                        ui.label("A running queue item cannot be moved or removed.");
+                    }
+                });
+            });
+
+            ui.add_space(8.0);
+        }
+
+        if let Some(id) = move_up {
+            if self.queue.move_up(id) {
+                self.notice = format!("Moved queued transfer #{id} up.");
+            }
+        } else if let Some(id) = move_down {
+            if self.queue.move_down(id) {
+                self.notice = format!("Moved queued transfer #{id} down.");
+            }
+        } else if let Some(id) = remove
+            && self.queue.remove(id).is_some()
+        {
+            self.notice = format!("Removed queued transfer #{id}.");
+        }
     }
 
     fn render_history(&mut self, ui: &mut egui::Ui) {
@@ -2178,6 +2437,48 @@ impl eframe::App for NetworkCopyManager {
 
                     ui.add_space(10.0);
 
+                    let pending_queue_items = self
+                        .queue
+                        .items()
+                        .iter()
+                        .filter(|item| item.state == QueuedTransferState::Pending)
+                        .count();
+
+                    let queue_summary = if self.queue.is_empty() {
+                        "Empty".to_string()
+                    } else if self.queue.paused_after_current() {
+                        format!(
+                            "{} item(s) · {} pending · paused",
+                            self.queue.len(),
+                            pending_queue_items,
+                        )
+                    } else {
+                        format!(
+                            "{} item(s) · {} pending",
+                            self.queue.len(),
+                            pending_queue_items,
+                        )
+                    };
+
+                    ui.group(|ui| {
+                        ui.set_min_width(ui.available_width());
+
+                        render_section_toggle(
+                            ui,
+                            "Transfer queue",
+                            &queue_summary,
+                            &mut self.show_queue,
+                        );
+
+                        if self.show_queue {
+                            ui.add_space(8.0);
+
+                            self.render_queue(ui);
+                        }
+                    });
+
+                    ui.add_space(10.0);
+
                     let history_summary =
                         format!("{} / {} retained", self.history.len(), MAX_TRANSFER_HISTORY,);
 
@@ -2213,6 +2514,43 @@ impl eframe::App for NetworkCopyManager {
         });
 
         self.persist_state_if_needed(ui.ctx());
+    }
+}
+
+fn queued_transfer_kind_label(kind: QueuedTransferKind) -> String {
+    match kind {
+        QueuedTransferKind::Fresh => "Fresh transfer".to_string(),
+
+        QueuedTransferKind::Resume { data_stream_count } => {
+            format!("Resume · {data_stream_count} streams")
+        }
+    }
+}
+
+const fn queued_transfer_state_label(state: QueuedTransferState) -> &'static str {
+    match state {
+        QueuedTransferState::Pending => "Pending",
+        QueuedTransferState::Running => "Running",
+        QueuedTransferState::Blocked => "Blocked",
+        QueuedTransferState::Failed => "Failed",
+        QueuedTransferState::Completed => "Completed",
+        QueuedTransferState::Cancelled => "Cancelled",
+    }
+}
+
+fn queued_transfer_state_color(state: QueuedTransferState) -> egui::Color32 {
+    match state {
+        QueuedTransferState::Pending => egui::Color32::from_rgb(95, 194, 255),
+
+        QueuedTransferState::Running => egui::Color32::from_rgb(126, 230, 64),
+
+        QueuedTransferState::Blocked => egui::Color32::from_rgb(255, 190, 82),
+
+        QueuedTransferState::Failed => egui::Color32::from_rgb(255, 112, 120),
+
+        QueuedTransferState::Completed => egui::Color32::from_rgb(126, 230, 64),
+
+        QueuedTransferState::Cancelled => egui::Color32::from_rgb(255, 190, 82),
     }
 }
 
