@@ -12,7 +12,8 @@ use networkcopy_speed::management_orchestration::{
 };
 use networkcopy_speed::management_persistence::{self, ManagerHistoryEntry, ManagerPersistedState};
 use networkcopy_speed::management_queue::{
-    QueuedTransferId, QueuedTransferKind, QueuedTransferRequest, QueuedTransferState, TransferQueue,
+    QueuedTransfer, QueuedTransferId, QueuedTransferKind, QueuedTransferRequest,
+    QueuedTransferState, TransferQueue,
 };
 use networkcopy_speed::management_reconnect;
 use networkcopy_speed::management_snapshot::{
@@ -374,6 +375,10 @@ struct NetworkCopyManager {
 
     queue: TransferQueue,
 
+    queue_running: bool,
+
+    active_queue_id: Option<QueuedTransferId>,
+
     history: VecDeque<PairedTransferHistoryEntry>,
 
     state_path: Option<PathBuf>,
@@ -450,6 +455,10 @@ impl NetworkCopyManager {
 
             queue: TransferQueue::default(),
 
+            queue_running: false,
+
+            active_queue_id: None,
+
             history: VecDeque::new(),
 
             state_path: state_path.as_ref().ok().cloned(),
@@ -495,8 +504,8 @@ impl NetworkCopyManager {
 
                 self.last_saved_state = Some(state);
 
-                self.notice =
-                    "Restored saved manager configuration and transfer history.".to_string();
+                self.notice = "Restored saved manager configuration, queue, and transfer history."
+                    .to_string();
             }
 
             Ok(None) => {}
@@ -522,7 +531,32 @@ impl NetworkCopyManager {
 
         self.update_existing = state.update_existing;
 
-        self.queue = state.queue;
+        let mut queue = state.queue;
+
+        let interrupted_queue_ids = queue
+            .items()
+            .iter()
+            .filter(|item| item.state == QueuedTransferState::Running)
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+
+        for id in interrupted_queue_ids {
+            if let Err(error) = queue.set_state(
+                id,
+                QueuedTransferState::Blocked,
+                "The Manager restarted while this queue item was active. Reattachment is required before retrying it.",
+            ) {
+                self.persistence_error = format!(
+                    "Failed to recover persisted queue item #{id}: {error}",
+                );
+            }
+        }
+
+        self.queue = queue;
+
+        self.queue_running = false;
+
+        self.active_queue_id = None;
 
         self.history = state
             .history
@@ -667,6 +701,292 @@ impl NetworkCopyManager {
 
             Err(error) => {
                 self.error = format!("Failed to add transfer to queue: {error}");
+            }
+        }
+    }
+
+    fn clear_transfer_card(&mut self) {
+        self.transfer = None;
+
+        self.peer_cleanup_receiver = None;
+
+        self.peer_cleanup_attempted = false;
+
+        self.sender_snapshot = None;
+
+        self.receiver_snapshot = None;
+
+        self.monitoring_complete = false;
+    }
+
+    fn start_queue(&mut self) {
+        if self.queue_running {
+            return;
+        }
+
+        let transfer_active = self.transfer.is_some() && !self.monitoring_complete;
+
+        if self.start_receiver.is_some()
+            || self.attach_receiver.is_some()
+            || self.poll_receiver.is_some()
+            || self.cancel_receiver.is_some()
+            || self.peer_cleanup_receiver.is_some()
+            || transfer_active
+        {
+            self.error =
+                "The queue cannot start while another managed operation is active.".to_string();
+
+            return;
+        }
+
+        let Some(item) = self.queue.first_pending().cloned() else {
+            self.error = "The transfer queue has no pending items.".to_string();
+
+            return;
+        };
+
+        self.error.clear();
+
+        self.show_queue = true;
+
+        self.queue_running = true;
+
+        self.begin_queued_transfer(item);
+    }
+
+    fn begin_queued_transfer(&mut self, item: QueuedTransfer) {
+        let id = item.id;
+
+        let request = item.request;
+
+        let source_root = request.source_root.clone();
+
+        self.sender_agent = request.sender_agent.to_string();
+
+        self.receiver_agent = request.receiver_agent.to_string();
+
+        self.source_root = request.source_root.clone();
+
+        self.destination_root = request.destination_root.clone();
+
+        self.worker_count = request.worker_count;
+
+        self.calibration_mib = request.calibration_mib;
+
+        self.update_existing = request.update_existing;
+
+        let kind = request.kind;
+
+        let managed_request = ManagedTransferRequest {
+            sender_agent: request.sender_agent,
+
+            receiver_agent: request.receiver_agent,
+
+            source_root: request.source_root,
+
+            destination_root: request.destination_root,
+
+            update_existing: request.update_existing,
+
+            worker_count: request.worker_count,
+
+            calibration_mib: request.calibration_mib,
+        };
+
+        self.clear_transfer_card();
+
+        self.error.clear();
+
+        if let Err(error) = self.queue.set_state(
+            id,
+            QueuedTransferState::Running,
+            "Preparing receiver and sender endpoint jobs.",
+        ) {
+            self.queue_running = false;
+
+            self.active_queue_id = None;
+
+            self.error = format!("Failed to start queued transfer #{id}: {error}");
+
+            return;
+        }
+
+        self.active_queue_id = Some(id);
+
+        self.show_setup = false;
+
+        self.show_queue = true;
+
+        self.notice = format!("Starting queued transfer #{id}: {source_root}");
+
+        let (sender, receiver) = mpsc::channel();
+
+        self.start_receiver = Some(receiver);
+
+        thread::spawn(move || {
+            let result = match kind {
+                QueuedTransferKind::Fresh => {
+                    management_orchestration::start_transfer(managed_request)
+                        .map_err(|error| format!("Queued managed transfer startup failed: {error}"))
+                }
+
+                QueuedTransferKind::Resume { data_stream_count } => {
+                    management_orchestration::resume_transfer(managed_request, data_stream_count)
+                        .map_err(|error| format!("Queued managed transfer resume failed: {error}"))
+                }
+            };
+
+            let _ = sender.send(result);
+        });
+    }
+
+    fn fail_active_queue_start(&mut self, error: String) {
+        let Some(id) = self.active_queue_id.take() else {
+            self.error = error;
+
+            self.notice.clear();
+
+            return;
+        };
+
+        if let Err(state_error) =
+            self.queue
+                .set_state(id, QueuedTransferState::Failed, error.clone())
+        {
+            self.error = format!("{error} Queue item #{id} could not be updated: {state_error}",);
+        } else {
+            self.error = error;
+        }
+
+        self.queue_running = false;
+
+        self.notice = format!("The queue stopped because transfer #{id} could not start.",);
+    }
+
+    fn finish_active_queue_item(&mut self) {
+        let Some(id) = self.active_queue_id else {
+            return;
+        };
+
+        let terminal_results = self.transfer.as_ref().and_then(|transfer| {
+            let sender_result =
+                terminal_result_for(self.sender_snapshot.as_ref(), transfer.sender_job_id)?.clone();
+
+            let receiver_result =
+                terminal_result_for(self.receiver_snapshot.as_ref(), transfer.receiver_job_id)?
+                    .clone();
+
+            Some((sender_result, receiver_result))
+        });
+
+        let Some((sender_result, receiver_result)) = terminal_results else {
+            let message = "The paired endpoint results were unavailable after the transfer ended."
+                .to_string();
+
+            let _ = self
+                .queue
+                .set_state(id, QueuedTransferState::Blocked, message.clone());
+
+            self.active_queue_id = None;
+
+            self.queue_running = false;
+
+            self.clear_transfer_card();
+
+            self.error = message;
+
+            self.notice = format!(
+                "The queue stopped at transfer #{id} because its final state was incomplete.",
+            );
+
+            return;
+        };
+
+        let outcome = paired_outcome(&sender_result, &receiver_result);
+
+        let state = queue_state_for_outcome(outcome);
+
+        let endpoint_message = if !sender_result.message.is_empty() {
+            sender_result.message.clone()
+        } else if !receiver_result.message.is_empty() {
+            receiver_result.message.clone()
+        } else {
+            format!("Both endpoint jobs reached {}.", outcome.label())
+        };
+
+        let status_message = if outcome == ManagementJobOutcome::Completed {
+            format!(
+                "Completed {} file(s), {} logical data.",
+                sender_result.files.max(receiver_result.files),
+                format_bytes(
+                    sender_result
+                        .logical_bytes
+                        .max(receiver_result.logical_bytes),
+                ),
+            )
+        } else {
+            endpoint_message
+        };
+
+        if let Err(error) = self.queue.set_state(id, state, status_message) {
+            self.active_queue_id = None;
+
+            self.queue_running = false;
+
+            self.clear_transfer_card();
+
+            self.error = format!("Failed to finalize queued transfer #{id}: {error}",);
+
+            return;
+        }
+
+        self.active_queue_id = None;
+
+        self.clear_transfer_card();
+
+        match outcome {
+            ManagementJobOutcome::Completed => {
+                if self.queue.paused_after_current() {
+                    self.queue_running = false;
+
+                    self.notice = format!(
+                        "Queued transfer #{id} completed. The queue is paused before the next item.",
+                    );
+
+                    return;
+                }
+
+                let next = self.queue.first_pending().cloned();
+
+                if let Some(next) = next {
+                    self.notice = format!(
+                        "Queued transfer #{id} completed. Starting transfer #{}.",
+                        next.id,
+                    );
+
+                    self.begin_queued_transfer(next);
+                } else {
+                    self.queue_running = false;
+
+                    self.notice =
+                        "Every pending queued transfer completed successfully.".to_string();
+                }
+            }
+
+            ManagementJobOutcome::Cancelled => {
+                self.queue_running = false;
+
+                self.notice = format!(
+                    "Queued transfer #{id} was cancelled. The remaining queue is waiting for an explicit restart.",
+                );
+            }
+
+            ManagementJobOutcome::Failed => {
+                self.queue_running = false;
+
+                self.notice = format!(
+                    "Queued transfer #{id} failed. The remaining queue is waiting for an explicit restart.",
+                );
             }
         }
     }
@@ -1108,8 +1428,23 @@ impl NetworkCopyManager {
 
                 self.receiver_agent = transfer.receiver_agent.to_string();
 
-                self.notice = "Both endpoint jobs were accepted. The manager is now polling them."
-                    .to_string();
+                if let Some(id) = self.active_queue_id {
+                    if let Err(error) = self.queue.set_state(
+                        id,
+                        QueuedTransferState::Running,
+                        "Both endpoint jobs were accepted. Transfer is in progress.",
+                    ) {
+                        self.error = format!(
+                            "Queued transfer #{id} started, but its queue state could not be updated: {error}",
+                        );
+                    }
+
+                    self.notice = format!("Queued transfer #{id} was accepted by both endpoints.",);
+                } else {
+                    self.notice =
+                        "Both endpoint jobs were accepted. The manager is now polling them."
+                            .to_string();
+                }
 
                 self.transfer = Some(transfer);
 
@@ -1127,17 +1462,13 @@ impl NetworkCopyManager {
             Some(Ok(Err(error))) => {
                 self.start_receiver = None;
 
-                self.error = error;
-
-                self.notice.clear();
+                self.fail_active_queue_start(error);
             }
 
             Some(Err(TryRecvError::Disconnected)) => {
                 self.start_receiver = None;
 
-                self.error = "Transfer startup worker disconnected.".to_string();
-
-                self.notice.clear();
+                self.fail_active_queue_start("Transfer startup worker disconnected.".to_string());
             }
 
             Some(Err(TryRecvError::Empty)) | None => {}
@@ -1266,7 +1597,11 @@ impl NetworkCopyManager {
                 if monitoring_complete {
                     self.archive_terminal_transfer();
 
-                    self.notice = "Both endpoint jobs reached a terminal state.".to_string();
+                    if self.active_queue_id.is_some() {
+                        self.finish_active_queue_item();
+                    } else {
+                        self.notice = "Both endpoint jobs reached a terminal state.".to_string();
+                    }
                 } else {
                     self.begin_peer_cleanup_if_needed();
                 }
@@ -1819,6 +2154,7 @@ impl NetworkCopyManager {
 
         let can_start = self.start_receiver.is_none()
             && self.attach_receiver.is_none()
+            && !self.queue_running
             && !transfer_active
             && configuration_ready;
 
@@ -1826,6 +2162,7 @@ impl NetworkCopyManager {
 
         let can_attach = self.attach_receiver.is_none()
             && self.start_receiver.is_none()
+            && !self.queue_running
             && !transfer_active
             && !self.sender_agent.trim().is_empty()
             && !self.receiver_agent.trim().is_empty()
@@ -1957,17 +2294,7 @@ impl NetworkCopyManager {
             }
 
             if self.monitoring_complete && ui.button("Clear transfer card").clicked() {
-                self.transfer = None;
-
-                self.peer_cleanup_receiver = None;
-
-                self.peer_cleanup_attempted = false;
-
-                self.sender_snapshot = None;
-
-                self.receiver_snapshot = None;
-
-                self.monitoring_complete = false;
+                self.clear_transfer_card();
             }
         });
     }
@@ -1975,7 +2302,60 @@ impl NetworkCopyManager {
     fn render_queue(&mut self, ui: &mut egui::Ui) {
         let mut paused_after_current = self.queue.paused_after_current();
 
+        let has_pending = self
+            .queue
+            .items()
+            .iter()
+            .any(|item| item.state == QueuedTransferState::Pending);
+
+        let has_interrupted_items = self.queue.items().iter().any(|item| {
+            matches!(
+                item.state,
+                QueuedTransferState::Blocked
+                    | QueuedTransferState::Failed
+                    | QueuedTransferState::Cancelled
+            )
+        });
+
+        let transfer_active = self.transfer.is_some() && !self.monitoring_complete;
+
+        let can_start_queue = !self.queue_running
+            && has_pending
+            && self.start_receiver.is_none()
+            && self.attach_receiver.is_none()
+            && self.poll_receiver.is_none()
+            && self.cancel_receiver.is_none()
+            && self.peer_cleanup_receiver.is_none()
+            && !transfer_active;
+
         ui.horizontal_wrapped(|ui| {
+            let start_label = if has_interrupted_items {
+                "Continue queue"
+            } else {
+                "Start queue"
+            };
+
+            if ui
+                .add_enabled(
+                    can_start_queue,
+                    egui::Button::new(
+                        egui::RichText::new(start_label).strong(),
+                    )
+                    .fill(egui::Color32::from_rgb(0, 112, 170)),
+                )
+                .clicked()
+            {
+                self.start_queue();
+            }
+
+            if self.queue_running {
+                status_label(
+                    ui,
+                    "Queue running",
+                    egui::Color32::from_rgb(126, 230, 64),
+                );
+            }
+
             ui.label(
                 "Queued transfers are retained across manager restarts and run in their displayed order.",
             );
@@ -2179,6 +2559,7 @@ impl NetworkCopyManager {
         let can_resume = self.start_receiver.is_none()
             && self.attach_receiver.is_none()
             && self.cancel_receiver.is_none()
+            && !self.queue_running
             && !transfer_active;
 
         for entry in entries {
@@ -2446,6 +2827,12 @@ impl eframe::App for NetworkCopyManager {
 
                     let queue_summary = if self.queue.is_empty() {
                         "Empty".to_string()
+                    } else if self.queue_running {
+                        format!(
+                            "{} item(s) · {} pending · running",
+                            self.queue.len(),
+                            pending_queue_items,
+                        )
                     } else if self.queue.paused_after_current() {
                         format!(
                             "{} item(s) · {} pending · paused",
@@ -2514,6 +2901,16 @@ impl eframe::App for NetworkCopyManager {
         });
 
         self.persist_state_if_needed(ui.ctx());
+    }
+}
+
+const fn queue_state_for_outcome(outcome: ManagementJobOutcome) -> QueuedTransferState {
+    match outcome {
+        ManagementJobOutcome::Completed => QueuedTransferState::Completed,
+
+        ManagementJobOutcome::Cancelled => QueuedTransferState::Cancelled,
+
+        ManagementJobOutcome::Failed => QueuedTransferState::Failed,
     }
 }
 
@@ -3109,9 +3506,11 @@ fn main() -> eframe::Result {
 mod tests {
     use super::{
         MAX_TRANSFER_HISTORY, ManagedEndpointRole, PairedTransferHistoryEntry, join_remote_path,
-        paired_outcome, parent_remote_path, peer_cleanup_target, remember_history,
+        paired_outcome, parent_remote_path, peer_cleanup_target, queue_state_for_outcome,
+        remember_history,
     };
     use networkcopy_speed::management_orchestration::ManagedTransferRecord;
+    use networkcopy_speed::management_queue::QueuedTransferState;
     use networkcopy_speed::management_snapshot::{
         ManagementActiveJobDetails, ManagementActiveJobSnapshot, ManagementAgentSnapshot,
         ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
@@ -3345,6 +3744,24 @@ mod tests {
         assert_eq!(target.job_id, transfer.receiver_job_id,);
 
         assert_eq!(target.trigger_outcome, ManagementJobOutcome::Failed,);
+    }
+
+    #[test]
+    fn queue_state_matches_paired_terminal_outcome() {
+        assert_eq!(
+            queue_state_for_outcome(ManagementJobOutcome::Completed),
+            QueuedTransferState::Completed,
+        );
+
+        assert_eq!(
+            queue_state_for_outcome(ManagementJobOutcome::Cancelled),
+            QueuedTransferState::Cancelled,
+        );
+
+        assert_eq!(
+            queue_state_for_outcome(ManagementJobOutcome::Failed),
+            QueuedTransferState::Failed,
+        );
     }
 
     #[test]
