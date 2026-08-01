@@ -173,7 +173,7 @@ Initial v2.2 scope:
 - [x] start sender and receiver transfer jobs remotely;
 - [x] expose live managed-job progress for GUI polling;
 - [x] retain the most recent completed, cancelled, or failed job result;
-- [ ] resume complete transfer jobs remotely;
+- [x] resume interrupted transfer jobs remotely from retained manager history;
 - [x] keep active transfers running if the management UI disconnects;
 - [x] reconnect the manager to a paired transfer already running on the endpoints;
 - [x] add an initial separate WGPU management application;
@@ -341,6 +341,16 @@ The manager retains the 20 most recent paired terminal transfers for the current
 application session. History cards combine sender and receiver results, show the
 paired outcome, logical and wire data, wire savings, stream count, endpoint
 errors, and can restore the previous transfer setup for another run.
+
+Cancelled and failed managed transfers expose a resume action when the receiver
+retained a valid `.networkcopy-resume.bin` journal. The manager restarts the
+same source and destination, reruns the calibration matrix, and forces the
+journal's original TCP stream count for the actual payload. The receiver then
+validates the stored manifest fingerprint, stream count, committed files, and
+completed stripes before reusing any previous work.
+
+Completed transfers and failures that occurred before journal creation do not
+show a resume action.
 
 After the manager is closed and reopened, select the original sender and receiver
 agents and click **Attach to active jobs**. The manager reads both active

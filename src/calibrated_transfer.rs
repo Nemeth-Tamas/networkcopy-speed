@@ -159,6 +159,28 @@ pub(crate) fn send_with_progress(
     calibration_bytes: u64,
     progress: ProgressCounter,
 ) -> io::Result<CalibratedSendReport> {
+    send_with_progress_and_stream_count(
+        receiver_address,
+        source_root,
+        worker_count,
+        calibration_bytes,
+        progress,
+        None,
+    )
+}
+
+pub(crate) fn send_with_progress_and_stream_count(
+    receiver_address: SocketAddr,
+    source_root: &Path,
+    worker_count: usize,
+    calibration_bytes: u64,
+    progress: ProgressCounter,
+    forced_data_stream_count: Option<usize>,
+) -> io::Result<CalibratedSendReport> {
+    if let Some(data_stream_count) = forced_data_stream_count {
+        network_calibration::validate_matrix_stream_count(data_stream_count)?;
+    }
+
     progress.set_label("Connecting calibration");
 
     progress.set_completed(0);
@@ -173,11 +195,35 @@ pub(crate) fn send_with_progress(
 
     progress.check_cancelled()?;
 
-    let data_stream_count = calibration.recommended.data_stream_count;
+    let data_stream_count =
+        forced_data_stream_count.unwrap_or(calibration.recommended.data_stream_count);
+
+    if !calibration
+        .reports
+        .iter()
+        .any(|report| report.data_stream_count == data_stream_count)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "requested transfer stream count {data_stream_count} was not included in the completed calibration matrix"
+            ),
+        ));
+    }
 
     let calibrated_report = calibration.best;
 
-    progress.set_label("Scanning source");
+    match forced_data_stream_count {
+        Some(data_stream_count) => {
+            progress.set_label(format!(
+                "Scanning source - resuming with {data_stream_count} streams"
+            ));
+        }
+
+        None => {
+            progress.set_label("Scanning source");
+        }
+    }
 
     progress.set_completed(0);
 
@@ -212,10 +258,15 @@ pub(crate) fn send_with_progress(
 
     Ok(CalibratedSendReport {
         calibration,
+
         transfer,
+
         calibrated_megabytes_per_second,
+
         logical_megabytes_per_second,
+
         wire_megabytes_per_second,
+
         path_efficiency_percent,
     })
 }

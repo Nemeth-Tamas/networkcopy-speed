@@ -94,6 +94,20 @@ impl PairedTransferHistoryEntry {
             .data_stream_count
             .max(self.receiver_result.data_stream_count)
     }
+
+    fn resume_data_stream_count(&self) -> Option<usize> {
+        if self.outcome() == ManagementJobOutcome::Completed {
+            return None;
+        }
+
+        let data_stream_count = self.receiver_result.data_stream_count;
+
+        if data_stream_count == 0 {
+            return None;
+        }
+
+        usize::try_from(data_stream_count).ok()
+    }
 }
 
 enum BrowserPayload {
@@ -614,6 +628,84 @@ impl NetworkCopyManager {
         thread::spawn(move || {
             let result = management_orchestration::start_transfer(request)
                 .map_err(|error| format!("Managed transfer startup failed: {error}"));
+
+            let _ = sender.send(result);
+        });
+    }
+
+    fn begin_resumed_transfer(&mut self, entry: PairedTransferHistoryEntry) {
+        if self.start_receiver.is_some() || self.attach_receiver.is_some() {
+            return;
+        }
+
+        let transfer_active = self.transfer.is_some() && !self.monitoring_complete;
+
+        if transfer_active {
+            self.error = "A managed transfer is already active.".to_string();
+
+            return;
+        }
+
+        let Some(data_stream_count) = entry.resume_data_stream_count() else {
+            self.error = "The receiver did not retain a usable resume journal for this transfer."
+                .to_string();
+
+            return;
+        };
+
+        let transfer = entry.transfer;
+
+        self.sender_agent = transfer.sender_agent.to_string();
+
+        self.receiver_agent = transfer.receiver_agent.to_string();
+
+        self.source_root = transfer.source_root.clone();
+
+        self.destination_root = transfer.destination_root.clone();
+
+        self.worker_count = transfer.worker_count;
+
+        self.calibration_mib = transfer.calibration_mib;
+
+        self.update_existing = transfer.update_existing;
+
+        let request = ManagedTransferRequest {
+            sender_agent: transfer.sender_agent,
+
+            receiver_agent: transfer.receiver_agent,
+
+            source_root: transfer.source_root,
+
+            destination_root: transfer.destination_root,
+
+            update_existing: transfer.update_existing,
+
+            worker_count: transfer.worker_count,
+
+            calibration_mib: transfer.calibration_mib,
+        };
+
+        self.transfer = None;
+
+        self.sender_snapshot = None;
+
+        self.receiver_snapshot = None;
+
+        self.monitoring_complete = false;
+
+        self.error.clear();
+
+        self.notice = format!(
+            "Preparing resume with the journal's original {data_stream_count} TCP stream(s)..."
+        );
+
+        let (sender, receiver) = mpsc::channel();
+
+        self.start_receiver = Some(receiver);
+
+        thread::spawn(move || {
+            let result = management_orchestration::resume_transfer(request, data_stream_count)
+                .map_err(|error| format!("Managed transfer resume failed: {error}"));
 
             let _ = sender.send(result);
         });
@@ -1371,6 +1463,15 @@ impl NetworkCopyManager {
 
         let mut reuse = None::<ManagedTransferRecord>;
 
+        let mut resume = None::<PairedTransferHistoryEntry>;
+
+        let transfer_active = self.transfer.is_some() && !self.monitoring_complete;
+
+        let can_resume = self.start_receiver.is_none()
+            && self.attach_receiver.is_none()
+            && self.cancel_receiver.is_none()
+            && !transfer_active;
+
         for entry in entries {
             ui.group(|ui| {
                 ui.set_min_width(ui.available_width());
@@ -1487,12 +1588,30 @@ impl NetworkCopyManager {
                 if ui.button("Use this setup again").clicked() {
                     reuse = Some(entry.transfer.clone());
                 }
+
+                if let Some(data_stream_count) = entry.resume_data_stream_count() {
+                    if ui
+                        .add_enabled(
+                            can_resume,
+                            egui::Button::new(format!(
+                                "Resume interrupted transfer ({data_stream_count} streams)"
+                            )),
+                        )
+                        .clicked()
+                    {
+                        resume = Some(entry.clone());
+                    }
+                } else if outcome != ManagementJobOutcome::Completed {
+                    ui.label("Receiver resume journal unavailable.");
+                }
             });
 
             ui.add_space(8.0);
         }
 
-        if let Some(transfer) = reuse {
+        if let Some(entry) = resume {
+            self.begin_resumed_transfer(entry);
+        } else if let Some(transfer) = reuse {
             self.sender_agent = transfer.sender_agent.to_string();
 
             self.receiver_agent = transfer.receiver_agent.to_string();
@@ -2239,5 +2358,22 @@ mod tests {
                 .saturating_mul(2)
                 .saturating_add(1),
         );
+    }
+
+    #[test]
+    fn interrupted_history_exposes_receiver_resume_stream_count() {
+        let cancelled = history_entry(1, ManagementJobOutcome::Cancelled);
+
+        assert_eq!(cancelled.resume_data_stream_count(), Some(4),);
+
+        let completed = history_entry(2, ManagementJobOutcome::Completed);
+
+        assert_eq!(completed.resume_data_stream_count(), None,);
+
+        let mut missing_journal = history_entry(3, ManagementJobOutcome::Failed);
+
+        missing_journal.receiver_result.data_stream_count = 0;
+
+        assert_eq!(missing_journal.resume_data_stream_count(), None,);
     }
 }

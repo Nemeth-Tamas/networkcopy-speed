@@ -7,6 +7,7 @@ use crate::management_snapshot::{
 use crate::manifest_scan;
 use crate::multistream_copy::DestinationMode;
 use crate::network_calibration;
+use crate::resume_state::ResumeJournal;
 use std::fs;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
@@ -18,8 +19,13 @@ use std::thread;
 const PREPARE_REQUEST_VERSION: u16 = 1;
 const PREPARE_REQUEST_HEADER_BYTES: usize = 8;
 
-const START_SEND_REQUEST_VERSION: u16 = 1;
-const START_SEND_REQUEST_HEADER_BYTES: usize = 24;
+const START_SEND_REQUEST_VERSION_V1: u16 = 1;
+
+const START_SEND_REQUEST_VERSION: u16 = 2;
+
+const START_SEND_REQUEST_HEADER_BYTES_V1: usize = 24;
+
+const START_SEND_REQUEST_HEADER_BYTES: usize = 28;
 
 const START_SEND_RESPONSE_VERSION: u16 = 1;
 const START_SEND_RESPONSE_HEADER_BYTES: usize = 12;
@@ -129,6 +135,8 @@ pub(crate) struct StartSendRequest {
     pub(crate) worker_count: usize,
 
     pub(crate) calibration_mib: u64,
+
+    pub(crate) forced_data_stream_count: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -285,7 +293,7 @@ impl ManagementJobRegistry {
                     destination_mode,
                 );
 
-                let terminal_result = build_receive_result(job_id, &result);
+                let terminal_result = build_receive_result(job_id, &worker_destination, &result);
 
                 if let Err(error) = worker_registry.finish_receive(job_id, terminal_result) {
                     eprintln!("failed to finalize managed receiver job {job_id}: {error}");
@@ -325,8 +333,11 @@ impl ManagementJobRegistry {
         source_root: &str,
         worker_count: usize,
         calibration_mib: u64,
+        forced_data_stream_count: Option<usize>,
     ) -> io::Result<StartedSendJob> {
         validate_send_parameters(receiver_address, source_root, worker_count, calibration_mib)?;
+
+        validate_forced_data_stream_count(forced_data_stream_count)?;
 
         let calibration_bytes = network_calibration::bytes_from_mib(calibration_mib)?;
 
@@ -400,12 +411,13 @@ impl ManagementJobRegistry {
         let spawn_result = thread::Builder::new()
             .name(format!("networkcopy-managed-sender-{job_id}"))
             .spawn(move || {
-                let result = calibrated_transfer::send_with_progress(
+                let result = calibrated_transfer::send_with_progress_and_stream_count(
                     receiver_address,
                     &worker_source,
                     worker_count,
                     calibration_bytes,
                     worker_progress,
+                    forced_data_stream_count,
                 );
 
                 let terminal_result = build_send_result(job_id, &result);
@@ -540,7 +552,7 @@ impl ManagementJobRegistry {
             ));
         }
 
-        let progress = {
+        let (progress, role, resume_destination) = {
             let mut inner = self.lock_inner()?;
 
             let existing_job_id = active_job_id(&inner).ok_or_else(|| {
@@ -559,15 +571,27 @@ impl ManagementJobRegistry {
                 ));
             }
 
-            let (progress, role) = if let Some(active) = inner.active_receive.take() {
-                (active.progress, ManagementJobRole::Receiver)
+            if let Some(active) = inner.active_receive.take() {
+                (
+                    active.progress,
+                    ManagementJobRole::Receiver,
+                    Some(PathBuf::from(active.job.destination_root)),
+                )
             } else if let Some(active) = inner.active_send.take() {
-                (active.progress, ManagementJobRole::Sender)
+                (active.progress, ManagementJobRole::Sender, None)
             } else {
                 return Err(io::Error::other(
                     "active management job disappeared during cancellation",
                 ));
-            };
+            }
+        };
+
+        progress.cancel();
+
+        let data_stream_count = resume_destination.as_deref().map_or(0, resume_stream_count);
+
+        {
+            let mut inner = self.lock_inner()?;
 
             inner.latest_result = Some(ManagementJobResult {
                 role,
@@ -582,15 +606,11 @@ impl ManagementJobRegistry {
 
                 wire_bytes: 0,
 
-                data_stream_count: 0,
+                data_stream_count,
 
                 message: "cancelled by management request".to_string(),
             });
-
-            progress
-        };
-
-        progress.cancel();
+        }
 
         Ok(job_id)
     }
@@ -697,6 +717,7 @@ fn build_active_snapshot(
 
 fn build_receive_result(
     job_id: u64,
+    destination_root: &Path,
     result: &io::Result<calibrated_transfer::CalibratedReceiveReport>,
 ) -> ManagementJobResult {
     match result {
@@ -718,7 +739,13 @@ fn build_receive_result(
             message: String::new(),
         },
 
-        Err(error) => build_error_result(ManagementJobRole::Receiver, job_id, error),
+        Err(error) => {
+            let mut result = build_error_result(ManagementJobRole::Receiver, job_id, error);
+
+            result.data_stream_count = resume_stream_count(destination_root);
+
+            result
+        }
     }
 }
 
@@ -777,6 +804,13 @@ fn build_error_result(
 
         message: error.to_string(),
     }
+}
+
+fn resume_stream_count(destination_root: &Path) -> u32 {
+    ResumeJournal::stored_data_stream_count(destination_root)
+        .ok()
+        .flatten()
+        .map_or(0, stream_count_u32)
 }
 
 fn stream_count_u32(stream_count: usize) -> u32 {
@@ -897,7 +931,25 @@ pub(crate) fn encode_start_send_request(
     worker_count: usize,
     calibration_mib: u64,
 ) -> io::Result<Vec<u8>> {
+    encode_start_send_request_with_stream_count(
+        receiver_address,
+        source_root,
+        worker_count,
+        calibration_mib,
+        None,
+    )
+}
+
+pub(crate) fn encode_start_send_request_with_stream_count(
+    receiver_address: SocketAddr,
+    source_root: &str,
+    worker_count: usize,
+    calibration_mib: u64,
+    forced_data_stream_count: Option<usize>,
+) -> io::Result<Vec<u8>> {
     validate_send_parameters(receiver_address, source_root, worker_count, calibration_mib)?;
+
+    validate_forced_data_stream_count(forced_data_stream_count)?;
 
     let receiver_text = receiver_address.to_string();
 
@@ -922,6 +974,17 @@ pub(crate) fn encode_start_send_request(
         )
     })?;
 
+    let forced_data_stream_count = match forced_data_stream_count {
+        Some(data_stream_count) => u32::try_from(data_stream_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "forced data stream count cannot be represented",
+            )
+        })?,
+
+        None => 0,
+    };
+
     let total_length = START_SEND_REQUEST_HEADER_BYTES
         .checked_add(receiver_text.len())
         .and_then(|length| length.checked_add(source_root.len()))
@@ -943,6 +1006,8 @@ pub(crate) fn encode_start_send_request(
 
     payload.extend_from_slice(&source_length.to_le_bytes());
 
+    payload.extend_from_slice(&forced_data_stream_count.to_le_bytes());
+
     payload.extend_from_slice(receiver_text.as_bytes());
 
     payload.extend_from_slice(source_root.as_bytes());
@@ -951,11 +1016,11 @@ pub(crate) fn encode_start_send_request(
 }
 
 pub(crate) fn decode_start_send_request(payload: &[u8]) -> io::Result<StartSendRequest> {
-    if payload.len() < START_SEND_REQUEST_HEADER_BYTES {
+    if payload.len() < START_SEND_REQUEST_HEADER_BYTES_V1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "start-send request has {} bytes, expected at least {START_SEND_REQUEST_HEADER_BYTES}",
+                "start-send request has {} bytes, expected at least {START_SEND_REQUEST_HEADER_BYTES_V1}",
                 payload.len(),
             ),
         ));
@@ -968,12 +1033,48 @@ pub(crate) fn decode_start_send_request(payload: &[u8]) -> io::Result<StartSendR
         )
     })?);
 
-    if version != START_SEND_REQUEST_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported start-send request version {version}"),
-        ));
-    }
+    let (header_bytes, forced_data_stream_count) = match version {
+        START_SEND_REQUEST_VERSION_V1 => (START_SEND_REQUEST_HEADER_BYTES_V1, None),
+
+        START_SEND_REQUEST_VERSION => {
+            if payload.len() < START_SEND_REQUEST_HEADER_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "start-send v2 request has {} bytes, expected at least {START_SEND_REQUEST_HEADER_BYTES}",
+                        payload.len(),
+                    ),
+                ));
+            }
+
+            let encoded = u32::from_le_bytes(payload[24..28].try_into().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "forced data stream count was malformed",
+                )
+            })?);
+
+            let decoded = if encoded == 0 {
+                None
+            } else {
+                Some(usize::try_from(encoded).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "forced data stream count cannot be represented",
+                    )
+                })?)
+            };
+
+            (START_SEND_REQUEST_HEADER_BYTES, decoded)
+        }
+
+        unknown => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported start-send request version {unknown}"),
+            ));
+        }
+    };
 
     let reserved = u16::from_le_bytes(payload[2..4].try_into().map_err(|_| {
         io::Error::new(
@@ -1049,14 +1150,12 @@ pub(crate) fn decode_start_send_request(payload: &[u8]) -> io::Result<StartSendR
         )
     })?;
 
-    let receiver_end = START_SEND_REQUEST_HEADER_BYTES
-        .checked_add(receiver_length)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "start-send receiver position overflowed",
-            )
-        })?;
+    let receiver_end = header_bytes.checked_add(receiver_length).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send receiver position overflowed",
+        )
+    })?;
 
     let expected_length = receiver_end.checked_add(source_length).ok_or_else(|| {
         io::Error::new(
@@ -1075,15 +1174,13 @@ pub(crate) fn decode_start_send_request(payload: &[u8]) -> io::Result<StartSendR
         ));
     }
 
-    let receiver_text = std::str::from_utf8(
-        &payload[START_SEND_REQUEST_HEADER_BYTES..receiver_end],
-    )
-    .map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("receiver endpoint was not valid UTF-8: {error}"),
-        )
-    })?;
+    let receiver_text =
+        std::str::from_utf8(&payload[header_bytes..receiver_end]).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("receiver endpoint was not valid UTF-8: {error}"),
+            )
+        })?;
 
     if receiver_text.is_empty() || receiver_text.len() > MAX_RECEIVER_ENDPOINT_BYTES {
         return Err(io::Error::new(
@@ -1114,6 +1211,7 @@ pub(crate) fn decode_start_send_request(payload: &[u8]) -> io::Result<StartSendR
         worker_count,
         calibration_mib,
     )
+    .and_then(|()| validate_forced_data_stream_count(forced_data_stream_count))
     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
 
     Ok(StartSendRequest {
@@ -1121,6 +1219,7 @@ pub(crate) fn decode_start_send_request(payload: &[u8]) -> io::Result<StartSendR
         source_root,
         worker_count,
         calibration_mib,
+        forced_data_stream_count,
     })
 }
 
@@ -1658,6 +1757,14 @@ fn decode_job_flags(flags: u8) -> io::Result<bool> {
     Ok(flags & UPDATE_EXISTING_FLAG != 0)
 }
 
+fn validate_forced_data_stream_count(forced_data_stream_count: Option<usize>) -> io::Result<()> {
+    if let Some(data_stream_count) = forced_data_stream_count {
+        network_calibration::validate_matrix_stream_count(data_stream_count)?;
+    }
+
+    Ok(())
+}
+
 fn validate_send_parameters(
     receiver_address: SocketAddr,
     source_root: &str,
@@ -1770,8 +1877,8 @@ mod tests {
         ManagementJobPhase, ManagementJobRegistry, ManagementJobStatus, StartedSendJob,
         decode_prepare_request, decode_prepared_response, decode_start_send_request,
         decode_started_send_response, decode_status, encode_prepare_request,
-        encode_prepared_response, encode_start_send_request, encode_started_send_response,
-        encode_status,
+        encode_prepared_response, encode_start_send_request,
+        encode_start_send_request_with_stream_count, encode_started_send_response, encode_status,
     };
     use crate::management_snapshot::{ManagementJobOutcome, ManagementJobRole};
     use std::fs;
@@ -1911,6 +2018,8 @@ mod tests {
         assert_eq!(decoded.worker_count, 4,);
 
         assert_eq!(decoded.calibration_mib, 8,);
+
+        assert_eq!(decoded.forced_data_stream_count, None,);
     }
 
     #[test]
@@ -1964,5 +2073,36 @@ mod tests {
         let decoded = decode_status(&encoded).unwrap();
 
         assert_eq!(decoded, status);
+    }
+
+    #[test]
+    fn resumed_start_send_request_round_trips() {
+        let receiver = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7337));
+
+        let encoded =
+            encode_start_send_request_with_stream_count(receiver, r"C:\Source", 4, 8, Some(4))
+                .unwrap();
+
+        let decoded = decode_start_send_request(&encoded).unwrap();
+
+        assert_eq!(decoded.receiver_address, receiver,);
+
+        assert_eq!(decoded.source_root, r"C:\Source",);
+
+        assert_eq!(decoded.worker_count, 4,);
+
+        assert_eq!(decoded.calibration_mib, 8,);
+
+        assert_eq!(decoded.forced_data_stream_count, Some(4),);
+    }
+
+    #[test]
+    fn resumed_start_send_rejects_non_matrix_stream_count() {
+        let receiver = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7337));
+
+        assert!(
+            encode_start_send_request_with_stream_count(receiver, r"C:\Source", 4, 8, Some(3),)
+                .is_err(),
+        );
     }
 }

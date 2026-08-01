@@ -137,6 +137,19 @@ struct CalibrationConfig {
     total_bytes: u64,
 }
 
+pub(crate) fn validate_matrix_stream_count(data_stream_count: usize) -> io::Result<()> {
+    if MATRIX_STREAM_COUNTS.contains(&data_stream_count) {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!(
+            "calibrated transfer stream count {data_stream_count} is not present in the calibration matrix {MATRIX_STREAM_COUNTS:?}"
+        ),
+    ))
+}
+
 pub fn bytes_from_mib(total_mib: u64) -> io::Result<u64> {
     let total_bytes = total_mib.checked_mul(MIB).ok_or_else(|| {
         io::Error::new(
@@ -1072,6 +1085,17 @@ mod tests {
 
         for report in receiver_matrix.reports {
             assert_eq!(report.total_bytes, total_bytes);
+        }
+    }
+
+    #[test]
+    fn matrix_stream_count_validation_accepts_supported_counts() {
+        for data_stream_count in [1, 2, 4, 8] {
+            super::validate_matrix_stream_count(data_stream_count).unwrap();
+        }
+
+        for data_stream_count in [0, 3, 16] {
+            assert!(super::validate_matrix_stream_count(data_stream_count,).is_err(),);
         }
     }
 }

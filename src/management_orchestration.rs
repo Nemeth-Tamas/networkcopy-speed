@@ -1,5 +1,6 @@
 use crate::management_control;
 use crate::management_jobs::{PreparedReceiveJob, StartedSendJob};
+use crate::network_calibration;
 use std::io;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 
@@ -48,6 +49,29 @@ pub fn start_transfer(request: ManagedTransferRequest) -> io::Result<ManagedTran
         request,
         management_control::prepare_receive,
         management_control::start_send,
+        management_control::cancel_job,
+    )
+}
+
+pub fn resume_transfer(
+    request: ManagedTransferRequest,
+    data_stream_count: usize,
+) -> io::Result<ManagedTransferRecord> {
+    network_calibration::validate_matrix_stream_count(data_stream_count)?;
+
+    start_transfer_with(
+        request,
+        management_control::prepare_receive,
+        move |endpoint, receiver_address, source_root, worker_count, calibration_mib| {
+            management_control::start_send_with_stream_count(
+                endpoint,
+                receiver_address,
+                source_root,
+                worker_count,
+                calibration_mib,
+                Some(data_stream_count),
+            )
+        },
         management_control::cancel_job,
     )
 }
@@ -162,7 +186,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{ManagedTransferRequest, payload_endpoint, start_transfer_with};
+    use super::{ManagedTransferRequest, payload_endpoint, resume_transfer, start_transfer_with};
     use crate::management_jobs::{PreparedReceiveJob, StartedSendJob};
     use std::cell::Cell;
     use std::io;
@@ -348,5 +372,12 @@ mod tests {
         assert_eq!(payload.flowinfo(), 17,);
 
         assert_eq!(payload.scope_id(), 42,);
+    }
+
+    #[test]
+    fn resume_rejects_stream_count_outside_matrix_before_networking() {
+        let error = resume_transfer(example_request(), 3).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput,);
     }
 }

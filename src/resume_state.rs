@@ -122,6 +122,25 @@ impl ResumeJournal {
         Ok(journal)
     }
 
+    pub(crate) fn stored_data_stream_count(destination_root: &Path) -> io::Result<Option<usize>> {
+        let journal_path = destination_root.join(JOURNAL_FILE_NAME);
+
+        if !journal_path.try_exists()? {
+            return Ok(None);
+        }
+
+        let journal = Self::read_path(&journal_path)?;
+
+        let data_stream_count = usize::try_from(journal.data_stream_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resume journal stream count cannot be represented",
+            )
+        })?;
+
+        Ok(Some(data_stream_count))
+    }
+
     pub(crate) fn mark_completed(&mut self, stripe: ResumeStripe) -> bool {
         self.completed_stripes.insert(stripe)
     }
@@ -472,6 +491,11 @@ mod tests {
 
         journal.save_atomic(&root).unwrap();
 
+        assert_eq!(
+            ResumeJournal::stored_data_stream_count(&root,).unwrap(),
+            Some(4),
+        );
+
         journal.mark_completed(ResumeStripe::new(7, 1024, 2048).unwrap());
         journal.mark_file_completed(9);
 
@@ -486,6 +510,11 @@ mod tests {
         assert!(!root.join(TEMPORARY_JOURNAL_FILE_NAME,).exists());
 
         ResumeJournal::remove(&root).unwrap();
+
+        assert_eq!(
+            ResumeJournal::stored_data_stream_count(&root,).unwrap(),
+            None,
+        );
 
         assert!(!root.join(JOURNAL_FILE_NAME).exists());
 

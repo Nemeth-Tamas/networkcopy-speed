@@ -238,6 +238,7 @@ impl ManagementControlServer {
                             &started.source_root,
                             started.worker_count,
                             started.calibration_mib,
+                            started.forced_data_stream_count,
                         )
                     })
                     .and_then(|job| crate::management_jobs::encode_started_send_response(&job));
@@ -401,11 +402,30 @@ pub fn start_send(
     worker_count: usize,
     calibration_mib: u64,
 ) -> io::Result<StartedSendJob> {
-    let payload = crate::management_jobs::encode_start_send_request(
+    start_send_with_stream_count(
+        endpoint,
         receiver_address,
         source_root,
         worker_count,
         calibration_mib,
+        None,
+    )
+}
+
+pub fn start_send_with_stream_count(
+    endpoint: SocketAddr,
+    receiver_address: SocketAddr,
+    source_root: &str,
+    worker_count: usize,
+    calibration_mib: u64,
+    forced_data_stream_count: Option<usize>,
+) -> io::Result<StartedSendJob> {
+    let payload = crate::management_jobs::encode_start_send_request_with_stream_count(
+        receiver_address,
+        source_root,
+        worker_count,
+        calibration_mib,
+        forced_data_stream_count,
     )?;
 
     let response = exchange(endpoint, ManagementMessageKind::StartSendRequest, payload)?;
