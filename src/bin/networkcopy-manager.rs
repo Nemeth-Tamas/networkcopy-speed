@@ -5,12 +5,14 @@
 
 use eframe::egui;
 use networkcopy_speed::management_control;
+use networkcopy_speed::management_directory::{ManagementDirectoryEntry, ManagementEntryKind};
 use networkcopy_speed::management_discovery::{self, DiscoveredAgent};
 use networkcopy_speed::management_orchestration::{
     self, ManagedTransferRecord, ManagedTransferRequest,
 };
 use networkcopy_speed::management_snapshot::ManagementAgentSnapshot;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -37,6 +39,176 @@ struct CancelResponse {
     receiver: Result<u64, String>,
 }
 
+enum BrowserPayload {
+    Roots(Vec<management_control::ManagementRoot>),
+
+    Directory {
+        path: String,
+
+        entries: Vec<ManagementDirectoryEntry>,
+    },
+}
+
+struct BrowserResponse {
+    endpoint: SocketAddr,
+
+    result: Result<BrowserPayload, String>,
+}
+
+struct RemoteBrowserPane {
+    endpoint: Option<SocketAddr>,
+
+    current_path: String,
+
+    roots: Vec<management_control::ManagementRoot>,
+
+    entries: Vec<ManagementDirectoryEntry>,
+
+    receiver: Option<Receiver<BrowserResponse>>,
+
+    error: String,
+}
+
+impl RemoteBrowserPane {
+    fn new() -> Self {
+        Self {
+            endpoint: None,
+
+            current_path: String::new(),
+
+            roots: Vec::new(),
+
+            entries: Vec::new(),
+
+            receiver: None,
+
+            error: String::new(),
+        }
+    }
+
+    fn sync_endpoint(&mut self, endpoint: Option<SocketAddr>) {
+        if self.receiver.is_some() || self.endpoint == endpoint {
+            return;
+        }
+
+        self.endpoint = endpoint;
+
+        self.current_path.clear();
+
+        self.roots.clear();
+
+        self.entries.clear();
+
+        self.error.clear();
+    }
+
+    fn begin_roots(&mut self, endpoint_text: &str) -> Result<(), String> {
+        if self.receiver.is_some() {
+            return Ok(());
+        }
+
+        let endpoint = parse_endpoint(endpoint_text, "remote browser agent")?;
+
+        self.endpoint = Some(endpoint);
+
+        self.current_path.clear();
+
+        self.entries.clear();
+
+        self.error.clear();
+
+        let (sender, receiver) = mpsc::channel();
+
+        self.receiver = Some(receiver);
+
+        thread::spawn(move || {
+            let result = management_control::list_roots(endpoint)
+                .map(BrowserPayload::Roots)
+                .map_err(|error| format!("Failed to list remote drives: {error}"));
+
+            let _ = sender.send(BrowserResponse { endpoint, result });
+        });
+
+        Ok(())
+    }
+
+    fn begin_directory(&mut self, endpoint_text: &str, path: String) -> Result<(), String> {
+        if self.receiver.is_some() {
+            return Ok(());
+        }
+
+        let endpoint = parse_endpoint(endpoint_text, "remote browser agent")?;
+
+        self.endpoint = Some(endpoint);
+
+        self.error.clear();
+
+        let (sender, receiver) = mpsc::channel();
+
+        self.receiver = Some(receiver);
+
+        thread::spawn(move || {
+            let result = management_control::list_directory(endpoint, &path)
+                .map(|entries| BrowserPayload::Directory { path, entries })
+                .map_err(|error| format!("Failed to list remote directory: {error}"));
+
+            let _ = sender.send(BrowserResponse { endpoint, result });
+        });
+
+        Ok(())
+    }
+
+    fn process_message(&mut self) {
+        let message = self.receiver.as_ref().map(|receiver| receiver.try_recv());
+
+        match message {
+            Some(Ok(response)) => {
+                self.receiver = None;
+
+                if self.endpoint != Some(response.endpoint) {
+                    return;
+                }
+
+                match response.result {
+                    Ok(BrowserPayload::Roots(roots)) => {
+                        self.current_path.clear();
+
+                        self.entries.clear();
+
+                        self.roots = roots;
+
+                        self.error.clear();
+                    }
+
+                    Ok(BrowserPayload::Directory { path, entries }) => {
+                        self.current_path = path;
+
+                        self.entries = entries;
+
+                        self.error.clear();
+                    }
+
+                    Err(error) => {
+                        self.error = error;
+                    }
+                }
+            }
+
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.receiver = None;
+
+                self.error = "Remote browser worker disconnected.".to_string();
+            }
+
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    fn is_loading(&self) -> bool {
+        self.receiver.is_some()
+    }
+}
+
 struct NetworkCopyManager {
     agents: Vec<DiscoveredAgent>,
 
@@ -47,6 +219,10 @@ struct NetworkCopyManager {
     source_root: String,
 
     destination_root: String,
+
+    sender_browser: RemoteBrowserPane,
+
+    receiver_browser: RemoteBrowserPane,
 
     worker_count: usize,
 
@@ -89,6 +265,10 @@ impl NetworkCopyManager {
             source_root: String::new(),
 
             destination_root: String::new(),
+
+            sender_browser: RemoteBrowserPane::new(),
+
+            receiver_browser: RemoteBrowserPane::new(),
 
             worker_count: 4,
 
@@ -302,14 +482,17 @@ impl NetworkCopyManager {
         self.process_poll_message();
 
         self.process_cancel_message();
+
+        self.sender_browser.process_message();
+
+        self.receiver_browser.process_message();
     }
 
     fn process_discovery_message(&mut self) {
-        let message = match &self.discovery_receiver {
-            Some(receiver) => Some(receiver.try_recv()),
-
-            None => None,
-        };
+        let message = self
+            .discovery_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
 
         match message {
             Some(Ok(Ok(agents))) => {
@@ -341,11 +524,10 @@ impl NetworkCopyManager {
     }
 
     fn process_start_message(&mut self) {
-        let message = match &self.start_receiver {
-            Some(receiver) => Some(receiver.try_recv()),
-
-            None => None,
-        };
+        let message = self
+            .start_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
 
         match message {
             Some(Ok(Ok(transfer))) => {
@@ -386,11 +568,10 @@ impl NetworkCopyManager {
     }
 
     fn process_poll_message(&mut self) {
-        let message = match &self.poll_receiver {
-            Some(receiver) => Some(receiver.try_recv()),
-
-            None => None,
-        };
+        let message = self
+            .poll_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
 
         let Some(message) = message else {
             return;
@@ -454,11 +635,10 @@ impl NetworkCopyManager {
     }
 
     fn process_cancel_message(&mut self) {
-        let message = match &self.cancel_receiver {
-            Some(receiver) => Some(receiver.try_recv()),
-
-            None => None,
-        };
+        let message = self
+            .cancel_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
 
         let Some(message) = message else {
             return;
@@ -504,6 +684,8 @@ impl NetworkCopyManager {
             || self.start_receiver.is_some()
             || self.poll_receiver.is_some()
             || self.cancel_receiver.is_some()
+            || self.sender_browser.is_loading()
+            || self.receiver_browser.is_loading()
             || (self.transfer.is_some() && !self.monitoring_complete)
     }
 
@@ -627,6 +809,38 @@ impl NetworkCopyManager {
             "Update and verify an existing destination",
         );
 
+        ui.add_space(12.0);
+
+        ui.heading("Remote folder browser");
+
+        ui.label("Browse both endpoint machines without opening their desktops.");
+
+        ui.add_space(6.0);
+
+        let sender_agent = self.sender_agent.clone();
+
+        let receiver_agent = self.receiver_agent.clone();
+
+        ui.columns(2, |columns| {
+            let (left, right) = columns.split_at_mut(1);
+
+            render_remote_browser(
+                &mut left[0],
+                "Sender folders",
+                &sender_agent,
+                &mut self.source_root,
+                &mut self.sender_browser,
+            );
+
+            render_remote_browser(
+                &mut right[0],
+                "Receiver folders",
+                &receiver_agent,
+                &mut self.destination_root,
+                &mut self.receiver_browser,
+            );
+        });
+
         if !self.sender_agent.is_empty() && self.sender_agent == self.receiver_agent {
             ui.label("Sender and receiver cannot be the same agent.");
         }
@@ -734,19 +948,13 @@ impl NetworkCopyManager {
 }
 
 impl eframe::App for NetworkCopyManager {
-    fn ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        _frame: &mut eframe::Frame,
-    ) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.process_messages();
 
         self.begin_poll();
 
         if self.has_background_work() {
-            ui.ctx().request_repaint_after(
-                REPAINT_INTERVAL,
-            );
+            ui.ctx().request_repaint_after(REPAINT_INTERVAL);
         }
 
         egui::CentralPanel::default()
@@ -836,6 +1044,195 @@ impl eframe::App for NetworkCopyManager {
     }
 }
 
+fn render_remote_browser(
+    ui: &mut egui::Ui,
+    title: &str,
+    endpoint_text: &str,
+    selected_path: &mut String,
+    browser: &mut RemoteBrowserPane,
+) {
+    let parsed_endpoint = endpoint_text.trim().parse::<SocketAddr>().ok();
+
+    browser.sync_endpoint(parsed_endpoint);
+
+    let mut request_roots = false;
+
+    let mut request_directory = None::<String>;
+
+    let mut use_current = false;
+
+    ui.group(|ui| {
+        ui.set_min_width(ui.available_width());
+
+        ui.heading(title);
+
+        if endpoint_text.trim().is_empty() {
+            ui.label("Select or enter a management agent first.");
+
+            return;
+        }
+
+        if parsed_endpoint.is_none() {
+            ui.label("The management agent address is invalid.");
+
+            return;
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!browser.is_loading(), egui::Button::new("Load drives"))
+                .clicked()
+            {
+                request_roots = true;
+            }
+
+            let can_go_up = !browser.current_path.is_empty();
+
+            if ui
+                .add_enabled(can_go_up && !browser.is_loading(), egui::Button::new("Up"))
+                .clicked()
+            {
+                match parent_remote_path(&browser.current_path) {
+                    Some(parent) => {
+                        request_directory = Some(parent);
+                    }
+
+                    None => {
+                        request_roots = true;
+                    }
+                }
+            }
+
+            let can_refresh = browser.endpoint.is_some() && !browser.is_loading();
+
+            if ui
+                .add_enabled(can_refresh, egui::Button::new("Refresh"))
+                .clicked()
+            {
+                if browser.current_path.is_empty() {
+                    request_roots = true;
+                } else {
+                    request_directory = Some(browser.current_path.clone());
+                }
+            }
+
+            if ui
+                .add_enabled(
+                    !browser.current_path.is_empty(),
+                    egui::Button::new("Use current folder"),
+                )
+                .clicked()
+            {
+                use_current = true;
+            }
+        });
+
+        if browser.is_loading() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+
+                ui.label("Loading remote directory...");
+            });
+        }
+
+        if !browser.error.is_empty() {
+            ui.label(
+                egui::RichText::new(&browser.error).color(egui::Color32::from_rgb(255, 112, 120)),
+            );
+        }
+
+        ui.add_space(6.0);
+
+        if browser.current_path.is_empty() {
+            ui.strong("Remote drives");
+
+            if browser.roots.is_empty() && !browser.is_loading() {
+                ui.label("Click Load drives to browse this machine.");
+            }
+
+            let roots = browser.roots.clone();
+
+            for root in roots {
+                if ui.button(&root.path).clicked() {
+                    request_directory = Some(root.path);
+                }
+            }
+
+            return;
+        }
+
+        ui.label(egui::RichText::new(&browser.current_path).strong());
+
+        ui.add_space(4.0);
+
+        egui::ScrollArea::vertical()
+            .max_height(280.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let entries = browser.entries.clone();
+
+                if entries.is_empty() && !browser.is_loading() {
+                    ui.label("This directory is empty.");
+                }
+
+                for entry in entries {
+                    match entry.kind {
+                        ManagementEntryKind::Directory => {
+                            let label = format!("[DIR] {}", entry.name,);
+
+                            if ui.button(label).clicked() {
+                                request_directory =
+                                    Some(join_remote_path(&browser.current_path, &entry.name));
+                            }
+                        }
+
+                        ManagementEntryKind::File => {
+                            ui.horizontal(|ui| {
+                                ui.label(entry.name);
+
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(format_bytes(entry.size));
+                                    },
+                                );
+                            });
+                        }
+
+                        ManagementEntryKind::Other => {
+                            ui.label(format!("[OTHER] {}", entry.name,));
+                        }
+                    }
+                }
+            });
+    });
+
+    if use_current {
+        *selected_path = browser.current_path.clone();
+    }
+
+    if request_roots && let Err(error) = browser.begin_roots(endpoint_text) {
+        browser.error = error;
+    }
+
+    if let Some(path) = request_directory
+        && let Err(error) = browser.begin_directory(endpoint_text, path)
+    {
+        browser.error = error;
+    }
+}
+
+fn join_remote_path(parent: &str, child: &str) -> String {
+    Path::new(parent).join(child).to_string_lossy().into_owned()
+}
+
+fn parent_remote_path(path: &str) -> Option<String> {
+    Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.to_string_lossy().into_owned())
+}
+
 fn render_endpoint_snapshot(
     ui: &mut egui::Ui,
     title: &str,
@@ -856,35 +1253,35 @@ fn render_endpoint_snapshot(
             return;
         };
 
-        if let Some(active) = &snapshot.active {
-            if active.job_id == expected_job_id {
-                ui.strong(format!("{} job {}", active.role.label(), active.job_id,));
+        if let Some(active) = &snapshot.active
+            && active.job_id == expected_job_id
+        {
+            ui.strong(format!("{} job {}", active.role.label(), active.job_id,));
 
-                ui.label(&active.phase);
+            ui.label(&active.phase);
 
-                if active.total == 0 {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
+            if active.total == 0 {
+                ui.horizontal(|ui| {
+                    ui.spinner();
 
-                        ui.label(format!("{} processed", format_bytes(active.completed),));
-                    });
-                } else {
-                    let fraction = active.completed.min(active.total) as f64 / active.total as f64;
+                    ui.label(format!("{} processed", format_bytes(active.completed),));
+                });
+            } else {
+                let fraction = active.completed.min(active.total) as f64 / active.total as f64;
 
-                    ui.add(
-                        egui::ProgressBar::new(fraction as f32)
-                            .show_percentage()
-                            .text(format!(
-                                "{} / {}",
-                                format_bytes(active.completed),
-                                format_bytes(active.total),
-                            )),
-                    );
-                }
+                ui.add(
+                    egui::ProgressBar::new(fraction as f32)
+                        .show_percentage()
+                        .text(format!(
+                            "{} / {}",
+                            format_bytes(active.completed),
+                            format_bytes(active.total),
+                        )),
+                );
+            }
 
-                if active.cancel_requested {
-                    ui.label("Cancellation requested");
-                }
+            if active.cancel_requested {
+                ui.label("Cancellation requested");
             }
         }
 
@@ -972,83 +1369,58 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn configure_style(
-    context: &egui::Context,
-) {
-    context.set_theme(
-        egui::Theme::Dark,
-    );
+fn configure_style(context: &egui::Context) {
+    context.set_theme(egui::Theme::Dark);
 
-    context.style_mut_of(
-        egui::Theme::Dark,
-        |style| {
-            style.spacing.item_spacing =
-                egui::vec2(10.0, 8.0);
+    context.style_mut_of(egui::Theme::Dark, |style| {
+        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
 
-            style.spacing.button_padding =
-                egui::vec2(12.0, 7.0);
+        style.spacing.button_padding = egui::vec2(12.0, 7.0);
 
-            style
-                .text_styles
-                .insert(
-                    egui::TextStyle::Heading,
-                    egui::FontId::
-                        proportional(22.0),
-                );
+        style
+            .text_styles
+            .insert(egui::TextStyle::Heading, egui::FontId::proportional(22.0));
 
-            style
-                .text_styles
-                .insert(
-                    egui::TextStyle::Body,
-                    egui::FontId::
-                        proportional(15.0),
-                );
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
 
-            style
-                .text_styles
-                .insert(
-                    egui::TextStyle::Button,
-                    egui::FontId::
-                        proportional(15.0),
-                );
-        },
-    );
+        style
+            .text_styles
+            .insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
+    });
 
-    let mut visuals =
-        egui::Visuals::dark();
+    let mut visuals = egui::Visuals::dark();
 
-    visuals.panel_fill =
-        egui::Color32::from_rgb(
-            10,
-            17,
-            27,
+    visuals.panel_fill = egui::Color32::from_rgb(10, 17, 27);
+
+    visuals.window_fill = egui::Color32::from_rgb(16, 27, 42);
+
+    visuals.extreme_bg_color = egui::Color32::from_rgb(5, 10, 17);
+
+    visuals.selection.bg_fill = egui::Color32::from_rgb(0, 128, 194);
+
+    context.set_visuals_of(egui::Theme::Dark, visuals);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{join_remote_path, parent_remote_path};
+
+    #[test]
+    fn remote_path_navigation_works() {
+        assert_eq!(join_remote_path(r"C:\Users", "Public",), r"C:\Users\Public",);
+
+        assert_eq!(
+            parent_remote_path(r"C:\Users\Public",),
+            Some(r"C:\Users".to_string(),),
         );
+    }
 
-    visuals.window_fill =
-        egui::Color32::from_rgb(
-            16,
-            27,
-            42,
-        );
-
-    visuals.extreme_bg_color =
-        egui::Color32::from_rgb(
-            5,
-            10,
-            17,
-        );
-
-    visuals.selection.bg_fill =
-        egui::Color32::from_rgb(
-            0,
-            128,
-            194,
-        );
-
-    context.set_visuals_of(
-        egui::Theme::Dark,
-        visuals,
-    );
+    #[test]
+    fn drive_root_has_no_browser_parent() {
+        assert_eq!(parent_remote_path(r"C:\"), None,);
+    }
 }
 
 fn main() -> eframe::Result {

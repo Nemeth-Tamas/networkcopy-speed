@@ -176,7 +176,7 @@ Initial v2.2 scope:
 - [ ] resume complete transfer jobs remotely;
 - [x] keep active transfers running if the management UI disconnects;
 - [x] add an initial separate WGPU management application;
-- [ ] add remote dual-pane folder browsing to the management application;
+- [x] add remote dual-pane folder browsing to the management application;
 - [ ] add paired transfer history and richer diagnostics to the management application;
 - [ ] test three-machine orchestration on a physical LAN.
 
@@ -329,6 +329,11 @@ The initial manager discovers LAN agents, assigns sender and receiver roles,
 accepts remote source and destination paths, starts a paired transfer, polls both
 endpoint snapshots, displays live progress and retained terminal results, and
 cancels both endpoint jobs from one window.
+
+The manager includes independent sender and receiver folder browsers. Each pane
+loads the selected endpoint's Windows drive roots, navigates directories,
+refreshes the current folder, moves to the parent folder, and copies the current
+remote path into the paired transfer configuration.
 
 The manager is not part of the payload path. Closing it does not terminate a
 transfer that has already been accepted by both endpoint agents.
