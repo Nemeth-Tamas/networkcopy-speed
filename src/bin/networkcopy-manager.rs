@@ -23,6 +23,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 const REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 
+const REMOTE_BROWSER_HEIGHT: f32 = 460.0;
+
 type DiscoveryResult = Result<Vec<DiscoveredAgent>, String>;
 
 type StartResult = Result<ManagedTransferRecord, String>;
@@ -1064,6 +1066,8 @@ fn render_remote_browser(
     ui.group(|ui| {
         ui.set_min_width(ui.available_width());
 
+        ui.set_min_height(REMOTE_BROWSER_HEIGHT + 120.0);
+
         ui.heading(title);
 
         if endpoint_text.trim().is_empty() {
@@ -1166,7 +1170,7 @@ fn render_remote_browser(
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical()
-            .max_height(280.0)
+            .max_height(REMOTE_BROWSER_HEIGHT)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let entries = browser.entries.clone();
@@ -1403,26 +1407,6 @@ fn configure_style(context: &egui::Context) {
     context.set_visuals_of(egui::Theme::Dark, visuals);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{join_remote_path, parent_remote_path};
-
-    #[test]
-    fn remote_path_navigation_works() {
-        assert_eq!(join_remote_path(r"C:\Users", "Public",), r"C:\Users\Public",);
-
-        assert_eq!(
-            parent_remote_path(r"C:\Users\Public",),
-            Some(r"C:\Users".to_string(),),
-        );
-    }
-
-    #[test]
-    fn drive_root_has_no_browser_parent() {
-        assert_eq!(parent_remote_path(r"C:\"), None,);
-    }
-}
-
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1445,4 +1429,24 @@ fn main() -> eframe::Result {
             Ok(Box::new(NetworkCopyManager::new()))
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{join_remote_path, parent_remote_path};
+
+    #[test]
+    fn remote_path_navigation_works() {
+        assert_eq!(join_remote_path(r"C:\Users", "Public",), r"C:\Users\Public",);
+
+        assert_eq!(
+            parent_remote_path(r"C:\Users\Public",),
+            Some(r"C:\Users".to_string(),),
+        );
+    }
+
+    #[test]
+    fn drive_root_has_no_browser_parent() {
+        assert_eq!(parent_remote_path(r"C:\"), None,);
+    }
 }
