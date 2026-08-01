@@ -13,7 +13,7 @@ use networkcopy_speed::management_orchestration::{
 use networkcopy_speed::management_persistence::{self, ManagerHistoryEntry, ManagerPersistedState};
 use networkcopy_speed::management_reconnect;
 use networkcopy_speed::management_snapshot::{
-    ManagementAgentSnapshot, ManagementJobOutcome, ManagementJobResult,
+    ManagementAgentSnapshot, ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
 };
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -57,6 +57,44 @@ struct CancelResponse {
     sender: Result<u64, String>,
 
     receiver: Result<u64, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedEndpointRole {
+    Sender,
+
+    Receiver,
+}
+
+impl ManagedEndpointRole {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Sender => "sender",
+
+            Self::Receiver => "receiver",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PeerCleanupTarget {
+    endpoint_role: ManagedEndpointRole,
+
+    endpoint: SocketAddr,
+
+    job_id: u64,
+
+    trigger_role: ManagementJobRole,
+
+    trigger_job_id: u64,
+
+    trigger_outcome: ManagementJobOutcome,
+}
+
+struct PeerCleanupResponse {
+    target: PeerCleanupTarget,
+
+    result: Result<u64, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -311,6 +349,10 @@ struct NetworkCopyManager {
 
     cancel_receiver: Option<Receiver<CancelResponse>>,
 
+    peer_cleanup_receiver: Option<Receiver<PeerCleanupResponse>>,
+
+    peer_cleanup_attempted: bool,
+
     transfer: Option<ManagedTransferRecord>,
 
     sender_snapshot: Option<ManagementAgentSnapshot>,
@@ -370,6 +412,10 @@ impl NetworkCopyManager {
             poll_receiver: None,
 
             cancel_receiver: None,
+
+            peer_cleanup_receiver: None,
+
+            peer_cleanup_attempted: false,
 
             transfer: None,
 
@@ -613,6 +659,10 @@ impl NetworkCopyManager {
 
         self.transfer = None;
 
+        self.peer_cleanup_receiver = None;
+
+        self.peer_cleanup_attempted = false;
+
         self.sender_snapshot = None;
 
         self.receiver_snapshot = None;
@@ -686,6 +736,10 @@ impl NetworkCopyManager {
         };
 
         self.transfer = None;
+
+        self.peer_cleanup_receiver = None;
+
+        self.peer_cleanup_attempted = false;
 
         self.sender_snapshot = None;
 
@@ -805,6 +859,55 @@ impl NetworkCopyManager {
         });
     }
 
+    fn begin_peer_cleanup_if_needed(&mut self) {
+        if self.monitoring_complete
+            || self.peer_cleanup_attempted
+            || self.peer_cleanup_receiver.is_some()
+            || self.cancel_receiver.is_some()
+        {
+            return;
+        }
+
+        let Some(transfer) = self.transfer.as_ref() else {
+            return;
+        };
+
+        let Some(target) = peer_cleanup_target(
+            transfer,
+            self.sender_snapshot.as_ref(),
+            self.receiver_snapshot.as_ref(),
+        ) else {
+            return;
+        };
+
+        self.peer_cleanup_attempted = true;
+
+        self.notice = format!(
+            "{} job {} reached {}. Cancelling still-active {} job {}...",
+            target.trigger_role.label(),
+            target.trigger_job_id,
+            target.trigger_outcome.label(),
+            target.endpoint_role.label(),
+            target.job_id,
+        );
+
+        let (sender, receiver) = mpsc::channel();
+
+        self.peer_cleanup_receiver = Some(receiver);
+
+        thread::spawn(move || {
+            let result =
+                management_control::cancel_job(target.endpoint, target.job_id).map_err(|error| {
+                    format!(
+                        "automatic {} cleanup failed: {error}",
+                        target.endpoint_role.label(),
+                    )
+                });
+
+            let _ = sender.send(PeerCleanupResponse { target, result });
+        });
+    }
+
     fn begin_cancel(&mut self) {
         if self.cancel_receiver.is_some() {
             return;
@@ -815,6 +918,8 @@ impl NetworkCopyManager {
         };
 
         self.error.clear();
+
+        self.peer_cleanup_attempted = true;
 
         self.notice = "Sending cancellation to both endpoints...".to_string();
 
@@ -849,6 +954,8 @@ impl NetworkCopyManager {
         self.process_poll_message();
 
         self.process_cancel_message();
+
+        self.process_peer_cleanup_message();
 
         self.sender_browser.process_message();
 
@@ -909,6 +1016,10 @@ impl NetworkCopyManager {
 
                 self.transfer = Some(transfer);
 
+                self.peer_cleanup_receiver = None;
+
+                self.peer_cleanup_attempted = false;
+
                 self.last_poll = Instant::now();
 
                 self.monitoring_complete = false;
@@ -963,6 +1074,10 @@ impl NetworkCopyManager {
                 self.receiver_snapshot = Some(receiver_snapshot);
 
                 self.transfer = Some(transfer);
+
+                self.peer_cleanup_receiver = None;
+
+                self.peer_cleanup_attempted = false;
 
                 self.monitoring_complete = false;
 
@@ -1051,6 +1166,8 @@ impl NetworkCopyManager {
                     self.archive_terminal_transfer();
 
                     self.notice = "Both endpoint jobs reached a terminal state.".to_string();
+                } else {
+                    self.begin_peer_cleanup_if_needed();
                 }
             }
 
@@ -1138,12 +1255,73 @@ impl NetworkCopyManager {
         }
     }
 
+    fn process_peer_cleanup_message(&mut self) {
+        let message = self
+            .peer_cleanup_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
+
+        let Some(message) = message else {
+            return;
+        };
+
+        match message {
+            Ok(response) => {
+                self.peer_cleanup_receiver = None;
+
+                match response.result {
+                    Ok(cancelled_job_id) if cancelled_job_id == response.target.job_id => {
+                        self.notice = format!(
+                            "Automatic cleanup cancelled {} job {} after paired {} job {} reached {}.",
+                            response.target.endpoint_role.label(),
+                            cancelled_job_id,
+                            response.target.trigger_role.label(),
+                            response.target.trigger_job_id,
+                            response.target.trigger_outcome.label(),
+                        );
+                    }
+
+                    Ok(cancelled_job_id) => {
+                        self.error = format!(
+                            "Automatic peer cleanup returned job ID {cancelled_job_id}, expected {}.",
+                            response.target.job_id,
+                        );
+
+                        self.notice =
+                            "Automatic peer cleanup returned an unexpected response.".to_string();
+                    }
+
+                    Err(error) => {
+                        self.error = error;
+
+                        self.notice = format!(
+                            "Automatic cleanup of {} job {} failed. Manual cancellation remains available.",
+                            response.target.endpoint_role.label(),
+                            response.target.job_id,
+                        );
+                    }
+                }
+
+                self.last_poll = Instant::now();
+            }
+
+            Err(TryRecvError::Disconnected) => {
+                self.peer_cleanup_receiver = None;
+
+                self.error = "Automatic peer-cleanup worker disconnected.".to_string();
+            }
+
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
     fn has_background_work(&self) -> bool {
         self.discovery_receiver.is_some()
             || self.start_receiver.is_some()
             || self.attach_receiver.is_some()
             || self.poll_receiver.is_some()
             || self.cancel_receiver.is_some()
+            || self.peer_cleanup_receiver.is_some()
             || self.sender_browser.is_loading()
             || self.receiver_browser.is_loading()
             || (self.transfer.is_some() && !self.monitoring_complete)
@@ -1400,7 +1578,9 @@ impl NetworkCopyManager {
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            let can_cancel = !self.monitoring_complete && self.cancel_receiver.is_none();
+            let can_cancel = !self.monitoring_complete
+                && self.cancel_receiver.is_none()
+                && self.peer_cleanup_receiver.is_none();
 
             if ui
                 .add_enabled(can_cancel, egui::Button::new("Cancel both endpoints"))
@@ -1415,8 +1595,18 @@ impl NetworkCopyManager {
                 ui.label("Cancelling...");
             }
 
+            if self.peer_cleanup_receiver.is_some() {
+                ui.spinner();
+
+                ui.label("Cleaning up paired endpoint...");
+            }
+
             if self.monitoring_complete && ui.button("Clear transfer card").clicked() {
                 self.transfer = None;
+
+                self.peer_cleanup_receiver = None;
+
+                self.peer_cleanup_attempted = false;
 
                 self.sender_snapshot = None;
 
@@ -2100,6 +2290,66 @@ fn render_endpoint_snapshot(
     });
 }
 
+fn peer_cleanup_target(
+    transfer: &ManagedTransferRecord,
+    sender_snapshot: Option<&ManagementAgentSnapshot>,
+    receiver_snapshot: Option<&ManagementAgentSnapshot>,
+) -> Option<PeerCleanupTarget> {
+    let sender_result = terminal_result_for(sender_snapshot, transfer.sender_job_id)
+        .filter(|result| result.outcome != ManagementJobOutcome::Completed);
+
+    let receiver_result = terminal_result_for(receiver_snapshot, transfer.receiver_job_id)
+        .filter(|result| result.outcome != ManagementJobOutcome::Completed);
+
+    let sender_active = snapshot_has_active_job(sender_snapshot, transfer.sender_job_id);
+
+    let receiver_active = snapshot_has_active_job(receiver_snapshot, transfer.receiver_job_id);
+
+    if let Some(result) = sender_result
+        && receiver_active
+    {
+        return Some(PeerCleanupTarget {
+            endpoint_role: ManagedEndpointRole::Receiver,
+
+            endpoint: transfer.receiver_agent,
+
+            job_id: transfer.receiver_job_id,
+
+            trigger_role: ManagementJobRole::Sender,
+
+            trigger_job_id: result.job_id,
+
+            trigger_outcome: result.outcome,
+        });
+    }
+
+    if let Some(result) = receiver_result
+        && sender_active
+    {
+        return Some(PeerCleanupTarget {
+            endpoint_role: ManagedEndpointRole::Sender,
+
+            endpoint: transfer.sender_agent,
+
+            job_id: transfer.sender_job_id,
+
+            trigger_role: ManagementJobRole::Receiver,
+
+            trigger_job_id: result.job_id,
+
+            trigger_outcome: result.outcome,
+        });
+    }
+
+    None
+}
+
+fn snapshot_has_active_job(snapshot: Option<&ManagementAgentSnapshot>, job_id: u64) -> bool {
+    snapshot
+        .and_then(|snapshot| snapshot.active.as_ref())
+        .is_some_and(|active| active.job_id == job_id)
+}
+
 fn snapshot_is_terminal(snapshot: Option<&ManagementAgentSnapshot>, job_id: u64) -> bool {
     let Some(snapshot) = snapshot else {
         return false;
@@ -2211,11 +2461,12 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_TRANSFER_HISTORY, PairedTransferHistoryEntry, join_remote_path, paired_outcome,
-        parent_remote_path, remember_history,
+        MAX_TRANSFER_HISTORY, ManagedEndpointRole, PairedTransferHistoryEntry, join_remote_path,
+        paired_outcome, parent_remote_path, peer_cleanup_target, remember_history,
     };
     use networkcopy_speed::management_orchestration::ManagedTransferRecord;
     use networkcopy_speed::management_snapshot::{
+        ManagementActiveJobDetails, ManagementActiveJobSnapshot, ManagementAgentSnapshot,
         ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
     };
     use std::collections::VecDeque;
@@ -2305,6 +2556,56 @@ mod tests {
         }
     }
 
+    fn active_snapshot(role: ManagementJobRole, job_id: u64) -> ManagementAgentSnapshot {
+        let details = match role {
+            ManagementJobRole::Sender => ManagementActiveJobDetails::Sender {
+                receiver_address: "127.0.0.1:7337".parse().unwrap(),
+
+                source_root: r"C:\Source".to_string(),
+
+                worker_count: 4,
+
+                calibration_mib: 8,
+            },
+
+            ManagementJobRole::Receiver => ManagementActiveJobDetails::Receiver {
+                transfer_port: 7337,
+
+                destination_root: r"D:\Destination".to_string(),
+
+                update_existing: false,
+            },
+        };
+
+        ManagementAgentSnapshot {
+            active: Some(ManagementActiveJobSnapshot {
+                role,
+
+                job_id,
+
+                phase: "Transfer".to_string(),
+
+                completed: 10,
+
+                total: 100,
+
+                cancel_requested: false,
+
+                details,
+            }),
+
+            latest_result: None,
+        }
+    }
+
+    fn terminal_snapshot(result: ManagementJobResult) -> ManagementAgentSnapshot {
+        ManagementAgentSnapshot {
+            active: None,
+
+            latest_result: Some(result),
+        }
+    }
+
     #[test]
     fn paired_outcome_uses_worst_endpoint_result() {
         let completed = history_entry(1, ManagementJobOutcome::Completed);
@@ -2375,5 +2676,65 @@ mod tests {
         missing_journal.receiver_result.data_stream_count = 0;
 
         assert_eq!(missing_journal.resume_data_stream_count(), None,);
+    }
+
+    #[test]
+    fn failed_sender_cleans_up_active_receiver() {
+        let entry = history_entry(1, ManagementJobOutcome::Failed);
+
+        let transfer = entry.transfer.clone();
+
+        let sender_snapshot = terminal_snapshot(entry.sender_result);
+
+        let receiver_snapshot =
+            active_snapshot(ManagementJobRole::Receiver, transfer.receiver_job_id);
+
+        let target =
+            peer_cleanup_target(&transfer, Some(&sender_snapshot), Some(&receiver_snapshot))
+                .unwrap();
+
+        assert_eq!(target.endpoint_role, ManagedEndpointRole::Receiver,);
+
+        assert_eq!(target.job_id, transfer.receiver_job_id,);
+
+        assert_eq!(target.trigger_outcome, ManagementJobOutcome::Failed,);
+    }
+
+    #[test]
+    fn cancelled_receiver_cleans_up_active_sender() {
+        let entry = history_entry(2, ManagementJobOutcome::Cancelled);
+
+        let transfer = entry.transfer.clone();
+
+        let sender_snapshot = active_snapshot(ManagementJobRole::Sender, transfer.sender_job_id);
+
+        let receiver_snapshot = terminal_snapshot(entry.receiver_result);
+
+        let target =
+            peer_cleanup_target(&transfer, Some(&sender_snapshot), Some(&receiver_snapshot))
+                .unwrap();
+
+        assert_eq!(target.endpoint_role, ManagedEndpointRole::Sender,);
+
+        assert_eq!(target.job_id, transfer.sender_job_id,);
+
+        assert_eq!(target.trigger_outcome, ManagementJobOutcome::Cancelled,);
+    }
+
+    #[test]
+    fn completed_endpoint_does_not_cancel_finalizing_peer() {
+        let entry = history_entry(3, ManagementJobOutcome::Completed);
+
+        let transfer = entry.transfer.clone();
+
+        let sender_snapshot = terminal_snapshot(entry.sender_result);
+
+        let receiver_snapshot =
+            active_snapshot(ManagementJobRole::Receiver, transfer.receiver_job_id);
+
+        assert_eq!(
+            peer_cleanup_target(&transfer, Some(&sender_snapshot), Some(&receiver_snapshot),),
+            None,
+        );
     }
 }

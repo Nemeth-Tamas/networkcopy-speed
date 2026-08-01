@@ -162,7 +162,8 @@ selected receiver.
 Initial v2.2 scope:
 
 - [x] add a persistent LAN-visible agent process;
-- [ ] connect the agent to sender and receiver job control;
+- [x] connect the agent to sender and receiver job control;
+- [x] automatically cancel a still-active endpoint when its paired job fails or is cancelled;
 - [x] advertise and discover available agents on the LAN;
 - [x] report machine name, reachable management address, capabilities, and current state;
 - [x] remotely enumerate Windows drive roots on each endpoint;
@@ -366,6 +367,11 @@ first launch.
 
 The manager is not part of the payload path. Closing it does not terminate a
 transfer that has already been accepted by both endpoint agents.
+
+When one paired endpoint reaches a failed or cancelled terminal state while the
+other endpoint is still active, the manager performs one best-effort
+cancellation of the surviving job. Normal completion on one endpoint does not
+trigger cleanup because the peer may still be finalizing its result.
 
 Management traffic remains unauthenticated during the current trusted-LAN
 development phase.
