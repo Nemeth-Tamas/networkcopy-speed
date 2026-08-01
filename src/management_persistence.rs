@@ -1,4 +1,8 @@
 use crate::management_orchestration::ManagedTransferRecord;
+use crate::management_queue::{
+    MAX_QUEUE_ENTRIES, QueuedTransfer, QueuedTransferId, QueuedTransferKind, QueuedTransferRequest,
+    QueuedTransferState, TransferQueue,
+};
 use crate::management_snapshot::{ManagementJobOutcome, ManagementJobResult, ManagementJobRole};
 use std::env;
 use std::fs::{self, File};
@@ -6,7 +10,9 @@ use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-const STATE_MAGIC: &str = "NCMS1";
+const STATE_MAGIC_V1: &str = "NCMS1";
+
+const STATE_MAGIC_V2: &str = "NCMS2";
 
 const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -39,6 +45,8 @@ pub struct ManagerPersistedState {
 
     pub update_existing: bool,
 
+    pub queue: TransferQueue,
+
     pub history: Vec<ManagerHistoryEntry>,
 }
 
@@ -58,6 +66,8 @@ impl Default for ManagerPersistedState {
             calibration_mib: 8,
 
             update_existing: false,
+
+            queue: TransferQueue::default(),
 
             history: Vec::new(),
         }
@@ -167,7 +177,7 @@ fn encode_state(state: &ManagerPersistedState) -> io::Result<String> {
 
     let mut output = String::new();
 
-    push_line(&mut output, STATE_MAGIC);
+    push_line(&mut output, STATE_MAGIC_V2);
 
     push_text_field(&mut output, "sender_agent", &state.sender_agent);
 
@@ -182,6 +192,8 @@ fn encode_state(state: &ManagerPersistedState) -> io::Result<String> {
     push_number_field(&mut output, "calibration_mib", state.calibration_mib);
 
     push_bool_field(&mut output, "update_existing", state.update_existing);
+
+    encode_queue(&state.queue, &mut output);
 
     push_number_field(&mut output, "history_count", state.history.len());
 
@@ -217,7 +229,17 @@ fn decode_state(text: &str) -> io::Result<ManagerPersistedState> {
 
     let mut lines = text.lines();
 
-    expect_line(&mut lines, STATE_MAGIC)?;
+    let has_queue = match required_line(&mut lines)? {
+        STATE_MAGIC_V1 => false,
+        STATE_MAGIC_V2 => true,
+
+        unknown => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("manager state used unsupported format {unknown:?}"),
+            ));
+        }
+    };
 
     let sender_agent = decode_text_field(required_line(&mut lines)?, "sender_agent")?;
 
@@ -232,6 +254,12 @@ fn decode_state(text: &str) -> io::Result<ManagerPersistedState> {
     let calibration_mib = parse_u64_field(required_line(&mut lines)?, "calibration_mib")?;
 
     let update_existing = parse_bool_field(required_line(&mut lines)?, "update_existing")?;
+
+    let queue = if has_queue {
+        decode_queue(&mut lines)?
+    } else {
+        TransferQueue::default()
+    };
 
     let history_count = parse_usize_field(required_line(&mut lines)?, "history_count")?;
 
@@ -274,12 +302,233 @@ fn decode_state(text: &str) -> io::Result<ManagerPersistedState> {
 
         update_existing,
 
+        queue,
+
         history,
     };
 
     validate_state(&state).map_err(invalid_data)?;
 
     Ok(state)
+}
+
+fn encode_queue(queue: &TransferQueue, output: &mut String) {
+    push_number_field(output, "queue_next_id", queue.next_id());
+
+    push_bool_field(
+        output,
+        "queue_paused_after_current",
+        queue.paused_after_current(),
+    );
+
+    push_number_field(output, "queue_count", queue.len());
+
+    for item in queue.items() {
+        push_line(output, "queue_begin");
+
+        push_number_field(output, "queue_id", item.id.get());
+
+        let (kind, resume_stream_count) = match item.request.kind {
+            QueuedTransferKind::Fresh => (0_u8, 0),
+
+            QueuedTransferKind::Resume { data_stream_count } => (1_u8, data_stream_count),
+        };
+
+        push_number_field(output, "queue_kind", kind);
+
+        push_number_field(output, "queue_resume_stream_count", resume_stream_count);
+
+        push_number_field(output, "queue_state", queue_state_code(item.state));
+
+        push_text_field(
+            output,
+            "queue_sender_agent",
+            &item.request.sender_agent.to_string(),
+        );
+
+        push_text_field(
+            output,
+            "queue_receiver_agent",
+            &item.request.receiver_agent.to_string(),
+        );
+
+        push_text_field(output, "queue_source_root", &item.request.source_root);
+
+        push_text_field(
+            output,
+            "queue_destination_root",
+            &item.request.destination_root,
+        );
+
+        push_bool_field(
+            output,
+            "queue_update_existing",
+            item.request.update_existing,
+        );
+
+        push_number_field(output, "queue_worker_count", item.request.worker_count);
+
+        push_number_field(
+            output,
+            "queue_calibration_mib",
+            item.request.calibration_mib,
+        );
+
+        push_text_field(output, "queue_status_message", &item.status_message);
+
+        push_line(output, "queue_end");
+    }
+}
+
+fn decode_queue(lines: &mut std::str::Lines<'_>) -> io::Result<TransferQueue> {
+    let next_id = parse_u64_field(required_line(lines)?, "queue_next_id")?;
+
+    let paused_after_current =
+        parse_bool_field(required_line(lines)?, "queue_paused_after_current")?;
+
+    let count = parse_usize_field(required_line(lines)?, "queue_count")?;
+
+    if count > MAX_QUEUE_ENTRIES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "manager state contains {count} queue entries, exceeding the {MAX_QUEUE_ENTRIES} entry limit"
+            ),
+        ));
+    }
+
+    let mut items = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        items.push(decode_queue_entry(lines)?);
+    }
+
+    TransferQueue::from_parts(next_id, paused_after_current, items)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn decode_queue_entry(lines: &mut std::str::Lines<'_>) -> io::Result<QueuedTransfer> {
+    expect_line(lines, "queue_begin")?;
+
+    let id_value = parse_u64_field(required_line(lines)?, "queue_id")?;
+
+    let id = QueuedTransferId::from_raw(id_value).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "persisted queue entry used ID zero",
+        )
+    })?;
+
+    let kind_code = parse_u8_field(required_line(lines)?, "queue_kind")?;
+
+    let resume_stream_count =
+        parse_usize_field(required_line(lines)?, "queue_resume_stream_count")?;
+
+    let kind = match (kind_code, resume_stream_count) {
+        (0, 0) => QueuedTransferKind::Fresh,
+
+        (0, _) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fresh queued transfer used a resume stream count",
+            ));
+        }
+
+        (1, 0) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resumed queued transfer used stream count zero",
+            ));
+        }
+
+        (1, data_stream_count) => QueuedTransferKind::Resume { data_stream_count },
+
+        (unknown, _) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("queued transfer used unknown kind {unknown}"),
+            ));
+        }
+    };
+
+    let state = decode_queue_state(parse_u8_field(required_line(lines)?, "queue_state")?)?;
+
+    let sender_agent = parse_socket_address(
+        &decode_text_field(required_line(lines)?, "queue_sender_agent")?,
+        "queued sender agent",
+    )?;
+
+    let receiver_agent = parse_socket_address(
+        &decode_text_field(required_line(lines)?, "queue_receiver_agent")?,
+        "queued receiver agent",
+    )?;
+
+    let source_root = decode_text_field(required_line(lines)?, "queue_source_root")?;
+
+    let destination_root = decode_text_field(required_line(lines)?, "queue_destination_root")?;
+
+    let update_existing = parse_bool_field(required_line(lines)?, "queue_update_existing")?;
+
+    let worker_count = parse_usize_field(required_line(lines)?, "queue_worker_count")?;
+
+    let calibration_mib = parse_u64_field(required_line(lines)?, "queue_calibration_mib")?;
+
+    let status_message = decode_text_field(required_line(lines)?, "queue_status_message")?;
+
+    expect_line(lines, "queue_end")?;
+
+    Ok(QueuedTransfer {
+        id,
+
+        request: QueuedTransferRequest {
+            sender_agent,
+
+            receiver_agent,
+
+            source_root,
+
+            destination_root,
+
+            update_existing,
+
+            worker_count,
+
+            calibration_mib,
+
+            kind,
+        },
+
+        state,
+
+        status_message,
+    })
+}
+
+const fn queue_state_code(state: QueuedTransferState) -> u8 {
+    match state {
+        QueuedTransferState::Pending => 0,
+        QueuedTransferState::Running => 1,
+        QueuedTransferState::Blocked => 2,
+        QueuedTransferState::Failed => 3,
+        QueuedTransferState::Completed => 4,
+        QueuedTransferState::Cancelled => 5,
+    }
+}
+
+fn decode_queue_state(value: u8) -> io::Result<QueuedTransferState> {
+    match value {
+        0 => Ok(QueuedTransferState::Pending),
+        1 => Ok(QueuedTransferState::Running),
+        2 => Ok(QueuedTransferState::Blocked),
+        3 => Ok(QueuedTransferState::Failed),
+        4 => Ok(QueuedTransferState::Completed),
+        5 => Ok(QueuedTransferState::Cancelled),
+
+        unknown => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("queued transfer used unknown state {unknown}"),
+        )),
+    }
 }
 
 fn encode_history_entry(entry: &ManagerHistoryEntry, output: &mut String) {
@@ -500,6 +749,11 @@ fn validate_state(state: &ManagerPersistedState) -> io::Result<()> {
     validate_text(&state.source_root, "source root")?;
 
     validate_text(&state.destination_root, "destination root")?;
+
+    state
+        .queue
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
     for entry in &state.history {
         validate_history_entry(entry)?;
@@ -762,6 +1016,9 @@ mod tests {
         ManagerHistoryEntry, ManagerPersistedState, decode_state, encode_state, load_from, save_to,
     };
     use crate::management_orchestration::ManagedTransferRecord;
+    use crate::management_queue::{
+        QueuedTransferKind, QueuedTransferRequest, QueuedTransferState, TransferQueue,
+    };
     use crate::management_snapshot::{
         ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
     };
@@ -792,6 +1049,68 @@ mod tests {
             calibration_mib: 8,
         };
 
+        let mut queue = TransferQueue::default();
+
+        let desktop = queue
+            .add(QueuedTransferRequest {
+                sender_agent: "127.0.0.1:7339".parse().unwrap(),
+
+                receiver_agent: "127.0.0.2:7339".parse().unwrap(),
+
+                source_root: r"C:\Users\User\Desktop".to_string(),
+
+                destination_root: r"D:\Backup\Desktop".to_string(),
+
+                update_existing: true,
+
+                worker_count: 4,
+
+                calibration_mib: 8,
+
+                kind: QueuedTransferKind::Fresh,
+            })
+            .unwrap();
+
+        queue
+            .set_state(
+                desktop,
+                QueuedTransferState::Completed,
+                "Transfer completed",
+            )
+            .unwrap();
+
+        let documents = queue
+            .add(QueuedTransferRequest {
+                sender_agent: "127.0.0.1:7339".parse().unwrap(),
+
+                receiver_agent: "127.0.0.2:7339".parse().unwrap(),
+
+                source_root: r"C:\Users\User\Documents".to_string(),
+
+                destination_root: r"D:\Backup\Documents".to_string(),
+
+                update_existing: true,
+
+                worker_count: 4,
+
+                calibration_mib: 8,
+
+                kind: QueuedTransferKind::Resume {
+                    data_stream_count: 4,
+                },
+            })
+            .unwrap();
+
+        queue
+            .set_state(
+                documents,
+                QueuedTransferState::Failed,
+                "Transfer interrupted",
+            )
+            .unwrap();
+
+        queue.set_paused_after_current(true);
+
         ManagerPersistedState {
             sender_agent: "127.0.0.1:7339".to_string(),
 
@@ -806,6 +1125,8 @@ mod tests {
             calibration_mib: 8,
 
             update_existing: true,
+
+            queue,
 
             history: vec![ManagerHistoryEntry {
                 sender_result: ManagementJobResult {
@@ -849,11 +1170,58 @@ mod tests {
         }
     }
 
+    fn encode_v1_state(state: &ManagerPersistedState) -> String {
+        let mut output = String::new();
+
+        super::push_line(&mut output, super::STATE_MAGIC_V1);
+
+        super::push_text_field(&mut output, "sender_agent", &state.sender_agent);
+
+        super::push_text_field(&mut output, "receiver_agent", &state.receiver_agent);
+
+        super::push_text_field(&mut output, "source_root", &state.source_root);
+
+        super::push_text_field(&mut output, "destination_root", &state.destination_root);
+
+        super::push_number_field(&mut output, "worker_count", state.worker_count);
+
+        super::push_number_field(&mut output, "calibration_mib", state.calibration_mib);
+
+        super::push_bool_field(&mut output, "update_existing", state.update_existing);
+
+        super::push_number_field(&mut output, "history_count", state.history.len());
+
+        for entry in &state.history {
+            super::encode_history_entry(entry, &mut output);
+        }
+
+        super::push_line(&mut output, "end");
+
+        output
+    }
+
     #[test]
     fn manager_state_round_trips() {
         let expected = example_state();
 
         let encoded = encode_state(&expected).unwrap();
+
+        assert!(encoded.starts_with("NCMS2\n"));
+
+        let decoded = decode_state(&encoded).unwrap();
+
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn version_one_state_loads_with_empty_queue() {
+        let source = example_state();
+
+        let encoded = encode_v1_state(&source);
+
+        let mut expected = source;
+
+        expected.queue = TransferQueue::default();
 
         let decoded = decode_state(&encoded).unwrap();
 

@@ -11,6 +11,7 @@ use networkcopy_speed::management_orchestration::{
     self, ManagedTransferRecord, ManagedTransferRequest,
 };
 use networkcopy_speed::management_persistence::{self, ManagerHistoryEntry, ManagerPersistedState};
+use networkcopy_speed::management_queue::TransferQueue;
 use networkcopy_speed::management_reconnect;
 use networkcopy_speed::management_snapshot::{
     ManagementAgentSnapshot, ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
@@ -367,6 +368,8 @@ struct NetworkCopyManager {
 
     receiver_snapshot: Option<ManagementAgentSnapshot>,
 
+    queue: TransferQueue,
+
     history: VecDeque<PairedTransferHistoryEntry>,
 
     state_path: Option<PathBuf>,
@@ -438,6 +441,8 @@ impl NetworkCopyManager {
             sender_snapshot: None,
 
             receiver_snapshot: None,
+
+            queue: TransferQueue::default(),
 
             history: VecDeque::new(),
 
@@ -511,6 +516,8 @@ impl NetworkCopyManager {
 
         self.update_existing = state.update_existing;
 
+        self.queue = state.queue;
+
         self.history = state
             .history
             .into_iter()
@@ -540,6 +547,8 @@ impl NetworkCopyManager {
             calibration_mib: self.calibration_mib,
 
             update_existing: self.update_existing,
+
+            queue: self.queue.clone(),
 
             history: self
                 .history
