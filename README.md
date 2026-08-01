@@ -179,7 +179,7 @@ Initial v2.2 scope:
 - [x] add an initial separate WGPU management application;
 - [x] add remote dual-pane folder browsing to the management application;
 - [x] add paired session history and richer diagnostics to the management application;
-- [ ] persist management transfer history across manager restarts;
+- [x] persist management configuration and transfer history across manager restarts;
 - [ ] test three-machine orchestration on a physical LAN.
 
 The first v2.2 management release will intentionally use a trusted-LAN model
@@ -347,6 +347,12 @@ agents and click **Attach to active jobs**. The manager reads both active
 snapshots, verifies that the sender targets the selected receiver payload
 endpoint, reconstructs the paired job record, and resumes live monitoring and
 cancellation without restarting the transfer.
+
+The manager saves its last-used endpoint addresses, remote paths, transfer
+settings, and the 20 retained history cards beneath the current user's
+`%LOCALAPPDATA%\NetworkCopy Speed Edition` directory. State replacement uses
+temporary and backup files, and a missing state file is treated as a normal
+first launch.
 
 The manager is not part of the payload path. Closing it does not terminate a
 transfer that has already been accepted by both endpoint agents.

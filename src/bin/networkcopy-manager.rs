@@ -10,13 +10,14 @@ use networkcopy_speed::management_discovery::{self, DiscoveredAgent};
 use networkcopy_speed::management_orchestration::{
     self, ManagedTransferRecord, ManagedTransferRequest,
 };
+use networkcopy_speed::management_persistence::{self, ManagerHistoryEntry, ManagerPersistedState};
 use networkcopy_speed::management_reconnect;
 use networkcopy_speed::management_snapshot::{
     ManagementAgentSnapshot, ManagementJobOutcome, ManagementJobResult,
 };
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,6 +31,8 @@ const REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 const REMOTE_BROWSER_HEIGHT: f32 = 460.0;
 
 const MAX_TRANSFER_HISTORY: usize = 20;
+
+const STATE_SAVE_INTERVAL: Duration = Duration::from_millis(750);
 
 type DiscoveryResult = Result<Vec<DiscoveredAgent>, String>;
 
@@ -302,6 +305,14 @@ struct NetworkCopyManager {
 
     history: VecDeque<PairedTransferHistoryEntry>,
 
+    state_path: Option<PathBuf>,
+
+    last_saved_state: Option<ManagerPersistedState>,
+
+    last_state_save: Instant,
+
+    persistence_error: String,
+
     monitoring_complete: bool,
 
     last_poll: Instant,
@@ -313,6 +324,8 @@ struct NetworkCopyManager {
 
 impl NetworkCopyManager {
     fn new() -> Self {
+        let state_path = management_persistence::default_state_path();
+
         let mut manager = Self {
             agents: Vec::new(),
 
@@ -352,6 +365,14 @@ impl NetworkCopyManager {
 
             history: VecDeque::new(),
 
+            state_path: state_path.as_ref().ok().cloned(),
+
+            last_saved_state: None,
+
+            last_state_save: Instant::now(),
+
+            persistence_error: String::new(),
+
             monitoring_complete: false,
 
             last_poll: Instant::now(),
@@ -363,7 +384,136 @@ impl NetworkCopyManager {
 
         manager.begin_discovery();
 
+        match state_path {
+            Ok(_) => {
+                manager.restore_persisted_state();
+            }
+
+            Err(error) => {
+                manager.persistence_error = format!("Manager state path is unavailable: {error}");
+            }
+        }
+
         manager
+    }
+
+    fn restore_persisted_state(&mut self) {
+        let Some(path) = self.state_path.clone() else {
+            return;
+        };
+
+        match management_persistence::load_from(&path) {
+            Ok(Some(state)) => {
+                self.apply_persisted_state(state.clone());
+
+                self.last_saved_state = Some(state);
+
+                self.notice =
+                    "Restored saved manager configuration and transfer history.".to_string();
+            }
+
+            Ok(None) => {}
+
+            Err(error) => {
+                self.persistence_error = format!("Failed to load {}: {error}", path.display(),);
+            }
+        }
+    }
+
+    fn apply_persisted_state(&mut self, state: ManagerPersistedState) {
+        self.sender_agent = state.sender_agent;
+
+        self.receiver_agent = state.receiver_agent;
+
+        self.source_root = state.source_root;
+
+        self.destination_root = state.destination_root;
+
+        self.worker_count = state.worker_count;
+
+        self.calibration_mib = state.calibration_mib;
+
+        self.update_existing = state.update_existing;
+
+        self.history = state
+            .history
+            .into_iter()
+            .take(MAX_TRANSFER_HISTORY)
+            .map(|entry| PairedTransferHistoryEntry {
+                transfer: entry.transfer,
+
+                sender_result: entry.sender_result,
+
+                receiver_result: entry.receiver_result,
+            })
+            .collect();
+    }
+
+    fn persisted_state(&self) -> ManagerPersistedState {
+        ManagerPersistedState {
+            sender_agent: self.sender_agent.clone(),
+
+            receiver_agent: self.receiver_agent.clone(),
+
+            source_root: self.source_root.clone(),
+
+            destination_root: self.destination_root.clone(),
+
+            worker_count: self.worker_count,
+
+            calibration_mib: self.calibration_mib,
+
+            update_existing: self.update_existing,
+
+            history: self
+                .history
+                .iter()
+                .take(MAX_TRANSFER_HISTORY)
+                .map(|entry| ManagerHistoryEntry {
+                    transfer: entry.transfer.clone(),
+
+                    sender_result: entry.sender_result.clone(),
+
+                    receiver_result: entry.receiver_result.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    fn persist_state_if_needed(&mut self, context: &egui::Context) {
+        let Some(path) = self.state_path.clone() else {
+            return;
+        };
+
+        let state = self.persisted_state();
+
+        if self.last_saved_state.as_ref() == Some(&state) {
+            return;
+        }
+
+        let elapsed = self.last_state_save.elapsed();
+
+        if elapsed < STATE_SAVE_INTERVAL {
+            context.request_repaint_after(STATE_SAVE_INTERVAL - elapsed);
+
+            return;
+        }
+
+        self.last_state_save = Instant::now();
+
+        match management_persistence::save_to(&path, &state) {
+            Ok(()) => {
+                self.last_saved_state = Some(state);
+
+                self.persistence_error.clear();
+            }
+
+            Err(error) => {
+                self.persistence_error = format!("Failed to save {}: {error}", path.display(),);
+
+                context.request_repaint_after(STATE_SAVE_INTERVAL);
+            }
+        }
     }
 
     fn begin_discovery(&mut self) {
@@ -1402,6 +1552,10 @@ impl eframe::App for NetworkCopyManager {
                             "Trusted-LAN development mode — management traffic is currently unauthenticated.",
                         );
 
+                        if let Some(path) = &self.state_path {
+                            ui.label(format!("Manager state: {}", path.display(),));
+                        }
+
                         ui.add_space(12.0);
 
                         ui.separator();
@@ -1462,9 +1616,23 @@ impl eframe::App for NetworkCopyManager {
                             );
                         }
 
+                        if !self.persistence_error.is_empty() {
+                            ui.add_space(12.0);
+
+                            ui.separator();
+
+                            ui.add_space(8.0);
+
+                            ui.strong("State persistence");
+
+                            ui.label(&self.persistence_error);
+                        }
+
                         ui.add_space(16.0);
                     });
             });
+
+        self.persist_state_if_needed(ui.ctx());
     }
 }
 

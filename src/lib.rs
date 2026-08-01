@@ -32,6 +32,7 @@ pub mod management_discovery;
 mod management_filesystem;
 pub mod management_jobs;
 pub mod management_orchestration;
+pub mod management_persistence;
 pub mod management_protocol;
 pub mod management_reconnect;
 pub mod management_snapshot;
