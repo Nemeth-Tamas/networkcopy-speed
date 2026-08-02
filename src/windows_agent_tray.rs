@@ -222,14 +222,15 @@ unsafe extern "system" fn tray_window_proc(
         TRAY_CALLBACK_MESSAGE => {
             match lparam as u32 {
                 WM_LBUTTONDBLCLK => {
-                    show_status_notification();
+                    show_status_notification(window);
                 }
 
                 WM_RBUTTONUP => {
                     if let Err(error) = show_context_menu(window) {
                         let body = format!("The agent tray menu could not open: {error}",);
 
-                        let _ = windows_notification::show(
+                        show_tray_notification(
+                            window,
                             NotificationKind::Error,
                             "Agent tray error",
                             &body,
@@ -322,7 +323,7 @@ fn show_context_menu(window: HWND) -> io::Result<()> {
 
         match command as u32 {
             MENU_SHOW_STATUS => {
-                show_status_notification();
+                show_status_notification(window);
             }
 
             MENU_EXIT_IDLE => {
@@ -385,7 +386,7 @@ fn update_tooltip(window: HWND) -> io::Result<()> {
     Ok(())
 }
 
-fn show_status_notification() {
+fn show_status_notification(window: HWND) {
     let status = query_agent_status();
 
     let (kind, title, body) = match status {
@@ -408,8 +409,14 @@ fn show_status_notification() {
         ),
     };
 
-    if let Err(error) = windows_notification::show(kind, title, &body) {
-        eprintln!("Agent status notification failed: {error}",);
+    show_tray_notification(window, kind, title, &body);
+}
+
+fn show_tray_notification(window: HWND, kind: NotificationKind, title: &str, body: &str) {
+    if let Err(error) =
+        windows_notification::show_on_existing_icon(window, TRAY_ICON_ID, kind, title, body)
+    {
+        eprintln!("Agent tray notification failed: {error}",);
     }
 }
 
@@ -426,11 +433,12 @@ fn exit_idle_agent(window: HWND) {
                 "{hostname} has an active transfer. Exit was refused so the transfer remains untouched.",
             );
 
-            let _ = windows_notification::show(NotificationKind::Warning, "Agent is busy", &body);
+            show_tray_notification(window, NotificationKind::Warning, "Agent is busy", &body);
         }
 
         AgentTrayStatus::Unavailable { message } => {
-            let _ = windows_notification::show(
+            show_tray_notification(
+                window,
                 NotificationKind::Error,
                 "Agent state unavailable",
                 &message,

@@ -47,3 +47,26 @@ pub(crate) fn load_executable_icon() -> io::Result<OwnedIcon> {
 
     Ok(OwnedIcon { handle: small_icon })
 }
+
+pub(crate) fn load_executable_large_icon() -> io::Result<OwnedIcon> {
+    let executable = env::current_exe()?;
+
+    let executable = executable
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+
+    let mut large_icon: HICON = null_mut();
+
+    let extracted =
+        unsafe { ExtractIconExW(executable.as_ptr(), 0, &mut large_icon, null_mut(), 1) };
+
+    if extracted == 0 || large_icon.is_null() {
+        return Err(io::Error::other(
+            "the embedded large NetworkCopy executable icon could not be extracted",
+        ));
+    }
+
+    Ok(OwnedIcon { handle: large_icon })
+}
