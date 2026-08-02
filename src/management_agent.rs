@@ -1,4 +1,6 @@
-use crate::{direct_address, management_discovery, management_protocol, windows_setup};
+use crate::{
+    direct_address, direct_discovery, management_discovery, management_protocol, windows_setup,
+};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
@@ -14,6 +16,8 @@ pub fn run() -> io::Result<()> {
     )))?;
 
     windows_setup::prepare_discovery_receiver(management_protocol::MANAGEMENT_DISCOVERY_PORT)?;
+
+    windows_setup::prepare_discovery_receiver(direct_discovery::DISCOVERY_PORT)?;
 
     management_discovery::run_agent()
 }

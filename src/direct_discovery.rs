@@ -218,21 +218,32 @@ fn automatic_direct_candidates() -> io::Result<direct_route::RouteCandidates> {
 }
 
 pub(crate) fn receive_all() -> io::Result<()> {
-    receive_automatically(false, None).map(|_| ())
+    receive_automatically(false, None, DIRECT_TRANSFER_PORT).map(|_| ())
+}
+
+pub(crate) fn receive_all_on_port(offer_port: u16) -> io::Result<()> {
+    receive_automatically(false, None, offer_port).map(|_| ())
 }
 
 pub(crate) fn receive_one() -> io::Result<ReceivedPath> {
-    receive_automatically(true, None)
+    receive_automatically(true, None, DIRECT_TRANSFER_PORT)
 }
 
 pub(crate) fn receive_one_with_progress(progress: &ProgressCounter) -> io::Result<ReceivedPath> {
-    receive_automatically(true, Some(progress))
+    receive_automatically(true, Some(progress), DIRECT_TRANSFER_PORT)
 }
 
 fn receive_automatically(
     stop_after_first: bool,
     progress: Option<&ProgressCounter>,
+    offer_port: u16,
 ) -> io::Result<ReceivedPath> {
+    if offer_port == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "direct discovery offer port must not be zero",
+        ));
+    }
     check_cancelled(progress)?;
 
     let candidates = automatic_direct_candidates()?;
@@ -257,15 +268,16 @@ fn receive_automatically(
         }
     }
 
-    let (ipv4_receiver, ipv4_warning) = match direct_discovery_v4::receiver(&interface_indices) {
-        Ok(receiver) => (receiver, None),
+    let (ipv4_receiver, ipv4_warning) =
+        match direct_discovery_v4::receiver(&interface_indices, offer_port) {
+            Ok(receiver) => (receiver, None),
 
-        Err(error) if !local_endpoints.is_empty() => (None, Some(error.to_string())),
+            Err(error) if !local_endpoints.is_empty() => (None, Some(error.to_string())),
 
-        Err(error) => {
-            return Err(error);
-        }
-    };
+            Err(error) => {
+                return Err(error);
+            }
+        };
 
     if local_endpoints.is_empty() && ipv4_receiver.is_none() {
         return Err(io::Error::new(
@@ -327,10 +339,7 @@ fn receive_automatically(
 
     println!();
 
-    println!(
-        "  Transfer port:       {}",
-        direct_address::DIRECT_TRANSFER_PORT,
-    );
+    println!("  Advertised port:     {}", offer_port,);
 
     println!();
     println!("Waiting for direct-link probes...");
@@ -339,7 +348,7 @@ fn receive_automatically(
         check_cancelled(progress)?;
 
         if let Some(socket) = &ipv6_socket
-            && let Some(path) = receive_ipv6_probe(socket, &interface_indices)?
+            && let Some(path) = receive_ipv6_probe(socket, &interface_indices, offer_port)?
             && stop_after_first
         {
             return Ok(path);
@@ -387,6 +396,7 @@ fn bind_ipv6_receiver() -> io::Result<UdpSocket> {
 fn receive_ipv6_probe(
     socket: &UdpSocket,
     interface_indices: &[u32],
+    offer_port: u16,
 ) -> io::Result<Option<ReceivedPath>> {
     let mut buffer = [0_u8; 256];
 
@@ -429,7 +439,7 @@ fn receive_ipv6_probe(
         return Ok(None);
     };
 
-    let offer = DiscoveryPacket::offer(packet.nonce, direct_address::DIRECT_TRANSFER_PORT);
+    let offer = DiscoveryPacket::offer(packet.nonce, offer_port);
 
     socket.send_to(&offer.encode(), reply_target)?;
 
@@ -438,8 +448,7 @@ fn receive_ipv6_probe(
         reply_target, interface_index,
     );
 
-    let local_endpoint =
-        direct_address::link_local_endpoint(interface_index, direct_address::DIRECT_TRANSFER_PORT)?;
+    let local_endpoint = direct_address::link_local_endpoint(interface_index, offer_port)?;
 
     Ok(Some(ReceivedPath {
         interface_index,

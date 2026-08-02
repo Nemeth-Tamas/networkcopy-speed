@@ -1,9 +1,13 @@
 use crate::direct_address;
+use crate::direct_discovery::{self, DiscoveredPath};
 use crate::direct_link;
 use crate::direct_route;
+use crate::management_control::{self, ManagementHello};
+use crate::management_discovery::DiscoveredAgent;
 use crate::management_protocol::MANAGEMENT_CONTROL_PORT;
 use std::io;
 use std::net::SocketAddr;
+use std::thread;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DirectManagementCandidate {
@@ -31,6 +35,15 @@ pub struct DirectManagementCandidateReport {
     pub routed_interface_indices: Vec<u32>,
 
     pub addressless_interface_indices: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectDiscoveredAgent {
+    pub interface_index: u32,
+
+    pub local_endpoint: SocketAddr,
+
+    pub agent: DiscoveredAgent,
 }
 
 pub fn discover_candidates() -> io::Result<DirectManagementCandidateReport> {
@@ -81,6 +94,108 @@ pub fn discover_candidates() -> io::Result<DirectManagementCandidateReport> {
     })
 }
 
+pub fn spawn_responder() -> io::Result<usize> {
+    let report = match discover_candidates() {
+        Ok(report) => report,
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(0);
+        }
+
+        Err(error) => {
+            return Err(error);
+        }
+    };
+
+    let interface_count = report.candidates.len();
+
+    if interface_count == 0 {
+        return Ok(0);
+    }
+
+    thread::Builder::new()
+        .name("networkcopy-management-direct-discovery".to_string())
+        .spawn(|| {
+            if let Err(error) = direct_discovery::receive_all_on_port(MANAGEMENT_CONTROL_PORT) {
+                eprintln!("Direct Link management discovery responder failed: {error}",);
+            }
+        })?;
+
+    Ok(interface_count)
+}
+
+pub fn discover_agents() -> io::Result<Vec<DirectDiscoveredAgent>> {
+    let paths = direct_discovery::discover_all()?;
+
+    let mut agents = Vec::new();
+
+    let mut failures = Vec::new();
+
+    for path in paths {
+        match management_control::hello(path.endpoint) {
+            Ok(hello) => {
+                agents.push(direct_agent_from_hello(path, hello));
+            }
+
+            Err(error) => {
+                failures.push(format!(
+                    "{} through interface {}: {error}",
+                    path.endpoint, path.interface_index,
+                ));
+            }
+        }
+    }
+
+    if agents.is_empty() {
+        let details = if failures.is_empty() {
+            "no Direct Link discovery response identified a management agent".to_string()
+        } else {
+            failures.join("; ")
+        };
+
+        return Err(io::Error::new(io::ErrorKind::NotFound, details));
+    }
+
+    agents.sort_by(|left, right| {
+        left.agent
+            .hostname
+            .cmp(&right.agent.hostname)
+            .then_with(|| left.interface_index.cmp(&right.interface_index))
+            .then_with(|| {
+                left.agent
+                    .endpoint
+                    .to_string()
+                    .cmp(&right.agent.endpoint.to_string())
+            })
+    });
+
+    agents.dedup_by(|left, right| {
+        left.interface_index == right.interface_index && left.agent.endpoint == right.agent.endpoint
+    });
+
+    Ok(agents)
+}
+
+fn direct_agent_from_hello(path: DiscoveredPath, hello: ManagementHello) -> DirectDiscoveredAgent {
+    DirectDiscoveredAgent {
+        interface_index: path.interface_index,
+
+        local_endpoint: path.local_endpoint,
+
+        agent: DiscoveredAgent {
+            hostname: hello.hostname,
+
+            endpoint: path.endpoint,
+
+            protocol_version: hello.protocol_version,
+
+            state: hello.state,
+
+            capabilities: hello.capabilities,
+        },
+    }
+}
+
 fn candidate_from_endpoints(
     interface_index: u32,
     ipv6_endpoint: Option<SocketAddr>,
@@ -111,9 +226,56 @@ fn optional_endpoint(result: io::Result<SocketAddr>) -> io::Result<Option<Socket
 
 #[cfg(test)]
 mod tests {
-    use super::{DirectManagementCandidate, candidate_from_endpoints, optional_endpoint};
+    use super::{
+        DirectManagementCandidate, candidate_from_endpoints, direct_agent_from_hello,
+        optional_endpoint,
+    };
+    use crate::direct_discovery::DiscoveredPath;
+    use crate::management_control::ManagementHello;
+    use crate::management_discovery::{AgentCapabilities, AgentState};
     use std::io;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
+    #[test]
+    fn discovered_management_agent_preserves_direct_path() {
+        let local_endpoint = "[fe80::10%42]:7339".parse().unwrap();
+
+        let peer_endpoint = "[fe80::20%42]:7339".parse().unwrap();
+
+        let path = DiscoveredPath {
+            interface_index: 42,
+
+            local_endpoint,
+
+            endpoint: peer_endpoint,
+        };
+
+        let hello = ManagementHello {
+            hostname: "DIRECT-PC".to_string(),
+
+            application_version: "2.3.0-dev".to_string(),
+
+            protocol_version: 1,
+
+            state: AgentState::Idle,
+
+            capabilities: AgentCapabilities::SEND_RECEIVE,
+        };
+
+        let actual = direct_agent_from_hello(path, hello);
+
+        assert_eq!(actual.interface_index, 42,);
+
+        assert_eq!(actual.local_endpoint, local_endpoint,);
+
+        assert_eq!(actual.agent.endpoint, peer_endpoint,);
+
+        assert_eq!(actual.agent.hostname, "DIRECT-PC",);
+
+        assert!(actual.agent.capabilities.can_send(),);
+
+        assert!(actual.agent.capabilities.can_receive(),);
+    }
 
     #[test]
     fn scoped_ipv6_is_preferred_over_apipa() {

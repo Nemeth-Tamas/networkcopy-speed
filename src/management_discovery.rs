@@ -1,4 +1,5 @@
 use crate::management_control;
+use crate::management_direct;
 use crate::management_jobs::ManagementJobRegistry;
 use crate::management_protocol::{
     MANAGEMENT_CONTROL_PORT, MANAGEMENT_DISCOVERY_PORT, MANAGEMENT_PROTOCOL_VERSION,
@@ -375,7 +376,9 @@ pub fn run_agent() -> io::Result<()> {
         Arc::clone(&jobs),
     )?;
 
-    println!("NetworkCopy Speed Edition management agent");
+    let direct_interface_count = management_direct::spawn_responder()?;
+
+    println!("NetworkCopy Speed Edition management agent",);
 
     println!("  Computer:       {}", descriptor.hostname,);
 
@@ -384,6 +387,16 @@ pub fn run_agent() -> io::Result<()> {
     println!("  Control TCP v4: 0.0.0.0:{}", descriptor.control_port,);
 
     println!("  Control TCP v6: [::]:{}", descriptor.control_port,);
+
+    if direct_interface_count == 0 {
+        println!("  Direct Link:    inactive — no gateway-free Ethernet cable",);
+    } else {
+        println!(
+            "  Direct Link:    listening on {} interface{}",
+            direct_interface_count,
+            if direct_interface_count == 1 { "" } else { "s" },
+        );
+    }
 
     println!("  Protocol:       {}", MANAGEMENT_PROTOCOL_VERSION,);
 

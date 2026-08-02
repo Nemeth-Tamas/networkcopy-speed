@@ -1,5 +1,5 @@
 use crate::console_progress::ProgressCounter;
-use crate::direct_address::{self, DIRECT_TRANSFER_PORT};
+use crate::direct_address;
 use crate::direct_discovery::{DISCOVERY_PORT, DiscoveryKind, DiscoveryPacket};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
@@ -29,13 +29,17 @@ pub(crate) struct Ipv4ReceivedPath {
 
 pub(crate) struct Ipv4Receiver {
     interface_index: u32,
+
     local_endpoint: SocketAddrV4,
+
+    offer_port: u16,
+
     socket: UdpSocket,
 }
 
 impl Ipv4Receiver {
     pub(crate) fn local_endpoint(&self) -> SocketAddrV4 {
-        SocketAddrV4::new(*self.local_endpoint.ip(), DIRECT_TRANSFER_PORT)
+        SocketAddrV4::new(*self.local_endpoint.ip(), self.offer_port)
     }
 
     pub(crate) fn poll(&self) -> io::Result<Option<Ipv4ReceivedPath>> {
@@ -74,7 +78,7 @@ impl Ipv4Receiver {
             return Ok(None);
         }
 
-        let offer = DiscoveryPacket::offer(packet.nonce, DIRECT_TRANSFER_PORT);
+        let offer = DiscoveryPacket::offer(packet.nonce, self.offer_port);
 
         self.socket.send_to(&offer.encode(), source)?;
 
@@ -91,7 +95,16 @@ impl Ipv4Receiver {
     }
 }
 
-pub(crate) fn receiver(interface_indices: &[u32]) -> io::Result<Option<Ipv4Receiver>> {
+pub(crate) fn receiver(
+    interface_indices: &[u32],
+    offer_port: u16,
+) -> io::Result<Option<Ipv4Receiver>> {
+    if offer_port == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "direct discovery offer port must not be zero",
+        ));
+    }
     let mut endpoints = Vec::new();
 
     for interface_index in interface_indices {
@@ -142,7 +155,11 @@ pub(crate) fn receiver(interface_indices: &[u32]) -> io::Result<Option<Ipv4Recei
 
     Ok(Some(Ipv4Receiver {
         interface_index,
+
         local_endpoint,
+
+        offer_port,
+
         socket,
     }))
 }

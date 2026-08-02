@@ -115,6 +115,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         }
 
+        "management-direct-discover" => {
+            run_management_direct_discover(
+                &mut arguments,
+            )
+        }
+
         "management-hello" => {
             run_management_hello(
                 &mut arguments,
@@ -351,6 +357,105 @@ fn run_management_direct_candidates(
 
         println!(
             "No usable gateway-free Direct Link management interface is currently available.",
+        );
+    }
+
+    Ok(())
+}
+
+fn run_management_direct_discover(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    let agents =
+        crate::management_direct::discover_agents()?;
+
+    println!(
+        "NetworkCopy Speed Edition Direct Link management discovery",
+    );
+
+    println!();
+
+    println!(
+        "  Management agents found: {}",
+        agents.len(),
+    );
+
+    for discovered in agents {
+        println!();
+
+        println!(
+            "  Computer:        {}",
+            discovered.agent.hostname,
+        );
+
+        println!(
+            "  Interface index: {}",
+            discovered.interface_index,
+        );
+
+        println!(
+            "  Local endpoint:  {}",
+            discovered.local_endpoint,
+        );
+
+        println!(
+            "  Control endpoint: {}",
+            discovered.agent.endpoint,
+        );
+
+        println!(
+            "  Protocol:        {}",
+            discovered
+                .agent
+                .protocol_version,
+        );
+
+        println!(
+            "  State:           {}",
+            discovered.agent.state.label(),
+        );
+
+        println!(
+            "  Capabilities:    {}{}",
+            if discovered
+                .agent
+                .capabilities
+                .can_send()
+            {
+                "sender"
+            } else {
+                ""
+            },
+            if discovered
+                .agent
+                .capabilities
+                .can_send()
+                && discovered
+                    .agent
+                    .capabilities
+                    .can_receive()
+            {
+                ", receiver"
+            } else if discovered
+                .agent
+                .capabilities
+                .can_receive()
+            {
+                "receiver"
+            } else {
+                ""
+            },
         );
     }
 
