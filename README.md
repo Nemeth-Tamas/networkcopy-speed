@@ -229,21 +229,37 @@ The primary workflow is:
 
 ### Planned v2.3 scope
 
-- [ ] add stable-ID queued transfer requests;
-- [ ] persist queue order and state across manager restarts;
-- [ ] add, reorder, remove, and clear queue entries;
-- [ ] show the current, next, and remaining transfers;
-- [ ] start the next eligible transfer automatically;
-- [ ] detect unavailable, busy, and conflicting endpoints;
-- [ ] support pausing after the current transfer;
-- [ ] retain failed work and require an explicit retry, skip, or continuation;
-- [ ] queue journal-backed resume operations with their original stream count;
-- [ ] reconnect a restarted manager to the correct active queue item;
-- [ ] expose Automatic LAN, Direct Link, and Explicit IP manager route modes;
+- [x] add stable-ID queued transfer requests;
+- [x] persist queue order and state across manager restarts;
+- [x] add, reorder, remove, and clear queue entries;
+- [x] show the current, next, and remaining transfers;
+- [x] start the next eligible transfer automatically;
+- [x] detect unavailable, busy, and conflicting endpoints;
+- [x] support pausing after the current transfer;
+- [x] retain failed work and require an explicit retry, skip, or continuation;
+- [x] queue journal-backed resume operations with their original stream count;
+- [x] reconnect a restarted manager to the correct active queue item;
+- [x] expose Automatic LAN, Direct Link, and Explicit IP manager route modes;
 - [ ] add useful Windows completion, failure, pause, and action-required notifications;
 - [ ] add a small endpoint-agent tray control surface;
 - [ ] check GitHub Releases for newer stable versions and open the download flow;
 - [ ] complete physical three-machine and queued-transfer acceptance testing.
+
+### Managed Direct Link progress
+
+- [x] persist route intent in Manager configuration and queued requests;
+- [x] support functional Explicit IP management endpoints;
+- [x] add the Automatic LAN, Direct Link, and Explicit IP route selector;
+- [x] preserve route intent during queue execution and Manager restart recovery;
+- [x] add dual-stack IPv4 and IPv6 management-control listeners;
+- [x] preserve IPv6 link-local scope IDs through payload orchestration;
+- [x] enumerate strict connected physical Ethernet interfaces;
+- [x] reject Ethernet interfaces carrying a default route;
+- [x] prefer scoped IPv6 link-local management addresses with APIPA fallback;
+- [ ] probe management agents through each strict Direct Link interface;
+- [ ] expose responding Direct Link agents in the Manager;
+- [ ] start, resume, and reattach queued transfers through the selected direct route;
+- [ ] complete physical Direct Link Manager acceptance.
 
 Sequential reliability comes before concurrent execution. Transfers using fully
 disjoint endpoint pairs may run concurrently later if doing so does not make the
@@ -265,7 +281,7 @@ Management traffic remains intended for known and controlled local networks.
 Start an agent from an elevated terminal:
 
 ```powershell
-cargo run -- management-agent
+cargo run --bin networkcopy-agent
 ```
 
 For normal endpoint use, build or download the dedicated
@@ -282,19 +298,28 @@ switching to the dedicated executable.
 Discover agents from another computer on the same LAN:
 
 ```powershell
-cargo run -- management-discover
+cargo run --bin networkcopy-speed -- management-discover
+```
+
+Inspect strict gateway-free Direct Link management candidates:
+
+```powershell
+cargo run `
+    --bin networkcopy-speed `
+    -- `
+    management-direct-candidates
 ```
 
 Query the available Windows drive roots:
 
 ```powershell
-cargo run -- management-roots 127.0.0.1:7339
+cargo run --bin networkcopy-speed -- management-roots 127.0.0.1:7339
 ```
 
 Browse a remote directory:
 
 ```powershell
-cargo run -- management-list 127.0.0.1:7339 "C:\Users"
+cargo run --bin networkcopy-speed -- management-list 127.0.0.1:7339 "C:\Users"
 ```
 
 The WGPU management application uses this protocol to provide discovered-machine
@@ -304,19 +329,19 @@ destination without typing paths manually.
 Prepare a receiver destination on another computer:
 
 ```powershell
-cargo run -- management-prepare-receive 127.0.0.1:7339 "C:\Transfers\Corpus" --update
+cargo run --bin networkcopy-speed -- management-prepare-receive 127.0.0.1:7339 "C:\Transfers\Corpus" --update
 ```
 
 Inspect active management job state:
 
 ```powershell
-cargo run -- management-job-status 127.0.0.1:7339
+cargo run --bin networkcopy-speed -- management-job-status 127.0.0.1:7339
 ```
 
 Cancel a prepared management job:
 
 ```powershell
-cargo run -- management-cancel 127.0.0.1:7339 1
+cargo run --bin networkcopy-speed -- management-cancel 127.0.0.1:7339 1
 ```
 
 A prepared receiver now binds the production transfer listener on TCP port 7337
