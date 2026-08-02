@@ -381,7 +381,9 @@ pub fn run_agent() -> io::Result<()> {
 
     println!("  Discovery UDP:  0.0.0.0:{}", MANAGEMENT_DISCOVERY_PORT,);
 
-    println!("  Control TCP:    {}", descriptor.control_port,);
+    println!("  Control TCP v4: 0.0.0.0:{}", descriptor.control_port,);
+
+    println!("  Control TCP v6: [::]:{}", descriptor.control_port,);
 
     println!("  Protocol:       {}", MANAGEMENT_PROTOCOL_VERSION,);
 

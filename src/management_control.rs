@@ -10,8 +10,11 @@ use crate::management_protocol::{
     read_frame, write_frame,
 };
 use crate::management_snapshot::ManagementAgentSnapshot;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{
+    Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream,
+};
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +34,8 @@ const MAX_HOSTNAME_BYTES: usize = 255;
 const MAX_APPLICATION_VERSION_BYTES: usize = 64;
 
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+const CONTROL_LISTEN_BACKLOG: i32 = 128;
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -65,7 +70,7 @@ struct ManagementControlServer {
 }
 
 impl ManagementControlServer {
-    fn bind(
+    fn bind_ipv4(
         hostname: String,
         capabilities: AgentCapabilities,
         jobs: Arc<ManagementJobRegistry>,
@@ -78,6 +83,30 @@ impl ManagementControlServer {
             SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::UNSPECIFIED,
                 DIRECT_TRANSFER_PORT,
+            )),
+            hostname,
+            capabilities,
+            jobs,
+        )
+    }
+
+    fn bind_ipv6(
+        hostname: String,
+        capabilities: AgentCapabilities,
+        jobs: Arc<ManagementJobRegistry>,
+    ) -> io::Result<Self> {
+        Self::bind_at_with_receiver(
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::UNSPECIFIED,
+                MANAGEMENT_CONTROL_PORT,
+                0,
+                0,
+            )),
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::UNSPECIFIED,
+                DIRECT_TRANSFER_PORT,
+                0,
+                0,
             )),
             hostname,
             capabilities,
@@ -109,7 +138,7 @@ impl ManagementControlServer {
     ) -> io::Result<Self> {
         validate_text(&hostname, MAX_HOSTNAME_BYTES, "management hostname")?;
 
-        let listener = TcpListener::bind(address)?;
+        let listener = bind_control_listener(address)?;
 
         Ok(Self {
             listener,
@@ -335,18 +364,46 @@ impl ManagementControlServer {
     }
 }
 
+fn bind_control_listener(address: SocketAddr) -> io::Result<TcpListener> {
+    if address.is_ipv4() {
+        return TcpListener::bind(address);
+    }
+
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+
+    socket.set_only_v6(true)?;
+
+    socket.bind(&address.into())?;
+
+    socket.listen(CONTROL_LISTEN_BACKLOG)?;
+
+    Ok(socket.into())
+}
+
 pub(crate) fn spawn(
     hostname: String,
     capabilities: AgentCapabilities,
     jobs: Arc<ManagementJobRegistry>,
 ) -> io::Result<()> {
-    let server = ManagementControlServer::bind(hostname, capabilities, jobs)?;
+    let ipv4_server =
+        ManagementControlServer::bind_ipv4(hostname.clone(), capabilities, Arc::clone(&jobs))?;
 
+    let ipv6_server = ManagementControlServer::bind_ipv6(hostname, capabilities, jobs)?;
+
+    spawn_control_server("networkcopy-management-control-ipv4", ipv4_server)?;
+
+    spawn_control_server("networkcopy-management-control-ipv6", ipv6_server)
+}
+
+fn spawn_control_server(
+    thread_name: &'static str,
+    server: ManagementControlServer,
+) -> io::Result<()> {
     thread::Builder::new()
-        .name("networkcopy-management-control".to_string())
+        .name(thread_name.to_string())
         .spawn(move || {
             if let Err(error) = server.serve_forever() {
-                eprintln!("management control server failed: {error}");
+                eprintln!("{thread_name} failed: {error}",);
 
                 process::exit(1);
             }
@@ -966,7 +1023,7 @@ mod tests {
     use crate::management_protocol::MANAGEMENT_PROTOCOL_VERSION;
     use std::fs;
     use std::io;
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener};
     use std::process;
     use std::sync::Arc;
     use std::thread;
@@ -1002,6 +1059,67 @@ mod tests {
         assert!(response.capabilities.can_send(),);
 
         assert!(response.capabilities.can_receive(),);
+    }
+
+    #[test]
+    fn ipv6_loopback_hello_round_trips() {
+        let server = ManagementControlServer::bind_at(
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0)),
+            "IPV6-LOOPBACK-PC".to_string(),
+            AgentCapabilities::SEND_RECEIVE,
+        )
+        .unwrap();
+
+        let endpoint = server.local_addr().unwrap();
+
+        assert!(endpoint.is_ipv6());
+
+        let server_thread = thread::spawn(move || {
+            server.serve_one().unwrap();
+        });
+
+        let response = hello(endpoint).unwrap();
+
+        server_thread.join().unwrap();
+
+        assert_eq!(response.hostname, "IPV6-LOOPBACK-PC",);
+
+        assert_eq!(response.application_version, env!("CARGO_PKG_VERSION"),);
+
+        assert_eq!(response.protocol_version, MANAGEMENT_PROTOCOL_VERSION,);
+
+        assert_eq!(response.state, AgentState::Idle,);
+
+        assert!(response.capabilities.can_send(),);
+
+        assert!(response.capabilities.can_receive(),);
+    }
+
+    #[test]
+    fn ipv4_and_ipv6_listeners_can_share_port() {
+        let ipv4 = ManagementControlServer::bind_at(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            "IPV4-PC".to_string(),
+            AgentCapabilities::SEND_RECEIVE,
+        )
+        .unwrap();
+
+        let port = ipv4.local_addr().unwrap().port();
+
+        let ipv6 = ManagementControlServer::bind_at(
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, port, 0, 0)),
+            "IPV6-PC".to_string(),
+            AgentCapabilities::SEND_RECEIVE,
+        )
+        .unwrap();
+
+        assert_eq!(ipv4.local_addr().unwrap().port(), port,);
+
+        assert_eq!(ipv6.local_addr().unwrap().port(), port,);
+
+        assert!(ipv4.local_addr().unwrap().is_ipv4(),);
+
+        assert!(ipv6.local_addr().unwrap().is_ipv6(),);
     }
 
     #[test]
