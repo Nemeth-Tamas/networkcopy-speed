@@ -6,7 +6,7 @@
 use eframe::egui;
 use networkcopy_speed::management_control;
 use networkcopy_speed::management_directory::{ManagementDirectoryEntry, ManagementEntryKind};
-use networkcopy_speed::management_discovery::{self, DiscoveredAgent};
+use networkcopy_speed::management_discovery::{self, AgentState, DiscoveredAgent};
 use networkcopy_speed::management_orchestration::{
     self, ManagedTransferRecord, ManagedTransferRequest,
 };
@@ -40,7 +40,39 @@ const STATE_SAVE_INTERVAL: Duration = Duration::from_millis(750);
 
 type DiscoveryResult = Result<Vec<DiscoveredAgent>, String>;
 
-type StartResult = Result<ManagedTransferRecord, String>;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedStartFailureKind {
+    Blocked,
+
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedStartFailure {
+    kind: ManagedStartFailureKind,
+
+    message: String,
+}
+
+impl ManagedStartFailure {
+    fn blocked(message: impl Into<String>) -> Self {
+        Self {
+            kind: ManagedStartFailureKind::Blocked,
+
+            message: message.into(),
+        }
+    }
+
+    fn failed(message: impl Into<String>) -> Self {
+        Self {
+            kind: ManagedStartFailureKind::Failed,
+
+            message: message.into(),
+        }
+    }
+}
+
+type StartResult = Result<ManagedTransferRecord, ManagedStartFailure>;
 
 type AttachResult = Result<
     (
@@ -513,8 +545,7 @@ impl NetworkCopyManager {
 
         match management_persistence::load_from(&path) {
             Ok(Some(state)) => {
-                let reattaching_queue_item =
-                    self.apply_persisted_state(state.clone());
+                let reattaching_queue_item = self.apply_persisted_state(state.clone());
 
                 self.last_saved_state = Some(state);
 
@@ -533,10 +564,7 @@ impl NetworkCopyManager {
         }
     }
 
-    fn apply_persisted_state(
-        &mut self,
-        state: ManagerPersistedState,
-    ) -> bool {
+    fn apply_persisted_state(&mut self, state: ManagerPersistedState) -> bool {
         self.sender_agent = state.sender_agent;
 
         self.receiver_agent = state.receiver_agent;
@@ -556,9 +584,7 @@ impl NetworkCopyManager {
         let mut running_items = queue
             .items()
             .iter()
-            .filter(|item| {
-                item.state == QueuedTransferState::Running
-            })
+            .filter(|item| item.state == QueuedTransferState::Running)
             .cloned()
             .collect::<Vec<_>>();
 
@@ -915,43 +941,68 @@ impl NetworkCopyManager {
         self.start_receiver = Some(receiver);
 
         thread::spawn(move || {
-            let result = match kind {
-                QueuedTransferKind::Fresh => {
-                    management_orchestration::start_transfer(managed_request)
-                        .map_err(|error| format!("Queued managed transfer startup failed: {error}"))
-                }
+            let result = match preflight_queue_endpoints(&managed_request) {
+                Err(error) => Err(error),
 
-                QueuedTransferKind::Resume { data_stream_count } => {
-                    management_orchestration::resume_transfer(managed_request, data_stream_count)
-                        .map_err(|error| format!("Queued managed transfer resume failed: {error}"))
-                }
+                Ok(()) => match kind {
+                    QueuedTransferKind::Fresh => {
+                        management_orchestration::start_transfer(managed_request).map_err(|error| {
+                            ManagedStartFailure::failed(format!(
+                                "Queued managed transfer startup failed: {error}",
+                            ))
+                        })
+                    }
+
+                    QueuedTransferKind::Resume { data_stream_count } => {
+                        management_orchestration::resume_transfer(
+                            managed_request,
+                            data_stream_count,
+                        )
+                        .map_err(|error| {
+                            ManagedStartFailure::failed(format!(
+                                "Queued managed transfer resume failed: {error}",
+                            ))
+                        })
+                    }
+                },
             };
 
             let _ = sender.send(result);
         });
     }
 
-    fn fail_active_queue_start(&mut self, error: String) {
+    fn fail_active_queue_start(&mut self, error: ManagedStartFailure) {
+        let state = queue_state_for_start_failure(error.kind);
+
+        let message = error.message;
+
         let Some(id) = self.active_queue_id.take() else {
-            self.error = error;
+            self.error = message;
 
             self.notice.clear();
 
             return;
         };
 
-        if let Err(state_error) =
-            self.queue
-                .set_state(id, QueuedTransferState::Failed, error.clone())
-        {
-            self.error = format!("{error} Queue item #{id} could not be updated: {state_error}",);
+        if let Err(state_error) = self.queue.set_state(id, state, message.clone()) {
+            self.error = format!("{message} Queue item #{id} could not be updated: {state_error}",);
         } else {
-            self.error = error;
+            self.error = message;
         }
 
         self.queue_running = false;
 
-        self.notice = format!("The queue stopped because transfer #{id} could not start.",);
+        self.notice = match state {
+            QueuedTransferState::Blocked => format!(
+                "The queue is waiting because transfer #{id} could not reach two idle endpoint agents.",
+            ),
+
+            QueuedTransferState::Failed => {
+                format!("The queue stopped because transfer #{id} could not start.",)
+            }
+
+            _ => unreachable!("startup failures only map to Blocked or Failed",),
+        };
     }
 
     fn finish_active_queue_item(&mut self) {
@@ -1182,8 +1233,9 @@ impl NetworkCopyManager {
         self.start_receiver = Some(receiver);
 
         thread::spawn(move || {
-            let result = management_orchestration::start_transfer(request)
-                .map_err(|error| format!("Managed transfer startup failed: {error}"));
+            let result = management_orchestration::start_transfer(request).map_err(|error| {
+                ManagedStartFailure::failed(format!("Managed transfer startup failed: {error}",))
+            });
 
             let _ = sender.send(result);
         });
@@ -1267,7 +1319,9 @@ impl NetworkCopyManager {
 
         thread::spawn(move || {
             let result = management_orchestration::resume_transfer(request, data_stream_count)
-                .map_err(|error| format!("Managed transfer resume failed: {error}"));
+                .map_err(|error| {
+                    ManagedStartFailure::failed(format!("Managed transfer resume failed: {error}",))
+                });
 
             let _ = sender.send(result);
         });
@@ -1317,16 +1371,12 @@ impl NetworkCopyManager {
 
             self.active_queue_id = None;
 
-            self.error = format!(
-                "Failed to prepare queue reattachment for #{id}: {error}",
-            );
+            self.error = format!("Failed to prepare queue reattachment for #{id}: {error}",);
 
             return;
         }
 
-        self.notice = format!(
-            "Reconnecting queued transfer #{id} to its endpoint jobs...",
-        );
+        self.notice = format!("Reconnecting queued transfer #{id} to its endpoint jobs...",);
 
         let (sender, receiver) = mpsc::channel();
 
@@ -1334,54 +1384,32 @@ impl NetworkCopyManager {
 
         thread::spawn(move || {
             let result = (|| {
-                let sender_snapshot =
-                    management_control::agent_snapshot(
-                        request.sender_agent,
-                    )
+                let sender_snapshot = management_control::agent_snapshot(request.sender_agent)
                     .map_err(|error| {
-                        format!(
-                            "Sender snapshot failed during restart recovery: {error}"
-                        )
+                        format!("Sender snapshot failed during restart recovery: {error}")
                     })?;
 
-                let receiver_snapshot =
-                    management_control::agent_snapshot(
-                        request.receiver_agent,
-                    )
+                let receiver_snapshot = management_control::agent_snapshot(request.receiver_agent)
                     .map_err(|error| {
-                        format!(
-                            "Receiver snapshot failed during restart recovery: {error}"
-                        )
+                        format!("Receiver snapshot failed during restart recovery: {error}")
                     })?;
 
-                let transfer =
-                    management_reconnect::reconstruct_active_transfer(
-                        request.sender_agent,
-                        request.receiver_agent,
-                        &sender_snapshot,
-                        &receiver_snapshot,
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "Active endpoint jobs could not be paired: {error}"
-                        )
-                    })?;
+                let transfer = management_reconnect::reconstruct_active_transfer(
+                    request.sender_agent,
+                    request.receiver_agent,
+                    &sender_snapshot,
+                    &receiver_snapshot,
+                )
+                .map_err(|error| format!("Active endpoint jobs could not be paired: {error}"))?;
 
-                if !transfer_matches_queue_request(
-                    &request,
-                    &transfer,
-                ) {
+                if !transfer_matches_queue_request(&request, &transfer) {
                     return Err(
                         "The active endpoint jobs do not match the persisted queued transfer."
                             .to_string(),
                     );
                 }
 
-                Ok((
-                    transfer,
-                    sender_snapshot,
-                    receiver_snapshot,
-                ))
+                Ok((transfer, sender_snapshot, receiver_snapshot))
             })();
 
             let _ = sender.send(result);
@@ -1397,18 +1425,13 @@ impl NetworkCopyManager {
             return;
         };
 
-        let message = format!(
-            "Automatic restart reattachment failed: {error}",
-        );
+        let message = format!("Automatic restart reattachment failed: {error}",);
 
-        if let Err(state_error) = self.queue.set_state(
-            id,
-            QueuedTransferState::Blocked,
-            message.clone(),
-        ) {
-            self.error = format!(
-                "{message} Queue item #{id} could not be updated: {state_error}",
-            );
+        if let Err(state_error) =
+            self.queue
+                .set_state(id, QueuedTransferState::Blocked, message.clone())
+        {
+            self.error = format!("{message} Queue item #{id} could not be updated: {state_error}",);
         } else {
             self.error = message;
         }
@@ -1710,7 +1733,9 @@ impl NetworkCopyManager {
             Some(Err(TryRecvError::Disconnected)) => {
                 self.start_receiver = None;
 
-                self.fail_active_queue_start("Transfer startup worker disconnected.".to_string());
+                self.fail_active_queue_start(ManagedStartFailure::failed(
+                    "Transfer startup worker disconnected.",
+                ));
             }
 
             Some(Err(TryRecvError::Empty)) | None => {}
@@ -1789,19 +1814,14 @@ impl NetworkCopyManager {
             .map(|receiver| receiver.try_recv());
 
         match message {
-            Some(Ok(Ok((
-                transfer,
-                sender_snapshot,
-                receiver_snapshot,
-            )))) => {
+            Some(Ok(Ok((transfer, sender_snapshot, receiver_snapshot)))) => {
                 self.queue_reattach_receiver = None;
 
                 let Some(id) = self.active_queue_id else {
                     self.queue_running = false;
 
                     self.error =
-                        "Queue reattachment completed without an active queue item."
-                            .to_string();
+                        "Queue reattachment completed without an active queue item.".to_string();
 
                     return;
                 };
@@ -1818,31 +1838,23 @@ impl NetworkCopyManager {
                     self.error.clear();
                 }
 
-                self.sender_agent =
-                    transfer.sender_agent.to_string();
+                self.sender_agent = transfer.sender_agent.to_string();
 
-                self.receiver_agent =
-                    transfer.receiver_agent.to_string();
+                self.receiver_agent = transfer.receiver_agent.to_string();
 
-                self.source_root =
-                    transfer.source_root.clone();
+                self.source_root = transfer.source_root.clone();
 
-                self.destination_root =
-                    transfer.destination_root.clone();
+                self.destination_root = transfer.destination_root.clone();
 
                 self.worker_count = transfer.worker_count;
 
-                self.calibration_mib =
-                    transfer.calibration_mib;
+                self.calibration_mib = transfer.calibration_mib;
 
-                self.update_existing =
-                    transfer.update_existing;
+                self.update_existing = transfer.update_existing;
 
-                self.sender_snapshot =
-                    Some(sender_snapshot);
+                self.sender_snapshot = Some(sender_snapshot);
 
-                self.receiver_snapshot =
-                    Some(receiver_snapshot);
+                self.receiver_snapshot = Some(receiver_snapshot);
 
                 self.transfer = Some(transfer);
 
@@ -1858,9 +1870,7 @@ impl NetworkCopyManager {
 
                 self.show_queue = true;
 
-                self.notice = format!(
-                    "Reattached queued transfer #{id} after Manager restart.",
-                );
+                self.notice = format!("Reattached queued transfer #{id} after Manager restart.",);
             }
 
             Some(Ok(Err(error))) => {
@@ -1873,8 +1883,7 @@ impl NetworkCopyManager {
                 self.queue_reattach_receiver = None;
 
                 self.block_queue_reattachment(
-                    "Queue reattachment worker disconnected."
-                        .to_string(),
+                    "Queue reattachment worker disconnected.".to_string(),
                 );
             }
 
@@ -3315,6 +3324,35 @@ impl eframe::App for NetworkCopyManager {
     }
 }
 
+fn preflight_queue_endpoints(request: &ManagedTransferRequest) -> Result<(), ManagedStartFailure> {
+    preflight_queue_endpoint("Sender", request.sender_agent)?;
+
+    preflight_queue_endpoint("Receiver", request.receiver_agent)
+}
+
+fn preflight_queue_endpoint(role: &str, endpoint: SocketAddr) -> Result<(), ManagedStartFailure> {
+    let agent = management_control::hello(endpoint).map_err(|error| {
+        ManagedStartFailure::blocked(format!("{role} agent {endpoint} is unavailable: {error}",))
+    })?;
+
+    match agent.state {
+        AgentState::Idle => Ok(()),
+
+        AgentState::Busy => Err(ManagedStartFailure::blocked(format!(
+            "{role} agent {} at {endpoint} is busy with another operation.",
+            agent.hostname,
+        ))),
+    }
+}
+
+const fn queue_state_for_start_failure(kind: ManagedStartFailureKind) -> QueuedTransferState {
+    match kind {
+        ManagedStartFailureKind::Blocked => QueuedTransferState::Blocked,
+
+        ManagedStartFailureKind::Failed => QueuedTransferState::Failed,
+    }
+}
+
 fn transfer_matches_queue_request(
     request: &QueuedTransferRequest,
     transfer: &ManagedTransferRecord,
@@ -3322,13 +3360,10 @@ fn transfer_matches_queue_request(
     request.sender_agent == transfer.sender_agent
         && request.receiver_agent == transfer.receiver_agent
         && request.source_root == transfer.source_root
-        && request.destination_root
-            == transfer.destination_root
-        && request.update_existing
-            == transfer.update_existing
+        && request.destination_root == transfer.destination_root
+        && request.update_existing == transfer.update_existing
         && request.worker_count == transfer.worker_count
-        && request.calibration_mib
-            == transfer.calibration_mib
+        && request.calibration_mib == transfer.calibration_mib
 }
 
 const fn queue_state_for_outcome(outcome: ManagementJobOutcome) -> QueuedTransferState {
@@ -3932,16 +3967,14 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_TRANSFER_HISTORY, ManagedEndpointRole,
-        PairedTransferHistoryEntry, join_remote_path,
-        paired_outcome, parent_remote_path,
-        peer_cleanup_target, queue_state_for_outcome,
+        MAX_TRANSFER_HISTORY, ManagedEndpointRole, ManagedStartFailureKind,
+        PairedTransferHistoryEntry, join_remote_path, paired_outcome, parent_remote_path,
+        peer_cleanup_target, queue_state_for_outcome, queue_state_for_start_failure,
         remember_history, transfer_matches_queue_request,
     };
     use networkcopy_speed::management_orchestration::ManagedTransferRecord;
     use networkcopy_speed::management_queue::{
-        QueuedTransferKind, QueuedTransferRequest,
-        QueuedTransferState,
+        QueuedTransferKind, QueuedTransferRequest, QueuedTransferState,
     };
     use networkcopy_speed::management_snapshot::{
         ManagementActiveJobDetails, ManagementActiveJobSnapshot, ManagementAgentSnapshot,
@@ -4197,20 +4230,28 @@ mod tests {
     }
 
     #[test]
+    fn queue_start_failures_distinguish_blocked_from_failed() {
+        assert_eq!(
+            queue_state_for_start_failure(ManagedStartFailureKind::Blocked,),
+            QueuedTransferState::Blocked,
+        );
+
+        assert_eq!(
+            queue_state_for_start_failure(ManagedStartFailureKind::Failed,),
+            QueuedTransferState::Failed,
+        );
+    }
+
+    #[test]
     fn restart_reattachment_requires_exact_queue_match() {
         let request = QueuedTransferRequest {
-            sender_agent: "127.0.0.1:7339"
-                .parse()
-                .unwrap(),
+            sender_agent: "127.0.0.1:7339".parse().unwrap(),
 
-            receiver_agent: "127.0.0.1:7340"
-                .parse()
-                .unwrap(),
+            receiver_agent: "127.0.0.1:7340".parse().unwrap(),
 
             source_root: r"C:\Source".to_string(),
 
-            destination_root:
-                r"D:\Destination".to_string(),
+            destination_root: r"D:\Destination".to_string(),
 
             update_existing: true,
 
@@ -4230,14 +4271,11 @@ mod tests {
 
             receiver_job_id: 17,
 
-            receiver_payload: "127.0.0.1:7337"
-                .parse()
-                .unwrap(),
+            receiver_payload: "127.0.0.1:7337".parse().unwrap(),
 
             source_root: request.source_root.clone(),
 
-            destination_root:
-                request.destination_root.clone(),
+            destination_root: request.destination_root.clone(),
 
             update_existing: request.update_existing,
 
@@ -4246,67 +4284,43 @@ mod tests {
             calibration_mib: request.calibration_mib,
         };
 
-        assert!(transfer_matches_queue_request(
-            &request,
-            &transfer,
-        ));
+        assert!(transfer_matches_queue_request(&request, &transfer,));
 
         let mut mismatch = transfer.clone();
 
-        mismatch.source_root =
-            r"C:\Different".to_string();
+        mismatch.source_root = r"C:\Different".to_string();
 
-        assert!(!transfer_matches_queue_request(
-            &request,
-            &mismatch,
-        ));
+        assert!(!transfer_matches_queue_request(&request, &mismatch,));
 
         let mut mismatch = transfer.clone();
 
-        mismatch.destination_root =
-            r"D:\Different".to_string();
+        mismatch.destination_root = r"D:\Different".to_string();
 
-        assert!(!transfer_matches_queue_request(
-            &request,
-            &mismatch,
-        ));
+        assert!(!transfer_matches_queue_request(&request, &mismatch,));
 
         let mut mismatch = transfer.clone();
 
         mismatch.update_existing = false;
 
-        assert!(!transfer_matches_queue_request(
-            &request,
-            &mismatch,
-        ));
+        assert!(!transfer_matches_queue_request(&request, &mismatch,));
 
         let mut mismatch = transfer.clone();
 
         mismatch.worker_count = 8;
 
-        assert!(!transfer_matches_queue_request(
-            &request,
-            &mismatch,
-        ));
+        assert!(!transfer_matches_queue_request(&request, &mismatch,));
 
         let mut mismatch = transfer.clone();
 
         mismatch.calibration_mib = 64;
 
-        assert!(!transfer_matches_queue_request(
-            &request,
-            &mismatch,
-        ));
+        assert!(!transfer_matches_queue_request(&request, &mismatch,));
 
         let mut mismatch = transfer.clone();
 
-        mismatch.receiver_agent =
-            "127.0.0.1:7350".parse().unwrap();
+        mismatch.receiver_agent = "127.0.0.1:7350".parse().unwrap();
 
-        assert!(!transfer_matches_queue_request(
-            &request,
-            &mismatch,
-        ));
+        assert!(!transfer_matches_queue_request(&request, &mismatch,));
     }
 
     #[test]
