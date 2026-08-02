@@ -28,6 +28,7 @@ mod iocp_copy;
 mod iocp_file_probe;
 mod iocp_probe;
 pub mod management_active_binding;
+mod management_active_binding_codec;
 pub mod management_agent;
 pub mod management_control;
 pub mod management_direct;
