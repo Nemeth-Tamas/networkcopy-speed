@@ -37,6 +37,7 @@ pub mod management_persistence;
 pub mod management_protocol;
 pub mod management_queue;
 pub mod management_reconnect;
+pub mod management_route;
 pub mod management_snapshot;
 mod manifest_scan;
 mod multistream_copy;

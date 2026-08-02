@@ -16,6 +16,7 @@ use networkcopy_speed::management_queue::{
     QueuedTransferState, TransferQueue,
 };
 use networkcopy_speed::management_reconnect;
+use networkcopy_speed::management_route::ManagementRouteMode;
 use networkcopy_speed::management_snapshot::{
     ManagementAgentSnapshot, ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
 };
@@ -384,6 +385,8 @@ struct NetworkCopyManager {
 
     update_existing: bool,
 
+    route_mode: ManagementRouteMode,
+
     show_agents: bool,
 
     show_setup: bool,
@@ -465,6 +468,8 @@ impl NetworkCopyManager {
             calibration_mib: 8,
 
             update_existing: false,
+
+            route_mode: ManagementRouteMode::AutomaticLan,
 
             show_agents: true,
 
@@ -579,6 +584,8 @@ impl NetworkCopyManager {
 
         self.update_existing = state.update_existing;
 
+        self.route_mode = state.route_mode;
+
         let mut queue = state.queue;
 
         let mut running_items = queue
@@ -658,6 +665,8 @@ impl NetworkCopyManager {
 
             update_existing: self.update_existing,
 
+            route_mode: self.route_mode,
+
             queue: self.queue.clone(),
 
             history: self
@@ -733,6 +742,8 @@ impl NetworkCopyManager {
 
             receiver_agent,
 
+            route_mode: self.route_mode,
+
             source_root: self.source_root.clone(),
 
             destination_root: self.destination_root.clone(),
@@ -793,6 +804,8 @@ impl NetworkCopyManager {
             sender_agent: transfer.sender_agent,
 
             receiver_agent: transfer.receiver_agent,
+
+            route_mode: ManagementRouteMode::ExplicitIp,
 
             source_root: transfer.source_root,
 
@@ -3976,6 +3989,7 @@ mod tests {
     use networkcopy_speed::management_queue::{
         QueuedTransferKind, QueuedTransferRequest, QueuedTransferState,
     };
+    use networkcopy_speed::management_route::ManagementRouteMode;
     use networkcopy_speed::management_snapshot::{
         ManagementActiveJobDetails, ManagementActiveJobSnapshot, ManagementAgentSnapshot,
         ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
@@ -4248,6 +4262,8 @@ mod tests {
             sender_agent: "127.0.0.1:7339".parse().unwrap(),
 
             receiver_agent: "127.0.0.1:7340".parse().unwrap(),
+
+            route_mode: ManagementRouteMode::AutomaticLan,
 
             source_root: r"C:\Source".to_string(),
 

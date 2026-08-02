@@ -3,6 +3,7 @@ use crate::management_queue::{
     MAX_QUEUE_ENTRIES, QueuedTransfer, QueuedTransferId, QueuedTransferKind, QueuedTransferRequest,
     QueuedTransferState, TransferQueue,
 };
+use crate::management_route::ManagementRouteMode;
 use crate::management_snapshot::{ManagementJobOutcome, ManagementJobResult, ManagementJobRole};
 use std::env;
 use std::fs::{self, File};
@@ -13,6 +14,8 @@ use std::path::{Path, PathBuf};
 const STATE_MAGIC_V1: &str = "NCMS1";
 
 const STATE_MAGIC_V2: &str = "NCMS2";
+
+const STATE_MAGIC_V3: &str = "NCMS3";
 
 const MAX_STATE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -45,6 +48,8 @@ pub struct ManagerPersistedState {
 
     pub update_existing: bool,
 
+    pub route_mode: ManagementRouteMode,
+
     pub queue: TransferQueue,
 
     pub history: Vec<ManagerHistoryEntry>,
@@ -66,6 +71,8 @@ impl Default for ManagerPersistedState {
             calibration_mib: 8,
 
             update_existing: false,
+
+            route_mode: ManagementRouteMode::AutomaticLan,
 
             queue: TransferQueue::default(),
 
@@ -177,7 +184,7 @@ fn encode_state(state: &ManagerPersistedState) -> io::Result<String> {
 
     let mut output = String::new();
 
-    push_line(&mut output, STATE_MAGIC_V2);
+    push_line(&mut output, STATE_MAGIC_V3);
 
     push_text_field(&mut output, "sender_agent", &state.sender_agent);
 
@@ -192,6 +199,8 @@ fn encode_state(state: &ManagerPersistedState) -> io::Result<String> {
     push_number_field(&mut output, "calibration_mib", state.calibration_mib);
 
     push_bool_field(&mut output, "update_existing", state.update_existing);
+
+    push_number_field(&mut output, "route_mode", state.route_mode.code());
 
     encode_queue(&state.queue, &mut output);
 
@@ -229,14 +238,15 @@ fn decode_state(text: &str) -> io::Result<ManagerPersistedState> {
 
     let mut lines = text.lines();
 
-    let has_queue = match required_line(&mut lines)? {
-        STATE_MAGIC_V1 => false,
-        STATE_MAGIC_V2 => true,
+    let (has_queue, has_route_mode) = match required_line(&mut lines)? {
+        STATE_MAGIC_V1 => (false, false),
+        STATE_MAGIC_V2 => (true, false),
+        STATE_MAGIC_V3 => (true, true),
 
         unknown => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("manager state used unsupported format {unknown:?}"),
+                format!("manager state used unsupported format {unknown:?}",),
             ));
         }
     };
@@ -255,8 +265,14 @@ fn decode_state(text: &str) -> io::Result<ManagerPersistedState> {
 
     let update_existing = parse_bool_field(required_line(&mut lines)?, "update_existing")?;
 
+    let route_mode = if has_route_mode {
+        decode_route_mode(parse_u8_field(required_line(&mut lines)?, "route_mode")?)?
+    } else {
+        ManagementRouteMode::AutomaticLan
+    };
+
     let queue = if has_queue {
-        decode_queue(&mut lines)?
+        decode_queue(&mut lines, has_route_mode)?
     } else {
         TransferQueue::default()
     };
@@ -302,6 +318,8 @@ fn decode_state(text: &str) -> io::Result<ManagerPersistedState> {
 
         update_existing,
 
+        route_mode,
+
         queue,
 
         history,
@@ -339,6 +357,8 @@ fn encode_queue(queue: &TransferQueue, output: &mut String) {
         push_number_field(output, "queue_resume_stream_count", resume_stream_count);
 
         push_number_field(output, "queue_state", queue_state_code(item.state));
+
+        push_number_field(output, "queue_route_mode", item.request.route_mode.code());
 
         push_text_field(
             output,
@@ -380,7 +400,10 @@ fn encode_queue(queue: &TransferQueue, output: &mut String) {
     }
 }
 
-fn decode_queue(lines: &mut std::str::Lines<'_>) -> io::Result<TransferQueue> {
+fn decode_queue(
+    lines: &mut std::str::Lines<'_>,
+    has_route_mode: bool,
+) -> io::Result<TransferQueue> {
     let next_id = parse_u64_field(required_line(lines)?, "queue_next_id")?;
 
     let paused_after_current =
@@ -400,14 +423,17 @@ fn decode_queue(lines: &mut std::str::Lines<'_>) -> io::Result<TransferQueue> {
     let mut items = Vec::with_capacity(count);
 
     for _ in 0..count {
-        items.push(decode_queue_entry(lines)?);
+        items.push(decode_queue_entry(lines, has_route_mode)?);
     }
 
     TransferQueue::from_parts(next_id, paused_after_current, items)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn decode_queue_entry(lines: &mut std::str::Lines<'_>) -> io::Result<QueuedTransfer> {
+fn decode_queue_entry(
+    lines: &mut std::str::Lines<'_>,
+    has_route_mode: bool,
+) -> io::Result<QueuedTransfer> {
     expect_line(lines, "queue_begin")?;
 
     let id_value = parse_u64_field(required_line(lines)?, "queue_id")?;
@@ -453,6 +479,12 @@ fn decode_queue_entry(lines: &mut std::str::Lines<'_>) -> io::Result<QueuedTrans
 
     let state = decode_queue_state(parse_u8_field(required_line(lines)?, "queue_state")?)?;
 
+    let route_mode = if has_route_mode {
+        decode_route_mode(parse_u8_field(required_line(lines)?, "queue_route_mode")?)?
+    } else {
+        ManagementRouteMode::AutomaticLan
+    };
+
     let sender_agent = parse_socket_address(
         &decode_text_field(required_line(lines)?, "queue_sender_agent")?,
         "queued sender agent",
@@ -485,6 +517,8 @@ fn decode_queue_entry(lines: &mut std::str::Lines<'_>) -> io::Result<QueuedTrans
 
             receiver_agent,
 
+            route_mode,
+
             source_root,
 
             destination_root,
@@ -501,6 +535,15 @@ fn decode_queue_entry(lines: &mut std::str::Lines<'_>) -> io::Result<QueuedTrans
         state,
 
         status_message,
+    })
+}
+
+fn decode_route_mode(value: u8) -> io::Result<ManagementRouteMode> {
+    ManagementRouteMode::from_code(value).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("manager state used unknown route mode {value}",),
+        )
     })
 }
 
@@ -1019,6 +1062,7 @@ mod tests {
     use crate::management_queue::{
         QueuedTransferKind, QueuedTransferRequest, QueuedTransferState, TransferQueue,
     };
+    use crate::management_route::ManagementRouteMode;
     use crate::management_snapshot::{
         ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
     };
@@ -1057,6 +1101,8 @@ mod tests {
 
                 receiver_agent: "127.0.0.2:7339".parse().unwrap(),
 
+                route_mode: ManagementRouteMode::AutomaticLan,
+
                 source_root: r"C:\Users\User\Desktop".to_string(),
 
                 destination_root: r"D:\Backup\Desktop".to_string(),
@@ -1084,6 +1130,8 @@ mod tests {
                 sender_agent: "127.0.0.1:7339".parse().unwrap(),
 
                 receiver_agent: "127.0.0.2:7339".parse().unwrap(),
+
+                route_mode: ManagementRouteMode::AutomaticLan,
 
                 source_root: r"C:\Users\User\Documents".to_string(),
 
@@ -1125,6 +1173,8 @@ mod tests {
             calibration_mib: 8,
 
             update_existing: true,
+
+            route_mode: ManagementRouteMode::DirectLink,
 
             queue,
 
@@ -1200,13 +1250,113 @@ mod tests {
         output
     }
 
+    fn encode_v2_queue(queue: &TransferQueue, output: &mut String) {
+        super::push_number_field(output, "queue_next_id", queue.next_id());
+
+        super::push_bool_field(
+            output,
+            "queue_paused_after_current",
+            queue.paused_after_current(),
+        );
+
+        super::push_number_field(output, "queue_count", queue.len());
+
+        for item in queue.items() {
+            super::push_line(output, "queue_begin");
+
+            super::push_number_field(output, "queue_id", item.id.get());
+
+            let (kind, resume_stream_count) = match item.request.kind {
+                QueuedTransferKind::Fresh => (0_u8, 0),
+
+                QueuedTransferKind::Resume { data_stream_count } => (1_u8, data_stream_count),
+            };
+
+            super::push_number_field(output, "queue_kind", kind);
+
+            super::push_number_field(output, "queue_resume_stream_count", resume_stream_count);
+
+            super::push_number_field(output, "queue_state", super::queue_state_code(item.state));
+
+            super::push_text_field(
+                output,
+                "queue_sender_agent",
+                &item.request.sender_agent.to_string(),
+            );
+
+            super::push_text_field(
+                output,
+                "queue_receiver_agent",
+                &item.request.receiver_agent.to_string(),
+            );
+
+            super::push_text_field(output, "queue_source_root", &item.request.source_root);
+
+            super::push_text_field(
+                output,
+                "queue_destination_root",
+                &item.request.destination_root,
+            );
+
+            super::push_bool_field(
+                output,
+                "queue_update_existing",
+                item.request.update_existing,
+            );
+
+            super::push_number_field(output, "queue_worker_count", item.request.worker_count);
+
+            super::push_number_field(
+                output,
+                "queue_calibration_mib",
+                item.request.calibration_mib,
+            );
+
+            super::push_text_field(output, "queue_status_message", &item.status_message);
+
+            super::push_line(output, "queue_end");
+        }
+    }
+
+    fn encode_v2_state(state: &ManagerPersistedState) -> String {
+        let mut output = String::new();
+
+        super::push_line(&mut output, super::STATE_MAGIC_V2);
+
+        super::push_text_field(&mut output, "sender_agent", &state.sender_agent);
+
+        super::push_text_field(&mut output, "receiver_agent", &state.receiver_agent);
+
+        super::push_text_field(&mut output, "source_root", &state.source_root);
+
+        super::push_text_field(&mut output, "destination_root", &state.destination_root);
+
+        super::push_number_field(&mut output, "worker_count", state.worker_count);
+
+        super::push_number_field(&mut output, "calibration_mib", state.calibration_mib);
+
+        super::push_bool_field(&mut output, "update_existing", state.update_existing);
+
+        encode_v2_queue(&state.queue, &mut output);
+
+        super::push_number_field(&mut output, "history_count", state.history.len());
+
+        for entry in &state.history {
+            super::encode_history_entry(entry, &mut output);
+        }
+
+        super::push_line(&mut output, "end");
+
+        output
+    }
+
     #[test]
     fn manager_state_round_trips() {
         let expected = example_state();
 
         let encoded = encode_state(&expected).unwrap();
 
-        assert!(encoded.starts_with("NCMS2\n"));
+        assert!(encoded.starts_with("NCMS3\n"));
 
         let decoded = decode_state(&encoded).unwrap();
 
@@ -1221,11 +1371,36 @@ mod tests {
 
         let mut expected = source;
 
+        expected.route_mode = ManagementRouteMode::AutomaticLan;
+
         expected.queue = TransferQueue::default();
 
         let decoded = decode_state(&encoded).unwrap();
 
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn version_two_state_loads_with_automatic_lan_routes() {
+        let source = example_state();
+
+        let encoded = encode_v2_state(&source);
+
+        let mut expected = source;
+
+        expected.route_mode = ManagementRouteMode::AutomaticLan;
+
+        let decoded = decode_state(&encoded).unwrap();
+
+        assert_eq!(decoded, expected);
+
+        assert!(
+            decoded
+                .queue
+                .items()
+                .iter()
+                .all(|item| { item.request.route_mode == ManagementRouteMode::AutomaticLan })
+        );
     }
 
     #[test]

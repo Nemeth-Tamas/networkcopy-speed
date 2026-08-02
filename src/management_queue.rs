@@ -1,3 +1,4 @@
+use crate::management_route::ManagementRouteMode;
 use std::collections::HashSet;
 use std::fmt;
 use std::net::SocketAddr;
@@ -58,6 +59,8 @@ pub struct QueuedTransferRequest {
     pub sender_agent: SocketAddr,
 
     pub receiver_agent: SocketAddr,
+
+    pub route_mode: ManagementRouteMode,
 
     pub source_root: String,
 
@@ -396,12 +399,15 @@ fn validate_optional_text(value: &str, description: &str) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::{QueuedTransferKind, QueuedTransferRequest, QueuedTransferState, TransferQueue};
+    use crate::management_route::ManagementRouteMode;
 
     fn request(name: &str) -> QueuedTransferRequest {
         QueuedTransferRequest {
             sender_agent: "192.0.2.10:7339".parse().unwrap(),
 
             receiver_agent: "192.0.2.11:7339".parse().unwrap(),
+
+            route_mode: ManagementRouteMode::AutomaticLan,
 
             source_root: format!("C:\\{name}"),
 
