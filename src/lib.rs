@@ -27,6 +27,7 @@ pub mod gui_transfer;
 mod iocp_copy;
 mod iocp_file_probe;
 mod iocp_probe;
+pub mod management_active_binding;
 pub mod management_agent;
 pub mod management_control;
 pub mod management_direct;
