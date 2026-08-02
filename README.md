@@ -242,7 +242,7 @@ The primary workflow is:
 - [x] expose Automatic LAN, Direct Link, and Explicit IP manager route modes;
 - [x] add useful Windows completion, failure, pause, and action-required notifications;
 - [x] add a small endpoint-agent tray control surface;
-- [ ] check GitHub Releases for newer stable versions and open the download flow;
+- [x] check GitHub Releases for newer stable versions and open the download flow;
 - [ ] complete physical three-machine and queued-transfer acceptance testing.
 
 ### Managed Direct Link progress
@@ -429,6 +429,11 @@ The dedicated agent also exposes a Windows notification-area icon:
 - double-click to show the current status;
 - right-click to show status or exit an idle agent;
 - exit remains disabled while a transfer is active.
+
+The Manager checks GitHub Releases in the background when it opens. It compares
+only stable numeric versions, ignores draft and prerelease releases, and can open
+the selected stable release page. It does not replace running executables or
+silently download binaries.
 
 The older `networkcopy-speed.exe management-agent` command remains available
 for command-line and development use.

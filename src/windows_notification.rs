@@ -4,7 +4,6 @@ use std::mem::size_of;
 use std::ptr::{null, null_mut};
 use std::thread;
 use std::time::Duration;
-use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_TIP, NIIF_ERROR, NIIF_LARGE_ICON, NIIF_USER, NIIF_WARNING, NIM_ADD,
     NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
@@ -76,65 +75,6 @@ pub fn show_blocking(kind: NotificationKind, title: &str, body: &str) -> io::Res
     validate_notification_text(title, body)?;
 
     show_validated(kind, title, body)
-}
-
-pub(crate) fn show_on_existing_icon(
-    window: HWND,
-    icon_id: u32,
-    kind: NotificationKind,
-    title: &str,
-    body: &str,
-) -> io::Result<()> {
-    validate_notification_text(title, body)?;
-
-    if window.is_null() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "notification tray window must not be null",
-        ));
-    }
-
-    if icon_id == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "notification tray icon ID must not be zero",
-        ));
-    }
-
-    let balloon_icon = windows_icon::load_executable_large_icon()?;
-
-    let structure_size = u32::try_from(size_of::<NOTIFYICONDATAW>())
-        .map_err(|_| io::Error::other("notification structure size cannot be represented"))?;
-
-    let mut data = NOTIFYICONDATAW {
-        cbSize: structure_size,
-
-        hWnd: window,
-
-        uID: icon_id,
-
-        uFlags: NIF_INFO,
-
-        dwInfoFlags: kind.info_flags(),
-
-        hBalloonIcon: balloon_icon.raw(),
-
-        ..Default::default()
-    };
-
-    copy_wide_truncated(&mut data.szInfoTitle, title);
-
-    copy_wide_truncated(&mut data.szInfo, body);
-
-    let modified = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
-
-    if modified == 0 {
-        return Err(io::Error::other(
-            "Shell_NotifyIconW failed to display a notification through the existing tray icon",
-        ));
-    }
-
-    Ok(())
 }
 
 fn show_validated(kind: NotificationKind, title: &str, body: &str) -> io::Result<()> {

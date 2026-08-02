@@ -127,6 +127,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         }
 
+        "management-update-check" => {
+            run_management_update_check(
+                &mut arguments,
+            )
+        }
+
         "management-hello" => {
             run_management_hello(
                 &mut arguments,
@@ -536,6 +542,92 @@ fn run_management_notification_test(
     )?;
 
     println!("Notification test finished.");
+
+    Ok(())
+}
+
+fn run_management_update_check(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let open_release =
+        match arguments.next() {
+            None => false,
+
+            Some(argument)
+                if argument == "--open" =>
+            {
+                true
+            }
+
+            Some(argument) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "unexpected argument: {}; expected --open or no argument",
+                        argument.to_string_lossy(),
+                    ),
+                )
+                .into());
+            }
+        };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    println!(
+        "NetworkCopy Speed Edition update check",
+    );
+
+    println!();
+
+    let check =
+        crate::release_update::check_latest(
+            env!("CARGO_PKG_VERSION"),
+        )?;
+
+    println!(
+        "  Current build:  {}",
+        check.current_version,
+    );
+
+    println!(
+        "  Latest stable: {}",
+        check.latest.tag_name,
+    );
+
+    println!(
+        "  Release name:  {}",
+        check.latest.name,
+    );
+
+    println!(
+        "  Status:        {}",
+        if check.update_available {
+            "newer stable release available"
+        } else {
+            "current build is up to date or newer"
+        },
+    );
+
+    if open_release {
+        println!();
+
+        println!(
+            "Opening the latest stable release page...",
+        );
+
+        crate::release_update::open_release_page(
+            &check.latest.html_url,
+        )?;
+    }
 
     Ok(())
 }
@@ -3405,6 +3497,9 @@ fn print_usage(program: &OsStr) {
     println!("  {program} management-discover");
     println!(
         "  {program} management-notification-test <info|warning|error>"
+    );
+    println!(
+        "  {program} management-update-check [--open]"
     );
     println!("  {program} management-hello <agent-address>");
     println!("  {program} management-roots <agent-address>");

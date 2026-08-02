@@ -2,7 +2,7 @@ use crate::management_control;
 use crate::management_discovery::AgentState;
 use crate::management_protocol::MANAGEMENT_CONTROL_PORT;
 use crate::windows_icon;
-use crate::windows_notification::{self, NotificationKind};
+use crate::windows_notification::NotificationKind;
 use std::io;
 use std::mem::size_of;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -17,10 +17,12 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, HWND_MESSAGE, KillTimer, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetTimer,
-    TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-    WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
+    DispatchMessageW, GetCursorPos, GetMessageW, HWND_MESSAGE, KillTimer, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MSG, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetForegroundWindow, SetTimer, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, TranslateMessage, WM_APP, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP,
+    WM_TIMER, WNDCLASSW,
 };
 
 const TRAY_ICON_ID: u32 = 1;
@@ -222,19 +224,14 @@ unsafe extern "system" fn tray_window_proc(
         TRAY_CALLBACK_MESSAGE => {
             match lparam as u32 {
                 WM_LBUTTONDBLCLK => {
-                    show_status_notification(window);
+                    show_status_dialog();
                 }
 
                 WM_RBUTTONUP => {
                     if let Err(error) = show_context_menu(window) {
                         let body = format!("The agent tray menu could not open: {error}",);
 
-                        show_tray_notification(
-                            window,
-                            NotificationKind::Error,
-                            "Agent tray error",
-                            &body,
-                        );
+                        show_dialog(NotificationKind::Error, "Agent tray error", &body);
                     }
                 }
 
@@ -323,7 +320,7 @@ fn show_context_menu(window: HWND) -> io::Result<()> {
 
         match command as u32 {
             MENU_SHOW_STATUS => {
-                show_status_notification(window);
+                show_status_dialog();
             }
 
             MENU_EXIT_IDLE => {
@@ -386,7 +383,7 @@ fn update_tooltip(window: HWND) -> io::Result<()> {
     Ok(())
 }
 
-fn show_status_notification(window: HWND) {
+fn show_status_dialog() {
     let status = query_agent_status();
 
     let (kind, title, body) = match status {
@@ -409,14 +406,33 @@ fn show_status_notification(window: HWND) {
         ),
     };
 
-    show_tray_notification(window, kind, title, &body);
+    show_dialog(kind, title, &body);
 }
 
-fn show_tray_notification(window: HWND, kind: NotificationKind, title: &str, body: &str) {
-    if let Err(error) =
-        windows_notification::show_on_existing_icon(window, TRAY_ICON_ID, kind, title, body)
-    {
-        eprintln!("Agent tray notification failed: {error}",);
+fn show_dialog(kind: NotificationKind, title: &str, body: &str) {
+    let title = wide(title);
+
+    let body = wide(body);
+
+    let icon = match kind {
+        NotificationKind::Information => MB_ICONINFORMATION,
+
+        NotificationKind::Warning => MB_ICONWARNING,
+
+        NotificationKind::Error => MB_ICONERROR,
+    };
+
+    let result = unsafe {
+        MessageBoxW(
+            null_mut(),
+            body.as_ptr(),
+            title.as_ptr(),
+            MB_OK | icon | MB_SETFOREGROUND | MB_TOPMOST,
+        )
+    };
+
+    if result == 0 {
+        eprintln!("Agent status dialog failed: {}", io::Error::last_os_error(),);
     }
 }
 
@@ -433,16 +449,11 @@ fn exit_idle_agent(window: HWND) {
                 "{hostname} has an active transfer. Exit was refused so the transfer remains untouched.",
             );
 
-            show_tray_notification(window, NotificationKind::Warning, "Agent is busy", &body);
+            show_dialog(NotificationKind::Warning, "Agent is busy", &body);
         }
 
         AgentTrayStatus::Unavailable { message } => {
-            show_tray_notification(
-                window,
-                NotificationKind::Error,
-                "Agent state unavailable",
-                &message,
-            );
+            show_dialog(NotificationKind::Error, "Agent state unavailable", &message);
         }
     }
 }

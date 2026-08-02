@@ -21,6 +21,7 @@ use networkcopy_speed::management_route::ManagementRouteMode;
 use networkcopy_speed::management_snapshot::{
     ManagementAgentSnapshot, ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
 };
+use networkcopy_speed::release_update::{self, ReleaseCheck};
 use networkcopy_speed::windows_notification::{self, NotificationKind};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -53,6 +54,8 @@ struct DirectManagementRoute {
 }
 
 type DirectDiscoveryResult = Result<Vec<DirectManagementRoute>, String>;
+
+type UpdateCheckResult = Result<ReleaseCheck, String>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ManagedStartFailureKind {
@@ -416,6 +419,14 @@ struct NetworkCopyManager {
 
     direct_discovery_receiver: Option<Receiver<DirectDiscoveryResult>>,
 
+    update_check_started: bool,
+
+    update_receiver: Option<Receiver<UpdateCheckResult>>,
+
+    update_check: Option<ReleaseCheck>,
+
+    update_error: String,
+
     start_receiver: Option<Receiver<StartResult>>,
 
     attach_receiver: Option<Receiver<AttachResult>>,
@@ -503,6 +514,14 @@ impl NetworkCopyManager {
             discovery_receiver: None,
 
             direct_discovery_receiver: None,
+
+            update_check_started: false,
+
+            update_receiver: None,
+
+            update_check: None,
+
+            update_error: String::new(),
 
             start_receiver: None,
 
@@ -1264,6 +1283,27 @@ impl NetworkCopyManager {
         });
     }
 
+    fn begin_update_check(&mut self) {
+        if self.update_receiver.is_some() {
+            return;
+        }
+
+        self.update_error.clear();
+
+        self.update_check = None;
+
+        let (sender, receiver) = mpsc::channel();
+
+        self.update_receiver = Some(receiver);
+
+        thread::spawn(move || {
+            let result = release_update::check_latest(env!("CARGO_PKG_VERSION"))
+                .map_err(|error| format!("Update check failed: {error}"));
+
+            let _ = sender.send(result);
+        });
+    }
+
     fn select_direct_route(&mut self, route: &DirectManagementRoute) {
         self.route_mode = ManagementRouteMode::DirectLink;
 
@@ -1740,6 +1780,8 @@ impl NetworkCopyManager {
 
         self.process_direct_discovery_message();
 
+        self.process_update_message();
+
         self.process_start_message();
 
         self.process_attach_message();
@@ -1848,6 +1890,54 @@ impl NetworkCopyManager {
                 self.error = "Direct Link discovery worker disconnected.".to_string();
 
                 self.notice.clear();
+            }
+
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    fn process_update_message(&mut self) {
+        let message = self
+            .update_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
+
+        match message {
+            Some(Ok(Ok(check))) => {
+                self.update_receiver = None;
+
+                self.update_error.clear();
+
+                if check.update_available {
+                    let body = format!(
+                        "{} is available. This build is {}.",
+                        check.latest.tag_name, check.current_version,
+                    );
+
+                    notify_manager(
+                        NotificationKind::Information,
+                        "NetworkCopy update available",
+                        &body,
+                    );
+                }
+
+                self.update_check = Some(check);
+            }
+
+            Some(Ok(Err(error))) => {
+                self.update_receiver = None;
+
+                self.update_check = None;
+
+                self.update_error = error;
+            }
+
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.update_receiver = None;
+
+                self.update_check = None;
+
+                self.update_error = "Update-check worker disconnected.".to_string();
             }
 
             Some(Err(TryRecvError::Empty)) | None => {}
@@ -2343,6 +2433,7 @@ impl NetworkCopyManager {
     fn has_background_work(&self) -> bool {
         self.discovery_receiver.is_some()
             || self.direct_discovery_receiver.is_some()
+            || self.update_receiver.is_some()
             || self.start_receiver.is_some()
             || self.attach_receiver.is_some()
             || self.queue_reattach_receiver.is_some()
@@ -2393,8 +2484,18 @@ impl NetworkCopyManager {
         }
     }
 
-    fn render_app_header(&self, ui: &mut egui::Ui) {
+    fn render_app_header(&mut self, ui: &mut egui::Ui) {
         let (status, status_color) = self.manager_status();
+
+        let checking_updates = self.update_receiver.is_some();
+
+        let update_check = self.update_check.clone();
+
+        let update_error = self.update_error.clone();
+
+        let mut check_requested = false;
+
+        let mut release_to_open = None::<String>;
 
         ui.horizontal_wrapped(|ui| {
             ui.heading(APP_NAME);
@@ -2406,6 +2507,44 @@ impl NetworkCopyManager {
             ui.separator();
 
             ui.label(format!("v{}", env!("CARGO_PKG_VERSION"),));
+
+            ui.separator();
+
+            if checking_updates {
+                ui.spinner();
+
+                ui.label("Checking GitHub Releases...");
+            } else if let Some(check) = &update_check {
+                if check.update_available {
+                    status_label(
+                        ui,
+                        &format!("{} available", check.latest.tag_name,),
+                        egui::Color32::from_rgb(126, 230, 64),
+                    );
+
+                    if ui.button("Open release").clicked() {
+                        release_to_open = Some(check.latest.html_url.clone());
+                    }
+                } else {
+                    ui.label(format!("Latest stable: {}", check.latest.tag_name,));
+                }
+
+                if ui.small_button("Check again").clicked() {
+                    check_requested = true;
+                }
+            } else {
+                if !update_error.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Update check unavailable")
+                            .color(egui::Color32::from_rgb(160, 170, 184)),
+                    )
+                    .on_hover_text(&update_error);
+                }
+
+                if ui.small_button("Check updates").clicked() {
+                    check_requested = true;
+                }
+            }
         });
 
         ui.label(
@@ -2431,6 +2570,16 @@ impl NetworkCopyManager {
 
             ui.label("Trusted LAN · management traffic is not yet encrypted");
         });
+
+        if check_requested {
+            self.begin_update_check();
+        }
+
+        if let Some(release_url) = release_to_open
+            && let Err(error) = release_update::open_release_page(&release_url)
+        {
+            self.error = format!("The release page could not be opened: {error}",);
+        }
     }
 
     fn render_messages(&mut self, ui: &mut egui::Ui) {
@@ -3653,6 +3802,12 @@ impl NetworkCopyManager {
 
 impl eframe::App for NetworkCopyManager {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if !self.update_check_started {
+            self.update_check_started = true;
+
+            self.begin_update_check();
+        }
+
         self.process_messages();
 
         self.begin_poll();

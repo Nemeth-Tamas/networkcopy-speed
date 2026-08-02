@@ -44,6 +44,7 @@ mod manifest_scan;
 mod multistream_copy;
 mod network_calibration;
 mod pipeline_bench;
+pub mod release_update;
 mod resume_state;
 pub mod session_cdc_catalog;
 mod session_cdc_lane;
