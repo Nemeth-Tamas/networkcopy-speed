@@ -51,6 +51,15 @@ type AttachResult = Result<
     String,
 >;
 
+type QueueReattachResult = Result<
+    (
+        ManagedTransferRecord,
+        ManagementAgentSnapshot,
+        ManagementAgentSnapshot,
+    ),
+    String,
+>;
+
 struct PollResponse {
     sender: Result<ManagementAgentSnapshot, String>,
 
@@ -359,6 +368,8 @@ struct NetworkCopyManager {
 
     attach_receiver: Option<Receiver<AttachResult>>,
 
+    queue_reattach_receiver: Option<Receiver<QueueReattachResult>>,
+
     poll_receiver: Option<Receiver<PollResponse>>,
 
     cancel_receiver: Option<Receiver<CancelResponse>>,
@@ -439,6 +450,8 @@ impl NetworkCopyManager {
 
             attach_receiver: None,
 
+            queue_reattach_receiver: None,
+
             poll_receiver: None,
 
             cancel_receiver: None,
@@ -500,12 +513,16 @@ impl NetworkCopyManager {
 
         match management_persistence::load_from(&path) {
             Ok(Some(state)) => {
-                self.apply_persisted_state(state.clone());
+                let reattaching_queue_item =
+                    self.apply_persisted_state(state.clone());
 
                 self.last_saved_state = Some(state);
 
-                self.notice = "Restored saved manager configuration, queue, and transfer history."
-                    .to_string();
+                if !reattaching_queue_item {
+                    self.notice =
+                        "Restored saved manager configuration, queue, and transfer history."
+                            .to_string();
+                }
             }
 
             Ok(None) => {}
@@ -516,7 +533,10 @@ impl NetworkCopyManager {
         }
     }
 
-    fn apply_persisted_state(&mut self, state: ManagerPersistedState) {
+    fn apply_persisted_state(
+        &mut self,
+        state: ManagerPersistedState,
+    ) -> bool {
         self.sender_agent = state.sender_agent;
 
         self.receiver_agent = state.receiver_agent;
@@ -533,24 +553,40 @@ impl NetworkCopyManager {
 
         let mut queue = state.queue;
 
-        let interrupted_queue_ids = queue
+        let mut running_items = queue
             .items()
             .iter()
-            .filter(|item| item.state == QueuedTransferState::Running)
-            .map(|item| item.id)
+            .filter(|item| {
+                item.state == QueuedTransferState::Running
+            })
+            .cloned()
             .collect::<Vec<_>>();
 
-        for id in interrupted_queue_ids {
-            if let Err(error) = queue.set_state(
-                id,
-                QueuedTransferState::Blocked,
-                "The Manager restarted while this queue item was active. Reattachment is required before retrying it.",
-            ) {
+        let recovery_item = if running_items.len() == 1 {
+            running_items.pop()
+        } else {
+            if running_items.len() > 1 {
+                for item in &running_items {
+                    if let Err(error) = queue.set_state(
+                        item.id,
+                        QueuedTransferState::Blocked,
+                        "The persisted queue contained multiple Running items. Automatic reattachment was refused.",
+                    ) {
+                        self.persistence_error = format!(
+                            "Failed to block ambiguous queue item #{}: {error}",
+                            item.id,
+                        );
+                    }
+                }
+
                 self.persistence_error = format!(
-                    "Failed to recover persisted queue item #{id}: {error}",
+                    "The persisted queue contained {} Running items. Sequential queues may contain only one.",
+                    running_items.len(),
                 );
             }
-        }
+
+            None
+        };
 
         self.queue = queue;
 
@@ -570,6 +606,14 @@ impl NetworkCopyManager {
                 receiver_result: entry.receiver_result,
             })
             .collect();
+
+        if let Some(item) = recovery_item {
+            self.begin_queue_reattach(item);
+
+            true
+        } else {
+            false
+        }
     }
 
     fn persisted_state(&self) -> ManagerPersistedState {
@@ -1229,6 +1273,155 @@ impl NetworkCopyManager {
         });
     }
 
+    fn begin_queue_reattach(&mut self, item: QueuedTransfer) {
+        if self.queue_reattach_receiver.is_some() {
+            return;
+        }
+
+        let id = item.id;
+
+        let request = item.request;
+
+        self.sender_agent = request.sender_agent.to_string();
+
+        self.receiver_agent = request.receiver_agent.to_string();
+
+        self.source_root = request.source_root.clone();
+
+        self.destination_root = request.destination_root.clone();
+
+        self.worker_count = request.worker_count;
+
+        self.calibration_mib = request.calibration_mib;
+
+        self.update_existing = request.update_existing;
+
+        self.clear_transfer_card();
+
+        self.error.clear();
+
+        self.queue_running = true;
+
+        self.active_queue_id = Some(id);
+
+        self.show_queue = true;
+
+        self.show_setup = false;
+
+        if let Err(error) = self.queue.set_state(
+            id,
+            QueuedTransferState::Running,
+            "The Manager restarted. Checking both endpoints for matching active jobs.",
+        ) {
+            self.queue_running = false;
+
+            self.active_queue_id = None;
+
+            self.error = format!(
+                "Failed to prepare queue reattachment for #{id}: {error}",
+            );
+
+            return;
+        }
+
+        self.notice = format!(
+            "Reconnecting queued transfer #{id} to its endpoint jobs...",
+        );
+
+        let (sender, receiver) = mpsc::channel();
+
+        self.queue_reattach_receiver = Some(receiver);
+
+        thread::spawn(move || {
+            let result = (|| {
+                let sender_snapshot =
+                    management_control::agent_snapshot(
+                        request.sender_agent,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "Sender snapshot failed during restart recovery: {error}"
+                        )
+                    })?;
+
+                let receiver_snapshot =
+                    management_control::agent_snapshot(
+                        request.receiver_agent,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "Receiver snapshot failed during restart recovery: {error}"
+                        )
+                    })?;
+
+                let transfer =
+                    management_reconnect::reconstruct_active_transfer(
+                        request.sender_agent,
+                        request.receiver_agent,
+                        &sender_snapshot,
+                        &receiver_snapshot,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "Active endpoint jobs could not be paired: {error}"
+                        )
+                    })?;
+
+                if !transfer_matches_queue_request(
+                    &request,
+                    &transfer,
+                ) {
+                    return Err(
+                        "The active endpoint jobs do not match the persisted queued transfer."
+                            .to_string(),
+                    );
+                }
+
+                Ok((
+                    transfer,
+                    sender_snapshot,
+                    receiver_snapshot,
+                ))
+            })();
+
+            let _ = sender.send(result);
+        });
+    }
+
+    fn block_queue_reattachment(&mut self, error: String) {
+        let Some(id) = self.active_queue_id.take() else {
+            self.queue_running = false;
+
+            self.error = error;
+
+            return;
+        };
+
+        let message = format!(
+            "Automatic restart reattachment failed: {error}",
+        );
+
+        if let Err(state_error) = self.queue.set_state(
+            id,
+            QueuedTransferState::Blocked,
+            message.clone(),
+        ) {
+            self.error = format!(
+                "{message} Queue item #{id} could not be updated: {state_error}",
+            );
+        } else {
+            self.error = message;
+        }
+
+        self.queue_running = false;
+
+        self.clear_transfer_card();
+
+        self.notice = format!(
+            "Queued transfer #{id} was not restarted. It was safely blocked to prevent duplicate endpoint jobs.",
+        );
+    }
+
     fn begin_attach(&mut self) {
         if self.attach_receiver.is_some() {
             return;
@@ -1415,6 +1608,8 @@ impl NetworkCopyManager {
 
         self.process_attach_message();
 
+        self.process_queue_reattach_message();
+
         self.process_poll_message();
 
         self.process_cancel_message();
@@ -1581,6 +1776,106 @@ impl NetworkCopyManager {
                 self.error = "Active-job attachment worker disconnected.".to_string();
 
                 self.notice.clear();
+            }
+
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    fn process_queue_reattach_message(&mut self) {
+        let message = self
+            .queue_reattach_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
+
+        match message {
+            Some(Ok(Ok((
+                transfer,
+                sender_snapshot,
+                receiver_snapshot,
+            )))) => {
+                self.queue_reattach_receiver = None;
+
+                let Some(id) = self.active_queue_id else {
+                    self.queue_running = false;
+
+                    self.error =
+                        "Queue reattachment completed without an active queue item."
+                            .to_string();
+
+                    return;
+                };
+
+                if let Err(error) = self.queue.set_state(
+                    id,
+                    QueuedTransferState::Running,
+                    "Reattached after Manager restart. Transfer is in progress.",
+                ) {
+                    self.error = format!(
+                        "Queued transfer #{id} was reattached, but its state could not be updated: {error}",
+                    );
+                } else {
+                    self.error.clear();
+                }
+
+                self.sender_agent =
+                    transfer.sender_agent.to_string();
+
+                self.receiver_agent =
+                    transfer.receiver_agent.to_string();
+
+                self.source_root =
+                    transfer.source_root.clone();
+
+                self.destination_root =
+                    transfer.destination_root.clone();
+
+                self.worker_count = transfer.worker_count;
+
+                self.calibration_mib =
+                    transfer.calibration_mib;
+
+                self.update_existing =
+                    transfer.update_existing;
+
+                self.sender_snapshot =
+                    Some(sender_snapshot);
+
+                self.receiver_snapshot =
+                    Some(receiver_snapshot);
+
+                self.transfer = Some(transfer);
+
+                self.peer_cleanup_receiver = None;
+
+                self.peer_cleanup_attempted = false;
+
+                self.monitoring_complete = false;
+
+                self.last_poll = Instant::now();
+
+                self.show_setup = false;
+
+                self.show_queue = true;
+
+                self.notice = format!(
+                    "Reattached queued transfer #{id} after Manager restart.",
+                );
+            }
+
+            Some(Ok(Err(error))) => {
+                self.queue_reattach_receiver = None;
+
+                self.block_queue_reattachment(error);
+            }
+
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.queue_reattach_receiver = None;
+
+                self.block_queue_reattachment(
+                    "Queue reattachment worker disconnected."
+                        .to_string(),
+                );
             }
 
             Some(Err(TryRecvError::Empty)) | None => {}
@@ -1804,6 +2099,7 @@ impl NetworkCopyManager {
         self.discovery_receiver.is_some()
             || self.start_receiver.is_some()
             || self.attach_receiver.is_some()
+            || self.queue_reattach_receiver.is_some()
             || self.poll_receiver.is_some()
             || self.cancel_receiver.is_some()
             || self.peer_cleanup_receiver.is_some()
@@ -1825,6 +2121,11 @@ impl NetworkCopyManager {
         } else if self.attach_receiver.is_some() {
             (
                 "Attaching to active jobs",
+                egui::Color32::from_rgb(95, 194, 255),
+            )
+        } else if self.queue_reattach_receiver.is_some() {
+            (
+                "Reattaching queued transfer",
                 egui::Color32::from_rgb(95, 194, 255),
             )
         } else if self.transfer.is_some() && !self.monitoring_complete {
@@ -3014,6 +3315,22 @@ impl eframe::App for NetworkCopyManager {
     }
 }
 
+fn transfer_matches_queue_request(
+    request: &QueuedTransferRequest,
+    transfer: &ManagedTransferRecord,
+) -> bool {
+    request.sender_agent == transfer.sender_agent
+        && request.receiver_agent == transfer.receiver_agent
+        && request.source_root == transfer.source_root
+        && request.destination_root
+            == transfer.destination_root
+        && request.update_existing
+            == transfer.update_existing
+        && request.worker_count == transfer.worker_count
+        && request.calibration_mib
+            == transfer.calibration_mib
+}
+
 const fn queue_state_for_outcome(outcome: ManagementJobOutcome) -> QueuedTransferState {
     match outcome {
         ManagementJobOutcome::Completed => QueuedTransferState::Completed,
@@ -3615,12 +3932,17 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_TRANSFER_HISTORY, ManagedEndpointRole, PairedTransferHistoryEntry, join_remote_path,
-        paired_outcome, parent_remote_path, peer_cleanup_target, queue_state_for_outcome,
-        remember_history,
+        MAX_TRANSFER_HISTORY, ManagedEndpointRole,
+        PairedTransferHistoryEntry, join_remote_path,
+        paired_outcome, parent_remote_path,
+        peer_cleanup_target, queue_state_for_outcome,
+        remember_history, transfer_matches_queue_request,
     };
     use networkcopy_speed::management_orchestration::ManagedTransferRecord;
-    use networkcopy_speed::management_queue::QueuedTransferState;
+    use networkcopy_speed::management_queue::{
+        QueuedTransferKind, QueuedTransferRequest,
+        QueuedTransferState,
+    };
     use networkcopy_speed::management_snapshot::{
         ManagementActiveJobDetails, ManagementActiveJobSnapshot, ManagementAgentSnapshot,
         ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
@@ -3872,6 +4194,119 @@ mod tests {
             queue_state_for_outcome(ManagementJobOutcome::Failed),
             QueuedTransferState::Failed,
         );
+    }
+
+    #[test]
+    fn restart_reattachment_requires_exact_queue_match() {
+        let request = QueuedTransferRequest {
+            sender_agent: "127.0.0.1:7339"
+                .parse()
+                .unwrap(),
+
+            receiver_agent: "127.0.0.1:7340"
+                .parse()
+                .unwrap(),
+
+            source_root: r"C:\Source".to_string(),
+
+            destination_root:
+                r"D:\Destination".to_string(),
+
+            update_existing: true,
+
+            worker_count: 4,
+
+            calibration_mib: 8,
+
+            kind: QueuedTransferKind::Fresh,
+        };
+
+        let transfer = ManagedTransferRecord {
+            sender_agent: request.sender_agent,
+
+            sender_job_id: 11,
+
+            receiver_agent: request.receiver_agent,
+
+            receiver_job_id: 17,
+
+            receiver_payload: "127.0.0.1:7337"
+                .parse()
+                .unwrap(),
+
+            source_root: request.source_root.clone(),
+
+            destination_root:
+                request.destination_root.clone(),
+
+            update_existing: request.update_existing,
+
+            worker_count: request.worker_count,
+
+            calibration_mib: request.calibration_mib,
+        };
+
+        assert!(transfer_matches_queue_request(
+            &request,
+            &transfer,
+        ));
+
+        let mut mismatch = transfer.clone();
+
+        mismatch.source_root =
+            r"C:\Different".to_string();
+
+        assert!(!transfer_matches_queue_request(
+            &request,
+            &mismatch,
+        ));
+
+        let mut mismatch = transfer.clone();
+
+        mismatch.destination_root =
+            r"D:\Different".to_string();
+
+        assert!(!transfer_matches_queue_request(
+            &request,
+            &mismatch,
+        ));
+
+        let mut mismatch = transfer.clone();
+
+        mismatch.update_existing = false;
+
+        assert!(!transfer_matches_queue_request(
+            &request,
+            &mismatch,
+        ));
+
+        let mut mismatch = transfer.clone();
+
+        mismatch.worker_count = 8;
+
+        assert!(!transfer_matches_queue_request(
+            &request,
+            &mismatch,
+        ));
+
+        let mut mismatch = transfer.clone();
+
+        mismatch.calibration_mib = 64;
+
+        assert!(!transfer_matches_queue_request(
+            &request,
+            &mismatch,
+        ));
+
+        let mut mismatch = transfer.clone();
+
+        mismatch.receiver_agent =
+            "127.0.0.1:7350".parse().unwrap();
+
+        assert!(!transfer_matches_queue_request(
+            &request,
+            &mismatch,
+        ));
     }
 
     #[test]
