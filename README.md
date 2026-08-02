@@ -24,26 +24,20 @@ The repository contains:
 
 ## Current status
 
-Current stable release:
+Current stable release and source version:
 
 ```text
-2.2.0
+2.3.0
 ```
 
-Current development version:
+v2.3 adds persistent queued orchestration, restart-safe queue recovery,
+Automatic LAN, managed Direct Link and Explicit IP routing, Windows transfer
+notifications, an endpoint-agent tray control, and a GitHub Releases update
+checker.
 
-```text
-2.3.0-dev
-```
-
-v2.2 introduced persistent LAN-visible endpoint agents, automatic discovery,
-remote filesystem browsing, sender-to-receiver orchestration, live progress,
-cancellation, paired failure cleanup, manager reconnection, managed resume,
-persistent history, and dedicated Manager and Agent executables.
-
-v2.3 development focuses on effortless queued orchestration: select several
-independent source and destination pairs, start the queue, and leave the
-machines to complete the work automatically.
+Select several independent source and destination pairs, start the queue, and
+leave the machines to complete the work sequentially. Failed or blocked work
+remains visible and requires an explicit retry, skip, or continuation.
 
 v2 supports verified content reuse during both updates
 and fresh folder transfers. Update mode reuses content from older receiver-side
@@ -214,9 +208,9 @@ orchestration is planned for v2.3.
 Management traffic remains unauthenticated and unencrypted in v2.2. Use the
 management agent only on a known and controlled local network.
 
-## v2.3 development roadmap — effortless queued transfers
+## v2.3 release — effortless queued transfers
 
-v2.3 centers on a persistent manager-side transfer queue. Endpoint agents remain
+v2.3 introduces a persistent manager-side transfer queue. Endpoint agents remain
 simple one-job-at-a-time executors, while the manager owns ordering, persistence,
 conflict detection, failure handling, resume, and automatic start-next behavior.
 
@@ -227,7 +221,27 @@ The primary workflow is:
 3. start the queue;
 4. leave the machines alone while the transfers run in sequence.
 
-### Planned v2.3 scope
+### v2.3 release highlights
+
+- persistent sequential transfer queue with stable request IDs;
+- queue order, state, pause preference, route intent, and recovery persistence;
+- automatic start-next behavior with safe unavailable and busy endpoint checks;
+- explicit retry, run-again, skip, cancellation, and pause-after-current controls;
+- journal-backed queued resume with the original stream count;
+- safe Manager restart reattachment without silently duplicating active work;
+- Automatic LAN, Direct Link, and Explicit IP management routes;
+- dual-stack IPv4 and IPv6 management control;
+- strict gateway-free physical-Ethernet Direct Link discovery;
+- scoped IPv6 link-local preference with IPv4 APIPA fallback;
+- completion, failure, pause, and action-required Windows notifications;
+- endpoint-agent notification-area control with idle/busy status and safe exit;
+- background GitHub Releases update checks with an explicit browser-opening flow;
+- packaged Manager, Agent, CLI, and Hungarian/English GUI executables.
+
+Management traffic remains unauthenticated and unencrypted. Use management mode
+only on a known and controlled network.
+
+### Released v2.3 scope and pending field acceptance
 
 - [x] add stable-ID queued transfer requests;
 - [x] persist queue order and state across manager restarts;
