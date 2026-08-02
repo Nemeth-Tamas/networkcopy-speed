@@ -11,6 +11,7 @@ mod control_plane;
 mod copy_bench;
 mod dedup_comparison_bench;
 mod destination_inventory;
+pub mod destination_layout;
 mod direct_address;
 mod direct_discovery;
 mod direct_discovery_v4;

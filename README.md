@@ -24,10 +24,16 @@ The repository contains:
 
 ## Current status
 
-Current stable release and source version:
+Current stable release:
 
 ```text
 2.3.0
+```
+
+Current development version:
+
+```text
+2.4.0-dev
 ```
 
 v2.3 adds persistent queued orchestration, restart-safe queue recovery,
@@ -275,9 +281,61 @@ only on a known and controlled network.
 - [x] start, resume, and reattach queued transfers through the selected direct route;
 - [ ] complete physical Direct Link Manager acceptance.
 
-Sequential reliability comes before concurrent execution. Transfers using fully
-disjoint endpoint pairs may run concurrently later if doing so does not make the
-queue harder to understand or recover.
+Sequential reliability comes before concurrent execution. v2.4 deliberately
+continues to operate one sender/receiver pair at a time.
+
+## v2.4 development roadmap — safer and faster unattended setup
+
+v2.4 strengthens queue recovery, adds destination-root batch mapping to the
+Manager and standalone GUI, and turns update checking into an explicit,
+user-approved executable update flow.
+
+### Queue recovery hardening
+
+- [ ] persist the exact active queue item and paired endpoint job IDs;
+- [ ] require exact job-ID matching during Manager restart reattachment;
+- [ ] distinguish retry reattachment from restarting the transfer;
+- [ ] prove both endpoints are clear before resetting blocked work to pending;
+- [ ] preserve safe recovery across persistence format migration.
+
+### Batch destination-root setup
+
+- [x] define one shared exact-destination and source-name-under-root mapping model;
+- [ ] select several source folders in the Manager;
+- [ ] select one receiver destination root;
+- [ ] preview the generated source-to-destination mappings;
+- [ ] reject duplicate source folder names that would collide beneath the root;
+- [ ] add the generated mappings to the persistent queue in one operation.
+
+### Standalone GUI root receiver
+
+- [ ] add Exact destination and Destination root receiver layouts;
+- [ ] transmit the selected source folder name as validated protocol metadata;
+- [ ] map a source such as `C:\Users\User\Desktop` beneath a receiver root as
+      `<root>\Desktop`;
+- [ ] keep a root-mode receiver listening after each completed transfer;
+- [ ] allow cancellation while waiting or while a transfer is active;
+- [ ] retain the existing one-folder standalone sender workflow;
+- [ ] migrate interrupted standalone GUI session persistence.
+
+### User-approved executable updates
+
+- [ ] identify the correct Manager, Agent, CLI, or GUI release asset;
+- [ ] download the selected release only after the user presses Update;
+- [ ] verify the GitHub release-asset size and SHA-256 digest;
+- [ ] save and migrate application persistence before handoff;
+- [ ] launch an officially named new executable beside an officially named old one;
+- [ ] replace a renamed executable in place while preserving its custom filename;
+- [ ] confirm successful startup before deleting backups or staging files;
+- [ ] roll back safely when replacement, migration, or startup fails.
+
+### Acceptance
+
+- [ ] complete v2.3 physical three-machine queue acceptance;
+- [ ] complete managed Direct Link physical acceptance;
+- [ ] complete Manager multi-source destination-root acceptance;
+- [ ] complete repeated standalone root-receiver acceptance;
+- [ ] complete renamed and officially named executable update acceptance.
 
 ### Deliberately deferred
 
