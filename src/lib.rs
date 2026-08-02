@@ -33,6 +33,7 @@ pub mod management_direct;
 pub mod management_directory;
 pub mod management_discovery;
 mod management_filesystem;
+pub mod management_instance;
 pub mod management_jobs;
 pub mod management_orchestration;
 pub mod management_persistence;

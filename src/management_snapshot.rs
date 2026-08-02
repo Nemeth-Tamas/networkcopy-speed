@@ -1,9 +1,11 @@
+use crate::management_instance::AgentInstanceId;
 use crate::management_protocol::MAX_MANAGEMENT_PAYLOAD_BYTES;
 use std::io;
 use std::net::SocketAddr;
 
-const SNAPSHOT_VERSION: u16 = 2;
-const SNAPSHOT_HEADER_BYTES: usize = 4;
+const SNAPSHOT_VERSION: u16 = 3;
+
+const SNAPSHOT_HEADER_BYTES: usize = 4 + AgentInstanceId::BYTE_COUNT;
 
 const ACTIVE_HEADER_BYTES: usize = 32;
 const SENDER_DETAIL_HEADER_BYTES: usize = 20;
@@ -149,8 +151,10 @@ pub struct ManagementJobResult {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagementAgentSnapshot {
+    pub agent_instance_id: AgentInstanceId,
+
     pub active: Option<ManagementActiveJobSnapshot>,
 
     pub latest_result: Option<ManagementJobResult>,
@@ -173,6 +177,8 @@ pub(crate) fn encode_snapshot(snapshot: &ManagementAgentSnapshot) -> io::Result<
 
     payload.push(flags);
     payload.push(0);
+
+    payload.extend_from_slice(&snapshot.agent_instance_id.to_le_bytes());
 
     if let Some(active) = &snapshot.active {
         encode_active(active, &mut payload)?;
@@ -236,6 +242,21 @@ pub(crate) fn decode_snapshot(payload: &[u8]) -> io::Result<ManagementAgentSnaps
         ));
     }
 
+    let agent_instance_id = AgentInstanceId::from_le_bytes(
+        payload[4..SNAPSHOT_HEADER_BYTES].try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "management agent instance ID was malformed",
+            )
+        })?,
+    )
+    .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "management agent instance ID was zero",
+        )
+    })?;
+
     let mut cursor = SNAPSHOT_HEADER_BYTES;
 
     let active = if flags & ACTIVE_PRESENT_FLAG != 0 {
@@ -261,7 +282,10 @@ pub(crate) fn decode_snapshot(payload: &[u8]) -> io::Result<ManagementAgentSnaps
     }
 
     Ok(ManagementAgentSnapshot {
+        agent_instance_id,
+
         active,
+
         latest_result,
     })
 }
@@ -1012,13 +1036,20 @@ fn invalid_data(error: io::Error) -> io::Error {
 mod tests {
     use super::{
         ManagementActiveJobDetails, ManagementActiveJobSnapshot, ManagementAgentSnapshot,
-        ManagementJobOutcome, ManagementJobResult, ManagementJobRole, decode_snapshot,
-        encode_snapshot,
+        ManagementJobOutcome, ManagementJobResult, ManagementJobRole, SNAPSHOT_HEADER_BYTES,
+        decode_snapshot, encode_snapshot,
     };
+    use crate::management_instance::AgentInstanceId;
+
+    fn instance_id() -> AgentInstanceId {
+        AgentInstanceId::from_raw(0x0011_2233_4455_6677_8899_AABB_CCDD_EEFF).unwrap()
+    }
 
     #[test]
     fn complete_snapshot_round_trips() {
         let expected = ManagementAgentSnapshot {
+            agent_instance_id: instance_id(),
+
             active: Some(ManagementActiveJobSnapshot {
                 role: ManagementJobRole::Sender,
 
@@ -1071,7 +1102,13 @@ mod tests {
 
     #[test]
     fn empty_snapshot_round_trips() {
-        let expected = ManagementAgentSnapshot::default();
+        let expected = ManagementAgentSnapshot {
+            agent_instance_id: instance_id(),
+
+            active: None,
+
+            latest_result: None,
+        };
 
         let encoded = encode_snapshot(&expected).unwrap();
 
@@ -1082,9 +1119,35 @@ mod tests {
 
     #[test]
     fn decoder_rejects_trailing_bytes() {
-        let mut encoded = encode_snapshot(&ManagementAgentSnapshot::default()).unwrap();
+        let mut encoded = encode_snapshot(&ManagementAgentSnapshot {
+            agent_instance_id: instance_id(),
+
+            active: None,
+
+            latest_result: None,
+        })
+        .unwrap();
 
         encoded.push(0xAA);
+
+        let error = decode_snapshot(&encoded).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData,);
+    }
+
+    #[test]
+    fn decoder_rejects_zero_instance_id() {
+        let snapshot = ManagementAgentSnapshot {
+            agent_instance_id: instance_id(),
+
+            active: None,
+
+            latest_result: None,
+        };
+
+        let mut encoded = encode_snapshot(&snapshot).unwrap();
+
+        encoded[4..SNAPSHOT_HEADER_BYTES].fill(0);
 
         let error = decode_snapshot(&encoded).unwrap_err();
 

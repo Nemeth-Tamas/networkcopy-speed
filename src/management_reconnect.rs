@@ -132,6 +132,7 @@ fn payload_endpoint(control_endpoint: SocketAddr, transfer_port: u16) -> SocketA
 #[cfg(test)]
 mod tests {
     use super::reconstruct_active_transfer;
+    use crate::management_instance::AgentInstanceId;
     use crate::management_snapshot::{
         ManagementActiveJobDetails, ManagementActiveJobSnapshot, ManagementAgentSnapshot,
         ManagementJobRole,
@@ -143,6 +144,8 @@ mod tests {
         details: ManagementActiveJobDetails,
     ) -> ManagementAgentSnapshot {
         ManagementAgentSnapshot {
+            agent_instance_id: AgentInstanceId::from_raw(u128::from(job_id)).unwrap(),
+
             active: Some(ManagementActiveJobSnapshot {
                 role,
 

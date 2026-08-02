@@ -363,7 +363,7 @@ impl DiscoveryPacket {
 pub fn run_agent() -> io::Result<()> {
     let descriptor = LocalAgentDescriptor::local()?;
 
-    let jobs = Arc::new(ManagementJobRegistry::new());
+    let jobs = Arc::new(ManagementJobRegistry::new()?);
 
     let socket = UdpSocket::bind(SocketAddrV4::new(
         Ipv4Addr::UNSPECIFIED,
@@ -381,6 +381,8 @@ pub fn run_agent() -> io::Result<()> {
     println!("NetworkCopy Speed Edition management agent",);
 
     println!("  Computer:       {}", descriptor.hostname,);
+
+    println!("  Instance:       {}", jobs.instance_id(),);
 
     println!("  Discovery UDP:  0.0.0.0:{}", MANAGEMENT_DISCOVERY_PORT,);
 
@@ -737,7 +739,7 @@ mod tests {
             capabilities: AgentCapabilities::SEND_RECEIVE,
         };
 
-        let jobs = Arc::new(ManagementJobRegistry::new());
+        let jobs = Arc::new(ManagementJobRegistry::new().unwrap());
 
         let server_jobs = Arc::clone(&jobs);
 

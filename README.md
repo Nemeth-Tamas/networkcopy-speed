@@ -292,6 +292,7 @@ user-approved executable update flow.
 
 ### Queue recovery hardening
 
+- [x] assign each running endpoint agent a random process identity;
 - [ ] persist the exact active queue item and paired endpoint job IDs;
 - [ ] require exact job-ID matching during Manager restart reattachment;
 - [ ] distinguish retry reattachment from restarting the transfer;

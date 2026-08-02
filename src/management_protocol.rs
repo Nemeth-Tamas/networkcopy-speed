@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 pub const MANAGEMENT_DISCOVERY_PORT: u16 = 7338;
 pub const MANAGEMENT_CONTROL_PORT: u16 = 7339;
 
-pub const MANAGEMENT_PROTOCOL_VERSION: u16 = 1;
+pub const MANAGEMENT_PROTOCOL_VERSION: u16 = 2;
 
 pub const MAX_MANAGEMENT_PAYLOAD_BYTES: usize = 1024 * 1024;
 

@@ -1,5 +1,6 @@
 use crate::calibrated_transfer;
 use crate::console_progress::{ProgressCounter, ProgressSnapshot};
+use crate::management_instance::AgentInstanceId;
 use crate::management_snapshot::{
     ManagementActiveJobDetails, ManagementActiveJobSnapshot, ManagementAgentSnapshot,
     ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
@@ -172,18 +173,26 @@ fn active_job_id(inner: &JobRegistryInner) -> Option<u64> {
 
 #[derive(Debug)]
 pub(crate) struct ManagementJobRegistry {
+    instance_id: AgentInstanceId,
+
     next_job_id: AtomicU64,
 
     inner: Mutex<JobRegistryInner>,
 }
 
 impl ManagementJobRegistry {
-    pub(crate) fn new() -> Self {
-        Self {
+    pub(crate) fn new() -> io::Result<Self> {
+        Ok(Self {
+            instance_id: AgentInstanceId::generate()?,
+
             next_job_id: AtomicU64::new(1),
 
             inner: Mutex::new(JobRegistryInner::default()),
-        }
+        })
+    }
+
+    pub(crate) const fn instance_id(&self) -> AgentInstanceId {
+        self.instance_id
     }
 
     pub(crate) fn is_busy(&self) -> io::Result<bool> {
@@ -492,6 +501,8 @@ impl ManagementJobRegistry {
         };
 
         Ok(ManagementAgentSnapshot {
+            agent_instance_id: self.instance_id,
+
             active,
 
             latest_result: inner.latest_result.clone(),
@@ -1913,7 +1924,7 @@ mod tests {
 
         let destination_text = destination.to_str().unwrap();
 
-        let registry = Arc::new(ManagementJobRegistry::new());
+        let registry = Arc::new(ManagementJobRegistry::new().unwrap());
 
         let job = registry
             .prepare_receive_on(
@@ -1970,7 +1981,7 @@ mod tests {
 
     #[test]
     fn prepared_response_round_trips() {
-        let registry = Arc::new(ManagementJobRegistry::new());
+        let registry = Arc::new(ManagementJobRegistry::new().unwrap());
 
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2066,7 +2077,7 @@ mod tests {
 
     #[test]
     fn idle_status_round_trips() {
-        let status = ManagementJobRegistry::new().status().unwrap();
+        let status = ManagementJobRegistry::new().unwrap().status().unwrap();
 
         let encoded = encode_status(&status).unwrap();
 
@@ -2104,5 +2115,22 @@ mod tests {
             encode_start_send_request_with_stream_count(receiver, r"C:\Source", 4, 8, Some(3),)
                 .is_err(),
         );
+    }
+
+    #[test]
+    fn registry_snapshot_keeps_instance_identity() {
+        let registry = ManagementJobRegistry::new().unwrap();
+
+        let expected = registry.instance_id();
+
+        let first = registry.snapshot().unwrap();
+
+        let second = registry.snapshot().unwrap();
+
+        assert_eq!(first.agent_instance_id, expected,);
+
+        assert_eq!(second.agent_instance_id, expected,);
+
+        assert_eq!(first.agent_instance_id, second.agent_instance_id,);
     }
 }

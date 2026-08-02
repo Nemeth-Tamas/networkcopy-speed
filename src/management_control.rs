@@ -125,7 +125,7 @@ impl ManagementControlServer {
             SocketAddr::new(address.ip(), 0),
             hostname,
             capabilities,
-            Arc::new(ManagementJobRegistry::new()),
+            Arc::new(ManagementJobRegistry::new()?),
         )
     }
 
@@ -1229,7 +1229,7 @@ mod tests {
 
         let destination_text = destination.to_str().unwrap().to_owned();
 
-        let jobs = Arc::new(ManagementJobRegistry::new());
+        let jobs = Arc::new(ManagementJobRegistry::new().unwrap());
 
         let server = ManagementControlServer::bind_at_with_receiver(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -1321,7 +1321,7 @@ mod tests {
             calibrated_transfer::receive_once(receiver_listener, &receiver_destination)
         });
 
-        let jobs = Arc::new(ManagementJobRegistry::new());
+        let jobs = Arc::new(ManagementJobRegistry::new().unwrap());
 
         let server = ManagementControlServer::bind_at_with_receiver(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -1399,9 +1399,9 @@ mod tests {
 
         fs::write(source.join("payload.bin"), vec![0x5A_u8; 256 * 1024]).unwrap();
 
-        let sender_jobs = Arc::new(ManagementJobRegistry::new());
+        let sender_jobs = Arc::new(ManagementJobRegistry::new().unwrap());
 
-        let receiver_jobs = Arc::new(ManagementJobRegistry::new());
+        let receiver_jobs = Arc::new(ManagementJobRegistry::new().unwrap());
 
         let sender_server = ManagementControlServer::bind_at_with_receiver(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),

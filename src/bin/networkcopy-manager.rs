@@ -4804,6 +4804,7 @@ mod tests {
         transfer_matches_queue_request,
     };
     use networkcopy_speed::management_discovery::{AgentCapabilities, AgentState, DiscoveredAgent};
+    use networkcopy_speed::management_instance::AgentInstanceId;
     use networkcopy_speed::management_orchestration::ManagedTransferRecord;
     use networkcopy_speed::management_queue::{
         QueuedTransferKind, QueuedTransferRequest, QueuedTransferState,
@@ -4922,6 +4923,8 @@ mod tests {
         };
 
         ManagementAgentSnapshot {
+            agent_instance_id: AgentInstanceId::from_raw(u128::from(job_id)).unwrap(),
+
             active: Some(ManagementActiveJobSnapshot {
                 role,
 
@@ -4944,6 +4947,8 @@ mod tests {
 
     fn terminal_snapshot(result: ManagementJobResult) -> ManagementAgentSnapshot {
         ManagementAgentSnapshot {
+            agent_instance_id: AgentInstanceId::from_raw(u128::from(result.job_id)).unwrap(),
+
             active: None,
 
             latest_result: Some(result),
