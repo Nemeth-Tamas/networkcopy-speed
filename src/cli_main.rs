@@ -109,6 +109,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         }
 
+        "management-direct-candidates" => {
+            run_management_direct_candidates(
+                &mut arguments,
+            )
+        }
+
         "management-hello" => {
             run_management_hello(
                 &mut arguments,
@@ -218,6 +224,147 @@ fn run_management_agent(
     crate::management_agent::run()?;
 
     Ok(())
+}
+
+fn run_management_direct_candidates(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    let report =
+        crate::management_direct::discover_candidates()?;
+
+    println!(
+        "NetworkCopy Speed Edition direct management candidates",
+    );
+
+    println!();
+
+    println!(
+        "  Usable direct interfaces: {}",
+        report.candidates.len(),
+    );
+
+    println!(
+        "  Routed Ethernet rejected: {}",
+        report.routed_interface_indices.len(),
+    );
+
+    println!(
+        "  Addressless interfaces:   {}",
+        report
+            .addressless_interface_indices
+            .len(),
+    );
+
+    for candidate in &report.candidates {
+        println!();
+
+        println!(
+            "Interface {}",
+            candidate.interface_index,
+        );
+
+        match candidate.ipv6_endpoint {
+            Some(endpoint) => {
+                println!(
+                    "  IPv6 management: {}",
+                    endpoint,
+                );
+            }
+
+            None => {
+                println!(
+                    "  IPv6 management: unavailable",
+                );
+            }
+        }
+
+        match candidate.ipv4_endpoint {
+            Some(endpoint) => {
+                println!(
+                    "  IPv4 management: {}",
+                    endpoint,
+                );
+            }
+
+            None => {
+                println!(
+                    "  IPv4 management: unavailable",
+                );
+            }
+        }
+
+        match candidate.preferred_endpoint() {
+            Some(endpoint) => {
+                println!(
+                    "  Preferred:       {}",
+                    endpoint,
+                );
+            }
+
+            None => {
+                println!(
+                    "  Preferred:       unavailable",
+                );
+            }
+        }
+    }
+
+    if !report.routed_interface_indices.is_empty() {
+        println!();
+
+        println!(
+            "Rejected routed Ethernet interface indexes: {}",
+            format_interface_indices(
+                &report.routed_interface_indices,
+            ),
+        );
+    }
+
+    if !report
+        .addressless_interface_indices
+        .is_empty()
+    {
+        println!();
+
+        println!(
+            "Direct interfaces without link-local/APIPA addresses: {}",
+            format_interface_indices(
+                &report
+                    .addressless_interface_indices,
+            ),
+        );
+    }
+
+    if report.candidates.is_empty() {
+        println!();
+
+        println!(
+            "No usable gateway-free Direct Link management interface is currently available.",
+        );
+    }
+
+    Ok(())
+}
+
+fn format_interface_indices(
+    interface_indices: &[u32],
+) -> String {
+    interface_indices
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn run_management_transfer(
@@ -3174,4 +3321,22 @@ fn print_usage(program: &OsStr) {
         pipeline_bench::DEFAULT_CHUNK_MIB,
         pipeline_bench::DEFAULT_BUFFER_COUNT
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_interface_indices;
+
+    #[test]
+    fn interface_indices_are_formatted_for_diagnostics() {
+        assert_eq!(
+            format_interface_indices(&[3, 10, 42]),
+            "3, 10, 42",
+        );
+
+        assert_eq!(
+            format_interface_indices(&[]),
+            "",
+        );
+    }
 }

@@ -28,6 +28,7 @@ mod iocp_file_probe;
 mod iocp_probe;
 pub mod management_agent;
 pub mod management_control;
+pub mod management_direct;
 pub mod management_directory;
 pub mod management_discovery;
 mod management_filesystem;
