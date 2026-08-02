@@ -5,6 +5,7 @@
 
 use eframe::egui;
 use networkcopy_speed::management_control;
+use networkcopy_speed::management_direct::{self, DirectDiscoveredAgent};
 use networkcopy_speed::management_directory::{ManagementDirectoryEntry, ManagementEntryKind};
 use networkcopy_speed::management_discovery::{self, AgentState, DiscoveredAgent};
 use networkcopy_speed::management_orchestration::{
@@ -40,6 +41,17 @@ const MAX_TRANSFER_HISTORY: usize = 20;
 const STATE_SAVE_INTERVAL: Duration = Duration::from_millis(750);
 
 type DiscoveryResult = Result<Vec<DiscoveredAgent>, String>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DirectManagementRoute {
+    interface_index: u32,
+
+    local_agent: DiscoveredAgent,
+
+    peer_agent: DiscoveredAgent,
+}
+
+type DirectDiscoveryResult = Result<Vec<DirectManagementRoute>, String>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ManagedStartFailureKind {
@@ -367,6 +379,8 @@ impl RemoteBrowserPane {
 struct NetworkCopyManager {
     agents: Vec<DiscoveredAgent>,
 
+    direct_routes: Vec<DirectManagementRoute>,
+
     sender_agent: String,
 
     receiver_agent: String,
@@ -398,6 +412,8 @@ struct NetworkCopyManager {
     show_history: bool,
 
     discovery_receiver: Option<Receiver<DiscoveryResult>>,
+
+    direct_discovery_receiver: Option<Receiver<DirectDiscoveryResult>>,
 
     start_receiver: Option<Receiver<StartResult>>,
 
@@ -451,6 +467,8 @@ impl NetworkCopyManager {
         let mut manager = Self {
             agents: Vec::new(),
 
+            direct_routes: Vec::new(),
+
             sender_agent: String::new(),
 
             receiver_agent: String::new(),
@@ -482,6 +500,8 @@ impl NetworkCopyManager {
             show_history: false,
 
             discovery_receiver: None,
+
+            direct_discovery_receiver: None,
 
             start_receiver: None,
 
@@ -726,6 +746,7 @@ impl NetworkCopyManager {
             &self.sender_agent,
             &self.receiver_agent,
             &self.agents,
+            &self.direct_routes,
         )
     }
 
@@ -1176,6 +1197,45 @@ impl NetworkCopyManager {
         });
     }
 
+    fn begin_direct_discovery(&mut self) {
+        if self.direct_discovery_receiver.is_some() {
+            return;
+        }
+
+        self.error.clear();
+
+        self.direct_routes.clear();
+
+        self.notice = "Searching dedicated Ethernet links...".to_string();
+
+        let (sender, receiver) = mpsc::channel();
+
+        self.direct_discovery_receiver = Some(receiver);
+
+        thread::spawn(move || {
+            let result = management_direct::discover_agents()
+                .map_err(|error| format!("Direct Link management discovery failed: {error}",))
+                .and_then(build_direct_management_routes);
+
+            let _ = sender.send(result);
+        });
+    }
+
+    fn select_direct_route(&mut self, route: &DirectManagementRoute) {
+        self.route_mode = ManagementRouteMode::DirectLink;
+
+        self.sender_agent = route.local_agent.endpoint.to_string();
+
+        self.receiver_agent = route.peer_agent.endpoint.to_string();
+
+        self.show_setup = true;
+
+        self.notice = format!(
+            "Selected Direct Link interface {}: {} → {}.",
+            route.interface_index, route.local_agent.hostname, route.peer_agent.hostname,
+        );
+    }
+
     fn begin_transfer(&mut self) {
         if self.start_receiver.is_some() {
             return;
@@ -1623,6 +1683,8 @@ impl NetworkCopyManager {
     fn process_messages(&mut self) {
         self.process_discovery_message();
 
+        self.process_direct_discovery_message();
+
         self.process_start_message();
 
         self.process_attach_message();
@@ -1667,6 +1729,68 @@ impl NetworkCopyManager {
                 self.discovery_receiver = None;
 
                 self.error = "Management discovery worker disconnected.".to_string();
+
+                self.notice.clear();
+            }
+
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    fn process_direct_discovery_message(&mut self) {
+        let message = self
+            .direct_discovery_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
+
+        match message {
+            Some(Ok(Ok(routes))) => {
+                self.direct_discovery_receiver = None;
+
+                let automatic_selection = if routes.len() == 1 {
+                    routes.first().cloned()
+                } else {
+                    None
+                };
+
+                let route_count = routes.len();
+
+                self.direct_routes = routes;
+
+                self.error.clear();
+
+                if let Some(route) = automatic_selection {
+                    self.select_direct_route(&route);
+
+                    self.notice = format!(
+                        "Discovered and selected Direct Link interface {}: {} → {}.",
+                        route.interface_index,
+                        route.local_agent.hostname,
+                        route.peer_agent.hostname,
+                    );
+                } else {
+                    self.notice = format!(
+                        "Discovered {route_count} Direct Link route(s). Choose one below.",
+                    );
+                }
+            }
+
+            Some(Ok(Err(error))) => {
+                self.direct_discovery_receiver = None;
+
+                self.direct_routes.clear();
+
+                self.error = error;
+
+                self.notice.clear();
+            }
+
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.direct_discovery_receiver = None;
+
+                self.direct_routes.clear();
+
+                self.error = "Direct Link discovery worker disconnected.".to_string();
 
                 self.notice.clear();
             }
@@ -2102,6 +2226,7 @@ impl NetworkCopyManager {
 
     fn has_background_work(&self) -> bool {
         self.discovery_receiver.is_some()
+            || self.direct_discovery_receiver.is_some()
             || self.start_receiver.is_some()
             || self.attach_receiver.is_some()
             || self.queue_reattach_receiver.is_some()
@@ -2137,8 +2262,16 @@ impl NetworkCopyManager {
             ("Transfer active", egui::Color32::from_rgb(126, 230, 64))
         } else if self.monitoring_complete {
             ("Transfer finished", egui::Color32::from_rgb(95, 194, 255))
+        } else if self.direct_discovery_receiver.is_some() {
+            (
+                "Discovering Direct Link",
+                egui::Color32::from_rgb(95, 194, 255),
+            )
         } else if self.discovery_receiver.is_some() {
-            ("Discovering agents", egui::Color32::from_rgb(95, 194, 255))
+            (
+                "Discovering LAN agents",
+                egui::Color32::from_rgb(95, 194, 255),
+            )
         } else {
             ("Ready", egui::Color32::from_rgb(126, 230, 64))
         }
@@ -2159,10 +2292,16 @@ impl NetworkCopyManager {
             ui.label(format!("v{}", env!("CARGO_PKG_VERSION"),));
         });
 
-        ui.label("Remote LAN orchestration with direct sender-to-receiver payload transfer.");
+        ui.label(
+            "Automatic LAN, Direct Link, and explicit-IP orchestration with direct sender-to-receiver payload transfer.",
+        );
 
         ui.horizontal_wrapped(|ui| {
-            ui.label(format!("{} agent(s) discovered", self.agents.len(),));
+            ui.label(format!("{} LAN agent(s)", self.agents.len(),));
+
+            ui.separator();
+
+            ui.label(format!("{} Direct Link route(s)", self.direct_routes.len(),));
 
             ui.separator();
 
@@ -2251,11 +2390,22 @@ impl NetworkCopyManager {
     }
 
     fn render_discovery(&mut self, ui: &mut egui::Ui) {
+        if self.route_mode == ManagementRouteMode::DirectLink {
+            self.render_direct_discovery(ui);
+
+            return;
+        }
+
         ui.horizontal_wrapped(|ui| {
             let discovering = self.discovery_receiver.is_some();
 
             if ui
-                .add_enabled(!discovering, egui::Button::new("Refresh discovery"))
+                .add_enabled(
+                    !discovering,
+                    egui::Button::new(
+                        "Refresh LAN discovery",
+                    ),
+                )
                 .clicked()
             {
                 self.begin_discovery();
@@ -2264,7 +2414,9 @@ impl NetworkCopyManager {
             if discovering {
                 ui.spinner();
 
-                ui.label("Searching LAN...");
+                ui.label(
+                    "Searching local network...",
+                );
             }
 
             ui.label(
@@ -2367,6 +2519,189 @@ impl NetworkCopyManager {
         }
     }
 
+    fn render_direct_discovery(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            let discovering = self
+                .direct_discovery_receiver
+                .is_some();
+
+            if ui
+                .add_enabled(
+                    !discovering,
+                    egui::Button::new(
+                        "Refresh Direct Link",
+                    ),
+                )
+                .clicked()
+            {
+                self.begin_direct_discovery();
+            }
+
+            if discovering {
+                ui.spinner();
+
+                ui.label(
+                    "Searching gateway-free Ethernet cables...",
+                );
+            }
+
+            ui.label(
+                "Run networkcopy-agent.exe on this source PC and on the directly connected destination PC.",
+            );
+        });
+
+        ui.add_space(6.0);
+
+        if self.direct_routes.is_empty() {
+            ui.label(
+                "No Direct Link route is selected. Connect the two PCs with Ethernet, start both agents, and refresh.",
+            );
+
+            ui.label(
+                "Wi-Fi and Ethernet interfaces carrying a default route are deliberately ignored.",
+            );
+
+            return;
+        }
+
+        let routes = self.direct_routes.clone();
+
+        for route in routes {
+            let sender_endpoint = route.local_agent.endpoint.to_string();
+
+            let receiver_endpoint = route.peer_agent.endpoint.to_string();
+
+            let selected = self.route_mode == ManagementRouteMode::DirectLink
+                && self.sender_agent == sender_endpoint
+                && self.receiver_agent == receiver_endpoint;
+
+            let usable = route.local_agent.capabilities.can_send()
+                && route.peer_agent.capabilities.can_receive();
+
+            ui.group(|ui| {
+                ui.set_min_width(
+                    ui.available_width(),
+                );
+
+                ui.horizontal_wrapped(|ui| {
+                    status_label(
+                        ui,
+                        if selected {
+                            "Selected"
+                        } else {
+                            "Direct Link"
+                        },
+                        if selected {
+                            egui::Color32::from_rgb(
+                                126, 230, 64,
+                            )
+                        } else {
+                            egui::Color32::from_rgb(
+                                95, 194, 255,
+                            )
+                        },
+                    );
+
+                    ui.strong(format!(
+                        "Interface {}",
+                        route.interface_index,
+                    ));
+                });
+
+                ui.add_space(4.0);
+
+                ui.columns(2, |columns| {
+                    let (local, peer) =
+                        columns.split_at_mut(1);
+
+                    local[0].group(|ui| {
+                        ui.strong("This PC · sender");
+
+                        status_label(
+                            ui,
+                            route.local_agent
+                                .state
+                                .label(),
+                            agent_state_color(
+                                route.local_agent
+                                    .state
+                                    .label(),
+                            ),
+                        );
+
+                        ui.label(
+                            &route.local_agent.hostname,
+                        );
+
+                        ui.label(
+                            egui::RichText::new(
+                                &sender_endpoint,
+                            )
+                            .monospace(),
+                        );
+                    });
+
+                    peer[0].group(|ui| {
+                        ui.strong(
+                            "Cable peer · receiver",
+                        );
+
+                        status_label(
+                            ui,
+                            route.peer_agent
+                                .state
+                                .label(),
+                            agent_state_color(
+                                route.peer_agent
+                                    .state
+                                    .label(),
+                            ),
+                        );
+
+                        ui.label(
+                            &route.peer_agent.hostname,
+                        );
+
+                        ui.label(
+                            egui::RichText::new(
+                                &receiver_endpoint,
+                            )
+                            .monospace(),
+                        );
+                    });
+                });
+
+                ui.add_space(6.0);
+
+                if ui
+                    .add_enabled(
+                        usable && !selected,
+                        egui::Button::new(
+                            if selected {
+                                "Direct Link selected"
+                            } else {
+                                "Use this Direct Link"
+                            },
+                        ),
+                    )
+                    .clicked()
+                {
+                    self.select_direct_route(
+                        &route,
+                    );
+                }
+
+                if !usable {
+                    ui.label(
+                        "The local agent must support sending and the cable peer must support receiving.",
+                    );
+                }
+            });
+
+            ui.add_space(6.0);
+        }
+    }
+
     fn render_configuration(&mut self, ui: &mut egui::Ui) {
         ui.label("Paths are evaluated on the selected remote endpoint machines.");
 
@@ -2386,13 +2721,10 @@ impl NetworkCopyManager {
                     "Automatic LAN",
                 );
 
-                ui.add_enabled(
-                    false,
-                    egui::RadioButton::new(
-                        self.route_mode
-                            == ManagementRouteMode::DirectLink,
-                        "Direct Link · wiring next",
-                    ),
+                ui.radio_value(
+                    &mut self.route_mode,
+                    ManagementRouteMode::DirectLink,
+                    "Direct Link",
                 );
 
                 ui.radio_value(
@@ -2410,14 +2742,7 @@ impl NetworkCopyManager {
                 == ManagementRouteMode::DirectLink
             {
                 ui.label(
-                    egui::RichText::new(
-                        "Direct Link management discovery is not active yet. Choose Automatic LAN or Explicit IP for now.",
-                    )
-                    .color(
-                        egui::Color32::from_rgb(
-                            255, 190, 82,
-                        ),
-                    ),
+                    "For scoped IPv6 safety, the Manager runs on the source PC: the local agent sends and the cable peer receives.",
                 );
             }
         });
@@ -2565,14 +2890,11 @@ impl NetworkCopyManager {
 
         let transfer_active = self.transfer.is_some() && !self.monitoring_complete;
 
-        let route_available = self.route_mode != ManagementRouteMode::DirectLink;
-
         let configuration_ready = !self.sender_agent.trim().is_empty()
             && !self.receiver_agent.trim().is_empty()
             && !self.source_root.trim().is_empty()
             && !self.destination_root.trim().is_empty()
-            && self.sender_agent != self.receiver_agent
-            && route_available;
+            && self.sender_agent != self.receiver_agent;
 
         let can_start = self.start_receiver.is_none()
             && self.attach_receiver.is_none()
@@ -2588,8 +2910,7 @@ impl NetworkCopyManager {
             && !transfer_active
             && !self.sender_agent.trim().is_empty()
             && !self.receiver_agent.trim().is_empty()
-            && self.sender_agent != self.receiver_agent
-            && route_available;
+            && self.sender_agent != self.receiver_agent;
 
         ui.horizontal(|ui| {
             if ui
@@ -3394,19 +3715,76 @@ impl eframe::App for NetworkCopyManager {
     }
 }
 
+fn build_direct_management_routes(
+    discovered: Vec<DirectDiscoveredAgent>,
+) -> Result<Vec<DirectManagementRoute>, String> {
+    let mut routes = Vec::new();
+
+    for discovered in discovered {
+        let local_hello =
+            management_control::hello(discovered.local_endpoint)
+                .map_err(|error| {
+                    format!(
+                        "The local management agent did not answer at {} for Direct Link interface {}: {error}",
+                        discovered.local_endpoint,
+                        discovered.interface_index,
+                    )
+                })?;
+
+        let local_agent = DiscoveredAgent {
+            hostname: local_hello.hostname,
+
+            endpoint: discovered.local_endpoint,
+
+            protocol_version: local_hello.protocol_version,
+
+            state: local_hello.state,
+
+            capabilities: local_hello.capabilities,
+        };
+
+        if local_agent.endpoint == discovered.agent.endpoint {
+            return Err(format!(
+                "Direct Link interface {} returned the same local and peer management endpoint.",
+                discovered.interface_index,
+            ));
+        }
+
+        routes.push(DirectManagementRoute {
+            interface_index: discovered.interface_index,
+
+            local_agent,
+
+            peer_agent: discovered.agent,
+        });
+    }
+
+    routes.sort_by(|left, right| {
+        left.interface_index
+            .cmp(&right.interface_index)
+            .then_with(|| left.peer_agent.hostname.cmp(&right.peer_agent.hostname))
+    });
+
+    routes.dedup_by(|left, right| {
+        left.interface_index == right.interface_index
+            && left.local_agent.endpoint == right.local_agent.endpoint
+            && left.peer_agent.endpoint == right.peer_agent.endpoint
+    });
+
+    if routes.is_empty() {
+        return Err("No usable Direct Link management route was discovered.".to_string());
+    }
+
+    Ok(routes)
+}
+
 fn resolve_management_endpoints(
     route_mode: ManagementRouteMode,
     sender_text: &str,
     receiver_text: &str,
     agents: &[DiscoveredAgent],
+    direct_routes: &[DirectManagementRoute],
 ) -> Result<(SocketAddr, SocketAddr), String> {
-    if route_mode == ManagementRouteMode::DirectLink {
-        return Err(
-            "Direct Link management discovery is not available yet. Choose Automatic LAN or Explicit IP."
-                .to_string(),
-        );
-    }
-
     let sender_agent = parse_endpoint(sender_text, "sender management agent")?;
 
     let receiver_agent = parse_endpoint(receiver_text, "receiver management agent")?;
@@ -3415,50 +3793,87 @@ fn resolve_management_endpoints(
         return Err("Sender and receiver must be different management agents.".to_string());
     }
 
-    if route_mode == ManagementRouteMode::ExplicitIp {
-        return Ok((sender_agent, receiver_agent));
+    match route_mode {
+        ManagementRouteMode::ExplicitIp => Ok((sender_agent, receiver_agent)),
+
+        ManagementRouteMode::AutomaticLan => {
+            let sender = agents
+                .iter()
+                .find(|agent| {
+                    agent.endpoint
+                        == sender_agent
+                })
+                .ok_or_else(|| {
+                    "Automatic LAN requires the sender to be selected from the discovered-agent list."
+                        .to_string()
+                })?;
+
+            if !sender.capabilities.can_send() {
+                return Err(format!(
+                    "Discovered agent {} cannot act as a sender.",
+                    sender.hostname,
+                ));
+            }
+
+            let receiver = agents
+                .iter()
+                .find(|agent| {
+                    agent.endpoint
+                        == receiver_agent
+                })
+                .ok_or_else(|| {
+                    "Automatic LAN requires the receiver to be selected from the discovered-agent list."
+                        .to_string()
+                })?;
+
+            if !receiver.capabilities.can_receive() {
+                return Err(format!(
+                    "Discovered agent {} cannot act as a receiver.",
+                    receiver.hostname,
+                ));
+            }
+
+            Ok((sender_agent, receiver_agent))
+        }
+
+        ManagementRouteMode::DirectLink => {
+            let route = direct_routes
+                .iter()
+                .find(|route| {
+                    route.local_agent.endpoint
+                        == sender_agent
+                        && route.peer_agent.endpoint
+                            == receiver_agent
+                })
+                .ok_or_else(|| {
+                    "Direct Link requires a matching local-sender and cable-peer receiver route. Refresh Direct Link discovery and select a route."
+                        .to_string()
+                })?;
+
+            if !route.local_agent.capabilities.can_send() {
+                return Err(format!(
+                    "Local Direct Link agent {} cannot act as a sender.",
+                    route.local_agent.hostname,
+                ));
+            }
+
+            if !route.peer_agent.capabilities.can_receive() {
+                return Err(format!(
+                    "Direct Link peer {} cannot act as a receiver.",
+                    route.peer_agent.hostname,
+                ));
+            }
+
+            Ok((sender_agent, receiver_agent))
+        }
     }
-
-    let sender = agents
-        .iter()
-        .find(|agent| agent.endpoint == sender_agent)
-        .ok_or_else(|| {
-            "Automatic LAN requires the sender to be selected from the discovered-agent list."
-                .to_string()
-        })?;
-
-    if !sender.capabilities.can_send() {
-        return Err(format!(
-            "Discovered agent {} cannot act as a sender.",
-            sender.hostname,
-        ));
-    }
-
-    let receiver = agents
-        .iter()
-        .find(|agent| agent.endpoint == receiver_agent)
-        .ok_or_else(|| {
-            "Automatic LAN requires the receiver to be selected from the discovered-agent list."
-                .to_string()
-        })?;
-
-    if !receiver.capabilities.can_receive() {
-        return Err(format!(
-            "Discovered agent {} cannot act as a receiver.",
-            receiver.hostname,
-        ));
-    }
-
-    Ok((sender_agent, receiver_agent))
 }
 
 fn preflight_queue_route(route_mode: ManagementRouteMode) -> Result<(), ManagedStartFailure> {
     match route_mode {
-        ManagementRouteMode::AutomaticLan | ManagementRouteMode::ExplicitIp => Ok(()),
-
-        ManagementRouteMode::DirectLink => Err(ManagedStartFailure::blocked(
-            "Direct Link management discovery is not available yet. The queued item was left blocked rather than falling back to normal LAN routing.",
-        )),
+        ManagementRouteMode::AutomaticLan
+        | ManagementRouteMode::DirectLink
+        | ManagementRouteMode::ExplicitIp => Ok(()),
     }
 }
 
@@ -4105,7 +4520,7 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_TRANSFER_HISTORY, ManagedEndpointRole, ManagedStartFailureKind,
+        DirectManagementRoute, MAX_TRANSFER_HISTORY, ManagedEndpointRole, ManagedStartFailureKind,
         PairedTransferHistoryEntry, join_remote_path, paired_outcome, parent_remote_path,
         peer_cleanup_target, preflight_queue_route, queue_state_for_outcome,
         queue_state_for_start_failure, remember_history, resolve_management_endpoints,
@@ -4396,6 +4811,7 @@ mod tests {
                 "192.0.2.10:7339",
                 "192.0.2.11:7339",
                 &[],
+                &[],
             )
             .unwrap(),
             expected,
@@ -4439,6 +4855,7 @@ mod tests {
                 &sender_endpoint.to_string(),
                 &receiver_endpoint.to_string(),
                 &agents,
+                &[],
             )
             .unwrap(),
             (sender_endpoint, receiver_endpoint,),
@@ -4450,26 +4867,70 @@ mod tests {
                 &sender_endpoint.to_string(),
                 &receiver_endpoint.to_string(),
                 &[],
+                &[],
             )
             .is_err(),
         );
     }
 
     #[test]
-    fn direct_link_is_blocked_until_scoped_discovery_exists() {
+    fn direct_link_requires_matching_local_sender_and_peer_receiver() {
+        let local_endpoint = "[fe80::10%42]:7339".parse().unwrap();
+
+        let peer_endpoint = "[fe80::20%42]:7339".parse().unwrap();
+
+        let route = DirectManagementRoute {
+            interface_index: 42,
+
+            local_agent: DiscoveredAgent {
+                hostname: "SOURCE-PC".to_string(),
+
+                endpoint: local_endpoint,
+
+                protocol_version: 1,
+
+                state: AgentState::Idle,
+
+                capabilities: AgentCapabilities::SEND_RECEIVE,
+            },
+
+            peer_agent: DiscoveredAgent {
+                hostname: "DESTINATION-PC".to_string(),
+
+                endpoint: peer_endpoint,
+
+                protocol_version: 1,
+
+                state: AgentState::Idle,
+
+                capabilities: AgentCapabilities::SEND_RECEIVE,
+            },
+        };
+
+        assert_eq!(
+            resolve_management_endpoints(
+                ManagementRouteMode::DirectLink,
+                &local_endpoint.to_string(),
+                &peer_endpoint.to_string(),
+                &[],
+                &[route.clone()],
+            )
+            .unwrap(),
+            (local_endpoint, peer_endpoint,),
+        );
+
         assert!(
             resolve_management_endpoints(
                 ManagementRouteMode::DirectLink,
-                "192.0.2.10:7339",
-                "192.0.2.11:7339",
+                &peer_endpoint.to_string(),
+                &local_endpoint.to_string(),
                 &[],
+                &[route],
             )
             .is_err(),
         );
 
-        let failure = preflight_queue_route(ManagementRouteMode::DirectLink).unwrap_err();
-
-        assert_eq!(failure.kind, ManagedStartFailureKind::Blocked,);
+        assert!(preflight_queue_route(ManagementRouteMode::DirectLink,).is_ok(),);
     }
 
     #[test]
