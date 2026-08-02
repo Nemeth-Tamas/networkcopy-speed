@@ -720,14 +720,17 @@ impl NetworkCopyManager {
         }
     }
 
+    fn configured_management_endpoints(&self) -> Result<(SocketAddr, SocketAddr), String> {
+        resolve_management_endpoints(
+            self.route_mode,
+            &self.sender_agent,
+            &self.receiver_agent,
+            &self.agents,
+        )
+    }
+
     fn queued_request_from_configuration(&self) -> Result<QueuedTransferRequest, String> {
-        let sender_agent = parse_endpoint(&self.sender_agent, "sender management agent")?;
-
-        let receiver_agent = parse_endpoint(&self.receiver_agent, "receiver management agent")?;
-
-        if sender_agent == receiver_agent {
-            return Err("Sender and receiver must be different management agents.".to_string());
-        }
+        let (sender_agent, receiver_agent) = self.configured_management_endpoints()?;
 
         if self.source_root.trim().is_empty() {
             return Err("Enter the source path on the sender machine.".to_string());
@@ -905,6 +908,10 @@ impl NetworkCopyManager {
 
         self.update_existing = request.update_existing;
 
+        self.route_mode = request.route_mode;
+
+        let route_mode = request.route_mode;
+
         let kind = request.kind;
 
         let managed_request = ManagedTransferRequest {
@@ -954,7 +961,9 @@ impl NetworkCopyManager {
         self.start_receiver = Some(receiver);
 
         thread::spawn(move || {
-            let result = match preflight_queue_endpoints(&managed_request) {
+            let result = match preflight_queue_route(route_mode)
+                .and_then(|()| preflight_queue_endpoints(&managed_request))
+            {
                 Err(error) => Err(error),
 
                 Ok(()) => match kind {
@@ -1174,30 +1183,15 @@ impl NetworkCopyManager {
 
         self.error.clear();
 
-        let sender_agent = match parse_endpoint(&self.sender_agent, "sender management agent") {
-            Ok(endpoint) => endpoint,
+        let (sender_agent, receiver_agent) = match self.configured_management_endpoints() {
+            Ok(endpoints) => endpoints,
 
             Err(error) => {
                 self.error = error;
+
                 return;
             }
         };
-
-        let receiver_agent = match parse_endpoint(&self.receiver_agent, "receiver management agent")
-        {
-            Ok(endpoint) => endpoint,
-
-            Err(error) => {
-                self.error = error;
-                return;
-            }
-        };
-
-        if sender_agent == receiver_agent {
-            self.error = "Sender and receiver must be different management agents.".to_string();
-
-            return;
-        }
 
         if self.source_root.trim().is_empty() {
             self.error = "Enter the source path on the sender machine.".to_string();
@@ -1290,6 +1284,8 @@ impl NetworkCopyManager {
 
         self.update_existing = transfer.update_existing;
 
+        self.route_mode = ManagementRouteMode::ExplicitIp;
+
         let request = ManagedTransferRequest {
             sender_agent: transfer.sender_agent,
 
@@ -1362,6 +1358,8 @@ impl NetworkCopyManager {
         self.calibration_mib = request.calibration_mib;
 
         self.update_existing = request.update_existing;
+
+        self.route_mode = request.route_mode;
 
         self.clear_transfer_card();
 
@@ -1465,30 +1463,15 @@ impl NetworkCopyManager {
 
         self.error.clear();
 
-        let sender_agent = match parse_endpoint(&self.sender_agent, "sender management agent") {
-            Ok(endpoint) => endpoint,
+        let (sender_agent, receiver_agent) = match self.configured_management_endpoints() {
+            Ok(endpoints) => endpoints,
 
             Err(error) => {
                 self.error = error;
+
                 return;
             }
         };
-
-        let receiver_agent = match parse_endpoint(&self.receiver_agent, "receiver management agent")
-        {
-            Ok(endpoint) => endpoint,
-
-            Err(error) => {
-                self.error = error;
-                return;
-            }
-        };
-
-        if sender_agent == receiver_agent {
-            self.error = "Sender and receiver must be different management agents.".to_string();
-
-            return;
-        }
 
         self.notice = "Reading active jobs from both endpoints...".to_string();
 
@@ -2284,7 +2267,9 @@ impl NetworkCopyManager {
                 ui.label("Searching LAN...");
             }
 
-            ui.label("Run networkcopy-speed.exe management-agent on each endpoint.");
+            ui.label(
+                "Run networkcopy-agent.exe on each endpoint. Selecting an agent uses Automatic LAN mode.",
+            );
         });
 
         ui.add_space(6.0);
@@ -2343,6 +2328,8 @@ impl NetworkCopyManager {
                         )
                         .clicked()
                     {
+                        self.route_mode = ManagementRouteMode::AutomaticLan;
+
                         self.sender_agent = endpoint_text.clone();
                     }
 
@@ -2357,6 +2344,8 @@ impl NetworkCopyManager {
                         )
                         .clicked()
                     {
+                        self.route_mode = ManagementRouteMode::AutomaticLan;
+
                         self.receiver_agent = endpoint_text.clone();
                     }
 
@@ -2383,6 +2372,60 @@ impl NetworkCopyManager {
 
         ui.add_space(8.0);
 
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Management route");
+
+                ui.separator();
+
+                ui.radio_value(
+                    &mut self.route_mode,
+                    ManagementRouteMode::AutomaticLan,
+                    "Automatic LAN",
+                );
+
+                ui.add_enabled(
+                    false,
+                    egui::RadioButton::new(
+                        self.route_mode
+                            == ManagementRouteMode::DirectLink,
+                        "Direct Link · wiring next",
+                    ),
+                );
+
+                ui.radio_value(
+                    &mut self.route_mode,
+                    ManagementRouteMode::ExplicitIp,
+                    "Explicit IP",
+                );
+            });
+
+            ui.add_space(4.0);
+
+            ui.label(self.route_mode.description());
+
+            if self.route_mode
+                == ManagementRouteMode::DirectLink
+            {
+                ui.label(
+                    egui::RichText::new(
+                        "Direct Link management discovery is not active yet. Choose Automatic LAN or Explicit IP for now.",
+                    )
+                    .color(
+                        egui::Color32::from_rgb(
+                            255, 190, 82,
+                        ),
+                    ),
+                );
+            }
+        });
+
+        ui.add_space(8.0);
+
+        let endpoint_fields_editable = self.route_mode == ManagementRouteMode::ExplicitIp;
+
         ui.columns(2, |columns| {
             let (sender_column, receiver_column) = columns.split_at_mut(1);
 
@@ -2397,7 +2440,10 @@ impl NetworkCopyManager {
 
                 let width = ui.available_width();
 
-                ui.add(egui::TextEdit::singleline(&mut self.sender_agent).desired_width(width));
+                ui.add_enabled(
+                    endpoint_fields_editable,
+                    egui::TextEdit::singleline(&mut self.sender_agent).desired_width(width),
+                );
 
                 ui.label("Source folder");
 
@@ -2421,7 +2467,10 @@ impl NetworkCopyManager {
 
                 let width = ui.available_width();
 
-                ui.add(egui::TextEdit::singleline(&mut self.receiver_agent).desired_width(width));
+                ui.add_enabled(
+                    endpoint_fields_editable,
+                    egui::TextEdit::singleline(&mut self.receiver_agent).desired_width(width),
+                );
 
                 ui.label("Destination folder");
 
@@ -2516,11 +2565,14 @@ impl NetworkCopyManager {
 
         let transfer_active = self.transfer.is_some() && !self.monitoring_complete;
 
+        let route_available = self.route_mode != ManagementRouteMode::DirectLink;
+
         let configuration_ready = !self.sender_agent.trim().is_empty()
             && !self.receiver_agent.trim().is_empty()
             && !self.source_root.trim().is_empty()
             && !self.destination_root.trim().is_empty()
-            && self.sender_agent != self.receiver_agent;
+            && self.sender_agent != self.receiver_agent
+            && route_available;
 
         let can_start = self.start_receiver.is_none()
             && self.attach_receiver.is_none()
@@ -2536,7 +2588,8 @@ impl NetworkCopyManager {
             && !transfer_active
             && !self.sender_agent.trim().is_empty()
             && !self.receiver_agent.trim().is_empty()
-            && self.sender_agent != self.receiver_agent;
+            && self.sender_agent != self.receiver_agent
+            && route_available;
 
         ui.horizontal(|ui| {
             if ui
@@ -2825,6 +2878,10 @@ impl NetworkCopyManager {
                         item.id,
                         queued_transfer_kind_label(item.request.kind),
                     ));
+
+                    ui.separator();
+
+                    ui.label(item.request.route_mode.label());
                 });
 
                 ui.add_space(4.0);
@@ -3229,7 +3286,7 @@ impl eframe::App for NetworkCopyManager {
                     {
                         "Choose source and destination".to_string()
                     } else {
-                        "Endpoints and paths selected".to_string()
+                        format!("{} · endpoints and paths selected", self.route_mode.label(),)
                     };
 
                     ui.group(|ui| {
@@ -3334,6 +3391,74 @@ impl eframe::App for NetworkCopyManager {
         });
 
         self.persist_state_if_needed(ui.ctx());
+    }
+}
+
+fn resolve_management_endpoints(
+    route_mode: ManagementRouteMode,
+    sender_text: &str,
+    receiver_text: &str,
+    agents: &[DiscoveredAgent],
+) -> Result<(SocketAddr, SocketAddr), String> {
+    if route_mode == ManagementRouteMode::DirectLink {
+        return Err(
+            "Direct Link management discovery is not available yet. Choose Automatic LAN or Explicit IP."
+                .to_string(),
+        );
+    }
+
+    let sender_agent = parse_endpoint(sender_text, "sender management agent")?;
+
+    let receiver_agent = parse_endpoint(receiver_text, "receiver management agent")?;
+
+    if sender_agent == receiver_agent {
+        return Err("Sender and receiver must be different management agents.".to_string());
+    }
+
+    if route_mode == ManagementRouteMode::ExplicitIp {
+        return Ok((sender_agent, receiver_agent));
+    }
+
+    let sender = agents
+        .iter()
+        .find(|agent| agent.endpoint == sender_agent)
+        .ok_or_else(|| {
+            "Automatic LAN requires the sender to be selected from the discovered-agent list."
+                .to_string()
+        })?;
+
+    if !sender.capabilities.can_send() {
+        return Err(format!(
+            "Discovered agent {} cannot act as a sender.",
+            sender.hostname,
+        ));
+    }
+
+    let receiver = agents
+        .iter()
+        .find(|agent| agent.endpoint == receiver_agent)
+        .ok_or_else(|| {
+            "Automatic LAN requires the receiver to be selected from the discovered-agent list."
+                .to_string()
+        })?;
+
+    if !receiver.capabilities.can_receive() {
+        return Err(format!(
+            "Discovered agent {} cannot act as a receiver.",
+            receiver.hostname,
+        ));
+    }
+
+    Ok((sender_agent, receiver_agent))
+}
+
+fn preflight_queue_route(route_mode: ManagementRouteMode) -> Result<(), ManagedStartFailure> {
+    match route_mode {
+        ManagementRouteMode::AutomaticLan | ManagementRouteMode::ExplicitIp => Ok(()),
+
+        ManagementRouteMode::DirectLink => Err(ManagedStartFailure::blocked(
+            "Direct Link management discovery is not available yet. The queued item was left blocked rather than falling back to normal LAN routing.",
+        )),
     }
 }
 
@@ -3982,9 +4107,11 @@ mod tests {
     use super::{
         MAX_TRANSFER_HISTORY, ManagedEndpointRole, ManagedStartFailureKind,
         PairedTransferHistoryEntry, join_remote_path, paired_outcome, parent_remote_path,
-        peer_cleanup_target, queue_state_for_outcome, queue_state_for_start_failure,
-        remember_history, transfer_matches_queue_request,
+        peer_cleanup_target, preflight_queue_route, queue_state_for_outcome,
+        queue_state_for_start_failure, remember_history, resolve_management_endpoints,
+        transfer_matches_queue_request,
     };
+    use networkcopy_speed::management_discovery::{AgentCapabilities, AgentState, DiscoveredAgent};
     use networkcopy_speed::management_orchestration::ManagedTransferRecord;
     use networkcopy_speed::management_queue::{
         QueuedTransferKind, QueuedTransferRequest, QueuedTransferState,
@@ -4254,6 +4381,95 @@ mod tests {
             queue_state_for_start_failure(ManagedStartFailureKind::Failed,),
             QueuedTransferState::Failed,
         );
+    }
+
+    #[test]
+    fn explicit_ip_does_not_require_discovery() {
+        let expected = (
+            "192.0.2.10:7339".parse().unwrap(),
+            "192.0.2.11:7339".parse().unwrap(),
+        );
+
+        assert_eq!(
+            resolve_management_endpoints(
+                ManagementRouteMode::ExplicitIp,
+                "192.0.2.10:7339",
+                "192.0.2.11:7339",
+                &[],
+            )
+            .unwrap(),
+            expected,
+        );
+    }
+
+    #[test]
+    fn automatic_lan_requires_discovered_capable_agents() {
+        let sender_endpoint = "192.0.2.10:7339".parse().unwrap();
+
+        let receiver_endpoint = "192.0.2.11:7339".parse().unwrap();
+
+        let agents = vec![
+            DiscoveredAgent {
+                hostname: "SENDER-PC".to_string(),
+
+                endpoint: sender_endpoint,
+
+                protocol_version: 1,
+
+                state: AgentState::Idle,
+
+                capabilities: AgentCapabilities::SEND_RECEIVE,
+            },
+            DiscoveredAgent {
+                hostname: "RECEIVER-PC".to_string(),
+
+                endpoint: receiver_endpoint,
+
+                protocol_version: 1,
+
+                state: AgentState::Idle,
+
+                capabilities: AgentCapabilities::SEND_RECEIVE,
+            },
+        ];
+
+        assert_eq!(
+            resolve_management_endpoints(
+                ManagementRouteMode::AutomaticLan,
+                &sender_endpoint.to_string(),
+                &receiver_endpoint.to_string(),
+                &agents,
+            )
+            .unwrap(),
+            (sender_endpoint, receiver_endpoint,),
+        );
+
+        assert!(
+            resolve_management_endpoints(
+                ManagementRouteMode::AutomaticLan,
+                &sender_endpoint.to_string(),
+                &receiver_endpoint.to_string(),
+                &[],
+            )
+            .is_err(),
+        );
+    }
+
+    #[test]
+    fn direct_link_is_blocked_until_scoped_discovery_exists() {
+        assert!(
+            resolve_management_endpoints(
+                ManagementRouteMode::DirectLink,
+                "192.0.2.10:7339",
+                "192.0.2.11:7339",
+                &[],
+            )
+            .is_err(),
+        );
+
+        let failure = preflight_queue_route(ManagementRouteMode::DirectLink).unwrap_err();
+
+        assert_eq!(failure.kind, ManagedStartFailureKind::Blocked,);
     }
 
     #[test]
