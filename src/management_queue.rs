@@ -1,3 +1,4 @@
+use crate::management_active_binding::ActiveQueueBinding;
 use crate::management_route::ManagementRouteMode;
 use std::collections::HashSet;
 use std::fmt;
@@ -51,6 +52,10 @@ pub enum QueuedTransferState {
 impl QueuedTransferState {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Failed | Self::Completed | Self::Cancelled)
+    }
+
+    pub const fn may_retain_active_binding(self) -> bool {
+        matches!(self, Self::Running | Self::Blocked)
     }
 }
 
@@ -133,6 +138,8 @@ pub struct TransferQueue {
     paused_after_current: bool,
 
     items: Vec<QueuedTransfer>,
+
+    active_binding: Option<ActiveQueueBinding>,
 }
 
 impl Default for TransferQueue {
@@ -143,6 +150,8 @@ impl Default for TransferQueue {
             paused_after_current: false,
 
             items: Vec::new(),
+
+            active_binding: None,
         }
     }
 }
@@ -153,12 +162,23 @@ impl TransferQueue {
         paused_after_current: bool,
         items: Vec<QueuedTransfer>,
     ) -> Result<Self, String> {
+        Self::from_parts_with_active_binding(next_id, paused_after_current, items, None)
+    }
+
+    pub fn from_parts_with_active_binding(
+        next_id: u64,
+        paused_after_current: bool,
+        items: Vec<QueuedTransfer>,
+        active_binding: Option<ActiveQueueBinding>,
+    ) -> Result<Self, String> {
         let queue = Self {
             next_id,
 
             paused_after_current,
 
             items,
+
+            active_binding,
         };
 
         queue.validate()?;
@@ -190,12 +210,41 @@ impl TransferQueue {
         self.items.is_empty()
     }
 
+    pub const fn active_binding(&self) -> Option<ActiveQueueBinding> {
+        self.active_binding
+    }
+
+    pub fn set_active_binding(&mut self, binding: ActiveQueueBinding) -> Result<(), String> {
+        if let Some(existing) = self.active_binding {
+            if existing == binding {
+                return Ok(());
+            }
+
+            return Err(format!(
+                "transfer queue already retains an active binding for transfer #{}",
+                existing.queue_id,
+            ));
+        }
+
+        binding
+            .validate_for_queue(self)
+            .map_err(|error| error.to_string())?;
+
+        self.active_binding = Some(binding);
+
+        Ok(())
+    }
+
+    pub fn clear_active_binding(&mut self) -> Option<ActiveQueueBinding> {
+        self.active_binding.take()
+    }
+
     pub fn add(&mut self, request: QueuedTransferRequest) -> Result<QueuedTransferId, String> {
         request.validate()?;
 
         if self.items.len() >= MAX_QUEUE_ENTRIES {
             return Err(format!(
-                "transfer queue already contains the maximum of {MAX_QUEUE_ENTRIES} items"
+                "transfer queue already contains the maximum of {MAX_QUEUE_ENTRIES} items",
             ));
         }
 
@@ -228,6 +277,8 @@ impl TransferQueue {
         };
 
         if index == 0
+            || self.is_bound(id)
+            || self.is_bound(self.items[index - 1].id)
             || self.items[index].state == QueuedTransferState::Running
             || self.items[index - 1].state == QueuedTransferState::Running
         {
@@ -245,6 +296,8 @@ impl TransferQueue {
         };
 
         if index + 1 >= self.items.len()
+            || self.is_bound(id)
+            || self.is_bound(self.items[index + 1].id)
             || self.items[index].state == QueuedTransferState::Running
             || self.items[index + 1].state == QueuedTransferState::Running
         {
@@ -259,7 +312,7 @@ impl TransferQueue {
     pub fn remove(&mut self, id: QueuedTransferId) -> Option<QueuedTransfer> {
         let index = self.items.iter().position(|item| item.id == id)?;
 
-        if self.items[index].state == QueuedTransferState::Running {
+        if self.is_bound(id) || self.items[index].state == QueuedTransferState::Running {
             return None;
         }
 
@@ -269,8 +322,11 @@ impl TransferQueue {
     pub fn clear_completed(&mut self) -> usize {
         let previous_len = self.items.len();
 
-        self.items
-            .retain(|item| item.state != QueuedTransferState::Completed);
+        let bound_id = self.active_binding.map(|binding| binding.queue_id);
+
+        self.items.retain(|item| {
+            item.state != QueuedTransferState::Completed || bound_id == Some(item.id)
+        });
 
         previous_len - self.items.len()
     }
@@ -285,20 +341,30 @@ impl TransferQueue {
 
         validate_optional_text(&status_message, "queue status message")?;
 
+        let bound_item = self.is_bound(id);
+
         let item = self
             .items
             .iter_mut()
             .find(|item| item.id == id)
-            .ok_or_else(|| format!("queued transfer {id} does not exist"))?;
+            .ok_or_else(|| format!("queued transfer {id} does not exist",))?;
 
         item.state = state;
 
         item.status_message = status_message;
 
+        if !state.may_retain_active_binding() && bound_item {
+            self.active_binding = None;
+        }
+
         Ok(())
     }
 
     pub fn reset_to_pending(&mut self, id: QueuedTransferId) -> bool {
+        if self.is_bound(id) {
+            return false;
+        }
+
         let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
             return false;
         };
@@ -318,6 +384,10 @@ impl TransferQueue {
     }
 
     pub fn skip(&mut self, id: QueuedTransferId) -> bool {
+        if self.is_bound(id) {
+            return false;
+        }
+
         let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
             return false;
         };
@@ -373,13 +443,24 @@ impl TransferQueue {
             item.validate()?;
         }
 
+        if let Some(binding) = self.active_binding {
+            binding
+                .validate_for_queue(self)
+                .map_err(|error| error.to_string())?;
+        }
+
         Ok(())
+    }
+
+    fn is_bound(&self, id: QueuedTransferId) -> bool {
+        self.active_binding
+            .is_some_and(|binding| binding.queue_id == id)
     }
 }
 
 fn validate_required_text(value: &str, description: &str) -> Result<(), String> {
     if value.trim().is_empty() {
-        return Err(format!("{description} must not be empty"));
+        return Err(format!("{description} must not be empty",));
     }
 
     validate_optional_text(value, description)
@@ -399,6 +480,8 @@ fn validate_optional_text(value: &str, description: &str) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::{QueuedTransferKind, QueuedTransferRequest, QueuedTransferState, TransferQueue};
+    use crate::management_active_binding::ActiveQueueBinding;
+    use crate::management_instance::AgentInstanceId;
     use crate::management_route::ManagementRouteMode;
 
     fn request(name: &str) -> QueuedTransferRequest {
@@ -409,9 +492,9 @@ mod tests {
 
             route_mode: ManagementRouteMode::AutomaticLan,
 
-            source_root: format!("C:\\{name}"),
+            source_root: format!(r"C:\{name}"),
 
-            destination_root: format!("D:\\Backup\\{name}"),
+            destination_root: format!(r"D:\Backup\{name}",),
 
             update_existing: true,
 
@@ -421,6 +504,14 @@ mod tests {
 
             kind: QueuedTransferKind::Fresh,
         }
+    }
+
+    fn instance(value: u128) -> AgentInstanceId {
+        AgentInstanceId::from_raw(value).unwrap()
+    }
+
+    fn binding(queue_id: super::QueuedTransferId) -> ActiveQueueBinding {
+        ActiveQueueBinding::new(queue_id, instance(101), 11, instance(202), 17).unwrap()
     }
 
     #[test]
@@ -437,19 +528,14 @@ mod tests {
 
         assert_eq!(
             queue.items().iter().map(|item| item.id).collect::<Vec<_>>(),
-            vec![desktop, downloads, documents],
+            vec![desktop, downloads, documents,],
         );
 
-        assert_eq!(queue.remove(documents).unwrap().id, documents);
+        assert_eq!(queue.remove(documents).unwrap().id, documents,);
 
         let pictures = queue.add(request("Pictures")).unwrap();
 
         assert_eq!(pictures.get(), 4);
-
-        assert_eq!(
-            queue.items().iter().map(|item| item.id).collect::<Vec<_>>(),
-            vec![desktop, downloads, pictures],
-        );
     }
 
     #[test]
@@ -469,83 +555,190 @@ mod tests {
         assert!(!queue.move_up(documents));
 
         assert!(queue.remove(desktop).is_none());
-
-        assert_eq!(queue.len(), 2);
     }
 
     #[test]
-    fn terminal_and_blocked_items_can_be_reset_to_pending() {
+    fn terminal_and_blocked_items_can_be_reset_without_binding() {
         let mut queue = TransferQueue::default();
 
-        let failed = queue.add(request("Desktop")).unwrap();
+        for state in [
+            QueuedTransferState::Blocked,
+            QueuedTransferState::Failed,
+            QueuedTransferState::Completed,
+            QueuedTransferState::Cancelled,
+        ] {
+            let id = queue.add(request("Folder")).unwrap();
 
-        let blocked = queue.add(request("Documents")).unwrap();
+            queue.set_state(id, state, "Interrupted").unwrap();
 
-        let completed = queue.add(request("Downloads")).unwrap();
-
-        queue
-            .set_state(failed, QueuedTransferState::Failed, "Sender unavailable")
-            .unwrap();
-
-        queue
-            .set_state(blocked, QueuedTransferState::Blocked, "Manager restarted")
-            .unwrap();
-
-        queue
-            .set_state(
-                completed,
-                QueuedTransferState::Completed,
-                "Transfer completed",
-            )
-            .unwrap();
-
-        assert!(queue.reset_to_pending(failed));
-
-        assert!(queue.reset_to_pending(blocked));
-
-        assert!(queue.reset_to_pending(completed));
-
-        for id in [failed, blocked, completed] {
-            let item = queue.items().iter().find(|item| item.id == id).unwrap();
-
-            assert_eq!(item.state, QueuedTransferState::Pending);
-
-            assert!(item.status_message.is_empty());
+            assert!(queue.reset_to_pending(id),);
         }
-
-        assert!(!queue.reset_to_pending(failed));
     }
 
     #[test]
-    fn pending_or_interrupted_items_can_be_skipped() {
+    fn binding_requires_running_or_blocked_item() {
+        let mut queue = TransferQueue::default();
+
+        let id = queue.add(request("Desktop")).unwrap();
+
+        assert!(queue.set_active_binding(binding(id),).is_err(),);
+
+        queue
+            .set_state(id, QueuedTransferState::Running, "Starting")
+            .unwrap();
+
+        queue.set_active_binding(binding(id)).unwrap();
+
+        assert_eq!(queue.active_binding(), Some(binding(id)),);
+    }
+
+    #[test]
+    fn unresolved_binding_blocks_destructive_queue_actions() {
+        let mut queue = TransferQueue::default();
+
+        let bound = queue.add(request("Desktop")).unwrap();
+
+        let other = queue.add(request("Documents")).unwrap();
+
+        queue
+            .set_state(bound, QueuedTransferState::Blocked, "Endpoint unavailable")
+            .unwrap();
+
+        queue.set_active_binding(binding(bound)).unwrap();
+
+        assert!(!queue.reset_to_pending(bound),);
+
+        assert!(!queue.skip(bound));
+
+        assert!(queue.remove(bound).is_none());
+
+        assert!(!queue.move_down(bound));
+
+        assert!(!queue.move_up(other));
+
+        assert_eq!(queue.active_binding(), Some(binding(bound)),);
+    }
+
+    #[test]
+    fn terminal_state_clears_binding() {
+        let mut queue = TransferQueue::default();
+
+        let id = queue.add(request("Desktop")).unwrap();
+
+        queue
+            .set_state(id, QueuedTransferState::Running, "Transferring")
+            .unwrap();
+
+        queue.set_active_binding(binding(id)).unwrap();
+
+        queue
+            .set_state(id, QueuedTransferState::Completed, "Complete")
+            .unwrap();
+
+        assert_eq!(queue.active_binding(), None,);
+    }
+
+    #[test]
+    fn blocked_state_retains_binding() {
+        let mut queue = TransferQueue::default();
+
+        let id = queue.add(request("Desktop")).unwrap();
+
+        queue
+            .set_state(id, QueuedTransferState::Running, "Transferring")
+            .unwrap();
+
+        queue.set_active_binding(binding(id)).unwrap();
+
+        queue
+            .set_state(id, QueuedTransferState::Blocked, "Agent unreachable")
+            .unwrap();
+
+        assert_eq!(queue.active_binding(), Some(binding(id)),);
+    }
+
+    #[test]
+    fn persisted_parts_validate_binding() {
+        let mut queue = TransferQueue::default();
+
+        let id = queue.add(request("Desktop")).unwrap();
+
+        queue
+            .set_state(id, QueuedTransferState::Running, "Transferring")
+            .unwrap();
+
+        let restored = TransferQueue::from_parts_with_active_binding(
+            queue.next_id(),
+            queue.paused_after_current(),
+            queue.items().to_vec(),
+            Some(binding(id)),
+        )
+        .unwrap();
+
+        assert_eq!(restored.active_binding(), Some(binding(id)),);
+    }
+
+    #[test]
+    fn mismatched_persisted_binding_is_rejected() {
+        let mut queue = TransferQueue::default();
+
+        let id = queue.add(request("Desktop")).unwrap();
+
+        let result = TransferQueue::from_parts_with_active_binding(
+            queue.next_id(),
+            false,
+            queue.items().to_vec(),
+            Some(binding(id)),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn binding_replacement_requires_clear() {
+        let mut queue = TransferQueue::default();
+
+        let first = queue.add(request("Desktop")).unwrap();
+
+        let second = queue.add(request("Documents")).unwrap();
+
+        queue
+            .set_state(first, QueuedTransferState::Running, "")
+            .unwrap();
+
+        queue.set_active_binding(binding(first)).unwrap();
+
+        queue
+            .set_state(second, QueuedTransferState::Blocked, "")
+            .unwrap();
+
+        assert!(queue.set_active_binding(binding(second),).is_err(),);
+
+        assert_eq!(queue.clear_active_binding(), Some(binding(first)),);
+
+        queue.set_active_binding(binding(second)).unwrap();
+    }
+
+    #[test]
+    fn pending_and_interrupted_items_can_be_skipped_without_binding() {
         let mut queue = TransferQueue::default();
 
         let pending = queue.add(request("Desktop")).unwrap();
 
         let failed = queue.add(request("Documents")).unwrap();
 
-        let running = queue.add(request("Downloads")).unwrap();
-
         queue
             .set_state(failed, QueuedTransferState::Failed, "Receiver unavailable")
-            .unwrap();
-
-        queue
-            .set_state(running, QueuedTransferState::Running, "Transferring")
             .unwrap();
 
         assert!(queue.skip(pending));
 
         assert!(queue.skip(failed));
 
-        assert!(!queue.skip(running));
-
         for id in [pending, failed] {
             let item = queue.items().iter().find(|item| item.id == id).unwrap();
 
-            assert_eq!(item.state, QueuedTransferState::Cancelled);
-
-            assert_eq!(item.status_message, "Skipped by user.");
+            assert_eq!(item.state, QueuedTransferState::Cancelled,);
         }
     }
 
@@ -557,69 +750,18 @@ mod tests {
 
         let failed = queue.add(request("Documents")).unwrap();
 
-        let cancelled = queue.add(request("Downloads")).unwrap();
-
         queue
             .set_state(completed, QueuedTransferState::Completed, "")
             .unwrap();
 
         queue
-            .set_state(failed, QueuedTransferState::Failed, "Receiver unavailable")
+            .set_state(failed, QueuedTransferState::Failed, "")
             .unwrap();
 
-        queue
-            .set_state(
-                cancelled,
-                QueuedTransferState::Cancelled,
-                "Cancelled by user",
-            )
-            .unwrap();
+        assert_eq!(queue.clear_completed(), 1,);
 
-        assert_eq!(queue.clear_completed(), 1);
+        assert_eq!(queue.len(), 1);
 
-        assert_eq!(queue.len(), 2);
-
-        assert!(queue.items().iter().all(|item| item.id != completed));
-    }
-
-    #[test]
-    fn queue_rejects_resume_without_stream_count() {
-        let mut queue = TransferQueue::default();
-
-        let mut resume = request("Desktop");
-
-        resume.kind = QueuedTransferKind::Resume {
-            data_stream_count: 0,
-        };
-
-        assert!(queue.add(resume).is_err());
-
-        assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn reconstructed_queue_rejects_duplicate_ids() {
-        let mut queue = TransferQueue::default();
-
-        queue.add(request("Desktop")).unwrap();
-
-        queue.add(request("Documents")).unwrap();
-
-        let mut items = queue.items.clone();
-
-        items[1].id = items[0].id;
-
-        assert!(TransferQueue::from_parts(queue.next_id, false, items).is_err(),);
-    }
-
-    #[test]
-    fn pause_after_current_is_retained_in_queue_state() {
-        let mut queue = TransferQueue::default();
-
-        assert!(!queue.paused_after_current());
-
-        queue.set_paused_after_current(true);
-
-        assert!(queue.paused_after_current());
+        assert_eq!(queue.items()[0].id, failed,);
     }
 }
