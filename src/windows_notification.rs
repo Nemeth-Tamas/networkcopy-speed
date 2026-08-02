@@ -1,3 +1,4 @@
+use crate::windows_icon;
 use std::io;
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
@@ -7,9 +8,7 @@ use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIIF_WARNING, NIM_ADD, NIM_DELETE,
     NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, HWND_MESSAGE, IDI_APPLICATION, LoadIconW,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, HWND_MESSAGE};
 
 const NOTIFICATION_ICON_ID: u32 = 1;
 
@@ -98,34 +97,41 @@ fn show_validated(kind: NotificationKind, title: &str, body: &str) -> io::Result
         return Err(io::Error::last_os_error());
     }
 
-    let icon = unsafe { LoadIconW(null_mut(), IDI_APPLICATION) };
+    let icon = match windows_icon::load_executable_icon() {
+        Ok(icon) => icon,
 
-    if icon.is_null() {
-        let error = io::Error::last_os_error();
+        Err(error) => {
+            unsafe {
+                DestroyWindow(window);
+            }
 
-        unsafe {
-            DestroyWindow(window);
+            return Err(error);
         }
+    };
 
-        return Err(error);
-    }
-
-    let mut data = NOTIFYICONDATAW::default();
-
-    data.cbSize = u32::try_from(size_of::<NOTIFYICONDATAW>())
+    let structure_size = u32::try_from(size_of::<NOTIFYICONDATAW>())
         .map_err(|_| io::Error::other("notification structure size cannot be represented"))?;
 
-    data.hWnd = window;
-    data.uID = NOTIFICATION_ICON_ID;
-    data.uFlags = NIF_ICON | NIF_TIP;
-    data.hIcon = icon;
+    let mut data = NOTIFYICONDATAW {
+        cbSize: structure_size,
+
+        hWnd: window,
+
+        uID: NOTIFICATION_ICON_ID,
+
+        uFlags: NIF_ICON | NIF_TIP,
+
+        hIcon: icon.raw(),
+
+        ..Default::default()
+    };
 
     copy_wide_truncated(&mut data.szTip, APPLICATION_TOOLTIP);
 
     let mut icon_added = false;
 
     let result = (|| {
-        let added = unsafe { Shell_NotifyIconW(NIM_ADD, &mut data) };
+        let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data) };
 
         if added == 0 {
             return Err(io::Error::other(
@@ -143,7 +149,7 @@ fn show_validated(kind: NotificationKind, title: &str, body: &str) -> io::Result
 
         copy_wide_truncated(&mut data.szInfo, body);
 
-        let modified = unsafe { Shell_NotifyIconW(NIM_MODIFY, &mut data) };
+        let modified = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
 
         if modified == 0 {
             return Err(io::Error::other(
@@ -158,7 +164,7 @@ fn show_validated(kind: NotificationKind, title: &str, body: &str) -> io::Result
 
     if icon_added {
         unsafe {
-            Shell_NotifyIconW(NIM_DELETE, &mut data);
+            Shell_NotifyIconW(NIM_DELETE, &data);
         }
     }
 

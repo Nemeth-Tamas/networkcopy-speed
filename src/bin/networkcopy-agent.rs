@@ -2,6 +2,7 @@ use networkcopy_speed::management_agent;
 use networkcopy_speed::management_control;
 use networkcopy_speed::management_discovery::AgentState;
 use networkcopy_speed::management_protocol::MANAGEMENT_CONTROL_PORT;
+use networkcopy_speed::windows_agent_tray;
 use networkcopy_speed::windows_elevation;
 use std::env;
 use std::ffi::{OsStr, c_void};
@@ -117,11 +118,15 @@ fn run() -> io::Result<()> {
 
     start_restart_watcher(restart_event)?;
 
+    windows_agent_tray::spawn()?;
+
     println!("NetworkCopy Agent launcher");
 
     println!("  Administrator: yes");
 
     println!("  Restart mode:  enabled");
+
+    println!("  Tray control:  enabled");
 
     println!();
 
