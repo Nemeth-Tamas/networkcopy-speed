@@ -240,7 +240,7 @@ The primary workflow is:
 - [x] queue journal-backed resume operations with their original stream count;
 - [x] reconnect a restarted manager to the correct active queue item;
 - [x] expose Automatic LAN, Direct Link, and Explicit IP manager route modes;
-- [ ] add useful Windows completion, failure, pause, and action-required notifications;
+- [x] add useful Windows completion, failure, pause, and action-required notifications;
 - [ ] add a small endpoint-agent tray control surface;
 - [ ] check GitHub Releases for newer stable versions and open the download flow;
 - [ ] complete physical three-machine and queued-transfer acceptance testing.
@@ -256,9 +256,9 @@ The primary workflow is:
 - [x] enumerate strict connected physical Ethernet interfaces;
 - [x] reject Ethernet interfaces carrying a default route;
 - [x] prefer scoped IPv6 link-local management addresses with APIPA fallback;
-- [ ] probe management agents through each strict Direct Link interface;
-- [ ] expose responding Direct Link agents in the Manager;
-- [ ] start, resume, and reattach queued transfers through the selected direct route;
+- [x] probe management agents through each strict Direct Link interface;
+- [x] expose responding Direct Link agents in the Manager;
+- [x] start, resume, and reattach queued transfers through the selected direct route;
 - [ ] complete physical Direct Link Manager acceptance.
 
 Sequential reliability comes before concurrent execution. Transfers using fully

@@ -121,6 +121,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         }
 
+        "management-notification-test" => {
+            run_management_notification_test(
+                &mut arguments,
+            )
+        }
+
         "management-hello" => {
             run_management_hello(
                 &mut arguments,
@@ -458,6 +464,78 @@ fn run_management_direct_discover(
             },
         );
     }
+
+    Ok(())
+}
+
+fn run_management_notification_test(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let kind_argument = required_argument(
+        arguments,
+        "notification kind: info, warning, or error",
+    )?;
+
+    let kind_text =
+        kind_argument.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "notification kind must contain valid Unicode",
+            )
+        })?;
+
+    let kind = match kind_text {
+        "info" | "information" => {
+            crate::windows_notification::NotificationKind::Information
+        }
+
+        "warning" => {
+            crate::windows_notification::NotificationKind::Warning
+        }
+
+        "error" => {
+            crate::windows_notification::NotificationKind::Error
+        }
+
+        unknown => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unknown notification kind {unknown:?}; expected info, warning, or error",
+                ),
+            )
+            .into());
+        }
+    };
+
+    if let Some(extra) = arguments.next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "unexpected extra argument: {}",
+                extra.to_string_lossy(),
+            ),
+        )
+        .into());
+    }
+
+    let body = format!(
+        "This is a NetworkCopy {} notification test.",
+        kind.label(),
+    );
+
+    println!(
+        "Showing Windows {} notification...",
+        kind.label(),
+    );
+
+    crate::windows_notification::show_blocking(
+        kind,
+        "NetworkCopy notification test",
+        &body,
+    )?;
+
+    println!("Notification test finished.");
 
     Ok(())
 }
@@ -3325,6 +3403,9 @@ fn print_usage(program: &OsStr) {
     println!("  {program} --version");
     println!("  {program} management-agent");
     println!("  {program} management-discover");
+    println!(
+        "  {program} management-notification-test <info|warning|error>"
+    );
     println!("  {program} management-hello <agent-address>");
     println!("  {program} management-roots <agent-address>");
     println!(

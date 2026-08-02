@@ -21,6 +21,7 @@ use networkcopy_speed::management_route::ManagementRouteMode;
 use networkcopy_speed::management_snapshot::{
     ManagementAgentSnapshot, ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
 };
+use networkcopy_speed::windows_notification::{self, NotificationKind};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -1024,6 +1025,12 @@ impl NetworkCopyManager {
 
             self.notice.clear();
 
+            notify_manager(
+                NotificationKind::Error,
+                "Transfer could not start",
+                &self.error,
+            );
+
             return;
         };
 
@@ -1046,6 +1053,18 @@ impl NetworkCopyManager {
 
             _ => unreachable!("startup failures only map to Blocked or Failed",),
         };
+
+        let (kind, title) = match state {
+            QueuedTransferState::Blocked => (NotificationKind::Warning, "Queue needs attention"),
+
+            QueuedTransferState::Failed => {
+                (NotificationKind::Error, "Queued transfer could not start")
+            }
+
+            _ => unreachable!("startup failures only map to Blocked or Failed",),
+        };
+
+        notify_manager(kind, title, &self.error);
     }
 
     fn finish_active_queue_item(&mut self) {
@@ -1084,6 +1103,12 @@ impl NetworkCopyManager {
                 "The queue stopped at transfer #{id} because its final state was incomplete.",
             );
 
+            notify_manager(
+                NotificationKind::Warning,
+                "Queue needs attention",
+                &self.error,
+            );
+
             return;
         };
 
@@ -1113,7 +1138,7 @@ impl NetworkCopyManager {
             endpoint_message
         };
 
-        if let Err(error) = self.queue.set_state(id, state, status_message) {
+        if let Err(error) = self.queue.set_state(id, state, status_message.clone()) {
             self.active_queue_id = None;
 
             self.queue_running = false;
@@ -1121,6 +1146,8 @@ impl NetworkCopyManager {
             self.clear_transfer_card();
 
             self.error = format!("Failed to finalize queued transfer #{id}: {error}",);
+
+            notify_manager(NotificationKind::Error, "Queue update failed", &self.error);
 
             return;
         }
@@ -1137,6 +1164,8 @@ impl NetworkCopyManager {
                     self.notice = format!(
                         "Queued transfer #{id} completed. The queue is paused before the next item.",
                     );
+
+                    notify_manager(NotificationKind::Information, "Queue paused", &self.notice);
 
                     return;
                 }
@@ -1155,6 +1184,12 @@ impl NetworkCopyManager {
 
                     self.notice =
                         "Every pending queued transfer completed successfully.".to_string();
+
+                    notify_manager(
+                        NotificationKind::Information,
+                        "Transfer queue complete",
+                        &self.notice,
+                    );
                 }
             }
 
@@ -1164,6 +1199,10 @@ impl NetworkCopyManager {
                 self.notice = format!(
                     "Queued transfer #{id} was cancelled. The remaining queue is waiting for an explicit restart.",
                 );
+
+                let body = format!("{} {}", self.notice, status_message,);
+
+                notify_manager(NotificationKind::Warning, "Transfer queue stopped", &body);
             }
 
             ManagementJobOutcome::Failed => {
@@ -1172,6 +1211,10 @@ impl NetworkCopyManager {
                 self.notice = format!(
                     "Queued transfer #{id} failed. The remaining queue is waiting for an explicit restart.",
                 );
+
+                let body = format!("{} {}", self.notice, status_message,);
+
+                notify_manager(NotificationKind::Error, "Queued transfer failed", &body);
             }
         }
     }
@@ -1493,6 +1536,12 @@ impl NetworkCopyManager {
 
             self.error = error;
 
+            notify_manager(
+                NotificationKind::Warning,
+                "Queue reattachment needs attention",
+                &self.error,
+            );
+
             return;
         };
 
@@ -1513,6 +1562,12 @@ impl NetworkCopyManager {
 
         self.notice = format!(
             "Queued transfer #{id} was not restarted. It was safely blocked to prevent duplicate endpoint jobs.",
+        );
+
+        notify_manager(
+            NotificationKind::Warning,
+            "Queue reattachment blocked",
+            &self.error,
         );
     }
 
@@ -2071,6 +2126,8 @@ impl NetworkCopyManager {
                     if self.active_queue_id.is_some() {
                         self.finish_active_queue_item();
                     } else {
+                        self.notify_current_terminal_transfer();
+
                         self.notice = "Both endpoint jobs reached a terminal state.".to_string();
                     }
                 } else {
@@ -2085,6 +2142,65 @@ impl NetworkCopyManager {
             }
 
             Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn notify_current_terminal_transfer(&self) {
+        let Some(transfer) = self.transfer.as_ref() else {
+            return;
+        };
+
+        let Some(sender_result) =
+            terminal_result_for(self.sender_snapshot.as_ref(), transfer.sender_job_id)
+        else {
+            return;
+        };
+
+        let Some(receiver_result) =
+            terminal_result_for(self.receiver_snapshot.as_ref(), transfer.receiver_job_id)
+        else {
+            return;
+        };
+
+        let outcome = paired_outcome(sender_result, receiver_result);
+
+        let files = sender_result.files.max(receiver_result.files);
+
+        let logical_bytes = sender_result
+            .logical_bytes
+            .max(receiver_result.logical_bytes);
+
+        let path = format!("{} → {}", transfer.source_root, transfer.destination_root,);
+
+        match outcome {
+            ManagementJobOutcome::Completed => {
+                let body = format!(
+                    "{files} file(s), {} logical data. {path}",
+                    format_bytes(logical_bytes),
+                );
+
+                notify_manager(NotificationKind::Information, "Transfer complete", &body);
+            }
+
+            ManagementJobOutcome::Cancelled => {
+                let body = format!("The transfer was cancelled. {path}",);
+
+                notify_manager(NotificationKind::Warning, "Transfer cancelled", &body);
+            }
+
+            ManagementJobOutcome::Failed => {
+                let details = if !sender_result.message.is_empty() {
+                    sender_result.message.as_str()
+                } else if !receiver_result.message.is_empty() {
+                    receiver_result.message.as_str()
+                } else {
+                    "Both endpoint jobs reported a failure."
+                };
+
+                let body = format!("{path}. {details}",);
+
+                notify_manager(NotificationKind::Error, "Transfer failed", &body);
+            }
         }
     }
 
@@ -3715,6 +3831,12 @@ impl eframe::App for NetworkCopyManager {
     }
 }
 
+fn notify_manager(kind: NotificationKind, title: &str, body: &str) {
+    if let Err(error) = windows_notification::show(kind, title, body) {
+        eprintln!("Failed to start Windows notification: {error}",);
+    }
+}
+
 fn build_direct_management_routes(
     discovered: Vec<DirectDiscoveredAgent>,
 ) -> Result<Vec<DirectManagementRoute>, String> {
@@ -4913,7 +5035,7 @@ mod tests {
                 &local_endpoint.to_string(),
                 &peer_endpoint.to_string(),
                 &[],
-                &[route.clone()],
+                std::slice::from_ref(&route),
             )
             .unwrap(),
             (local_endpoint, peer_endpoint,),

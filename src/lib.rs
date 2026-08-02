@@ -57,6 +57,7 @@ mod transfer_memory;
 mod update_verification;
 pub mod windows_elevation;
 mod windows_file_replace;
+pub mod windows_notification;
 mod windows_setup;
 mod zstd_dictionary_bench;
 
