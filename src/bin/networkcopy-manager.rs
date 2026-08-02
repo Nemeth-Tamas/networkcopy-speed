@@ -705,6 +705,53 @@ impl NetworkCopyManager {
         }
     }
 
+    fn add_resume_to_queue(&mut self, entry: PairedTransferHistoryEntry) {
+        self.error.clear();
+
+        let Some(data_stream_count) = entry.resume_data_stream_count() else {
+            self.error = "The receiver did not retain a usable resume journal for this transfer."
+                .to_string();
+
+            return;
+        };
+
+        let transfer = entry.transfer;
+
+        let source_root = transfer.source_root.clone();
+
+        let request = QueuedTransferRequest {
+            sender_agent: transfer.sender_agent,
+
+            receiver_agent: transfer.receiver_agent,
+
+            source_root: transfer.source_root,
+
+            destination_root: transfer.destination_root,
+
+            update_existing: transfer.update_existing,
+
+            worker_count: transfer.worker_count,
+
+            calibration_mib: transfer.calibration_mib,
+
+            kind: QueuedTransferKind::Resume { data_stream_count },
+        };
+
+        match self.queue.add(request) {
+            Ok(id) => {
+                self.show_queue = true;
+
+                self.notice = format!(
+                    "Added resume #{id} to the queue: {source_root} · {data_stream_count} streams.",
+                );
+            }
+
+            Err(error) => {
+                self.error = format!("Failed to add resume to queue: {error}");
+            }
+        }
+    }
+
     fn clear_transfer_card(&mut self) {
         self.transfer = None;
 
@@ -2405,6 +2452,10 @@ impl NetworkCopyManager {
 
         let mut remove = None::<QueuedTransferId>;
 
+        let mut retry = None::<QueuedTransferId>;
+
+        let mut skip = None::<QueuedTransferId>;
+
         for (index, item) in items.iter().enumerate() {
             let previous_running = index
                 .checked_sub(1)
@@ -2415,6 +2466,22 @@ impl NetworkCopyManager {
                 .is_some_and(|next| next.state == QueuedTransferState::Running);
 
             let item_running = item.state == QueuedTransferState::Running;
+
+            let can_retry = !self.queue_running
+                && matches!(
+                    item.state,
+                    QueuedTransferState::Blocked
+                        | QueuedTransferState::Failed
+                        | QueuedTransferState::Completed
+                        | QueuedTransferState::Cancelled
+                );
+
+            let can_skip = matches!(
+                item.state,
+                QueuedTransferState::Pending
+                    | QueuedTransferState::Blocked
+                    | QueuedTransferState::Failed
+            );
 
             let can_move_up = index > 0 && !item_running && !previous_running;
 
@@ -2477,6 +2544,26 @@ impl NetworkCopyManager {
                 ui.add_space(6.0);
 
                 ui.horizontal_wrapped(|ui| {
+                    let retry_label = if item.state == QueuedTransferState::Completed {
+                        "Run again"
+                    } else {
+                        "Retry"
+                    };
+
+                    if ui
+                        .add_enabled(can_retry, egui::Button::new(retry_label))
+                        .clicked()
+                    {
+                        retry = Some(item.id);
+                    }
+
+                    if ui
+                        .add_enabled(can_skip, egui::Button::new("Skip"))
+                        .clicked()
+                    {
+                        skip = Some(item.id);
+                    }
+
                     if ui
                         .add_enabled(can_move_up, egui::Button::new("Move up"))
                         .clicked()
@@ -2507,7 +2594,19 @@ impl NetworkCopyManager {
             ui.add_space(8.0);
         }
 
-        if let Some(id) = move_up {
+        if let Some(id) = retry {
+            if self.queue.reset_to_pending(id) {
+                self.notice = format!("Queued transfer #{id} was reset to Pending.",);
+
+                self.error.clear();
+            }
+        } else if let Some(id) = skip {
+            if self.queue.skip(id) {
+                self.notice = format!("Queued transfer #{id} was skipped.");
+
+                self.error.clear();
+            }
+        } else if let Some(id) = move_up {
             if self.queue.move_up(id) {
                 self.notice = format!("Moved queued transfer #{id} up.");
             }
@@ -2553,6 +2652,8 @@ impl NetworkCopyManager {
         let mut reuse = None::<ManagedTransferRecord>;
 
         let mut resume = None::<PairedTransferHistoryEntry>;
+
+        let mut queue_resume = None::<PairedTransferHistoryEntry>;
 
         let transfer_active = self.transfer.is_some() && !self.monitoring_complete;
 
@@ -2691,6 +2792,13 @@ impl NetworkCopyManager {
                     {
                         resume = Some(entry.clone());
                     }
+
+                    if ui
+                        .button(format!("Add resume to queue ({data_stream_count} streams)"))
+                        .clicked()
+                    {
+                        queue_resume = Some(entry.clone());
+                    }
                 } else if outcome != ManagementJobOutcome::Completed {
                     ui.label("Receiver resume journal unavailable.");
                 }
@@ -2701,6 +2809,8 @@ impl NetworkCopyManager {
 
         if let Some(entry) = resume {
             self.begin_resumed_transfer(entry);
+        } else if let Some(entry) = queue_resume {
+            self.add_resume_to_queue(entry);
         } else if let Some(transfer) = reuse {
             self.sender_agent = transfer.sender_agent.to_string();
 

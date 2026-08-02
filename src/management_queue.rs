@@ -295,6 +295,46 @@ impl TransferQueue {
         Ok(())
     }
 
+    pub fn reset_to_pending(&mut self, id: QueuedTransferId) -> bool {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            return false;
+        };
+
+        if matches!(
+            item.state,
+            QueuedTransferState::Pending | QueuedTransferState::Running
+        ) {
+            return false;
+        }
+
+        item.state = QueuedTransferState::Pending;
+
+        item.status_message.clear();
+
+        true
+    }
+
+    pub fn skip(&mut self, id: QueuedTransferId) -> bool {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            return false;
+        };
+
+        if !matches!(
+            item.state,
+            QueuedTransferState::Pending
+                | QueuedTransferState::Blocked
+                | QueuedTransferState::Failed
+        ) {
+            return false;
+        }
+
+        item.state = QueuedTransferState::Cancelled;
+
+        item.status_message = "Skipped by user.".to_string();
+
+        true
+    }
+
     pub fn first_pending(&self) -> Option<&QueuedTransfer> {
         self.items
             .iter()
@@ -425,6 +465,82 @@ mod tests {
         assert!(queue.remove(desktop).is_none());
 
         assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn terminal_and_blocked_items_can_be_reset_to_pending() {
+        let mut queue = TransferQueue::default();
+
+        let failed = queue.add(request("Desktop")).unwrap();
+
+        let blocked = queue.add(request("Documents")).unwrap();
+
+        let completed = queue.add(request("Downloads")).unwrap();
+
+        queue
+            .set_state(failed, QueuedTransferState::Failed, "Sender unavailable")
+            .unwrap();
+
+        queue
+            .set_state(blocked, QueuedTransferState::Blocked, "Manager restarted")
+            .unwrap();
+
+        queue
+            .set_state(
+                completed,
+                QueuedTransferState::Completed,
+                "Transfer completed",
+            )
+            .unwrap();
+
+        assert!(queue.reset_to_pending(failed));
+
+        assert!(queue.reset_to_pending(blocked));
+
+        assert!(queue.reset_to_pending(completed));
+
+        for id in [failed, blocked, completed] {
+            let item = queue.items().iter().find(|item| item.id == id).unwrap();
+
+            assert_eq!(item.state, QueuedTransferState::Pending);
+
+            assert!(item.status_message.is_empty());
+        }
+
+        assert!(!queue.reset_to_pending(failed));
+    }
+
+    #[test]
+    fn pending_or_interrupted_items_can_be_skipped() {
+        let mut queue = TransferQueue::default();
+
+        let pending = queue.add(request("Desktop")).unwrap();
+
+        let failed = queue.add(request("Documents")).unwrap();
+
+        let running = queue.add(request("Downloads")).unwrap();
+
+        queue
+            .set_state(failed, QueuedTransferState::Failed, "Receiver unavailable")
+            .unwrap();
+
+        queue
+            .set_state(running, QueuedTransferState::Running, "Transferring")
+            .unwrap();
+
+        assert!(queue.skip(pending));
+
+        assert!(queue.skip(failed));
+
+        assert!(!queue.skip(running));
+
+        for id in [pending, failed] {
+            let item = queue.items().iter().find(|item| item.id == id).unwrap();
+
+            assert_eq!(item.state, QueuedTransferState::Cancelled);
+
+            assert_eq!(item.status_message, "Skipped by user.");
+        }
     }
 
     #[test]
