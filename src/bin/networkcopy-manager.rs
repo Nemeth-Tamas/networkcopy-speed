@@ -3022,36 +3022,52 @@ impl NetworkCopyManager {
                 });
 
                 ui.horizontal_wrapped(|ui| {
+                    let sender_button_label = match (sender_selected, receiver_selected) {
+                        (true, true) => "Keep as sender",
+
+                        (true, false) => "Clear sender",
+
+                        _ => "Use as sender",
+                    };
+
                     if ui
                         .add_enabled(
-                            sender_enabled && !sender_selected,
-                            egui::Button::new(if sender_selected {
-                                "Sender selected"
-                            } else {
-                                "Use as sender"
-                            }),
+                            sender_selected || sender_enabled,
+                            egui::Button::new(sender_button_label),
                         )
                         .clicked()
                     {
                         self.route_mode = ManagementRouteMode::AutomaticLan;
 
-                        self.sender_agent = endpoint_text.clone();
+                        select_or_clear_discovered_endpoint(
+                            &mut self.sender_agent,
+                            &mut self.receiver_agent,
+                            &endpoint_text,
+                        );
                     }
 
+                    let receiver_button_label = match (receiver_selected, sender_selected) {
+                        (true, true) => "Keep as receiver",
+
+                        (true, false) => "Clear receiver",
+
+                        _ => "Use as receiver",
+                    };
+
                     if ui
                         .add_enabled(
-                            receiver_enabled && !receiver_selected,
-                            egui::Button::new(if receiver_selected {
-                                "Receiver selected"
-                            } else {
-                                "Use as receiver"
-                            }),
+                            receiver_selected || receiver_enabled,
+                            egui::Button::new(receiver_button_label),
                         )
                         .clicked()
                     {
                         self.route_mode = ManagementRouteMode::AutomaticLan;
 
-                        self.receiver_agent = endpoint_text.clone();
+                        select_or_clear_discovered_endpoint(
+                            &mut self.receiver_agent,
+                            &mut self.sender_agent,
+                            &endpoint_text,
+                        );
                     }
 
                     let capability = match (sender_enabled, receiver_enabled) {
@@ -3302,7 +3318,7 @@ impl NetworkCopyManager {
 
         ui.add_space(8.0);
 
-        let endpoint_fields_editable = self.route_mode == ManagementRouteMode::ExplicitIp;
+        let endpoint_fields_editable = self.route_mode != ManagementRouteMode::DirectLink;
 
         ui.columns(2, |columns| {
             let (sender_column, receiver_column) = columns.split_at_mut(1);
@@ -3318,10 +3334,15 @@ impl NetworkCopyManager {
 
                 let width = ui.available_width();
 
-                ui.add_enabled(
+                let sender_response = ui.add_enabled(
                     endpoint_fields_editable,
                     egui::TextEdit::singleline(&mut self.sender_agent).desired_width(width),
                 );
+
+                if sender_response.changed() && self.route_mode == ManagementRouteMode::AutomaticLan
+                {
+                    self.route_mode = ManagementRouteMode::ExplicitIp;
+                }
 
                 ui.label("Source folder / batch candidate");
 
@@ -3345,10 +3366,16 @@ impl NetworkCopyManager {
 
                 let width = ui.available_width();
 
-                ui.add_enabled(
+                let receiver_response = ui.add_enabled(
                     endpoint_fields_editable,
                     egui::TextEdit::singleline(&mut self.receiver_agent).desired_width(width),
                 );
+
+                if receiver_response.changed()
+                    && self.route_mode == ManagementRouteMode::AutomaticLan
+                {
+                    self.route_mode = ManagementRouteMode::ExplicitIp;
+                }
 
                 ui.label("Destination folder / batch root");
 
@@ -3578,21 +3605,25 @@ impl NetworkCopyManager {
             ui.columns(2, |columns| {
                 let (left, right) = columns.split_at_mut(1);
 
-                render_remote_browser(
-                    &mut left[0],
-                    "Sender folders",
-                    &sender_agent,
-                    &mut self.source_root,
-                    &mut self.sender_browser,
-                );
+                left[0].push_id("sender_remote_browser", |ui| {
+                    render_remote_browser(
+                        ui,
+                        "Sender folders",
+                        &sender_agent,
+                        &mut self.source_root,
+                        &mut self.sender_browser,
+                    );
+                });
 
-                render_remote_browser(
-                    &mut right[0],
-                    "Receiver folders",
-                    &receiver_agent,
-                    &mut self.destination_root,
-                    &mut self.receiver_browser,
-                );
+                right[0].push_id("receiver_remote_browser", |ui| {
+                    render_remote_browser(
+                        ui,
+                        "Receiver folders",
+                        &receiver_agent,
+                        &mut self.destination_root,
+                        &mut self.receiver_browser,
+                    );
+                });
             });
         }
 
@@ -4591,9 +4622,29 @@ fn resolve_management_endpoints(
     }
 }
 
+fn select_or_clear_discovered_endpoint(
+    selected_role: &mut String,
+    other_role: &mut String,
+    endpoint: &str,
+) {
+    if selected_role == endpoint && other_role != endpoint {
+        selected_role.clear();
+
+        return;
+    }
+
+    selected_role.clear();
+
+    selected_role.push_str(endpoint);
+
+    if other_role == endpoint {
+        other_role.clear();
+    }
+}
+
 fn comparable_windows_path(path: &str) -> String {
     path.trim()
-        .trim_end_matches(|character| character == '\\' || character == '/')
+        .trim_end_matches(['\\', '/'])
         .replace('/', "\\")
         .to_lowercase()
 }
@@ -5412,7 +5463,8 @@ mod tests {
         PairedTransferHistoryEntry, build_batch_queue_requests, join_remote_path, paired_outcome,
         parent_remote_path, peer_cleanup_target, preflight_queue_route, queue_state_for_outcome,
         queue_state_for_start_failure, remember_history, resolve_management_endpoints,
-        select_bound_recovery_item, transfer_matches_queue_request,
+        select_bound_recovery_item, select_or_clear_discovered_endpoint,
+        transfer_matches_queue_request,
     };
     use networkcopy_speed::management_active_binding::ActiveQueueBinding;
     use networkcopy_speed::management_discovery::{AgentCapabilities, AgentState, DiscoveredAgent};
@@ -5441,6 +5493,31 @@ mod tests {
     #[test]
     fn drive_root_has_no_browser_parent() {
         assert_eq!(parent_remote_path(r"C:\"), None,);
+    }
+
+    #[test]
+    fn discovered_endpoint_selection_resolves_role_conflict() {
+        let endpoint = "192.168.1.2:7339";
+
+        let mut sender = endpoint.to_string();
+
+        let mut receiver = endpoint.to_string();
+
+        select_or_clear_discovered_endpoint(&mut sender, &mut receiver, endpoint);
+
+        assert_eq!(sender, endpoint);
+
+        assert!(receiver.is_empty());
+
+        select_or_clear_discovered_endpoint(&mut sender, &mut receiver, endpoint);
+
+        assert!(sender.is_empty());
+
+        select_or_clear_discovered_endpoint(&mut receiver, &mut sender, endpoint);
+
+        assert_eq!(receiver, endpoint);
+
+        assert!(sender.is_empty());
     }
 
     fn history_entry(sequence: u64, outcome: ManagementJobOutcome) -> PairedTransferHistoryEntry {
