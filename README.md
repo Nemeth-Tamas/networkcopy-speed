@@ -287,17 +287,42 @@ continues to operate one sender/receiver pair at a time.
 ## v2.4 development roadmap — safer and faster unattended setup
 
 v2.4 strengthens queue recovery, adds destination-root batch mapping to the
-Manager and standalone GUI, and turns update checking into an explicit,
-user-approved executable update flow.
+Manager and existing bilingual standalone GUI, and turns update checking into
+an explicit, user-approved executable update flow.
+
+### Current v2.4 checkpoint — 2026-08-04
+
+The queue-hardening foundation is now implemented:
+
+- each running endpoint agent receives a random process identity;
+- an exact queue binding records the queue item, both agent identities, and both
+  endpoint job IDs;
+- unresolved bindings prevent unsafe retry, skip, removal, and queue reordering;
+- bindings survive Running-to-Blocked transitions and clear on terminal states;
+- the `NCMS4` state format persists optional exact bindings atomically;
+- `NCMS1`, `NCMS2`, and `NCMS3` states remain loadable and migrate without an
+  active binding.
+
+The Manager does not yet create, immediately save, or use the exact binding
+during real transfer startup and restart recovery. That lifecycle wiring is the
+next development slice.
 
 ### Queue recovery hardening
 
 - [x] assign each running endpoint agent a random process identity;
-- [ ] persist the exact active queue item and paired endpoint job IDs;
-- [ ] require exact job-ID matching during Manager restart reattachment;
-- [ ] distinguish retry reattachment from restarting the transfer;
-- [ ] prove both endpoints are clear before resetting blocked work to pending;
-- [ ] preserve safe recovery across persistence format migration.
+- [x] define an exact binding containing the queue item, agent identities, and
+      endpoint job IDs;
+- [x] retain unresolved bindings inside the persistent transfer queue;
+- [x] prevent retry, skip, removal, and reordering while a binding is unresolved;
+- [x] clear bindings on terminal states while retaining them when work is blocked;
+- [x] encode and validate exact bindings through the `NCMS4` state format;
+- [x] preserve loading of `NCMS1`, `NCMS2`, and `NCMS3` states without bindings;
+- [ ] create the binding from verified endpoint snapshots after transfer startup;
+- [ ] save a newly created binding immediately instead of waiting for debounce;
+- [ ] require exact agent-instance and job-ID matching during restart reattachment;
+- [ ] distinguish retry reattachment from deliberately restarting the transfer;
+- [ ] prove both endpoints are clear before resetting bound work to pending;
+- [ ] complete exact-binding Manager restart and unreachable-endpoint acceptance.
 
 ### Batch destination-root setup
 
@@ -344,8 +369,9 @@ user-approved executable update flow.
 - automatic agent startup with Windows;
 - major diagnostics expansion;
 - transfer-history export;
-- ZIP-based release deployment;
-- automatic in-place executable replacement.
+- ZIP-based release deployment.
+
+The in-place updater is no longer deferred. It remains user-triggered: pressing Update downloads the new release, migrates shared persistence, exits the old process, installs or replaces the executable as appropriate, and relaunches the new version.
 
 Management traffic remains intended for known and controlled local networks.
 
