@@ -303,9 +303,14 @@ The queue-hardening foundation is now implemented:
 - `NCMS1`, `NCMS2`, and `NCMS3` states remain loadable and migrate without an
   active binding.
 
-The Manager does not yet create, immediately save, or use the exact binding
-during real transfer startup and restart recovery. That lifecycle wiring is the
-next development slice.
+The Manager now creates exact bindings from verified endpoint snapshots, saves
+them immediately, and requires exact agent-instance and job-ID matches during
+restart recovery. Retry on bound work performs reattachment without starting
+duplicate endpoint jobs.
+
+The Manager also includes a multi-source batch builder. Several source folders
+can be collected, previewed beneath one receiver destination root, checked for
+name collisions, and added atomically to the persistent transfer queue.
 
 ### Queue recovery hardening
 
@@ -327,11 +332,11 @@ next development slice.
 ### Batch destination-root setup
 
 - [x] define one shared exact-destination and source-name-under-root mapping model;
-- [ ] select several source folders in the Manager;
-- [ ] select one receiver destination root;
-- [ ] preview the generated source-to-destination mappings;
-- [ ] reject duplicate source folder names that would collide beneath the root;
-- [ ] add the generated mappings to the persistent queue in one operation.
+- [x] select several source folders in the Manager;
+- [x] select one receiver destination root;
+- [x] preview the generated source-to-destination mappings;
+- [x] reject duplicate source folder names that would collide beneath the root;
+- [x] add the generated mappings to the persistent queue in one operation.
 
 ### Standalone GUI root receiver
 

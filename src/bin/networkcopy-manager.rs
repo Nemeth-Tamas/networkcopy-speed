@@ -4,6 +4,7 @@
 )]
 
 use eframe::egui;
+use networkcopy_speed::destination_layout::{self, DestinationLayout};
 use networkcopy_speed::management_active_binding::ActiveQueueBinding;
 use networkcopy_speed::management_control;
 use networkcopy_speed::management_direct::{self, DirectDiscoveredAgent};
@@ -14,7 +15,7 @@ use networkcopy_speed::management_orchestration::{
 };
 use networkcopy_speed::management_persistence::{self, ManagerHistoryEntry, ManagerPersistedState};
 use networkcopy_speed::management_queue::{
-    QueuedTransfer, QueuedTransferId, QueuedTransferKind, QueuedTransferRequest,
+    MAX_QUEUE_ENTRIES, QueuedTransfer, QueuedTransferId, QueuedTransferKind, QueuedTransferRequest,
     QueuedTransferState, TransferQueue,
 };
 use networkcopy_speed::management_reconnect;
@@ -24,7 +25,7 @@ use networkcopy_speed::management_snapshot::{
 };
 use networkcopy_speed::release_update::{self, ReleaseCheck};
 use networkcopy_speed::windows_notification::{self, NotificationKind};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -394,6 +395,8 @@ struct NetworkCopyManager {
 
     destination_root: String,
 
+    batch_sources: Vec<String>,
+
     sender_browser: RemoteBrowserPane,
 
     receiver_browser: RemoteBrowserPane,
@@ -489,6 +492,8 @@ impl NetworkCopyManager {
             source_root: String::new(),
 
             destination_root: String::new(),
+
+            batch_sources: Vec::new(),
 
             sender_browser: RemoteBrowserPane::new(),
 
@@ -874,6 +879,109 @@ impl NetworkCopyManager {
 
             kind: QueuedTransferKind::Fresh,
         })
+    }
+
+    fn add_current_source_to_batch(&mut self) {
+        self.error.clear();
+
+        let source_root = self.source_root.trim().to_string();
+
+        if source_root.is_empty() {
+            self.error =
+                "Select or enter a source folder before adding it to the batch.".to_string();
+
+            return;
+        }
+
+        if let Err(error) = destination_layout::source_directory_name(Path::new(&source_root)) {
+            self.error = format!("The batch source must end with a usable folder name: {error}",);
+
+            return;
+        }
+
+        let source_key = comparable_windows_path(&source_root);
+
+        if self
+            .batch_sources
+            .iter()
+            .any(|existing| comparable_windows_path(existing) == source_key)
+        {
+            self.error = format!("The source folder is already in the batch: {source_root}",);
+
+            return;
+        }
+
+        self.batch_sources.push(source_root.clone());
+
+        self.notice = format!(
+            "Added batch source {}: {source_root}",
+            self.batch_sources.len(),
+        );
+    }
+
+    fn add_batch_to_queue(&mut self) {
+        self.error.clear();
+
+        let (sender_agent, receiver_agent) = match self.configured_management_endpoints() {
+            Ok(endpoints) => endpoints,
+
+            Err(error) => {
+                self.error = error;
+
+                return;
+            }
+        };
+
+        let requests = match build_batch_queue_requests(
+            sender_agent,
+            receiver_agent,
+            self.route_mode,
+            &self.batch_sources,
+            &self.destination_root,
+            self.update_existing,
+            self.worker_count,
+            self.calibration_mib,
+        ) {
+            Ok(requests) => requests,
+
+            Err(error) => {
+                self.error = error;
+
+                return;
+            }
+        };
+
+        let request_count = requests.len();
+
+        if self.queue.len().saturating_add(request_count) > MAX_QUEUE_ENTRIES {
+            let remaining = MAX_QUEUE_ENTRIES.saturating_sub(self.queue.len());
+
+            self.error = format!(
+                "The batch contains {request_count} transfer(s), but the queue has room for only {remaining} more.",
+            );
+
+            return;
+        }
+
+        let mut updated_queue = self.queue.clone();
+
+        for request in requests {
+            if let Err(error) = updated_queue.add(request) {
+                self.error = format!(
+                    "The batch could not be added atomically. The existing queue was left unchanged: {error}",
+                );
+
+                return;
+            }
+        }
+
+        self.queue = updated_queue;
+
+        self.batch_sources.clear();
+
+        self.show_queue = true;
+
+        self.notice = format!("Added {request_count} mapped transfer(s) to the persistent queue.",);
     }
 
     fn add_current_to_queue(&mut self) {
@@ -3215,7 +3323,7 @@ impl NetworkCopyManager {
                     egui::TextEdit::singleline(&mut self.sender_agent).desired_width(width),
                 );
 
-                ui.label("Source folder");
+                ui.label("Source folder / batch candidate");
 
                 let width = ui.available_width();
 
@@ -3242,7 +3350,7 @@ impl NetworkCopyManager {
                     egui::TextEdit::singleline(&mut self.receiver_agent).desired_width(width),
                 );
 
-                ui.label("Destination folder");
+                ui.label("Destination folder / batch root");
 
                 let width = ui.available_width();
 
@@ -3280,6 +3388,167 @@ impl NetworkCopyManager {
                 );
             });
         });
+
+        ui.add_space(8.0);
+
+        let batch_sources = self.batch_sources.clone();
+
+        let batch_destination_root = self.destination_root.clone();
+
+        let mut add_source_to_batch = false;
+
+        let mut clear_batch = false;
+
+        let mut remove_batch_index = None::<usize>;
+
+        let mut add_batch_to_queue = false;
+
+        ui.group(|ui| {
+            ui.set_min_width(ui.available_width());
+
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Batch queue builder");
+
+                ui.separator();
+
+                ui.label(
+                    "Each source folder is placed beneath the receiver root using its final folder name.",
+                );
+            });
+
+            ui.add_space(6.0);
+
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        !self.source_root.trim().is_empty(),
+                        egui::Button::new("Add current source"),
+                    )
+                    .clicked()
+                {
+                    add_source_to_batch = true;
+                }
+
+                if ui
+                    .add_enabled(
+                        !batch_sources.is_empty(),
+                        egui::Button::new("Clear source list"),
+                    )
+                    .clicked()
+                {
+                    clear_batch = true;
+                }
+
+                ui.label(format!(
+                    "{} source folder(s) selected",
+                    batch_sources.len(),
+                ));
+            });
+
+            ui.add_space(6.0);
+
+            if batch_sources.is_empty() {
+                ui.label(
+                    "Select or type a source folder, then click Add current source. Repeat for Desktop, Documents, Downloads, and the other folders you want.",
+                );
+            } else {
+                for (index, source_root) in
+                    batch_sources.iter().enumerate()
+                {
+                    let mapped_destination =
+                        destination_layout::resolve_destination_text(
+                            DestinationLayout::SourceNameUnderRoot,
+                            source_root,
+                            &batch_destination_root,
+                        );
+
+                    ui.group(|ui| {
+                        ui.set_min_width(ui.available_width());
+
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(
+                                egui::RichText::new(source_root)
+                                    .monospace(),
+                            );
+
+                            ui.label("→");
+
+                            match &mapped_destination {
+                                Ok(destination) => {
+                                    ui.label(
+                                        egui::RichText::new(destination)
+                                            .monospace(),
+                                    );
+                                }
+
+                                Err(error) => {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            error.to_string(),
+                                        )
+                                        .color(
+                                            egui::Color32::from_rgb(
+                                                255, 112, 120,
+                                            ),
+                                        ),
+                                    );
+                                }
+                            }
+
+                            if ui.small_button("Remove").clicked() {
+                                remove_batch_index = Some(index);
+                            }
+                        });
+                    });
+
+                    ui.add_space(4.0);
+                }
+            }
+
+            ui.add_space(6.0);
+
+            let batch_ready = !batch_sources.is_empty()
+                && !self.sender_agent.trim().is_empty()
+                && !self.receiver_agent.trim().is_empty()
+                && !self.destination_root.trim().is_empty()
+                && self.sender_agent != self.receiver_agent;
+
+            if ui
+                .add_enabled(
+                    batch_ready,
+                    egui::Button::new(
+                        egui::RichText::new(
+                            "Add mapped batch to queue",
+                        )
+                        .strong(),
+                    )
+                    .fill(egui::Color32::from_rgb(42, 78, 72)),
+                )
+                .clicked()
+            {
+                add_batch_to_queue = true;
+            }
+        });
+
+        if add_source_to_batch {
+            self.add_current_source_to_batch();
+        }
+
+        if clear_batch {
+            self.batch_sources.clear();
+
+            self.notice = "Cleared the batch source list.".to_string();
+        } else if let Some(index) = remove_batch_index
+            && index < self.batch_sources.len()
+        {
+            let removed = self.batch_sources.remove(index);
+
+            self.notice = format!("Removed batch source: {removed}",);
+        }
+
+        if add_batch_to_queue {
+            self.add_batch_to_queue();
+        }
 
         ui.add_space(12.0);
 
@@ -4322,6 +4591,100 @@ fn resolve_management_endpoints(
     }
 }
 
+fn comparable_windows_path(path: &str) -> String {
+    path.trim()
+        .trim_end_matches(|character| character == '\\' || character == '/')
+        .replace('/', "\\")
+        .to_lowercase()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_batch_queue_requests(
+    sender_agent: SocketAddr,
+    receiver_agent: SocketAddr,
+    route_mode: ManagementRouteMode,
+    source_roots: &[String],
+    destination_root: &str,
+    update_existing: bool,
+    worker_count: usize,
+    calibration_mib: u64,
+) -> Result<Vec<QueuedTransferRequest>, String> {
+    if source_roots.is_empty() {
+        return Err("Add at least one source folder to the batch.".to_string());
+    }
+
+    let destination_root = destination_root.trim();
+
+    if destination_root.is_empty() {
+        return Err("Select or enter one destination root for the batch.".to_string());
+    }
+
+    let mut source_keys = HashSet::new();
+
+    let mut destination_keys = HashSet::new();
+
+    let mut requests = Vec::with_capacity(source_roots.len());
+
+    for source_root in source_roots {
+        let source_root = source_root.trim().to_string();
+
+        if source_root.is_empty() {
+            return Err("A batch source folder must not be empty.".to_string());
+        }
+
+        let source_key = comparable_windows_path(&source_root);
+
+        if !source_keys.insert(source_key) {
+            return Err(format!(
+                "The batch contains the same source folder more than once: {source_root}",
+            ));
+        }
+
+        let resolved_destination = destination_layout::resolve_destination_text(
+            DestinationLayout::SourceNameUnderRoot,
+            &source_root,
+            destination_root,
+        )
+        .map_err(|error| format!("Could not map batch source {source_root}: {error}",))?;
+
+        let destination_key = comparable_windows_path(&resolved_destination);
+
+        if !destination_keys.insert(destination_key) {
+            return Err(format!(
+                "Two batch sources would map to the same destination folder: {resolved_destination}",
+            ));
+        }
+
+        let request = QueuedTransferRequest {
+            sender_agent,
+
+            receiver_agent,
+
+            route_mode,
+
+            source_root,
+
+            destination_root: resolved_destination,
+
+            update_existing,
+
+            worker_count,
+
+            calibration_mib,
+
+            kind: QueuedTransferKind::Fresh,
+        };
+
+        request
+            .validate()
+            .map_err(|error| format!("Generated batch transfer was invalid: {error}"))?;
+
+        requests.push(request);
+    }
+
+    Ok(requests)
+}
+
 fn active_queue_binding_for_snapshots(
     queue_id: QueuedTransferId,
     transfer: &ManagedTransferRecord,
@@ -5046,8 +5409,8 @@ fn main() -> eframe::Result {
 mod tests {
     use super::{
         DirectManagementRoute, MAX_TRANSFER_HISTORY, ManagedEndpointRole, ManagedStartFailureKind,
-        PairedTransferHistoryEntry, join_remote_path, paired_outcome, parent_remote_path,
-        peer_cleanup_target, preflight_queue_route, queue_state_for_outcome,
+        PairedTransferHistoryEntry, build_batch_queue_requests, join_remote_path, paired_outcome,
+        parent_remote_path, peer_cleanup_target, preflight_queue_route, queue_state_for_outcome,
         queue_state_for_start_failure, remember_history, resolve_management_endpoints,
         select_bound_recovery_item, transfer_matches_queue_request,
     };
@@ -5462,6 +5825,75 @@ mod tests {
         );
 
         assert!(preflight_queue_route(ManagementRouteMode::DirectLink,).is_ok(),);
+    }
+
+    #[test]
+    fn batch_queue_builder_maps_sources_beneath_one_root() {
+        let requests = build_batch_queue_requests(
+            "127.0.0.1:7339".parse().unwrap(),
+            "127.0.0.1:7340".parse().unwrap(),
+            ManagementRouteMode::ExplicitIp,
+            &[
+                r"C:\Users\User\Desktop".to_string(),
+                r"C:\Users\User\Documents".to_string(),
+                r"C:\Users\User\Downloads".to_string(),
+            ],
+            r"D:\Backup\User",
+            true,
+            4,
+            8,
+        )
+        .unwrap();
+
+        assert_eq!(requests.len(), 3);
+
+        assert_eq!(requests[0].destination_root, r"D:\Backup\User\Desktop",);
+
+        assert_eq!(requests[1].destination_root, r"D:\Backup\User\Documents",);
+
+        assert_eq!(requests[2].destination_root, r"D:\Backup\User\Downloads",);
+
+        assert!(requests.iter().all(|request| request.update_existing),);
+    }
+
+    #[test]
+    fn batch_queue_builder_rejects_duplicate_sources() {
+        let error = build_batch_queue_requests(
+            "127.0.0.1:7339".parse().unwrap(),
+            "127.0.0.1:7340".parse().unwrap(),
+            ManagementRouteMode::ExplicitIp,
+            &[
+                r"C:\Users\User\Desktop".to_string(),
+                r"c:/users/user/desktop/".to_string(),
+            ],
+            r"D:\Backup\User",
+            false,
+            4,
+            8,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("same source folder"));
+    }
+
+    #[test]
+    fn batch_queue_builder_rejects_destination_collisions() {
+        let error = build_batch_queue_requests(
+            "127.0.0.1:7339".parse().unwrap(),
+            "127.0.0.1:7340".parse().unwrap(),
+            ManagementRouteMode::ExplicitIp,
+            &[
+                r"C:\Users\Alice\Desktop".to_string(),
+                r"C:\Users\Bob\Desktop".to_string(),
+            ],
+            r"D:\Backup",
+            false,
+            4,
+            8,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("same destination folder"));
     }
 
     #[test]
