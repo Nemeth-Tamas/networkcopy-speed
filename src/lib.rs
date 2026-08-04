@@ -38,6 +38,7 @@ mod management_filesystem;
 pub mod management_instance;
 pub mod management_jobs;
 pub mod management_orchestration;
+#[path = "management_persistence_v4.rs"]
 pub mod management_persistence;
 pub mod management_protocol;
 pub mod management_queue;
