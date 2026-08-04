@@ -4,6 +4,7 @@
 )]
 
 use eframe::egui;
+use networkcopy_speed::management_active_binding::ActiveQueueBinding;
 use networkcopy_speed::management_control;
 use networkcopy_speed::management_direct::{self, DirectDiscoveredAgent};
 use networkcopy_speed::management_directory::{ManagementDirectoryEntry, ManagementEntryKind};
@@ -628,37 +629,15 @@ impl NetworkCopyManager {
 
         let mut queue = state.queue;
 
-        let mut running_items = queue
-            .items()
-            .iter()
-            .filter(|item| item.state == QueuedTransferState::Running)
-            .cloned()
-            .collect::<Vec<_>>();
+        let recovery_item = match select_bound_recovery_item(&mut queue) {
+            Ok(item) => item,
 
-        let recovery_item = if running_items.len() == 1 {
-            running_items.pop()
-        } else {
-            if running_items.len() > 1 {
-                for item in &running_items {
-                    if let Err(error) = queue.set_state(
-                        item.id,
-                        QueuedTransferState::Blocked,
-                        "The persisted queue contained multiple Running items. Automatic reattachment was refused.",
-                    ) {
-                        self.persistence_error = format!(
-                            "Failed to block ambiguous queue item #{}: {error}",
-                            item.id,
-                        );
-                    }
-                }
+            Err(error) => {
+                self.persistence_error =
+                    format!("Failed to prepare exact queue recovery: {error}",);
 
-                self.persistence_error = format!(
-                    "The persisted queue contained {} Running items. Sequential queues may contain only one.",
-                    running_items.len(),
-                );
+                None
             }
-
-            None
         };
 
         self.queue = queue;
@@ -721,6 +700,101 @@ impl NetworkCopyManager {
                     receiver_result: entry.receiver_result.clone(),
                 })
                 .collect(),
+        }
+    }
+
+    fn persist_state_now(&mut self) -> Result<(), String> {
+        let path = self
+            .state_path
+            .clone()
+            .ok_or_else(|| "Manager state path is unavailable.".to_string())?;
+
+        let state = self.persisted_state();
+
+        management_persistence::save_to(&path, &state)
+            .map_err(|error| format!("Failed to save {}: {error}", path.display(),))?;
+
+        self.last_saved_state = Some(state);
+
+        self.last_state_save = Instant::now();
+
+        self.persistence_error.clear();
+
+        Ok(())
+    }
+
+    fn bind_active_queue_if_possible(&mut self) {
+        if self.queue.active_binding().is_some() {
+            return;
+        }
+
+        let Some(id) = self.active_queue_id else {
+            return;
+        };
+
+        let Some(transfer) = self.transfer.as_ref() else {
+            return;
+        };
+
+        let Some(sender_snapshot) = self.sender_snapshot.as_ref() else {
+            return;
+        };
+
+        let Some(receiver_snapshot) = self.receiver_snapshot.as_ref() else {
+            return;
+        };
+
+        if !snapshot_has_active_job(Some(sender_snapshot), transfer.sender_job_id)
+            || !snapshot_has_active_job(Some(receiver_snapshot), transfer.receiver_job_id)
+        {
+            return;
+        }
+
+        let binding = match active_queue_binding_for_snapshots(
+            id,
+            transfer,
+            sender_snapshot,
+            receiver_snapshot,
+        ) {
+            Ok(binding) => binding,
+
+            Err(error) => {
+                self.error = format!(
+                    "Queued transfer #{id} could not create its exact recovery binding: {error}",
+                );
+
+                return;
+            }
+        };
+
+        if let Err(error) = self.queue.set_active_binding(binding) {
+            self.error = format!(
+                "Queued transfer #{id} could not retain its exact recovery binding: {error}",
+            );
+
+            return;
+        }
+
+        match self.persist_state_now() {
+            Ok(()) => {
+                self.notice = format!(
+                    "Queued transfer #{id} is protected by an exact endpoint-job binding.",
+                );
+            }
+
+            Err(error) => {
+                self.persistence_error = error.clone();
+
+                self.error = format!(
+                    "Queued transfer #{id} is running, but its exact recovery binding could not be saved: {error}",
+                );
+
+                notify_manager(
+                    NotificationKind::Error,
+                    "Queue recovery state was not saved",
+                    &self.error,
+                );
+            }
         }
     }
 
@@ -1488,6 +1562,28 @@ impl NetworkCopyManager {
 
         let request = item.request;
 
+        let Some(binding) = self
+            .queue
+            .active_binding()
+            .filter(|binding| binding.queue_id == id)
+        else {
+            let message = format!(
+                "Queued transfer #{id} has no exact endpoint binding. Automatic reattachment was refused.",
+            );
+
+            let _ = self
+                .queue
+                .set_state(id, QueuedTransferState::Blocked, message.clone());
+
+            self.queue_running = false;
+
+            self.active_queue_id = None;
+
+            self.error = message;
+
+            return;
+        };
+
         self.sender_agent = request.sender_agent.to_string();
 
         self.receiver_agent = request.receiver_agent.to_string();
@@ -1546,6 +1642,17 @@ impl NetworkCopyManager {
                 let receiver_snapshot = management_control::agent_snapshot(request.receiver_agent)
                     .map_err(|error| {
                         format!("Receiver snapshot failed during restart recovery: {error}")
+                    })?;
+
+                binding
+                    .validate_active_snapshots(
+                        &sender_snapshot,
+                        &receiver_snapshot,
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "The persisted exact endpoint binding did not match the active jobs: {error}",
+                        )
                     })?;
 
                 let transfer = management_reconnect::reconstruct_active_transfer(
@@ -1982,7 +2089,9 @@ impl NetworkCopyManager {
 
                 self.peer_cleanup_attempted = false;
 
-                self.last_poll = Instant::now();
+                self.last_poll = Instant::now()
+                    .checked_sub(POLL_INTERVAL)
+                    .unwrap_or_else(Instant::now);
 
                 self.monitoring_complete = false;
 
@@ -2194,6 +2303,8 @@ impl NetworkCopyManager {
 
                 if !errors.is_empty() {
                     self.error = errors.join(" ");
+                } else {
+                    self.bind_active_queue_if_possible();
                 }
 
                 let monitoring_complete = self.transfer.as_ref().is_some_and(|transfer| {
@@ -4146,6 +4257,78 @@ fn resolve_management_endpoints(
     }
 }
 
+fn active_queue_binding_for_snapshots(
+    queue_id: QueuedTransferId,
+    transfer: &ManagedTransferRecord,
+    sender_snapshot: &ManagementAgentSnapshot,
+    receiver_snapshot: &ManagementAgentSnapshot,
+) -> Result<ActiveQueueBinding, String> {
+    let binding = ActiveQueueBinding::new(
+        queue_id,
+        sender_snapshot.agent_instance_id,
+        transfer.sender_job_id,
+        receiver_snapshot.agent_instance_id,
+        transfer.receiver_job_id,
+    )
+    .map_err(|error| format!("exact queue binding was invalid: {error}",))?;
+
+    binding
+        .validate_active_snapshots(sender_snapshot, receiver_snapshot)
+        .map_err(|error| format!("endpoint snapshots did not match the new binding: {error}",))?;
+
+    Ok(binding)
+}
+
+fn select_bound_recovery_item(queue: &mut TransferQueue) -> Result<Option<QueuedTransfer>, String> {
+    let Some(binding) = queue.active_binding() else {
+        let running_ids = queue
+            .items()
+            .iter()
+            .filter(|item| item.state == QueuedTransferState::Running)
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+
+        for id in running_ids {
+            queue.set_state(
+                id,
+                QueuedTransferState::Blocked,
+                "The Manager restarted without an exact endpoint binding. Automatic reattachment was refused.",
+            )?;
+        }
+
+        return Ok(None);
+    };
+
+    let extra_running_ids = queue
+        .items()
+        .iter()
+        .filter(|item| item.state == QueuedTransferState::Running && item.id != binding.queue_id)
+        .map(|item| item.id)
+        .collect::<Vec<_>>();
+
+    for id in extra_running_ids {
+        queue.set_state(
+            id,
+            QueuedTransferState::Blocked,
+            "Another queue item retained the exact endpoint binding. This extra Running item was blocked.",
+        )?;
+    }
+
+    let item = queue
+        .items()
+        .iter()
+        .find(|item| item.id == binding.queue_id)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "exact endpoint binding references missing queue item #{}",
+                binding.queue_id,
+            )
+        })?;
+
+    Ok(Some(item))
+}
+
 fn preflight_queue_route(route_mode: ManagementRouteMode) -> Result<(), ManagedStartFailure> {
     match route_mode {
         ManagementRouteMode::AutomaticLan
@@ -4801,13 +4984,14 @@ mod tests {
         PairedTransferHistoryEntry, join_remote_path, paired_outcome, parent_remote_path,
         peer_cleanup_target, preflight_queue_route, queue_state_for_outcome,
         queue_state_for_start_failure, remember_history, resolve_management_endpoints,
-        transfer_matches_queue_request,
+        select_bound_recovery_item, transfer_matches_queue_request,
     };
+    use networkcopy_speed::management_active_binding::ActiveQueueBinding;
     use networkcopy_speed::management_discovery::{AgentCapabilities, AgentState, DiscoveredAgent};
     use networkcopy_speed::management_instance::AgentInstanceId;
     use networkcopy_speed::management_orchestration::ManagedTransferRecord;
     use networkcopy_speed::management_queue::{
-        QueuedTransferKind, QueuedTransferRequest, QueuedTransferState,
+        QueuedTransferKind, QueuedTransferRequest, QueuedTransferState, TransferQueue,
     };
     use networkcopy_speed::management_route::ManagementRouteMode;
     use networkcopy_speed::management_snapshot::{
@@ -5213,6 +5397,93 @@ mod tests {
         );
 
         assert!(preflight_queue_route(ManagementRouteMode::DirectLink,).is_ok(),);
+    }
+
+    #[test]
+    fn persisted_running_item_without_binding_is_blocked() {
+        let mut queue = TransferQueue::default();
+
+        let id = queue
+            .add(QueuedTransferRequest {
+                sender_agent: "127.0.0.1:7339".parse().unwrap(),
+
+                receiver_agent: "127.0.0.1:7340".parse().unwrap(),
+
+                route_mode: ManagementRouteMode::AutomaticLan,
+
+                source_root: r"C:\Source".to_string(),
+
+                destination_root: r"D:\Destination".to_string(),
+
+                update_existing: true,
+
+                worker_count: 4,
+
+                calibration_mib: 8,
+
+                kind: QueuedTransferKind::Fresh,
+            })
+            .unwrap();
+
+        queue
+            .set_state(id, QueuedTransferState::Running, "Transfer active")
+            .unwrap();
+
+        assert!(select_bound_recovery_item(&mut queue,).unwrap().is_none(),);
+
+        let item = queue.items().iter().find(|item| item.id == id).unwrap();
+
+        assert_eq!(item.state, QueuedTransferState::Blocked,);
+
+        assert_eq!(queue.active_binding(), None,);
+    }
+
+    #[test]
+    fn persisted_bound_item_is_selected_for_exact_recovery() {
+        let mut queue = TransferQueue::default();
+
+        let id = queue
+            .add(QueuedTransferRequest {
+                sender_agent: "127.0.0.1:7339".parse().unwrap(),
+
+                receiver_agent: "127.0.0.1:7340".parse().unwrap(),
+
+                route_mode: ManagementRouteMode::AutomaticLan,
+
+                source_root: r"C:\Source".to_string(),
+
+                destination_root: r"D:\Destination".to_string(),
+
+                update_existing: true,
+
+                worker_count: 4,
+
+                calibration_mib: 8,
+
+                kind: QueuedTransferKind::Fresh,
+            })
+            .unwrap();
+
+        queue
+            .set_state(id, QueuedTransferState::Blocked, "Manager restarted")
+            .unwrap();
+
+        let binding = ActiveQueueBinding::new(
+            id,
+            AgentInstanceId::from_raw(11).unwrap(),
+            11,
+            AgentInstanceId::from_raw(17).unwrap(),
+            17,
+        )
+        .unwrap();
+
+        queue.set_active_binding(binding).unwrap();
+
+        let selected = select_bound_recovery_item(&mut queue).unwrap().unwrap();
+
+        assert_eq!(selected.id, id);
+
+        assert_eq!(queue.active_binding(), Some(binding),);
     }
 
     #[test]
