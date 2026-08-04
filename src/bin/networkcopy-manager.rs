@@ -967,6 +967,75 @@ impl NetworkCopyManager {
         self.monitoring_complete = false;
     }
 
+    fn retry_queue_item(&mut self, id: QueuedTransferId) {
+        let Some(item) = self
+            .queue
+            .items()
+            .iter()
+            .find(|item| item.id == id)
+            .cloned()
+        else {
+            self.error = format!("Queued transfer #{id} no longer exists.",);
+
+            return;
+        };
+
+        if let Some(binding) = self.queue.active_binding() {
+            if binding.queue_id != id {
+                self.error = format!(
+                    "Queued transfer #{} still retains the exact endpoint binding. Resolve that item before retrying transfer #{id}.",
+                    binding.queue_id,
+                );
+
+                return;
+            }
+
+            let transfer_active = self.transfer.is_some() && !self.monitoring_complete;
+
+            if self.queue_running
+                || self.start_receiver.is_some()
+                || self.attach_receiver.is_some()
+                || self.queue_reattach_receiver.is_some()
+                || self.poll_receiver.is_some()
+                || self.cancel_receiver.is_some()
+                || self.peer_cleanup_receiver.is_some()
+                || transfer_active
+            {
+                self.error =
+                    "Exact queue reattachment cannot start while another managed operation is active."
+                        .to_string();
+
+                return;
+            }
+
+            self.error.clear();
+
+            self.notice = format!(
+                "Retrying exact reattachment for queued transfer #{id}. No new endpoint jobs will be started.",
+            );
+
+            self.begin_queue_reattach(item);
+
+            return;
+        }
+
+        if self.queue_running {
+            self.error =
+                "A queued transfer cannot be reset while the queue is running.".to_string();
+
+            return;
+        }
+
+        if self.queue.reset_to_pending(id) {
+            self.error.clear();
+
+            self.notice = format!("Queued transfer #{id} is pending again.",);
+        } else {
+            self.error =
+                format!("Queued transfer #{id} cannot be retried from its current state.",);
+        }
+    }
+
     fn start_queue(&mut self) {
         if self.queue_running {
             return;
@@ -3672,11 +3741,7 @@ impl NetworkCopyManager {
         }
 
         if let Some(id) = retry {
-            if self.queue.reset_to_pending(id) {
-                self.notice = format!("Queued transfer #{id} was reset to Pending.",);
-
-                self.error.clear();
-            }
+            self.retry_queue_item(id);
         } else if let Some(id) = skip {
             if self.queue.skip(id) {
                 self.notice = format!("Queued transfer #{id} was skipped.");

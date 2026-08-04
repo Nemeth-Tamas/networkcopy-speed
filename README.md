@@ -317,11 +317,11 @@ next development slice.
 - [x] clear bindings on terminal states while retaining them when work is blocked;
 - [x] encode and validate exact bindings through the `NCMS4` state format;
 - [x] preserve loading of `NCMS1`, `NCMS2`, and `NCMS3` states without bindings;
-- [ ] create the binding from verified endpoint snapshots after transfer startup;
-- [ ] save a newly created binding immediately instead of waiting for debounce;
-- [ ] require exact agent-instance and job-ID matching during restart reattachment;
-- [ ] distinguish retry reattachment from deliberately restarting the transfer;
-- [ ] prove both endpoints are clear before resetting bound work to pending;
+- [x] create the binding from verified endpoint snapshots after transfer startup;
+- [x] save a newly created binding immediately instead of waiting for debounce;
+- [x] require exact agent-instance and job-ID matching during restart reattachment;
+- [x] make Retry reattach bound work without starting new endpoint jobs;
+- [ ] prove both endpoints are clear before deliberately restarting bound work;
 - [ ] complete exact-binding Manager restart and unreachable-endpoint acceptance.
 
 ### Batch destination-root setup
