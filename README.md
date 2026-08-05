@@ -323,6 +323,13 @@ own selected artifact on a worker thread, enforce the GitHub-reported byte
 count, verify the GitHub SHA-256 digest, and retain the verified executable
 without replacing the running application.
 
+Successful Manager preparation now also writes an `NCH1` binary handoff plan.
+The bounded format records the parent process ID, exact application kind,
+official-or-custom naming policy, expected executable size and SHA-256 digest,
+and every update path using lossless Windows UTF-16 encoding. The plan is
+written through a synchronized partial file, atomically renamed, read back, and
+validated before preparation is reported as successful.
+
 ### Queue recovery hardening
 
 - [x] assign each running endpoint agent a random process identity;
@@ -381,7 +388,8 @@ or payload transfer stops the loop without starting another receiver.
 - [x] remove incomplete partial files without touching the installed application;
 - [x] run Manager download and verification work outside the egui thread;
 - [x] save Manager persistence before beginning update preparation;
-- [ ] serialize and validate the executable handoff plan;
+- [x] serialize and validate the executable handoff plan using a bounded,
+      versioned binary format with lossless Windows UTF-16 paths;
 - [ ] launch an officially named new executable beside an officially named old one;
 - [ ] replace a renamed executable in place while preserving its custom filename;
 - [ ] relaunch the installed executable and confirm successful startup;

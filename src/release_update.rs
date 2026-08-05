@@ -1,10 +1,10 @@
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::time::Duration;
@@ -33,7 +33,19 @@ const UPDATE_STAGING_DIRECTORY: &str = "Updates";
 
 const UPDATE_BACKUP_FILE: &str = "previous.exe";
 
-const UPDATE_HANDOFF_FILE: &str = "handoff-plan.txt";
+const UPDATE_HANDOFF_FILE: &str = "handoff-plan.bin";
+
+const UPDATE_HANDOFF_MAGIC: [u8; 4] = *b"NCH1";
+
+const UPDATE_HANDOFF_VERSION: u16 = 1;
+
+const UPDATE_HANDOFF_MAX_BYTES: usize = 1024 * 1024;
+
+const UPDATE_HANDOFF_MAX_PATH_UTF16_UNITS: usize = 32_767;
+
+const UPDATE_HANDOFF_DIGEST_BYTES: usize = 32;
+
+const UPDATE_HANDOFF_PARTIAL_SUFFIX: &str = ".partial";
 
 const UPDATE_STARTUP_MARKER_FILE: &str = "startup-ok.marker";
 
@@ -163,6 +175,33 @@ pub struct VerifiedStagedUpdate {
     pub size: u64,
 
     pub sha256_hex: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateHandoffPlan {
+    pub parent_process_id: u32,
+
+    pub artifact_kind: ReleaseArtifactKind,
+
+    pub naming: UpdateInstallNaming,
+
+    pub current_executable: PathBuf,
+
+    pub install_path: PathBuf,
+
+    pub staging_directory: PathBuf,
+
+    pub staged_executable: PathBuf,
+
+    pub backup_executable: PathBuf,
+
+    pub handoff_plan: PathBuf,
+
+    pub startup_marker: PathBuf,
+
+    pub expected_size: u64,
+
+    pub expected_sha256_hex: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -339,6 +378,131 @@ pub fn download_and_stage_update(plan: &UpdateInstallPlan) -> io::Result<Verifie
     stage_update_from_reader(plan, &mut reader)
 }
 
+pub fn write_update_handoff_plan(
+    plan: &UpdateInstallPlan,
+    verified: &VerifiedStagedUpdate,
+    parent_process_id: u32,
+) -> io::Result<UpdateHandoffPlan> {
+    let handoff = build_update_handoff_plan(plan, verified, parent_process_id)?;
+
+    let staged_metadata = fs::metadata(&handoff.staged_executable).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "verified staged executable {:?} could not be inspected before handoff: {error}",
+                handoff.staged_executable,
+            ),
+        )
+    })?;
+
+    if !staged_metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "verified staged executable is not a regular file: {:?}",
+                handoff.staged_executable,
+            ),
+        ));
+    }
+
+    if staged_metadata.len() != handoff.expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "verified staged executable contains {} bytes, expected {}",
+                staged_metadata.len(),
+                handoff.expected_size,
+            ),
+        ));
+    }
+
+    let encoded = encode_update_handoff_plan(&handoff)?;
+
+    let partial_handoff = partial_handoff_plan_path(plan);
+
+    remove_file_if_exists(&partial_handoff)?;
+
+    remove_file_if_exists(&plan.handoff_plan)?;
+
+    match write_update_handoff_bytes(&partial_handoff, &plan.handoff_plan, &encoded) {
+        Ok(()) => {}
+
+        Err(error) => {
+            if let Err(cleanup_error) = remove_file_if_exists(&partial_handoff) {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}; incomplete handoff file {:?} also could not be removed: \
+                         {cleanup_error}",
+                        partial_handoff,
+                    ),
+                ));
+            }
+
+            return Err(error);
+        }
+    }
+
+    let decoded = read_update_handoff_plan(&plan.handoff_plan)?;
+
+    if decoded != handoff {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "written update handoff plan did not round-trip exactly",
+        ));
+    }
+
+    Ok(handoff)
+}
+
+pub fn read_update_handoff_plan(path: &Path) -> io::Result<UpdateHandoffPlan> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "update handoff path must be absolute",
+        ));
+    }
+
+    let file = fs::File::open(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("update handoff file {path:?} could not be opened: {error}"),
+        )
+    })?;
+
+    let mut reader = file.take((UPDATE_HANDOFF_MAX_BYTES + 1) as u64);
+
+    let mut encoded = Vec::new();
+
+    reader.read_to_end(&mut encoded).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("update handoff file {path:?} could not be read: {error}"),
+        )
+    })?;
+
+    if encoded.len() > UPDATE_HANDOFF_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("update handoff file exceeds the {UPDATE_HANDOFF_MAX_BYTES}-byte limit"),
+        ));
+    }
+
+    let handoff = decode_update_handoff_plan(&encoded)?;
+
+    if handoff.handoff_plan != path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update handoff file was loaded from {path:?}, but its encoded path is {:?}",
+                handoff.handoff_plan,
+            ),
+        ));
+    }
+
+    Ok(handoff)
+}
+
 fn stage_update_from_reader<R: Read>(
     plan: &UpdateInstallPlan,
     reader: &mut R,
@@ -463,11 +627,14 @@ fn prepare_update_staging_directory(plan: &UpdateInstallPlan) -> io::Result<()> 
 
     let partial_executable = partial_staged_executable_path(plan);
 
+    let partial_handoff = partial_handoff_plan_path(plan);
+
     for path in [
         &plan.staged_executable,
         &partial_executable,
         &plan.backup_executable,
         &plan.handoff_plan,
+        &partial_handoff,
         &plan.startup_marker,
     ] {
         remove_file_if_exists(path)?;
@@ -679,6 +846,654 @@ fn map_download_request_error(error: ureq::Error) -> io::Error {
         ureq::Error::Transport(error) => {
             io::Error::other(format!("GitHub update download failed: {error}",))
         }
+    }
+}
+
+fn build_update_handoff_plan(
+    plan: &UpdateInstallPlan,
+    verified: &VerifiedStagedUpdate,
+    parent_process_id: u32,
+) -> io::Result<UpdateHandoffPlan> {
+    validate_update_staging_plan(plan)?;
+
+    if parent_process_id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "update handoff parent process ID must not be zero",
+        ));
+    }
+
+    if verified.executable != plan.staged_executable {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "verified staged executable {:?} does not match the planned path {:?}",
+                verified.executable, plan.staged_executable,
+            ),
+        ));
+    }
+
+    if verified.size != plan.selected_asset.size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "verified update size {} does not match the planned size {}",
+                verified.size, plan.selected_asset.size,
+            ),
+        ));
+    }
+
+    if verified.sha256_hex != plan.selected_asset.sha256_hex {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "verified update SHA-256 does not match the selected release asset",
+        ));
+    }
+
+    let handoff = UpdateHandoffPlan {
+        parent_process_id,
+
+        artifact_kind: plan.artifact_kind,
+
+        naming: plan.naming,
+
+        current_executable: plan.current_executable.clone(),
+
+        install_path: plan.install_path.clone(),
+
+        staging_directory: plan.staging_directory.clone(),
+
+        staged_executable: plan.staged_executable.clone(),
+
+        backup_executable: plan.backup_executable.clone(),
+
+        handoff_plan: plan.handoff_plan.clone(),
+
+        startup_marker: plan.startup_marker.clone(),
+
+        expected_size: verified.size,
+
+        expected_sha256_hex: verified.sha256_hex.clone(),
+    };
+
+    validate_update_handoff_plan(&handoff)?;
+
+    Ok(handoff)
+}
+
+fn validate_update_handoff_plan(plan: &UpdateHandoffPlan) -> io::Result<()> {
+    if plan.parent_process_id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "update handoff parent process ID must not be zero",
+        ));
+    }
+
+    if plan.expected_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "update handoff expected size must not be zero",
+        ));
+    }
+
+    decode_sha256_hex(&plan.expected_sha256_hex)?;
+
+    for (path, label) in [
+        (&plan.current_executable, "current executable"),
+        (&plan.install_path, "install path"),
+        (&plan.staging_directory, "staging directory"),
+        (&plan.staged_executable, "staged executable"),
+        (&plan.backup_executable, "backup executable"),
+        (&plan.handoff_plan, "handoff plan"),
+        (&plan.startup_marker, "startup marker"),
+    ] {
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("update handoff {label} path must be absolute: {path:?}"),
+            ));
+        }
+    }
+
+    if plan.staged_executable.parent() != Some(plan.staging_directory.as_path()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "update handoff staged executable is not directly inside its staging directory",
+        ));
+    }
+
+    let staged_file_name = plan.staged_executable.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "update handoff staged executable has no file name",
+        )
+    })?;
+
+    if !is_official_release_file_name(staged_file_name, plan.artifact_kind) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update handoff staged executable {:?} is not an official {} release filename",
+                staged_file_name,
+                plan.artifact_kind.label(),
+            ),
+        ));
+    }
+
+    let expected_backup = plan.staging_directory.join(UPDATE_BACKUP_FILE);
+
+    if plan.backup_executable != expected_backup {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update handoff backup path {:?} does not match {:?}",
+                plan.backup_executable, expected_backup,
+            ),
+        ));
+    }
+
+    let expected_handoff = plan.staging_directory.join(UPDATE_HANDOFF_FILE);
+
+    if plan.handoff_plan != expected_handoff {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update handoff plan path {:?} does not match {:?}",
+                plan.handoff_plan, expected_handoff,
+            ),
+        ));
+    }
+
+    let expected_marker = plan.staging_directory.join(UPDATE_STARTUP_MARKER_FILE);
+
+    if plan.startup_marker != expected_marker {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update handoff startup marker path {:?} does not match {:?}",
+                plan.startup_marker, expected_marker,
+            ),
+        ));
+    }
+
+    match plan.naming {
+        UpdateInstallNaming::PublishedAssetName => {
+            if plan.current_executable.parent() != plan.install_path.parent() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "published-name update must install beside the current executable",
+                ));
+            }
+
+            if plan.install_path.file_name() != Some(staged_file_name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "published-name update install filename must match the staged release filename",
+                ));
+            }
+        }
+
+        UpdateInstallNaming::PreserveCurrentName => {
+            if plan.install_path != plan.current_executable {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "custom-name update must preserve the current executable path",
+                ));
+            }
+        }
+    }
+
+    if plan.staged_executable == plan.current_executable
+        || plan.staged_executable == plan.install_path
+        || plan.staged_executable == plan.backup_executable
+        || plan.staged_executable == plan.handoff_plan
+        || plan.staged_executable == plan.startup_marker
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "update handoff staged executable aliases another reserved path",
+        ));
+    }
+
+    Ok(())
+}
+
+fn encode_update_handoff_plan(plan: &UpdateHandoffPlan) -> io::Result<Vec<u8>> {
+    validate_update_handoff_plan(plan)?;
+
+    let digest = decode_sha256_hex(&plan.expected_sha256_hex)?;
+
+    let mut encoded = Vec::new();
+
+    encoded.extend_from_slice(&UPDATE_HANDOFF_MAGIC);
+
+    encoded.extend_from_slice(&UPDATE_HANDOFF_VERSION.to_le_bytes());
+
+    encoded.extend_from_slice(&0_u16.to_le_bytes());
+
+    encoded.extend_from_slice(&plan.parent_process_id.to_le_bytes());
+
+    encoded.push(encode_artifact_kind(plan.artifact_kind));
+
+    encoded.push(encode_install_naming(plan.naming));
+
+    encoded.extend_from_slice(&0_u16.to_le_bytes());
+
+    encoded.extend_from_slice(&plan.expected_size.to_le_bytes());
+
+    encoded.extend_from_slice(&digest);
+
+    write_update_handoff_path(&mut encoded, &plan.current_executable)?;
+
+    write_update_handoff_path(&mut encoded, &plan.install_path)?;
+
+    write_update_handoff_path(&mut encoded, &plan.staging_directory)?;
+
+    write_update_handoff_path(&mut encoded, &plan.staged_executable)?;
+
+    write_update_handoff_path(&mut encoded, &plan.backup_executable)?;
+
+    write_update_handoff_path(&mut encoded, &plan.handoff_plan)?;
+
+    write_update_handoff_path(&mut encoded, &plan.startup_marker)?;
+
+    if encoded.len() > UPDATE_HANDOFF_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "encoded update handoff plan exceeds the {UPDATE_HANDOFF_MAX_BYTES}-byte limit"
+            ),
+        ));
+    }
+
+    Ok(encoded)
+}
+
+fn decode_update_handoff_plan(encoded: &[u8]) -> io::Result<UpdateHandoffPlan> {
+    if encoded.len() > UPDATE_HANDOFF_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "encoded update handoff plan exceeds the {UPDATE_HANDOFF_MAX_BYTES}-byte limit"
+            ),
+        ));
+    }
+
+    let mut reader = UpdateHandoffReader::new(encoded);
+
+    let magic = reader.read_array::<4>("handoff magic")?;
+
+    if magic != UPDATE_HANDOFF_MAGIC {
+        return Err(invalid_handoff("update handoff magic is invalid"));
+    }
+
+    let version = reader.read_u16("handoff version")?;
+
+    if version != UPDATE_HANDOFF_VERSION {
+        return Err(invalid_handoff(format!(
+            "unsupported update handoff version {version}; expected {UPDATE_HANDOFF_VERSION}",
+        )));
+    }
+
+    let header_reserved = reader.read_u16("header reserved value")?;
+
+    if header_reserved != 0 {
+        return Err(invalid_handoff(
+            "update handoff header reserved value is not zero",
+        ));
+    }
+
+    let parent_process_id = reader.read_u32("parent process ID")?;
+
+    let artifact_kind = decode_artifact_kind(reader.read_u8("artifact kind")?)?;
+
+    let naming = decode_install_naming(reader.read_u8("install naming")?)?;
+
+    let naming_reserved = reader.read_u16("naming reserved value")?;
+
+    if naming_reserved != 0 {
+        return Err(invalid_handoff(
+            "update handoff naming reserved value is not zero",
+        ));
+    }
+
+    let expected_size = reader.read_u64("expected executable size")?;
+
+    let digest = reader.read_array::<UPDATE_HANDOFF_DIGEST_BYTES>("SHA-256 digest")?;
+
+    let plan = UpdateHandoffPlan {
+        parent_process_id,
+
+        artifact_kind,
+
+        naming,
+
+        current_executable: reader.read_path("current executable")?,
+
+        install_path: reader.read_path("install path")?,
+
+        staging_directory: reader.read_path("staging directory")?,
+
+        staged_executable: reader.read_path("staged executable")?,
+
+        backup_executable: reader.read_path("backup executable")?,
+
+        handoff_plan: reader.read_path("handoff plan")?,
+
+        startup_marker: reader.read_path("startup marker")?,
+
+        expected_size,
+
+        expected_sha256_hex: encode_lower_hex(&digest),
+    };
+
+    reader.finish()?;
+
+    validate_update_handoff_plan(&plan)?;
+
+    Ok(plan)
+}
+
+fn write_update_handoff_bytes(
+    partial_path: &Path,
+    final_path: &Path,
+    encoded: &[u8],
+) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(partial_path)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "partial update handoff file {partial_path:?} could not be created: {error}"
+                ),
+            )
+        })?;
+
+    file.write_all(encoded).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("partial update handoff file {partial_path:?} could not be written: {error}"),
+        )
+    })?;
+
+    file.flush().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("partial update handoff file {partial_path:?} could not be flushed: {error}"),
+        )
+    })?;
+
+    file.sync_all().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "partial update handoff file {partial_path:?} could not be synchronized: {error}"
+            ),
+        )
+    })?;
+
+    drop(file);
+
+    fs::rename(partial_path, final_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "update handoff file {partial_path:?} could not be renamed to \
+                 {final_path:?}: {error}"
+            ),
+        )
+    })
+}
+
+fn write_update_handoff_path(encoded: &mut Vec<u8>, path: &Path) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("update handoff path must be absolute: {path:?}"),
+        ));
+    }
+
+    let units = path.as_os_str().encode_wide().collect::<Vec<_>>();
+
+    if units.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "update handoff path must not be empty",
+        ));
+    }
+
+    if units.len() > UPDATE_HANDOFF_MAX_PATH_UTF16_UNITS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "update handoff path contains {} UTF-16 units, exceeding the {}-unit limit",
+                units.len(),
+                UPDATE_HANDOFF_MAX_PATH_UTF16_UNITS,
+            ),
+        ));
+    }
+
+    if units.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "update handoff path contains a null UTF-16 unit",
+        ));
+    }
+
+    let unit_count = u32::try_from(units.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "update handoff path length cannot be represented as u32",
+        )
+    })?;
+
+    encoded.extend_from_slice(&unit_count.to_le_bytes());
+
+    for unit in units {
+        encoded.extend_from_slice(&unit.to_le_bytes());
+    }
+
+    Ok(())
+}
+
+fn encode_artifact_kind(kind: ReleaseArtifactKind) -> u8 {
+    match kind {
+        ReleaseArtifactKind::Manager => 1,
+
+        ReleaseArtifactKind::Agent => 2,
+
+        ReleaseArtifactKind::Cli => 3,
+
+        ReleaseArtifactKind::GuiHungarian => 4,
+
+        ReleaseArtifactKind::GuiEnglish => 5,
+    }
+}
+
+fn decode_artifact_kind(code: u8) -> io::Result<ReleaseArtifactKind> {
+    match code {
+        1 => Ok(ReleaseArtifactKind::Manager),
+
+        2 => Ok(ReleaseArtifactKind::Agent),
+
+        3 => Ok(ReleaseArtifactKind::Cli),
+
+        4 => Ok(ReleaseArtifactKind::GuiHungarian),
+
+        5 => Ok(ReleaseArtifactKind::GuiEnglish),
+
+        _ => Err(invalid_handoff(format!(
+            "unknown update handoff artifact kind {code}"
+        ))),
+    }
+}
+
+fn encode_install_naming(naming: UpdateInstallNaming) -> u8 {
+    match naming {
+        UpdateInstallNaming::PublishedAssetName => 1,
+
+        UpdateInstallNaming::PreserveCurrentName => 2,
+    }
+}
+
+fn decode_install_naming(code: u8) -> io::Result<UpdateInstallNaming> {
+    match code {
+        1 => Ok(UpdateInstallNaming::PublishedAssetName),
+
+        2 => Ok(UpdateInstallNaming::PreserveCurrentName),
+
+        _ => Err(invalid_handoff(format!(
+            "unknown update handoff install naming {code}"
+        ))),
+    }
+}
+
+fn decode_sha256_hex(hex: &str) -> io::Result<[u8; UPDATE_HANDOFF_DIGEST_BYTES]> {
+    if hex.len() != SHA256_HEX_LENGTH
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "update handoff SHA-256 must contain exactly 64 lowercase hexadecimal characters",
+        ));
+    }
+
+    let bytes = hex.as_bytes();
+
+    let mut digest = [0_u8; UPDATE_HANDOFF_DIGEST_BYTES];
+
+    for (index, output) in digest.iter_mut().enumerate() {
+        let high = decode_hex_nibble(bytes[index * 2]).ok_or_else(|| {
+            invalid_handoff("update handoff SHA-256 contains an invalid character")
+        })?;
+
+        let low = decode_hex_nibble(bytes[index * 2 + 1]).ok_or_else(|| {
+            invalid_handoff("update handoff SHA-256 contains an invalid character")
+        })?;
+
+        *output = high << 4 | low;
+    }
+
+    Ok(digest)
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+
+        _ => None,
+    }
+}
+
+fn partial_handoff_plan_path(plan: &UpdateInstallPlan) -> PathBuf {
+    plan.staging_directory.join(format!(
+        "{UPDATE_HANDOFF_FILE}{UPDATE_HANDOFF_PARTIAL_SUFFIX}"
+    ))
+}
+
+fn invalid_handoff(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+struct UpdateHandoffReader<'a> {
+    encoded: &'a [u8],
+
+    offset: usize,
+}
+
+impl<'a> UpdateHandoffReader<'a> {
+    fn new(encoded: &'a [u8]) -> Self {
+        Self { encoded, offset: 0 }
+    }
+
+    fn read_array<const LENGTH: usize>(&mut self, label: &str) -> io::Result<[u8; LENGTH]> {
+        let end = self
+            .offset
+            .checked_add(LENGTH)
+            .ok_or_else(|| invalid_handoff(format!("update handoff {label} offset overflowed")))?;
+
+        let bytes = self
+            .encoded
+            .get(self.offset..end)
+            .ok_or_else(|| invalid_handoff(format!("update handoff {label} is truncated")))?;
+
+        let mut output = [0_u8; LENGTH];
+
+        output.copy_from_slice(bytes);
+
+        self.offset = end;
+
+        Ok(output)
+    }
+
+    fn read_u8(&mut self, label: &str) -> io::Result<u8> {
+        Ok(self.read_array::<1>(label)?[0])
+    }
+
+    fn read_u16(&mut self, label: &str) -> io::Result<u16> {
+        Ok(u16::from_le_bytes(self.read_array::<2>(label)?))
+    }
+
+    fn read_u32(&mut self, label: &str) -> io::Result<u32> {
+        Ok(u32::from_le_bytes(self.read_array::<4>(label)?))
+    }
+
+    fn read_u64(&mut self, label: &str) -> io::Result<u64> {
+        Ok(u64::from_le_bytes(self.read_array::<8>(label)?))
+    }
+
+    fn read_path(&mut self, label: &str) -> io::Result<PathBuf> {
+        let unit_count = usize::try_from(self.read_u32(&format!("{label} UTF-16 unit count"))?)
+            .map_err(|_| {
+                invalid_handoff(format!(
+                    "update handoff {label} UTF-16 unit count cannot be represented"
+                ))
+            })?;
+
+        if unit_count == 0 {
+            return Err(invalid_handoff(format!(
+                "update handoff {label} path is empty"
+            )));
+        }
+
+        if unit_count > UPDATE_HANDOFF_MAX_PATH_UTF16_UNITS {
+            return Err(invalid_handoff(format!(
+                "update handoff {label} path contains {unit_count} UTF-16 units, \
+                 exceeding the {UPDATE_HANDOFF_MAX_PATH_UTF16_UNITS}-unit limit",
+            )));
+        }
+
+        let mut units = Vec::with_capacity(unit_count);
+
+        for _ in 0..unit_count {
+            units.push(self.read_u16(&format!("{label} UTF-16 contents"))?);
+        }
+
+        if units.contains(&0) {
+            return Err(invalid_handoff(format!(
+                "update handoff {label} path contains a null UTF-16 unit"
+            )));
+        }
+
+        Ok(PathBuf::from(OsString::from_wide(&units)))
+    }
+
+    fn finish(self) -> io::Result<()> {
+        if self.offset != self.encoded.len() {
+            return Err(invalid_handoff(format!(
+                "update handoff contains {} trailing byte(s)",
+                self.encoded.len() - self.offset,
+            )));
+        }
+
+        Ok(())
     }
 }
 
@@ -1093,10 +1908,12 @@ fn wide(value: &OsStr) -> Vec<u16> {
 mod tests {
     use super::{
         GitHubReleaseResponse, ReleaseArtifactKind, ReleaseAssetInfo, ReleaseInfo,
-        SelectedReleaseAsset, UpdateInstallNaming, UpdateInstallPlan, build_update_install_plan,
-        is_official_release_file_name, parse_release_response, parse_sha256_digest,
-        parse_stable_version, partial_staged_executable_path, select_release_asset,
-        stage_update_from_reader, validate_release_url,
+        SelectedReleaseAsset, UpdateInstallNaming, UpdateInstallPlan, VerifiedStagedUpdate,
+        build_update_handoff_plan, build_update_install_plan, decode_update_handoff_plan,
+        encode_update_handoff_plan, is_official_release_file_name, parse_release_response,
+        parse_sha256_digest, parse_stable_version, partial_staged_executable_path,
+        read_update_handoff_plan, select_release_asset, stage_update_from_reader,
+        validate_release_url, write_update_handoff_plan,
     };
     use std::ffi::OsStr;
     use std::fs;
@@ -1187,7 +2004,7 @@ mod tests {
 
             backup_executable: staging_directory.join("previous.exe"),
 
-            handoff_plan: staging_directory.join("handoff-plan.txt"),
+            handoff_plan: staging_directory.join("handoff-plan.bin"),
 
             startup_marker: staging_directory.join("startup-ok.marker"),
         };
@@ -1610,5 +2427,112 @@ mod tests {
         assert!(!plan.staged_executable.exists(),);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn handoff_plan_round_trips_binary_windows_paths() {
+        let sha256_hex = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+        let (root, mut install_plan) = test_update_plan("handoff-roundtrip", 3, sha256_hex);
+
+        install_plan.current_executable = root.join("Árvíztűrő Manager custom name.exe");
+
+        install_plan.install_path = install_plan.current_executable.clone();
+
+        install_plan.naming = UpdateInstallNaming::PreserveCurrentName;
+
+        let verified = VerifiedStagedUpdate {
+            executable: install_plan.staged_executable.clone(),
+
+            size: 3,
+
+            sha256_hex: sha256_hex.to_string(),
+        };
+
+        let handoff = build_update_handoff_plan(&install_plan, &verified, 1234).unwrap();
+
+        let encoded = encode_update_handoff_plan(&handoff).unwrap();
+
+        let decoded = decode_update_handoff_plan(&encoded).unwrap();
+
+        assert_eq!(decoded, handoff);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn handoff_plan_file_is_written_and_read_back() {
+        let payload = b"abc";
+
+        let sha256_hex = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+        let (root, install_plan) =
+            test_update_plan("handoff-file", payload.len() as u64, sha256_hex);
+
+        let staged = stage_update_from_reader(&install_plan, &mut payload.as_slice()).unwrap();
+
+        let written = write_update_handoff_plan(&install_plan, &staged, process::id()).unwrap();
+
+        let read_back = read_update_handoff_plan(&install_plan.handoff_plan).unwrap();
+
+        assert_eq!(read_back, written);
+
+        assert_eq!(read_back.staged_executable, install_plan.staged_executable,);
+
+        assert_eq!(read_back.expected_size, payload.len() as u64);
+
+        assert_eq!(read_back.expected_sha256_hex, sha256_hex);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn handoff_plan_rejects_mismatched_verified_update() {
+        let sha256_hex = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+        let (root, install_plan) = test_update_plan("handoff-mismatch", 3, sha256_hex);
+
+        let verified = VerifiedStagedUpdate {
+            executable: install_plan.staged_executable.clone(),
+
+            size: 4,
+
+            sha256_hex: sha256_hex.to_string(),
+        };
+
+        let error = build_update_handoff_plan(&install_plan, &verified, 1234).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn handoff_plan_rejects_trailing_data() {
+        let sha256_hex = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+        let (root, install_plan) = test_update_plan("handoff-trailing", 3, sha256_hex);
+
+        let verified = VerifiedStagedUpdate {
+            executable: install_plan.staged_executable.clone(),
+
+            size: 3,
+
+            sha256_hex: sha256_hex.to_string(),
+        };
+
+        let handoff = build_update_handoff_plan(&install_plan, &verified, 1234).unwrap();
+
+        let mut encoded = encode_update_handoff_plan(&handoff).unwrap();
+
+        encoded.push(0);
+
+        let error = decode_update_handoff_plan(&encoded).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        assert!(error.to_string().contains("trailing"));
+
+        let _ = fs::remove_dir_all(root);
     }
 }

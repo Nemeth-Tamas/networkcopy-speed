@@ -1666,6 +1666,11 @@ impl NetworkCopyManager {
                         format!("Manager update download or verification failed: {error}")
                     })?;
 
+                release_update::write_update_handoff_plan(&plan, &verified, std::process::id())
+                    .map_err(|error| {
+                        format!("Manager update handoff preparation failed: {error}")
+                    })?;
+
                 Ok(PreparedManagerUpdate { plan, verified })
             })();
 
@@ -2183,6 +2188,8 @@ impl NetworkCopyManager {
         self.process_direct_discovery_message();
 
         self.process_update_message();
+
+        self.process_update_preparation_message();
 
         self.process_start_message();
 
