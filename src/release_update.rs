@@ -1,7 +1,9 @@
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::env;
 use std::ffi::OsStr;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
@@ -34,6 +36,12 @@ const UPDATE_BACKUP_FILE: &str = "previous.exe";
 const UPDATE_HANDOFF_FILE: &str = "handoff-plan.txt";
 
 const UPDATE_STARTUP_MARKER_FILE: &str = "startup-ok.marker";
+
+const UPDATE_PARTIAL_SUFFIX: &str = ".partial";
+
+const UPDATE_DOWNLOAD_BUFFER_SIZE: usize = 64 * 1024;
+
+const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleaseArtifactKind {
@@ -146,6 +154,15 @@ pub struct UpdateInstallPlan {
     pub handoff_plan: PathBuf,
 
     pub startup_marker: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedStagedUpdate {
+    pub executable: PathBuf,
+
+    pub size: u64,
+
+    pub sha256_hex: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -297,6 +314,372 @@ pub fn plan_current_update(
         release,
         artifact_kind,
     )
+}
+
+pub fn download_and_stage_update(plan: &UpdateInstallPlan) -> io::Result<VerifiedStagedUpdate> {
+    validate_update_staging_plan(plan)?;
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(UPDATE_DOWNLOAD_TIMEOUT)
+        .timeout_read(UPDATE_DOWNLOAD_TIMEOUT)
+        .timeout_write(UPDATE_DOWNLOAD_TIMEOUT)
+        .build();
+
+    let response = agent
+        .get(&plan.selected_asset.download_url)
+        .set("Accept", "application/octet-stream")
+        .set("User-Agent", REQUEST_USER_AGENT)
+        .call()
+        .map_err(map_download_request_error)?;
+
+    validate_download_content_length(response.header("Content-Length"), plan.selected_asset.size)?;
+
+    let mut reader = response.into_reader();
+
+    stage_update_from_reader(plan, &mut reader)
+}
+
+fn stage_update_from_reader<R: Read>(
+    plan: &UpdateInstallPlan,
+    reader: &mut R,
+) -> io::Result<VerifiedStagedUpdate> {
+    validate_update_staging_plan(plan)?;
+
+    prepare_update_staging_directory(plan)?;
+
+    let partial_executable = partial_staged_executable_path(plan);
+
+    match write_verified_staged_update(plan, &partial_executable, reader) {
+        Ok(staged) => Ok(staged),
+
+        Err(error) => {
+            if let Err(cleanup_error) = remove_file_if_exists(&partial_executable) {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}; incomplete update file {:?} also could not be removed: \
+                         {cleanup_error}",
+                        partial_executable,
+                    ),
+                ));
+            }
+
+            Err(error)
+        }
+    }
+}
+
+fn validate_update_staging_plan(plan: &UpdateInstallPlan) -> io::Result<()> {
+    if !plan.staging_directory.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "update staging directory must be absolute",
+        ));
+    }
+
+    if plan.selected_asset.size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "selected update asset has an invalid zero-byte size",
+        ));
+    }
+
+    if plan.selected_asset.sha256_hex.len() != SHA256_HEX_LENGTH
+        || !plan
+            .selected_asset
+            .sha256_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "selected update asset SHA-256 must contain exactly 64 lowercase hexadecimal characters",
+        ));
+    }
+
+    validate_asset_download_url(&plan.selected_asset.download_url)?;
+
+    let asset_path = Path::new(&plan.selected_asset.name);
+
+    if asset_path.components().count() != 1
+        || asset_path.file_name() != Some(OsStr::new(&plan.selected_asset.name))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "selected update asset name must be a single file name",
+        ));
+    }
+
+    let expected_staged_executable = plan.staging_directory.join(&plan.selected_asset.name);
+
+    if plan.staged_executable != expected_staged_executable {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "staged executable path {:?} does not match the selected asset path {:?}",
+                plan.staged_executable, expected_staged_executable,
+            ),
+        ));
+    }
+
+    let reserved_paths = [
+        (
+            &plan.backup_executable,
+            UPDATE_BACKUP_FILE,
+            "backup executable",
+        ),
+        (&plan.handoff_plan, UPDATE_HANDOFF_FILE, "handoff plan"),
+        (
+            &plan.startup_marker,
+            UPDATE_STARTUP_MARKER_FILE,
+            "startup marker",
+        ),
+    ];
+
+    for (actual, file_name, label) in reserved_paths {
+        let expected = plan.staging_directory.join(file_name);
+
+        if actual != &expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{label} path {actual:?} does not match the expected path {expected:?}",),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn prepare_update_staging_directory(plan: &UpdateInstallPlan) -> io::Result<()> {
+    fs::create_dir_all(&plan.staging_directory).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "update staging directory {:?} could not be created: {error}",
+                plan.staging_directory,
+            ),
+        )
+    })?;
+
+    let partial_executable = partial_staged_executable_path(plan);
+
+    for path in [
+        &plan.staged_executable,
+        &partial_executable,
+        &plan.backup_executable,
+        &plan.handoff_plan,
+        &plan.startup_marker,
+    ] {
+        remove_file_if_exists(path)?;
+    }
+
+    Ok(())
+}
+
+fn write_verified_staged_update<R: Read>(
+    plan: &UpdateInstallPlan,
+    partial_executable: &Path,
+    reader: &mut R,
+) -> io::Result<VerifiedStagedUpdate> {
+    let mut partial_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(partial_executable)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "partial update file {:?} could not be created: {error}",
+                    partial_executable,
+                ),
+            )
+        })?;
+
+    let mut hasher = Sha256::new();
+
+    let mut total_size = 0_u64;
+
+    let mut buffer = [0_u8; UPDATE_DOWNLOAD_BUFFER_SIZE];
+
+    loop {
+        let read = reader.read(&mut buffer).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("update download could not be read: {error}"),
+            )
+        })?;
+
+        if read == 0 {
+            break;
+        }
+
+        total_size = total_size.checked_add(read as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "update download size overflowed u64",
+            )
+        })?;
+
+        if total_size > plan.selected_asset.size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "update download exceeded its expected size of {} bytes",
+                    plan.selected_asset.size,
+                ),
+            ));
+        }
+
+        partial_file.write_all(&buffer[..read]).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "partial update file {:?} could not be written: {error}",
+                    partial_executable,
+                ),
+            )
+        })?;
+
+        hasher.update(&buffer[..read]);
+    }
+
+    if total_size != plan.selected_asset.size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update download contained {total_size} bytes, but GitHub reported {} bytes",
+                plan.selected_asset.size,
+            ),
+        ));
+    }
+
+    let digest = hasher.finalize();
+
+    let actual_sha256_hex = encode_lower_hex(&digest);
+
+    if actual_sha256_hex != plan.selected_asset.sha256_hex {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update download SHA-256 mismatch: expected {}, received {actual_sha256_hex}",
+                plan.selected_asset.sha256_hex,
+            ),
+        ));
+    }
+
+    partial_file.flush().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "partial update file {:?} could not be flushed: {error}",
+                partial_executable,
+            ),
+        )
+    })?;
+
+    partial_file.sync_all().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "partial update file {:?} could not be synchronized to disk: {error}",
+                partial_executable,
+            ),
+        )
+    })?;
+
+    drop(partial_file);
+
+    fs::rename(partial_executable, &plan.staged_executable).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "verified update file {:?} could not be renamed to {:?}: {error}",
+                partial_executable, plan.staged_executable,
+            ),
+        )
+    })?;
+
+    Ok(VerifiedStagedUpdate {
+        executable: plan.staged_executable.clone(),
+
+        size: total_size,
+
+        sha256_hex: actual_sha256_hex,
+    })
+}
+
+fn partial_staged_executable_path(plan: &UpdateInstallPlan) -> PathBuf {
+    plan.staging_directory.join(format!(
+        "{}{UPDATE_PARTIAL_SUFFIX}",
+        plan.selected_asset.name,
+    ))
+}
+
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("stale update artifact {path:?} could not be removed: {error}",),
+        )),
+    }
+}
+
+fn validate_download_content_length(
+    content_length: Option<&str>,
+    expected_size: u64,
+) -> io::Result<()> {
+    let Some(content_length) = content_length else {
+        return Ok(());
+    };
+
+    let content_length = content_length.trim().parse::<u64>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("update download returned an invalid Content-Length header: {error}",),
+        )
+    })?;
+
+    if content_length != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update download Content-Length is {content_length} bytes, but GitHub reported \
+                 {expected_size} bytes",
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn encode_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+
+    for &byte in bytes {
+        encoded.push(char::from(HEX[(byte >> 4) as usize]));
+
+        encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+    }
+
+    encoded
+}
+
+fn map_download_request_error(error: ureq::Error) -> io::Error {
+    match error {
+        ureq::Error::Status(status, _response) => io::Error::other(format!(
+            "GitHub update download returned HTTP status {status}",
+        )),
+
+        ureq::Error::Transport(error) => {
+            io::Error::other(format!("GitHub update download failed: {error}",))
+        }
+    }
 }
 
 fn build_update_install_plan(
@@ -710,13 +1093,17 @@ fn wide(value: &OsStr) -> Vec<u16> {
 mod tests {
     use super::{
         GitHubReleaseResponse, ReleaseArtifactKind, ReleaseAssetInfo, ReleaseInfo,
-        UpdateInstallNaming, build_update_install_plan, is_official_release_file_name,
-        parse_release_response, parse_sha256_digest, parse_stable_version, select_release_asset,
-        validate_release_url,
+        SelectedReleaseAsset, UpdateInstallNaming, UpdateInstallPlan, build_update_install_plan,
+        is_official_release_file_name, parse_release_response, parse_sha256_digest,
+        parse_stable_version, partial_staged_executable_path, select_release_asset,
+        stage_update_from_reader, validate_release_url,
     };
     use std::ffi::OsStr;
+    use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::process;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn test_release(assets: Vec<ReleaseAssetInfo>) -> ReleaseInfo {
         ReleaseInfo {
@@ -751,6 +1138,61 @@ mod tests {
 
     fn test_digest() -> String {
         format!("sha256:{}", "ab".repeat(32),)
+    }
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn test_update_plan(
+        test_name: &str,
+        expected_size: u64,
+        sha256_hex: &str,
+    ) -> (PathBuf, UpdateInstallPlan) {
+        let test_id = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+
+        let root = std::env::temp_dir().join(format!(
+            "networkcopy-speed-release-update-{test_name}-{}-{test_id}",
+            process::id(),
+        ));
+
+        let staging_directory = root.join("stage");
+
+        let asset_name = "NetworkCopy-Speed-v2.4.0-Manager-Windows-x64.exe";
+
+        let plan = UpdateInstallPlan {
+            artifact_kind: ReleaseArtifactKind::Manager,
+
+            selected_asset: SelectedReleaseAsset {
+                id: 42,
+
+                name: asset_name.to_string(),
+
+                size: expected_size,
+
+                sha256_hex: sha256_hex.to_string(),
+
+                download_url: format!(
+                    "https://github.com/Nemeth-Tamas/networkcopy-speed/releases/download/v2.4.0/{asset_name}",
+                ),
+            },
+
+            naming: UpdateInstallNaming::PreserveCurrentName,
+
+            current_executable: root.join("current.exe"),
+
+            install_path: root.join("current.exe"),
+
+            staging_directory: staging_directory.clone(),
+
+            staged_executable: staging_directory.join(asset_name),
+
+            backup_executable: staging_directory.join("previous.exe"),
+
+            handoff_plan: staging_directory.join("handoff-plan.txt"),
+
+            startup_marker: staging_directory.join("startup-ok.marker"),
+        };
+
+        (root, plan)
     }
 
     #[test]
@@ -1050,5 +1492,123 @@ mod tests {
             )
             .is_err(),
         );
+    }
+
+    #[test]
+    fn staged_update_writes_verified_executable() {
+        let payload: &[u8] = b"abc";
+
+        let expected_sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+        let (root, plan) = test_update_plan("verified", payload.len() as u64, expected_sha256);
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        let partial_executable = partial_staged_executable_path(&plan);
+
+        fs::write(&plan.staged_executable, b"stale executable").unwrap();
+
+        fs::write(&partial_executable, b"stale partial").unwrap();
+
+        fs::write(&plan.backup_executable, b"stale backup").unwrap();
+
+        fs::write(&plan.handoff_plan, b"stale handoff").unwrap();
+
+        fs::write(&plan.startup_marker, b"stale marker").unwrap();
+
+        let mut reader = io::Cursor::new(payload);
+
+        let staged = stage_update_from_reader(&plan, &mut reader).unwrap();
+
+        assert_eq!(staged.executable, plan.staged_executable,);
+
+        assert_eq!(staged.size, payload.len() as u64,);
+
+        assert_eq!(staged.sha256_hex, expected_sha256,);
+
+        assert_eq!(fs::read(&plan.staged_executable).unwrap(), payload,);
+
+        assert!(!partial_executable.exists(),);
+
+        assert!(!plan.backup_executable.exists(),);
+
+        assert!(!plan.handoff_plan.exists(),);
+
+        assert!(!plan.startup_marker.exists(),);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_update_rejects_short_body() {
+        let payload: &[u8] = b"abc";
+
+        let expected_sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+        let (root, plan) = test_update_plan("short", 4, expected_sha256);
+
+        let partial_executable = partial_staged_executable_path(&plan);
+
+        let mut reader = io::Cursor::new(payload);
+
+        let error = stage_update_from_reader(&plan, &mut reader).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+
+        assert!(error.to_string().contains("contained 3 bytes"),);
+
+        assert!(!partial_executable.exists(),);
+
+        assert!(!plan.staged_executable.exists(),);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_update_rejects_oversized_body() {
+        let payload: &[u8] = b"abc";
+
+        let expected_sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+        let (root, plan) = test_update_plan("oversized", 2, expected_sha256);
+
+        let partial_executable = partial_staged_executable_path(&plan);
+
+        let mut reader = io::Cursor::new(payload);
+
+        let error = stage_update_from_reader(&plan, &mut reader).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+
+        assert!(error.to_string().contains("exceeded its expected size"),);
+
+        assert!(!partial_executable.exists(),);
+
+        assert!(!plan.staged_executable.exists(),);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn staged_update_rejects_digest_mismatch() {
+        let payload: &[u8] = b"abc";
+
+        let (root, plan) = test_update_plan("digest-mismatch", 3, &"00".repeat(32));
+
+        let partial_executable = partial_staged_executable_path(&plan);
+
+        let mut reader = io::Cursor::new(payload);
+
+        let error = stage_update_from_reader(&plan, &mut reader).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+
+        assert!(error.to_string().contains("SHA-256 mismatch"),);
+
+        assert!(!partial_executable.exists(),);
+
+        assert!(!plan.staged_executable.exists(),);
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

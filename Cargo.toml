@@ -24,6 +24,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 blake3 = "1.8.5"
+sha2 = "0.11.0"
 zstd = "0.13.3"
 socket2 = "0.6.1"
 eframe = { version = "0.35.0", default-features = false, features = [
