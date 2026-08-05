@@ -23,7 +23,9 @@ use networkcopy_speed::management_route::ManagementRouteMode;
 use networkcopy_speed::management_snapshot::{
     ManagementAgentSnapshot, ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
 };
-use networkcopy_speed::release_update::{self, ReleaseCheck};
+use networkcopy_speed::release_update::{
+    self, ReleaseArtifactKind, ReleaseCheck, UpdateInstallPlan, VerifiedStagedUpdate,
+};
 use networkcopy_speed::windows_notification::{self, NotificationKind};
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -58,6 +60,15 @@ struct DirectManagementRoute {
 type DirectDiscoveryResult = Result<Vec<DirectManagementRoute>, String>;
 
 type UpdateCheckResult = Result<ReleaseCheck, String>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedManagerUpdate {
+    plan: UpdateInstallPlan,
+
+    verified: VerifiedStagedUpdate,
+}
+
+type UpdatePreparationResult = Result<PreparedManagerUpdate, String>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ManagedStartFailureKind {
@@ -431,6 +442,12 @@ struct NetworkCopyManager {
 
     update_error: String,
 
+    update_preparation_receiver: Option<Receiver<UpdatePreparationResult>>,
+
+    prepared_update: Option<PreparedManagerUpdate>,
+
+    update_preparation_error: String,
+
     start_receiver: Option<Receiver<StartResult>>,
 
     attach_receiver: Option<Receiver<AttachResult>>,
@@ -528,6 +545,12 @@ impl NetworkCopyManager {
             update_check: None,
 
             update_error: String::new(),
+
+            update_preparation_receiver: None,
+
+            prepared_update: None,
+
+            update_preparation_error: String::new(),
 
             start_receiver: None,
 
@@ -1535,13 +1558,17 @@ impl NetworkCopyManager {
     }
 
     fn begin_update_check(&mut self) {
-        if self.update_receiver.is_some() {
+        if self.update_receiver.is_some() || self.update_preparation_receiver.is_some() {
             return;
         }
 
         self.update_error.clear();
 
+        self.update_preparation_error.clear();
+
         self.update_check = None;
+
+        self.prepared_update = None;
 
         let (sender, receiver) = mpsc::channel();
 
@@ -1550,6 +1577,97 @@ impl NetworkCopyManager {
         thread::spawn(move || {
             let result = release_update::check_latest(env!("CARGO_PKG_VERSION"))
                 .map_err(|error| format!("Update check failed: {error}"));
+
+            let _ = sender.send(result);
+        });
+    }
+
+    fn update_preparation_blocked_reason(&self) -> Option<&'static str> {
+        let transfer_active = self.transfer.is_some() && !self.monitoring_complete;
+
+        if self.queue_running
+            || self.active_queue_id.is_some()
+            || self.queue_reattach_receiver.is_some()
+        {
+            return Some(
+                "Finish or stop the active transfer queue before preparing a Manager update.",
+            );
+        }
+
+        if self.start_receiver.is_some()
+            || self.attach_receiver.is_some()
+            || self.poll_receiver.is_some()
+            || self.cancel_receiver.is_some()
+            || self.peer_cleanup_receiver.is_some()
+            || transfer_active
+        {
+            return Some(
+                "Finish or cancel the active managed transfer before preparing a Manager update.",
+            );
+        }
+
+        None
+    }
+
+    fn begin_update_preparation(&mut self) {
+        if self.update_preparation_receiver.is_some() {
+            return;
+        }
+
+        if let Some(reason) = self.update_preparation_blocked_reason() {
+            self.update_preparation_error = reason.to_string();
+
+            return;
+        }
+
+        let Some(check) = self
+            .update_check
+            .clone()
+            .filter(|check| check.update_available)
+        else {
+            self.update_preparation_error =
+                "No newer stable release is currently selected.".to_string();
+
+            return;
+        };
+
+        if let Err(error) = self.persist_state_now() {
+            self.update_preparation_error =
+                format!("The Manager state could not be saved before update preparation: {error}",);
+
+            return;
+        }
+
+        self.error.clear();
+
+        self.update_preparation_error.clear();
+
+        self.prepared_update = None;
+
+        self.notice = format!(
+            "Preparing and verifying the {} Manager executable...",
+            check.latest.tag_name,
+        );
+
+        let release = check.latest;
+
+        let (sender, receiver) = mpsc::channel();
+
+        self.update_preparation_receiver = Some(receiver);
+
+        thread::spawn(move || {
+            let result = (|| -> UpdatePreparationResult {
+                let plan =
+                    release_update::plan_current_update(&release, ReleaseArtifactKind::Manager)
+                        .map_err(|error| format!("Manager update planning failed: {error}"))?;
+
+                let verified =
+                    release_update::download_and_stage_update(&plan).map_err(|error| {
+                        format!("Manager update download or verification failed: {error}")
+                    })?;
+
+                Ok(PreparedManagerUpdate { plan, verified })
+            })();
 
             let _ = sender.send(result);
         });
@@ -2228,6 +2346,72 @@ impl NetworkCopyManager {
         }
     }
 
+    fn process_update_preparation_message(&mut self) {
+        let message = self
+            .update_preparation_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
+
+        match message {
+            Some(Ok(Ok(prepared))) => {
+                self.update_preparation_receiver = None;
+
+                self.update_preparation_error.clear();
+
+                let release_name = self
+                    .update_check
+                    .as_ref()
+                    .map(|check| check.latest.tag_name.clone())
+                    .unwrap_or_else(|| prepared.plan.selected_asset.name.clone());
+
+                let staged_path = prepared.verified.executable.display().to_string();
+
+                self.notice = format!(
+                    "Downloaded and SHA-256 verified {} for {release_name}. Staged at \
+                     {staged_path}. The running Manager was not replaced.",
+                    format_bytes(prepared.verified.size),
+                );
+
+                notify_manager(
+                    NotificationKind::Information,
+                    "Manager update verified",
+                    &self.notice,
+                );
+
+                self.prepared_update = Some(prepared);
+            }
+
+            Some(Ok(Err(error))) => {
+                self.update_preparation_receiver = None;
+
+                self.prepared_update = None;
+
+                self.update_preparation_error = error;
+
+                self.notice.clear();
+
+                notify_manager(
+                    NotificationKind::Error,
+                    "Manager update preparation failed",
+                    &self.update_preparation_error,
+                );
+            }
+
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.update_preparation_receiver = None;
+
+                self.prepared_update = None;
+
+                self.update_preparation_error =
+                    "Manager update-preparation worker disconnected.".to_string();
+
+                self.notice.clear();
+            }
+
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+    }
+
     fn process_start_message(&mut self) {
         let message = self
             .start_receiver
@@ -2722,6 +2906,7 @@ impl NetworkCopyManager {
         self.discovery_receiver.is_some()
             || self.direct_discovery_receiver.is_some()
             || self.update_receiver.is_some()
+            || self.update_preparation_receiver.is_some()
             || self.start_receiver.is_some()
             || self.attach_receiver.is_some()
             || self.queue_reattach_receiver.is_some()
@@ -2757,6 +2942,11 @@ impl NetworkCopyManager {
             ("Transfer active", egui::Color32::from_rgb(126, 230, 64))
         } else if self.monitoring_complete {
             ("Transfer finished", egui::Color32::from_rgb(95, 194, 255))
+        } else if self.update_preparation_receiver.is_some() {
+            (
+                "Preparing Manager update",
+                egui::Color32::from_rgb(95, 194, 255),
+            )
         } else if self.direct_discovery_receiver.is_some() {
             (
                 "Discovering Direct Link",
@@ -2777,11 +2967,21 @@ impl NetworkCopyManager {
 
         let checking_updates = self.update_receiver.is_some();
 
+        let preparing_update = self.update_preparation_receiver.is_some();
+
         let update_check = self.update_check.clone();
 
         let update_error = self.update_error.clone();
 
+        let prepared_update = self.prepared_update.clone();
+
+        let update_preparation_error = self.update_preparation_error.clone();
+
+        let update_blocked_reason = self.update_preparation_blocked_reason().map(str::to_string);
+
         let mut check_requested = false;
+
+        let mut preparation_requested = false;
 
         let mut release_to_open = None::<String>;
 
@@ -2813,11 +3013,54 @@ impl NetworkCopyManager {
                     if ui.button("Open release").clicked() {
                         release_to_open = Some(check.latest.html_url.clone());
                     }
+
+                    if preparing_update {
+                        ui.spinner();
+
+                        ui.label("Downloading and SHA-256 verifying Manager update...");
+                    } else if let Some(prepared) = &prepared_update {
+                        status_label(
+                            ui,
+                            "Verified update staged",
+                            egui::Color32::from_rgb(126, 230, 64),
+                        );
+
+                        ui.label(format!("{} ready", format_bytes(prepared.verified.size),))
+                            .on_hover_text(format!(
+                                "Staged executable: {}\nPlanned install path: {}",
+                                prepared.verified.executable.display(),
+                                prepared.plan.install_path.display(),
+                            ));
+                    } else {
+                        let response = ui.add_enabled(
+                            update_blocked_reason.is_none(),
+                            egui::Button::new(egui::RichText::new("Prepare update").strong())
+                                .fill(egui::Color32::from_rgb(42, 78, 72)),
+                        );
+
+                        let response = if let Some(reason) = &update_blocked_reason {
+                            response.on_hover_text(reason)
+                        } else {
+                            response
+                        };
+
+                        if response.clicked() {
+                            preparation_requested = true;
+                        }
+                    }
+
+                    if !update_preparation_error.is_empty() {
+                        ui.label(
+                            egui::RichText::new("Update preparation failed")
+                                .color(egui::Color32::from_rgb(255, 112, 120)),
+                        )
+                        .on_hover_text(&update_preparation_error);
+                    }
                 } else {
                     ui.label(format!("Latest stable: {}", check.latest.tag_name,));
                 }
 
-                if ui.small_button("Check again").clicked() {
+                if !preparing_update && ui.small_button("Check again").clicked() {
                     check_requested = true;
                 }
             } else {
@@ -2858,6 +3101,10 @@ impl NetworkCopyManager {
 
             ui.label("Trusted LAN · management traffic is not yet encrypted");
         });
+
+        if preparation_requested {
+            self.begin_update_preparation();
+        }
 
         if check_requested {
             self.begin_update_check();

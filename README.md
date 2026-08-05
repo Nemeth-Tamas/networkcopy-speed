@@ -290,7 +290,7 @@ v2.4 strengthens queue recovery, adds destination-root batch mapping to the
 Manager and existing bilingual standalone GUI, and turns update checking into
 an explicit, user-approved executable update flow.
 
-### Current v2.4 checkpoint — 2026-08-04
+### Current v2.4 checkpoint — 2026-08-05
 
 The queue-hardening foundation is now implemented:
 
@@ -315,6 +315,13 @@ name collisions, and added atomically to the persistent transfer queue.
 The standalone transfer wire protocol is now version 12. Its control stream
 carries an optional validated source-folder name. Drive-root sources remain
 available for exact-destination transfers by sending no folder-name metadata.
+
+The updater now selects exact Manager, Agent, CLI, GUI-HU, and GUI-EN release
+assets, plans official or custom executable naming, and uses deterministic
+per-application LocalAppData staging. The Manager can explicitly download its
+own selected artifact on a worker thread, enforce the GitHub-reported byte
+count, verify the GitHub SHA-256 digest, and retain the verified executable
+without replacing the running application.
 
 ### Queue recovery hardening
 
@@ -363,15 +370,22 @@ or payload transfer stops the loop without starting another receiver.
 
 - [x] define exact app-kind and GUI-language-aware selection for Manager, Agent,
       CLI, GUI-HU, and GUI-EN release assets;
-- [ ] wire each running application to its own release artifact kind;
+- [x] wire the Manager to `ReleaseArtifactKind::Manager`;
+- [ ] wire Agent, CLI, GUI-HU, and GUI-EN to their own release artifact kinds;
 - [x] plan official-versus-custom executable naming and deterministic
       LocalAppData staging, backup, handoff, and startup-marker paths;
-- [ ] download the selected release only after the user presses Update;
-- [ ] verify the GitHub release-asset size and SHA-256 digest;
-- [ ] save and migrate application persistence before handoff;
+- [x] download the selected Manager release only after an explicit user action;
+- [x] stream the download through a temporary partial file;
+- [x] enforce the GitHub release-asset byte count and SHA-256 digest;
+- [x] flush, synchronize, and atomically publish the verified staged executable;
+- [x] remove incomplete partial files without touching the installed application;
+- [x] run Manager download and verification work outside the egui thread;
+- [x] save Manager persistence before beginning update preparation;
+- [ ] serialize and validate the executable handoff plan;
 - [ ] launch an officially named new executable beside an officially named old one;
 - [ ] replace a renamed executable in place while preserving its custom filename;
-- [ ] confirm successful startup before deleting backups or staging files;
+- [ ] relaunch the installed executable and confirm successful startup;
+- [ ] delete backups and staging files only after startup confirmation;
 - [ ] roll back safely when replacement, migration, or startup fails.
 
 ### Acceptance
@@ -381,6 +395,44 @@ or payload transfer stops the loop without starting another receiver.
 - [ ] complete Manager multi-source destination-root acceptance;
 - [ ] complete repeated standalone root-receiver acceptance;
 - [ ] complete renamed and officially named executable update acceptance.
+
+### Planned v2.5 performance work
+
+v2.5 will focus on measured throughput improvements rather than generic socket
+tuning. The current engine already applies `TCP_NODELAY`, uses adaptive
+Zstandard level 1 compression, prints the complete 1/2/4/8-stream calibration
+matrix, runs concurrent transfer lanes, and enforces a process-wide transfer
+buffer budget.
+
+Planned investigation order:
+
+- [ ] add stage-level timing for source reads, compression/probing, blocked
+      socket writes, socket reads, decompression, and destination writes;
+- [ ] add bounded IOCP-backed source read-ahead using a small reusable operation
+      pool inside the existing transfer-memory budget;
+- [ ] predict raw-versus-compressed completion time from measured compression
+      speed and calibrated path throughput instead of considering wire savings
+      alone;
+- [ ] benchmark Windows automatic TCP buffering against explicit 256 KiB,
+      1 MiB, and 4 MiB send/receive buffers before changing production defaults;
+- [ ] classify the actual transfer interface instead of inferring transport from
+      Automatic LAN or Explicit IP mode;
+- [ ] retain the smallest stream count reaching 90% of peak on Wi-Fi and unknown
+      interfaces;
+- [ ] test the smallest stream count reaching 95% of peak on physical Ethernet
+      and Direct Link interfaces;
+- [ ] retain the conservative 90% policy whenever interface classification is
+      unavailable or ambiguous;
+- [ ] stream CDC reconstruction operations and literal records instead of
+      duplicating complete plans in memory;
+- [ ] increase CDC literal allowances only after streaming plans are implemented,
+      with the limit derived from the global transfer-memory budget;
+- [ ] keep Windows IO Ring research for a later v3 investigation unless profiling
+      identifies syscall submission as a meaningful production bottleneck.
+
+Direct Link is always a physical Ethernet candidate. Automatic LAN and Explicit
+IP may use Ethernet, Wi-Fi, VPN, or virtual interfaces, so the v2.5 policy must
+inspect the selected path rather than treating every LAN address as wired.
 
 ### Deliberately deferred
 
@@ -549,9 +601,11 @@ The dedicated agent also exposes a Windows notification-area icon:
 - exit remains disabled while a transfer is active.
 
 The Manager checks GitHub Releases in the background when it opens. It compares
-only stable numeric versions, ignores draft and prerelease releases, and can open
-the selected stable release page. It does not replace running executables or
-silently download binaries.
+only stable numeric versions and can open the selected stable release page. It
+never downloads an executable silently. When a newer stable version is
+available, **Prepare update** explicitly downloads the Manager artifact,
+validates its size and GitHub SHA-256 digest, and stages it beneath LocalAppData.
+The running executable is not replaced or relaunched yet.
 
 The older `networkcopy-speed.exe management-agent` command remains available
 for command-line and development use.
@@ -801,11 +855,14 @@ flowchart TD
     N -->|No| Z["Folder plan complete"]
 ```
 
-The prototype defaults to a 64 MiB ceiling for literal bytes belonging to one
-active reconstruction plan. If the limit is reached, or the complete CDC wire
-payload would not beat an ordinary full-file transfer, that file immediately
-falls back to the existing transfer engine. Folder size and file count therefore
-do not cause unbounded chunk-index or literal memory growth.
+The production implementation currently uses a 16 MiB ceiling for literal bytes
+belonging to one active reconstruction plan. If the limit is reached, or the
+complete CDC wire payload would not beat an ordinary full-file transfer, that
+file immediately falls back to the existing transfer engine. Folder size and
+file count therefore do not cause unbounded chunk-index or literal memory
+growth. A larger dynamic ceiling is deferred until reconstruction plans and
+literal records can be streamed without duplicating the complete payload in
+memory.
 
 ### Protocol v7 medium-file update path
 
