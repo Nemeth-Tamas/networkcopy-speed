@@ -28,6 +28,8 @@ use networkcopy_speed::release_update::{
 };
 use networkcopy_speed::windows_notification::{self, NotificationKind};
 use std::collections::{HashSet, VecDeque};
+use std::env;
+use std::ffi::{OsStr, OsString};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -5686,7 +5688,69 @@ fn configure_style(context: &egui::Context) {
     context.set_visuals_of(egui::Theme::Dark, visuals);
 }
 
+const UPDATE_HANDOFF_WAIT_ARGUMENT: &str = "--update-handoff-wait";
+
+fn parse_update_handoff_wait_argument(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Result<Option<PathBuf>, String> {
+    let mut arguments = arguments.into_iter();
+
+    let _program_name = arguments.next();
+
+    let Some(first_argument) = arguments.next() else {
+        return Ok(None);
+    };
+
+    if first_argument.as_os_str() != OsStr::new(UPDATE_HANDOFF_WAIT_ARGUMENT) {
+        return Ok(None);
+    }
+
+    let handoff_path = arguments.next().ok_or_else(|| {
+        format!("{UPDATE_HANDOFF_WAIT_ARGUMENT} requires an absolute handoff-plan path")
+    })?;
+
+    if arguments.next().is_some() {
+        return Err(format!(
+            "{UPDATE_HANDOFF_WAIT_ARGUMENT} accepts exactly one handoff-plan path",
+        ));
+    }
+
+    Ok(Some(PathBuf::from(handoff_path)))
+}
+
+fn run_update_handoff_wait_if_requested() -> Result<bool, String> {
+    let Some(handoff_path) = parse_update_handoff_wait_argument(env::args_os())? else {
+        return Ok(false);
+    };
+
+    let report =
+        release_update::run_update_handoff_wait_mode(&handoff_path, ReleaseArtifactKind::Manager)
+            .map_err(|error| format!("Manager update handoff wait failed: {error}"))?;
+
+    eprintln!(
+        "Manager update helper validated {} and observed parent process {} as {:?}. \
+         No installation files were modified.",
+        report.handoff.staged_executable.display(),
+        report.handoff.parent_process_id,
+        report.parent_wait,
+    );
+
+    Ok(true)
+}
+
 fn main() -> eframe::Result {
+    match run_update_handoff_wait_if_requested() {
+        Ok(true) => return Ok(()),
+
+        Ok(false) => {}
+
+        Err(error) => {
+            eprintln!("{error}");
+
+            std::process::exit(2);
+        }
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 900.0])
@@ -5715,10 +5779,10 @@ mod tests {
     use super::{
         DirectManagementRoute, MAX_TRANSFER_HISTORY, ManagedEndpointRole, ManagedStartFailureKind,
         PairedTransferHistoryEntry, build_batch_queue_requests, join_remote_path, paired_outcome,
-        parent_remote_path, peer_cleanup_target, preflight_queue_route, queue_state_for_outcome,
-        queue_state_for_start_failure, remember_history, resolve_management_endpoints,
-        select_bound_recovery_item, select_or_clear_discovered_endpoint,
-        transfer_matches_queue_request,
+        parent_remote_path, parse_update_handoff_wait_argument, peer_cleanup_target,
+        preflight_queue_route, queue_state_for_outcome, queue_state_for_start_failure,
+        remember_history, resolve_management_endpoints, select_bound_recovery_item,
+        select_or_clear_discovered_endpoint, transfer_matches_queue_request,
     };
     use networkcopy_speed::management_active_binding::ActiveQueueBinding;
     use networkcopy_speed::management_discovery::{AgentCapabilities, AgentState, DiscoveredAgent};
@@ -5733,6 +5797,67 @@ mod tests {
         ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
     };
     use std::collections::VecDeque;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    #[test]
+    fn update_handoff_wait_argument_is_optional() {
+        let parsed =
+            parse_update_handoff_wait_argument([OsString::from("networkcopy-manager.exe")])
+                .unwrap();
+
+        assert_eq!(parsed, None);
+    }
+
+    #[test]
+    fn update_handoff_wait_argument_accepts_one_path() {
+        let handoff_path =
+            OsString::from(r"C:\Users\User\AppData\Local\NetworkCopy\handoff-plan.bin");
+
+        let parsed = parse_update_handoff_wait_argument([
+            OsString::from("networkcopy-manager.exe"),
+            OsString::from("--update-handoff-wait"),
+            handoff_path.clone(),
+        ])
+        .unwrap();
+
+        assert_eq!(parsed, Some(PathBuf::from(handoff_path)));
+    }
+
+    #[test]
+    fn update_handoff_wait_argument_requires_path() {
+        let error = parse_update_handoff_wait_argument([
+            OsString::from("networkcopy-manager.exe"),
+            OsString::from("--update-handoff-wait"),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("requires"));
+    }
+
+    #[test]
+    fn update_handoff_wait_argument_rejects_extra_values() {
+        let error = parse_update_handoff_wait_argument([
+            OsString::from("networkcopy-manager.exe"),
+            OsString::from("--update-handoff-wait"),
+            OsString::from(r"C:\handoff-plan.bin"),
+            OsString::from("unexpected"),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("exactly one"));
+    }
+
+    #[test]
+    fn update_handoff_wait_argument_ignores_unrelated_arguments() {
+        let parsed = parse_update_handoff_wait_argument([
+            OsString::from("networkcopy-manager.exe"),
+            OsString::from("--ordinary-manager-argument"),
+        ])
+        .unwrap();
+
+        assert_eq!(parsed, None);
+    }
 
     #[test]
     fn remote_path_navigation_works() {

@@ -6,8 +6,15 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::process;
 use std::ptr::{null, null_mut};
 use std::time::Duration;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_INVALID_PARAMETER, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
@@ -54,6 +61,8 @@ const UPDATE_PARTIAL_SUFFIX: &str = ".partial";
 const UPDATE_DOWNLOAD_BUFFER_SIZE: usize = 64 * 1024;
 
 const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+
+const UPDATE_PARENT_EXIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleaseArtifactKind {
@@ -202,6 +211,20 @@ pub struct UpdateHandoffPlan {
     pub expected_size: u64,
 
     pub expected_sha256_hex: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParentProcessWaitOutcome {
+    AlreadyExited,
+
+    Exited,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateHandoffWaitReport {
+    pub handoff: UpdateHandoffPlan,
+
+    pub parent_wait: ParentProcessWaitOutcome,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -501,6 +524,49 @@ pub fn read_update_handoff_plan(path: &Path) -> io::Result<UpdateHandoffPlan> {
     }
 
     Ok(handoff)
+}
+
+pub fn run_update_handoff_wait_mode(
+    handoff_path: &Path,
+    expected_artifact_kind: ReleaseArtifactKind,
+) -> io::Result<UpdateHandoffWaitReport> {
+    let handoff = read_update_handoff_plan(handoff_path)?;
+
+    if handoff.artifact_kind != expected_artifact_kind {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update handoff targets {}, but this helper expects {}",
+                handoff.artifact_kind.label(),
+                expected_artifact_kind.label(),
+            ),
+        ));
+    }
+
+    validate_update_helper_identity(&handoff)?;
+
+    // Acquire the process object before hashing. Once this handle is open, the
+    // later wait remains attached to that process object rather than merely
+    // checking the numeric PID again.
+    let parent_process = open_parent_process(handoff.parent_process_id)?;
+
+    verify_update_handoff_executable(&handoff)?;
+
+    let parent_wait = match parent_process {
+        Some(parent_process) => {
+            wait_for_parent_process_exit(&parent_process, UPDATE_PARENT_EXIT_TIMEOUT)?;
+
+            ParentProcessWaitOutcome::Exited
+        }
+
+        None => ParentProcessWaitOutcome::AlreadyExited,
+    };
+
+    Ok(UpdateHandoffWaitReport {
+        handoff,
+
+        parent_wait,
+    })
 }
 
 fn stage_update_from_reader<R: Read>(
@@ -1497,6 +1563,246 @@ impl<'a> UpdateHandoffReader<'a> {
     }
 }
 
+fn validate_update_helper_identity(handoff: &UpdateHandoffPlan) -> io::Result<()> {
+    let current_executable = env::current_exe().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("update helper executable path could not be determined: {error}"),
+        )
+    })?;
+
+    let actual = fs::canonicalize(&current_executable).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "update helper executable {:?} could not be canonicalized: {error}",
+                current_executable,
+            ),
+        )
+    })?;
+
+    let expected = fs::canonicalize(&handoff.staged_executable).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "planned staged executable {:?} could not be canonicalized: {error}",
+                handoff.staged_executable,
+            ),
+        )
+    })?;
+
+    if actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update helper is running from {:?}, but the handoff requires {:?}",
+                actual, expected,
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn verify_update_handoff_executable(handoff: &UpdateHandoffPlan) -> io::Result<()> {
+    let mut file = fs::File::open(&handoff.staged_executable).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "staged update executable {:?} could not be opened for handoff verification: \
+                 {error}",
+                handoff.staged_executable,
+            ),
+        )
+    })?;
+
+    let metadata = file.metadata().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "staged update executable {:?} could not be inspected: {error}",
+                handoff.staged_executable,
+            ),
+        )
+    })?;
+
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "staged update executable is not a regular file: {:?}",
+                handoff.staged_executable,
+            ),
+        ));
+    }
+
+    if metadata.len() != handoff.expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "staged update executable contains {} bytes, but the handoff requires {}",
+                metadata.len(),
+                handoff.expected_size,
+            ),
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+
+    let mut buffer = [0_u8; UPDATE_DOWNLOAD_BUFFER_SIZE];
+
+    let mut total_size = 0_u64;
+
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "staged update executable {:?} could not be read for SHA-256 verification: \
+                     {error}",
+                    handoff.staged_executable,
+                ),
+            )
+        })?;
+
+        if read == 0 {
+            break;
+        }
+
+        total_size = total_size.checked_add(read as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "staged update helper byte count overflowed u64",
+            )
+        })?;
+
+        if total_size > handoff.expected_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "staged update executable exceeded the expected {} bytes while being verified",
+                    handoff.expected_size,
+                ),
+            ));
+        }
+
+        hasher.update(&buffer[..read]);
+    }
+
+    if total_size != handoff.expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "staged update executable yielded {total_size} bytes, but the handoff requires {}",
+                handoff.expected_size,
+            ),
+        ));
+    }
+
+    let actual_sha256_hex = encode_lower_hex(&hasher.finalize());
+
+    if actual_sha256_hex != handoff.expected_sha256_hex {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "staged update executable SHA-256 mismatch: expected {}, received \
+                 {actual_sha256_hex}",
+                handoff.expected_sha256_hex,
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct OwnedProcessHandle(HANDLE);
+
+impl Drop for OwnedProcessHandle {
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn open_parent_process(parent_process_id: u32) -> io::Result<Option<OwnedProcessHandle>> {
+    if parent_process_id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "update handoff parent process ID must not be zero",
+        ));
+    }
+
+    if parent_process_id == process::id() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "update helper cannot wait for its own process",
+        ));
+    }
+
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, parent_process_id) };
+
+    if handle.is_null() {
+        let error = io::Error::last_os_error();
+
+        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            return Ok(None);
+        }
+
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "parent process {parent_process_id} could not be opened for synchronization: \
+                 {error}",
+            ),
+        ));
+    }
+
+    Ok(Some(OwnedProcessHandle(handle)))
+}
+
+fn wait_for_parent_process_exit(
+    parent_process: &OwnedProcessHandle,
+    timeout: Duration,
+) -> io::Result<()> {
+    let timeout_milliseconds = u32::try_from(timeout.as_millis()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "update parent-process timeout cannot be represented in milliseconds",
+        )
+    })?;
+
+    let wait_result = unsafe { WaitForSingleObject(parent_process.0, timeout_milliseconds) };
+
+    match wait_result {
+        WAIT_OBJECT_0 => Ok(()),
+
+        WAIT_TIMEOUT => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "the original application did not exit within {} seconds",
+                timeout.as_secs(),
+            ),
+        )),
+
+        WAIT_FAILED => {
+            let error = io::Error::last_os_error();
+
+            Err(io::Error::new(
+                error.kind(),
+                format!("waiting for the original application failed: {error}"),
+            ))
+        }
+
+        unexpected => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "waiting for the original application returned unexpected status \
+                 0x{unexpected:08X}",
+            ),
+        )),
+    }
+}
+
 fn build_update_install_plan(
     current_executable: &Path,
     local_app_data: &Path,
@@ -1910,10 +2216,11 @@ mod tests {
         GitHubReleaseResponse, ReleaseArtifactKind, ReleaseAssetInfo, ReleaseInfo,
         SelectedReleaseAsset, UpdateInstallNaming, UpdateInstallPlan, VerifiedStagedUpdate,
         build_update_handoff_plan, build_update_install_plan, decode_update_handoff_plan,
-        encode_update_handoff_plan, is_official_release_file_name, parse_release_response,
-        parse_sha256_digest, parse_stable_version, partial_staged_executable_path,
-        read_update_handoff_plan, select_release_asset, stage_update_from_reader,
-        validate_release_url, write_update_handoff_plan,
+        encode_update_handoff_plan, is_official_release_file_name, open_parent_process,
+        parse_release_response, parse_sha256_digest, parse_stable_version,
+        partial_staged_executable_path, read_update_handoff_plan, select_release_asset,
+        stage_update_from_reader, validate_release_url, verify_update_handoff_executable,
+        write_update_handoff_plan,
     };
     use std::ffi::OsStr;
     use std::fs;
@@ -2532,6 +2839,55 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         assert!(error.to_string().contains("trailing"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn handoff_wait_rejects_current_process() {
+        let error = match open_parent_process(process::id()) {
+            Err(error) => error,
+
+            Ok(_) => panic!("the update helper accepted its own process ID"),
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+        assert!(error.to_string().contains("own process"));
+    }
+
+    #[test]
+    fn handoff_wait_treats_missing_process_as_exited() {
+        let parent = open_parent_process(u32::MAX).unwrap();
+
+        assert!(parent.is_none());
+    }
+
+    #[test]
+    fn handoff_wait_reverifies_staged_executable() {
+        let payload = b"abc";
+
+        let sha256_hex = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+        let (root, install_plan) = test_update_plan(
+            "handoff-wait-verification",
+            payload.len() as u64,
+            sha256_hex,
+        );
+
+        let staged = stage_update_from_reader(&install_plan, &mut payload.as_slice()).unwrap();
+
+        let handoff = build_update_handoff_plan(&install_plan, &staged, 1234).unwrap();
+
+        verify_update_handoff_executable(&handoff).unwrap();
+
+        fs::write(&handoff.staged_executable, b"abd").unwrap();
+
+        let error = verify_update_handoff_executable(&handoff).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        assert!(error.to_string().contains("SHA-256 mismatch"));
 
         let _ = fs::remove_dir_all(root);
     }
