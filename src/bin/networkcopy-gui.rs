@@ -310,7 +310,7 @@ impl Text {
 
         destination_root_layout: "Célgyökér",
 
-        destination_layout_hint: "Pontos célmappánál a fájlok közvetlenül a kiválasztott mappába kerülnek. Célgyökér módban a küldött mappa neve automatikusan hozzáadódik, például D:\\Mentés\\Desktop.",
+        destination_layout_hint: "Pontos célmappánál a fájlok közvetlenül a kiválasztott mappába kerülnek. Célgyökér módban a küldött mappa neve automatikusan hozzáadódik, például D:\\Mentés\\Desktop. Sikeres átvitel után a fogadó automatikusan várja a következő mappát, amíg meg nem szakítja.",
 
         update_existing: "Meglévő célmappa frissítése",
 
@@ -494,7 +494,7 @@ impl Text {
 
         destination_root_layout: "Destination root",
 
-        destination_layout_hint: "Exact destination places the files directly in the selected folder. Destination root automatically appends the sender's folder name, for example D:\\Backup\\Desktop.",
+        destination_layout_hint: "Exact destination places the files directly in the selected folder. Destination root automatically appends the sender's folder name, for example D:\\Backup\\Desktop. After each successful transfer, the receiver automatically waits for the next folder until cancelled.",
 
         update_existing: "Update existing destination",
 
@@ -1127,19 +1127,33 @@ impl NetworkCopyGui {
             }
         };
 
-        let session_request = request.clone();
+        self.start_request(request, text, true, false);
+    }
 
-        match gui_session::save(&session_request) {
-            Ok(_path) => {
-                self.session_warning = None;
-            }
-
-            Err(error) => {
-                self.session_warning = Some(format!("{}: {error}", text.session_save_failed,));
-            }
+    fn start_request(
+        &mut self,
+        request: GuiTransferRequest,
+        text: Text,
+        save_session: bool,
+        preserve_summary: bool,
+    ) {
+        if self.transfer_receiver.is_some() {
+            return;
         }
 
-        self.pending_session = Some(session_request);
+        if save_session {
+            match gui_session::save(&request) {
+                Ok(_path) => {
+                    self.session_warning = None;
+                }
+
+                Err(error) => {
+                    self.session_warning = Some(format!("{}: {error}", text.session_save_failed,));
+                }
+            }
+
+            self.pending_session = Some(request.clone());
+        }
 
         self.show_resume_prompt = false;
 
@@ -1150,7 +1164,9 @@ impl NetworkCopyGui {
                 Ok(elevated) => elevated,
 
                 Err(error) => {
-                    self.last_summary = None;
+                    if !preserve_summary {
+                        self.last_summary = None;
+                    }
 
                     self.last_cancelled = false;
 
@@ -1168,7 +1184,9 @@ impl NetworkCopyGui {
                     }
 
                     Err(error) => {
-                        self.last_summary = None;
+                        if !preserve_summary {
+                            self.last_summary = None;
+                        }
 
                         self.last_cancelled = false;
 
@@ -1210,7 +1228,9 @@ impl NetworkCopyGui {
 
                 self.live_progress = None;
 
-                self.last_summary = None;
+                if !preserve_summary {
+                    self.last_summary = None;
+                }
 
                 self.last_error = None;
 
@@ -1222,7 +1242,9 @@ impl NetworkCopyGui {
 
                 self.live_progress = None;
 
-                self.last_summary = None;
+                if !preserve_summary {
+                    self.last_summary = None;
+                }
 
                 self.last_cancelled = false;
 
@@ -1266,6 +1288,15 @@ impl NetworkCopyGui {
             return;
         };
 
+        let rearm_request = if matches!(&outcome, TransferOutcome::Completed(_),) {
+            self.pending_session
+                .as_ref()
+                .filter(|request| should_rearm_root_receiver(request))
+                .cloned()
+        } else {
+            None
+        };
+
         self.transfer_receiver = None;
 
         self.transfer_control = None;
@@ -1274,13 +1305,17 @@ impl NetworkCopyGui {
 
         match outcome {
             TransferOutcome::Completed(summary) => {
-                self.clear_completed_session(text);
-
                 self.last_summary = Some(*summary);
 
                 self.last_error = None;
 
                 self.last_cancelled = false;
+
+                if let Some(request) = rearm_request {
+                    self.start_request(request, text, false, true);
+                } else {
+                    self.clear_completed_session(text);
+                }
             }
 
             TransferOutcome::Cancelled => {
@@ -1928,6 +1963,16 @@ fn warning_text() -> egui::Color32 {
     egui::Color32::from_rgb(255, 190, 82)
 }
 
+fn should_rearm_root_receiver(request: &GuiTransferRequest) -> bool {
+    matches!(
+        request,
+        GuiTransferRequest::Receive {
+            destination_layout: DestinationLayout::SourceNameUnderRoot,
+            ..
+        }
+    )
+}
+
 fn resume_request_summary(ui: &mut egui::Ui, text: Text, request: &GuiTransferRequest) {
     let (direction, folder, connection, send_options, update_existing, destination_layout) =
         match request {
@@ -2140,7 +2185,10 @@ fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Language, Text, localized_phase};
+    use super::{Language, Text, localized_phase, should_rearm_root_receiver};
+    use networkcopy_speed::destination_layout::DestinationLayout;
+    use networkcopy_speed::gui_transfer::{GuiConnectionMode, GuiTransferRequest};
+    use std::path::PathBuf;
 
     #[test]
     fn both_languages_are_embedded() {
@@ -2166,5 +2214,50 @@ mod tests {
             localized_phase(Language::Hungarian, "Calibration send - 4 streams",),
             "Sebességmérés küldése — 4 TCP szál",
         );
+    }
+
+    #[test]
+    fn root_receive_request_rearms() {
+        let request = GuiTransferRequest::Receive {
+            connection: GuiConnectionMode::Direct,
+
+            destination_root: PathBuf::from(r"D:\Backup"),
+
+            destination_layout: DestinationLayout::SourceNameUnderRoot,
+
+            update_existing: true,
+        };
+
+        assert!(should_rearm_root_receiver(&request,),);
+    }
+
+    #[test]
+    fn exact_receive_request_is_one_shot() {
+        let request = GuiTransferRequest::Receive {
+            connection: GuiConnectionMode::Direct,
+
+            destination_root: PathBuf::from(r"D:\Exact"),
+
+            destination_layout: DestinationLayout::Exact,
+
+            update_existing: false,
+        };
+
+        assert!(!should_rearm_root_receiver(&request,),);
+    }
+
+    #[test]
+    fn send_request_never_rearms_receiver() {
+        let request = GuiTransferRequest::Send {
+            connection: GuiConnectionMode::Direct,
+
+            source_root: PathBuf::from(r"C:\Desktop"),
+
+            worker_count: 4,
+
+            calibration_mib: 64,
+        };
+
+        assert!(!should_rearm_root_receiver(&request,),);
     }
 }

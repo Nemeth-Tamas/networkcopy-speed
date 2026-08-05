@@ -347,10 +347,17 @@ available for exact-destination transfers by sending no folder-name metadata.
 - [x] transmit the selected source folder name as validated protocol metadata;
 - [x] resolve validated source-folder metadata beneath the selected receiver root;
 - [x] expose Exact destination and Destination root selection in the HU/EN GUI;
-- [ ] keep a root-mode receiver listening after each completed transfer;
-- [ ] allow cancellation while waiting or while a transfer is active;
+- [x] keep a root-mode receiver listening after each completed transfer;
+- [x] allow cancellation while waiting or while a transfer is active;
 - [x] retain the existing one-folder standalone sender workflow;
 - [x] migrate interrupted standalone GUI session persistence.
+
+Destination-root mode now behaves as a persistent receiver. After a successful
+folder transfer, the standalone GUI retains the completed summary and
+automatically starts listening again with the same connection, destination
+root, layout, and update settings. Exact-destination mode remains a one-transfer
+operation. Cancelling while idle discovery, listener acceptance, calibration,
+or payload transfer stops the loop without starting another receiver.
 
 ### User-approved executable updates
 
