@@ -450,6 +450,8 @@ struct NetworkCopyManager {
 
     update_preparation_error: String,
 
+    update_handoff_confirmation: bool,
+
     start_receiver: Option<Receiver<StartResult>>,
 
     attach_receiver: Option<Receiver<AttachResult>>,
@@ -553,6 +555,8 @@ impl NetworkCopyManager {
             prepared_update: None,
 
             update_preparation_error: String::new(),
+
+            update_handoff_confirmation: false,
 
             start_receiver: None,
 
@@ -1572,6 +1576,8 @@ impl NetworkCopyManager {
 
         self.prepared_update = None;
 
+        self.update_handoff_confirmation = false;
+
         let (sender, receiver) = mpsc::channel();
 
         self.update_receiver = Some(receiver);
@@ -1646,6 +1652,8 @@ impl NetworkCopyManager {
 
         self.prepared_update = None;
 
+        self.update_handoff_confirmation = false;
+
         self.notice = format!(
             "Preparing and verifying the {} Manager executable...",
             check.latest.tag_name,
@@ -1678,6 +1686,74 @@ impl NetworkCopyManager {
 
             let _ = sender.send(result);
         });
+    }
+
+    fn begin_update_handoff(&mut self, context: &egui::Context) {
+        if let Some(reason) = self.update_preparation_blocked_reason() {
+            self.update_preparation_error = reason.to_string();
+
+            self.update_handoff_confirmation = false;
+
+            return;
+        }
+
+        let Some(prepared) = self.prepared_update.clone() else {
+            self.update_preparation_error =
+                "No verified Manager update is currently prepared.".to_string();
+
+            self.update_handoff_confirmation = false;
+
+            return;
+        };
+
+        if let Err(error) = self.persist_state_now() {
+            self.update_preparation_error =
+                format!("The Manager state could not be saved before updater handoff: {error}",);
+
+            self.update_handoff_confirmation = false;
+
+            return;
+        }
+
+        match release_update::launch_update_handoff_wait_helper(
+            &prepared.plan.handoff_plan,
+            ReleaseArtifactKind::Manager,
+        ) {
+            Ok(report) => {
+                self.update_preparation_error.clear();
+
+                self.update_handoff_confirmation = false;
+
+                self.notice = format!(
+                    "Verified updater helper process {} started. Closing Manager so the helper can \
+                     observe process {} exit. No executable will be replaced in this checkpoint.",
+                    report.helper_process_id, report.parent_process_id,
+                );
+
+                notify_manager(
+                    NotificationKind::Information,
+                    "Manager updater helper started",
+                    &self.notice,
+                );
+
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+
+            Err(error) => {
+                self.update_preparation_error =
+                    format!("Manager updater handoff could not be started: {error}");
+
+                self.update_handoff_confirmation = false;
+
+                self.notice.clear();
+
+                notify_manager(
+                    NotificationKind::Error,
+                    "Manager updater handoff failed",
+                    &self.update_preparation_error,
+                );
+            }
+        }
     }
 
     fn select_direct_route(&mut self, route: &DirectManagementRoute) {
@@ -2367,6 +2443,8 @@ impl NetworkCopyManager {
 
                 self.update_preparation_error.clear();
 
+                self.update_handoff_confirmation = false;
+
                 let release_name = self
                     .update_check
                     .as_ref()
@@ -2395,6 +2473,8 @@ impl NetworkCopyManager {
 
                 self.prepared_update = None;
 
+                self.update_handoff_confirmation = false;
+
                 self.update_preparation_error = error;
 
                 self.notice.clear();
@@ -2410,6 +2490,8 @@ impl NetworkCopyManager {
                 self.update_preparation_receiver = None;
 
                 self.prepared_update = None;
+
+                self.update_handoff_confirmation = false;
 
                 self.update_preparation_error =
                     "Manager update-preparation worker disconnected.".to_string();
@@ -2986,11 +3068,19 @@ impl NetworkCopyManager {
 
         let update_preparation_error = self.update_preparation_error.clone();
 
+        let update_handoff_confirmation = self.update_handoff_confirmation;
+
         let update_blocked_reason = self.update_preparation_blocked_reason().map(str::to_string);
 
         let mut check_requested = false;
 
         let mut preparation_requested = false;
+
+        let mut arm_handoff = false;
+
+        let mut cancel_handoff = false;
+
+        let mut launch_handoff = false;
 
         let mut release_to_open = None::<String>;
 
@@ -3036,10 +3126,59 @@ impl NetworkCopyManager {
 
                         ui.label(format!("{} ready", format_bytes(prepared.verified.size),))
                             .on_hover_text(format!(
-                                "Staged executable: {}\nPlanned install path: {}",
+                                "Staged executable: {}\nPlanned install path: {}\nHandoff plan: {}",
                                 prepared.verified.executable.display(),
                                 prepared.plan.install_path.display(),
+                                prepared.plan.handoff_plan.display(),
                             ));
+
+                        if update_handoff_confirmation {
+                            ui.label(
+                                egui::RichText::new(
+                                    "This checkpoint starts the verified updater helper and closes \
+                                     Manager. It does not replace or relaunch an executable yet.",
+                                )
+                                .color(egui::Color32::from_rgb(255, 196, 92)),
+                            );
+
+                            let confirm = ui.add_enabled(
+                                update_blocked_reason.is_none(),
+                                egui::Button::new(
+                                    egui::RichText::new("Confirm close and start updater").strong(),
+                                )
+                                .fill(egui::Color32::from_rgb(112, 64, 28)),
+                            );
+
+                            let confirm = if let Some(reason) = &update_blocked_reason {
+                                confirm.on_hover_text(reason)
+                            } else {
+                                confirm
+                            };
+
+                            if confirm.clicked() {
+                                launch_handoff = true;
+                            }
+
+                            if ui.small_button("Cancel").clicked() {
+                                cancel_handoff = true;
+                            }
+                        } else {
+                            let install = ui.add_enabled(
+                                update_blocked_reason.is_none(),
+                                egui::Button::new(egui::RichText::new("Install update").strong())
+                                    .fill(egui::Color32::from_rgb(42, 78, 72)),
+                            );
+
+                            let install = if let Some(reason) = &update_blocked_reason {
+                                install.on_hover_text(reason)
+                            } else {
+                                install
+                            };
+
+                            if install.clicked() {
+                                arm_handoff = true;
+                            }
+                        }
                     } else {
                         let response = ui.add_enabled(
                             update_blocked_reason.is_none(),
@@ -3060,7 +3199,7 @@ impl NetworkCopyManager {
 
                     if !update_preparation_error.is_empty() {
                         ui.label(
-                            egui::RichText::new("Update preparation failed")
+                            egui::RichText::new("Update preparation or handoff failed")
                                 .color(egui::Color32::from_rgb(255, 112, 120)),
                         )
                         .on_hover_text(&update_preparation_error);
@@ -3110,6 +3249,20 @@ impl NetworkCopyManager {
 
             ui.label("Trusted LAN · management traffic is not yet encrypted");
         });
+
+        if arm_handoff {
+            self.update_handoff_confirmation = true;
+
+            self.update_preparation_error.clear();
+        }
+
+        if cancel_handoff {
+            self.update_handoff_confirmation = false;
+        }
+
+        if launch_handoff {
+            self.begin_update_handoff(ui.ctx());
+        }
 
         if preparation_requested {
             self.begin_update_preparation();
@@ -5688,7 +5841,7 @@ fn configure_style(context: &egui::Context) {
     context.set_visuals_of(egui::Theme::Dark, visuals);
 }
 
-const UPDATE_HANDOFF_WAIT_ARGUMENT: &str = "--update-handoff-wait";
+const UPDATE_HANDOFF_WAIT_ARGUMENT: &str = release_update::UPDATE_HANDOFF_WAIT_ARGUMENT;
 
 fn parse_update_handoff_wait_argument(
     arguments: impl IntoIterator<Item = OsString>,

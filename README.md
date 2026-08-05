@@ -330,13 +330,19 @@ and every update path using lossless Windows UTF-16 encoding. The plan is
 written through a synchronized partial file, atomically renamed, read back, and
 validated before preparation is reported as successful.
 
-The staged Manager now recognizes a hidden `--update-handoff-wait` helper mode.
+The staged Manager recognizes a hidden `--update-handoff-wait` helper mode.
 Before waiting, it proves that it is running from the exact staged path named by
 the `NCH1` plan, independently checks its file size and SHA-256 digest, and opens
 a synchronization handle to the recorded original Manager process. It waits for
 that process object for at most 120 seconds and then exits without copying,
-renaming, deleting, backing up, replacing, or launching any executable. The
-running Manager does not launch this helper mode yet.
+renaming, deleting, backing up, replacing, or launching any executable.
+
+After a Manager update is prepared, the running Manager now exposes a two-step
+**Install update** confirmation. Final confirmation saves persistence again,
+launches the verified staged Manager in wait-only helper mode, and requests a
+clean close of the original Manager window. This checkpoint proves the
+cross-process handoff boundary only; the helper still exits without replacing or
+relaunching an executable.
 
 ### Queue recovery hardening
 
@@ -402,7 +408,10 @@ or payload transfer stops the loop without starting another receiver.
       accepting helper responsibilities;
 - [x] open and wait on the original Manager's Windows process object with a
       bounded timeout without modifying installation files;
-- [ ] launch the staged Manager in wait-only helper mode after explicit approval;
+- [x] launch the staged Manager in wait-only helper mode after explicit
+      two-step approval and save persistence immediately before handoff;
+- [x] request a clean close of the original Manager only after the helper process
+      has been created successfully;
 - [ ] launch an officially named new executable beside an officially named old one;
 - [ ] replace a renamed executable in place while preserving its custom filename;
 - [ ] relaunch the installed executable and confirm successful startup;

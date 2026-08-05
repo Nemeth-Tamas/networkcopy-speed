@@ -6,7 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command};
 use std::ptr::{null, null_mut};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
@@ -63,6 +63,8 @@ const UPDATE_DOWNLOAD_BUFFER_SIZE: usize = 64 * 1024;
 const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 const UPDATE_PARENT_EXIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+pub const UPDATE_HANDOFF_WAIT_ARGUMENT: &str = "--update-handoff-wait";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleaseArtifactKind {
@@ -225,6 +227,13 @@ pub struct UpdateHandoffWaitReport {
     pub handoff: UpdateHandoffPlan,
 
     pub parent_wait: ParentProcessWaitOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UpdateHandoffLaunchReport {
+    pub helper_process_id: u32,
+
+    pub parent_process_id: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -567,6 +576,97 @@ pub fn run_update_handoff_wait_mode(
 
         parent_wait,
     })
+}
+
+pub fn launch_update_handoff_wait_helper(
+    handoff_path: &Path,
+    expected_artifact_kind: ReleaseArtifactKind,
+) -> io::Result<UpdateHandoffLaunchReport> {
+    let handoff = read_update_handoff_plan(handoff_path)?;
+
+    if handoff.artifact_kind != expected_artifact_kind {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update handoff targets {}, but this launcher expects {}",
+                handoff.artifact_kind.label(),
+                expected_artifact_kind.label(),
+            ),
+        ));
+    }
+
+    let current_process_id = process::id();
+
+    if handoff.parent_process_id != current_process_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update handoff records parent process {}, but the running application is process \
+                 {current_process_id}",
+                handoff.parent_process_id,
+            ),
+        ));
+    }
+
+    let metadata = fs::metadata(&handoff.staged_executable).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "staged update helper {:?} could not be inspected before launch: {error}",
+                handoff.staged_executable,
+            ),
+        )
+    })?;
+
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "staged update helper is not a regular file: {:?}",
+                handoff.staged_executable,
+            ),
+        ));
+    }
+
+    if metadata.len() != handoff.expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "staged update helper contains {} bytes, but the handoff requires {}",
+                metadata.len(),
+                handoff.expected_size,
+            ),
+        ));
+    }
+
+    let mut command = build_update_handoff_wait_command(&handoff);
+
+    let child = command.spawn().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "staged update helper {:?} could not be launched: {error}",
+                handoff.staged_executable,
+            ),
+        )
+    })?;
+
+    Ok(UpdateHandoffLaunchReport {
+        helper_process_id: child.id(),
+
+        parent_process_id: current_process_id,
+    })
+}
+
+fn build_update_handoff_wait_command(handoff: &UpdateHandoffPlan) -> Command {
+    let mut command = Command::new(&handoff.staged_executable);
+
+    command
+        .arg(UPDATE_HANDOFF_WAIT_ARGUMENT)
+        .arg(&handoff.handoff_plan)
+        .current_dir(&handoff.staging_directory);
+
+    command
 }
 
 fn stage_update_from_reader<R: Read>(
@@ -2214,13 +2314,13 @@ fn wide(value: &OsStr) -> Vec<u16> {
 mod tests {
     use super::{
         GitHubReleaseResponse, ReleaseArtifactKind, ReleaseAssetInfo, ReleaseInfo,
-        SelectedReleaseAsset, UpdateInstallNaming, UpdateInstallPlan, VerifiedStagedUpdate,
-        build_update_handoff_plan, build_update_install_plan, decode_update_handoff_plan,
-        encode_update_handoff_plan, is_official_release_file_name, open_parent_process,
-        parse_release_response, parse_sha256_digest, parse_stable_version,
-        partial_staged_executable_path, read_update_handoff_plan, select_release_asset,
-        stage_update_from_reader, validate_release_url, verify_update_handoff_executable,
-        write_update_handoff_plan,
+        SelectedReleaseAsset, UPDATE_HANDOFF_WAIT_ARGUMENT, UpdateInstallNaming, UpdateInstallPlan,
+        VerifiedStagedUpdate, build_update_handoff_plan, build_update_handoff_wait_command,
+        build_update_install_plan, decode_update_handoff_plan, encode_update_handoff_plan,
+        is_official_release_file_name, open_parent_process, parse_release_response,
+        parse_sha256_digest, parse_stable_version, partial_staged_executable_path,
+        read_update_handoff_plan, select_release_asset, stage_update_from_reader,
+        validate_release_url, verify_update_handoff_executable, write_update_handoff_plan,
     };
     use std::ffi::OsStr;
     use std::fs;
@@ -2888,6 +2988,44 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 
         assert!(error.to_string().contains("SHA-256 mismatch"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn handoff_wait_command_targets_staged_manager_and_exact_plan() {
+        let sha256_hex = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+        let (root, install_plan) = test_update_plan("handoff-wait-command", 3, sha256_hex);
+
+        let verified = VerifiedStagedUpdate {
+            executable: install_plan.staged_executable.clone(),
+
+            size: 3,
+
+            sha256_hex: sha256_hex.to_string(),
+        };
+
+        let handoff = build_update_handoff_plan(&install_plan, &verified, 1234).unwrap();
+
+        let command = build_update_handoff_wait_command(&handoff);
+
+        assert_eq!(command.get_program(), handoff.staged_executable.as_os_str(),);
+
+        let arguments = command.get_args().collect::<Vec<_>>();
+
+        assert_eq!(
+            arguments,
+            vec![
+                OsStr::new(UPDATE_HANDOFF_WAIT_ARGUMENT),
+                handoff.handoff_plan.as_os_str(),
+            ],
+        );
+
+        assert_eq!(
+            command.get_current_dir(),
+            Some(handoff.staging_directory.as_path()),
+        );
 
         let _ = fs::remove_dir_all(root);
     }
