@@ -1,5 +1,6 @@
 use crate::calibrated_transfer::{self, CalibratedReceiveReport, CalibratedSendReport};
 use crate::console_progress::ProgressCounter;
+use crate::destination_layout::DestinationLayout;
 use crate::direct_discovery;
 use crate::multistream_copy::DestinationMode;
 use crate::tcp_connect;
@@ -8,7 +9,12 @@ use std::net::TcpListener;
 use std::path::Path;
 
 pub(crate) fn receive_once(destination_root: &Path) -> io::Result<CalibratedReceiveReport> {
-    receive_configured(destination_root, None, DestinationMode::Fresh)
+    receive_configured(
+        destination_root,
+        None,
+        DestinationMode::Fresh,
+        DestinationLayout::Exact,
+    )
 }
 
 pub(crate) fn receive_once_with_progress_and_mode(
@@ -16,13 +22,33 @@ pub(crate) fn receive_once_with_progress_and_mode(
     progress: ProgressCounter,
     destination_mode: DestinationMode,
 ) -> io::Result<CalibratedReceiveReport> {
-    receive_configured(destination_root, Some(progress), destination_mode)
+    receive_once_with_progress_mode_and_layout(
+        destination_root,
+        progress,
+        destination_mode,
+        DestinationLayout::Exact,
+    )
+}
+
+pub(crate) fn receive_once_with_progress_mode_and_layout(
+    destination_root: &Path,
+    progress: ProgressCounter,
+    destination_mode: DestinationMode,
+    destination_layout: DestinationLayout,
+) -> io::Result<CalibratedReceiveReport> {
+    receive_configured(
+        destination_root,
+        Some(progress),
+        destination_mode,
+        destination_layout,
+    )
 }
 
 fn receive_configured(
     destination_root: &Path,
     progress: Option<ProgressCounter>,
     destination_mode: DestinationMode,
+    destination_layout: DestinationLayout,
 ) -> io::Result<CalibratedReceiveReport> {
     if let Some(progress) = &progress {
         progress.set_label("Waiting for direct sender");
@@ -60,17 +86,20 @@ fn receive_configured(
     println!();
 
     match progress {
-        Some(progress) => calibrated_transfer::receive_once_with_progress_and_mode(
+        Some(progress) => calibrated_transfer::receive_once_with_progress_mode_and_layout(
             listener,
             destination_root,
             progress,
             destination_mode,
+            destination_layout,
         ),
 
         None => {
-            if destination_mode != DestinationMode::Fresh {
+            if destination_mode != DestinationMode::Fresh
+                || destination_layout != DestinationLayout::Exact
+            {
                 return Err(io::Error::other(
-                    "update mode requires progress-aware receiver execution",
+                    "update or destination-root mode requires progress-aware receiver execution",
                 ));
             }
 

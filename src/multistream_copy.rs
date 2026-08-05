@@ -6,7 +6,7 @@ use crate::content_hash;
 use crate::control_plane::{self, ConnectionRole, Handshake, ManifestSummary};
 use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_second, format_bytes};
 use crate::destination_inventory;
-use crate::destination_layout::SourceDirectoryName;
+use crate::destination_layout::{self, DestinationLayout, SourceDirectoryName};
 use crate::file_metadata;
 use crate::manifest_scan::{self, FileClass, ManifestEntry};
 use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
@@ -981,6 +981,24 @@ fn run_with_fault(
     data_stream_count: usize,
     fault_injection: Arc<TransferFault>,
 ) -> io::Result<MultistreamCopyReport> {
+    run_with_fault_and_layout(
+        source_root,
+        destination_root,
+        worker_count,
+        data_stream_count,
+        fault_injection,
+        DestinationLayout::Exact,
+    )
+}
+
+fn run_with_fault_and_layout(
+    source_root: &Path,
+    destination_root: &Path,
+    worker_count: usize,
+    data_stream_count: usize,
+    fault_injection: Arc<TransferFault>,
+    destination_layout: DestinationLayout,
+) -> io::Result<MultistreamCopyReport> {
     manifest_scan::validate_worker_count(worker_count)?;
 
     control_plane::validate_data_stream_count(data_stream_count)?;
@@ -1002,7 +1020,16 @@ fn run_with_fault(
 
     let server = thread::Builder::new()
         .name("networkcopy-transfer-server".to_string())
-        .spawn(move || run_server(&listener, server_destination, fault_injection, None))?;
+        .spawn(move || {
+            run_server_with_mode_and_layout(
+                &listener,
+                server_destination,
+                fault_injection,
+                None,
+                DestinationMode::Fresh,
+                destination_layout,
+            )
+        })?;
 
     send_internal(
         address,
@@ -1012,7 +1039,9 @@ fn run_with_fault(
         memory_plan,
         SendInternalOptions {
             server: Some(server),
+
             progress: None,
+
             catalog_limits,
         },
     )
@@ -1590,12 +1619,29 @@ pub(crate) fn receive_on_listener_with_progress_and_mode(
     progress: ProgressCounter,
     destination_mode: DestinationMode,
 ) -> io::Result<ReceiveReport> {
-    run_server_with_mode(
+    receive_on_listener_with_progress_mode_and_layout(
+        listener,
+        destination_root,
+        progress,
+        destination_mode,
+        DestinationLayout::Exact,
+    )
+}
+
+pub(crate) fn receive_on_listener_with_progress_mode_and_layout(
+    listener: &TcpListener,
+    destination_root: &Path,
+    progress: ProgressCounter,
+    destination_mode: DestinationMode,
+    destination_layout: DestinationLayout,
+) -> io::Result<ReceiveReport> {
+    run_server_with_mode_and_layout(
         listener,
         destination_root.to_path_buf(),
         Arc::new(TransferFault::disabled()),
         Some(progress),
         destination_mode,
+        destination_layout,
     )
 }
 
@@ -1634,10 +1680,34 @@ fn run_server_with_mode(
     progress: Option<ProgressCounter>,
     destination_mode: DestinationMode,
 ) -> io::Result<ReceiveReport> {
+    run_server_with_mode_and_layout(
+        listener,
+        destination_root,
+        fault_injection,
+        progress,
+        destination_mode,
+        DestinationLayout::Exact,
+    )
+}
+
+fn run_server_with_mode_and_layout(
+    listener: &TcpListener,
+    destination_root: PathBuf,
+    fault_injection: Arc<TransferFault>,
+    progress: Option<ProgressCounter>,
+    destination_mode: DestinationMode,
+    destination_layout: DestinationLayout,
+) -> io::Result<ReceiveReport> {
     let (mut control_stream, data_streams, accepted_session) =
         accept_session(listener, progress.as_ref())?;
 
     let session_started = Instant::now();
+
+    let destination_root = destination_layout::resolve_received_destination(
+        destination_layout,
+        &destination_root,
+        accepted_session.source_directory_name.as_ref(),
+    )?;
 
     let data_stream_count = accepted_session.data_stream_count;
 
@@ -7604,13 +7674,14 @@ mod tests {
         negotiate_verified_fresh_resume_files, persist_generation_commit, prepare_destination,
         read_generation_commit, read_lane_end, read_receiver_ready, read_source_directory_name,
         read_transfer_ack, read_u8, read_verification_request, rebuild_fresh_generation_execution,
-        receive_once, run, run_update, run_update_with_fault, run_with_fault, send, temporary_path,
-        tiny_pack_record_wire_bytes, validate_generation_commit, validate_resume_offer,
-        validate_source_metadata, verify_content_digest, write_generation_commit, write_lane_end,
-        write_receiver_ready, write_source_directory_name, write_transfer_ack,
-        write_verification_response,
+        receive_once, run, run_update, run_update_with_fault, run_with_fault,
+        run_with_fault_and_layout, send, temporary_path, tiny_pack_record_wire_bytes,
+        validate_generation_commit, validate_resume_offer, validate_source_metadata,
+        verify_content_digest, write_generation_commit, write_lane_end, write_receiver_ready,
+        write_source_directory_name, write_transfer_ack, write_verification_response,
     };
     use crate::control_plane::{self, ManifestSummary};
+    use crate::destination_layout::DestinationLayout;
     use crate::destination_layout::SourceDirectoryName;
     use crate::file_metadata;
     use crate::manifest_scan::{self, FileClass, ManifestEntry};
@@ -8188,6 +8259,50 @@ mod tests {
         );
 
         assert_eq!(report.tiny_files_packed, 2);
+    }
+
+    #[test]
+    fn root_layout_loopback_places_source_under_destination_root() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let parent = env::temp_dir().join(format!(
+            "networkcopy-root-layout-{}-{unique}",
+            process::id(),
+        ));
+
+        let source = parent.join("Desktop");
+
+        let destination_root = parent.join("Backup");
+
+        fs::create_dir_all(&source).unwrap();
+
+        fs::write(source.join("example.txt"), b"destination root mapping").unwrap();
+
+        let result = run_with_fault_and_layout(
+            &source,
+            &destination_root,
+            2,
+            2,
+            Arc::new(TransferFault::disabled()),
+            DestinationLayout::SourceNameUnderRoot,
+        );
+
+        let expected_file = destination_root.join("Desktop").join("example.txt");
+
+        let transferred = fs::read(&expected_file);
+
+        let cleanup = fs::remove_dir_all(&parent);
+
+        let report = result.unwrap();
+
+        assert_eq!(report.files_copied, 1);
+
+        assert_eq!(transferred.unwrap(), b"destination root mapping",);
+
+        cleanup.unwrap();
     }
 
     #[test]

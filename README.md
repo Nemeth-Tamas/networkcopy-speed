@@ -344,10 +344,9 @@ available for exact-destination transfers by sending no folder-name metadata.
 
 ### Standalone GUI root receiver
 
-- [ ] add Exact destination and Destination root receiver layouts;
 - [x] transmit the selected source folder name as validated protocol metadata;
-- [ ] map a source such as `C:\Users\User\Desktop` beneath a receiver root as
-      `<root>\Desktop`;
+- [x] resolve validated source-folder metadata beneath the selected receiver root;
+- [ ] expose Exact destination and Destination root selection in the HU/EN GUI;
 - [ ] keep a root-mode receiver listening after each completed transfer;
 - [ ] allow cancellation while waiting or while a transfer is active;
 - [ ] retain the existing one-folder standalone sender workflow;

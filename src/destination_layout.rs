@@ -170,6 +170,37 @@ pub fn resolve_destination(
     }
 }
 
+pub fn resolve_received_destination(
+    layout: DestinationLayout,
+    destination: &Path,
+    source_directory_name: Option<&SourceDirectoryName>,
+) -> io::Result<PathBuf> {
+    if destination.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination path must not be empty",
+        ));
+    }
+
+    match layout {
+        DestinationLayout::Exact => Ok(destination.to_path_buf()),
+
+        DestinationLayout::SourceNameUnderRoot => {
+            let source_directory_name =
+                source_directory_name.ok_or_else(
+                    || {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "destination-root mode requires source-folder metadata, but the sender did not provide a folder name",
+                        )
+                    },
+                )?;
+
+            Ok(destination.join(source_directory_name.as_str()))
+        }
+    }
+}
+
 pub fn resolve_destination_text(
     layout: DestinationLayout,
     source_root: &str,
@@ -189,7 +220,7 @@ pub fn resolve_destination_text(
 mod tests {
     use super::{
         DestinationLayout, SourceDirectoryName, resolve_destination, resolve_destination_text,
-        source_directory_name,
+        resolve_received_destination, source_directory_name,
     };
     use std::path::Path;
 
@@ -321,6 +352,50 @@ mod tests {
                 Path::new(r"D:\Backup",),
             )
             .is_err(),
+        );
+    }
+
+    #[test]
+    fn received_root_layout_uses_validated_source_name() {
+        let source_name = SourceDirectoryName::parse("Desktop").unwrap();
+
+        let actual = resolve_received_destination(
+            DestinationLayout::SourceNameUnderRoot,
+            Path::new(r"D:\Backup\User"),
+            Some(&source_name),
+        )
+        .unwrap();
+
+        assert_eq!(actual, Path::new(r"D:\Backup\User\Desktop",),);
+    }
+
+    #[test]
+    fn received_exact_layout_does_not_require_source_name() {
+        let actual = resolve_received_destination(
+            DestinationLayout::Exact,
+            Path::new(r"D:\ExactDestination"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(actual, Path::new(r"D:\ExactDestination",),);
+    }
+
+    #[test]
+    fn received_root_layout_requires_source_metadata() {
+        let error = resolve_received_destination(
+            DestinationLayout::SourceNameUnderRoot,
+            Path::new(r"D:\Backup"),
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData,);
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires source-folder metadata",),
         );
     }
 }
