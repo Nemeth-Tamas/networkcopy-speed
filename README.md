@@ -364,6 +364,8 @@ or payload transfer stops the loop without starting another receiver.
 - [x] define exact app-kind and GUI-language-aware selection for Manager, Agent,
       CLI, GUI-HU, and GUI-EN release assets;
 - [ ] wire each running application to its own release artifact kind;
+- [x] plan official-versus-custom executable naming and deterministic
+      LocalAppData staging, backup, handoff, and startup-marker paths;
 - [ ] download the selected release only after the user presses Update;
 - [ ] verify the GitHub release-asset size and SHA-256 digest;
 - [ ] save and migrate application persistence before handoff;
