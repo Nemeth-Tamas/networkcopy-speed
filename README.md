@@ -312,6 +312,10 @@ The Manager also includes a multi-source batch builder. Several source folders
 can be collected, previewed beneath one receiver destination root, checked for
 name collisions, and added atomically to the persistent transfer queue.
 
+The standalone transfer wire protocol is now version 12. Its control stream
+carries an optional validated source-folder name. Drive-root sources remain
+available for exact-destination transfers by sending no folder-name metadata.
+
 ### Queue recovery hardening
 
 - [x] assign each running endpoint agent a random process identity;
@@ -341,7 +345,7 @@ name collisions, and added atomically to the persistent transfer queue.
 ### Standalone GUI root receiver
 
 - [ ] add Exact destination and Destination root receiver layouts;
-- [ ] transmit the selected source folder name as validated protocol metadata;
+- [x] transmit the selected source folder name as validated protocol metadata;
 - [ ] map a source such as `C:\Users\User\Desktop` beneath a receiver root as
       `<root>\Desktop`;
 - [ ] keep a root-mode receiver listening after each completed transfer;

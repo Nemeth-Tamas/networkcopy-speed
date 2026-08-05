@@ -6,6 +6,7 @@ use crate::content_hash;
 use crate::control_plane::{self, ConnectionRole, Handshake, ManifestSummary};
 use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_second, format_bytes};
 use crate::destination_inventory;
+use crate::destination_layout::SourceDirectoryName;
 use crate::file_metadata;
 use crate::manifest_scan::{self, FileClass, ManifestEntry};
 use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
@@ -33,6 +34,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
+const MESSAGE_SOURCE_DIRECTORY_NAME: u8 = 0x2F;
 const MESSAGE_RECEIVER_READY: u8 = 0x30;
 const MESSAGE_FILE: u8 = 0x31;
 const MESSAGE_STREAM_END: u8 = 0x32;
@@ -84,6 +86,7 @@ const GENERATION_COMMIT_FILE_ID_WIRE_BYTES: u64 = 8;
 const MAX_RESUME_OFFER_STRIPES: u32 = 1_000_000;
 const MAX_UNCHANGED_OFFER_FILES: u32 = 1_000_000;
 const MAX_GENERATION_COMMIT_FILE_IDS: u32 = 1_000_000;
+const MAX_SOURCE_DIRECTORY_NAME_UTF8_BYTES: usize = 1024;
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
 
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -874,10 +877,13 @@ struct StripeDescriptor {
     length: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct AcceptedSession {
     session_id: u64,
+
     data_stream_count: usize,
+
+    source_directory_name: Option<SourceDirectoryName>,
 }
 
 struct SendInternalOptions {
@@ -1145,6 +1151,12 @@ fn send_internal(
         memory_plan.per_peer_bytes
     };
 
+    let source_directory_name = source_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(SourceDirectoryName::parse)
+        .transpose()?;
+
     let source_root = source_root.canonicalize()?;
 
     let scan_result = manifest_scan::run(&source_root, worker_count)?;
@@ -1181,6 +1193,8 @@ fn send_internal(
             stream_count: data_stream_count as u32,
         },
     )?;
+
+    write_source_directory_name(&mut control_stream, source_directory_name.as_ref())?;
 
     let mut data_streams = Vec::with_capacity(data_stream_count);
 
@@ -1627,6 +1641,15 @@ fn run_server_with_mode(
 
     let data_stream_count = accepted_session.data_stream_count;
 
+    if let (Some(progress), Some(source_directory_name)) =
+        (&progress, accepted_session.source_directory_name.as_ref())
+    {
+        progress.set_label(format!(
+            "Receiving source folder {}",
+            source_directory_name.as_str(),
+        ));
+    }
+
     let (manifest, summary, _) = control_plane::receive_manifest_entries(&mut control_stream)?;
 
     if let Some(progress) = &progress {
@@ -2003,6 +2026,89 @@ fn accept_with_progress(
     }
 }
 
+fn write_source_directory_name(
+    writer: &mut impl Write,
+    source_directory_name: Option<&SourceDirectoryName>,
+) -> io::Result<()> {
+    let bytes = source_directory_name.map_or(&[][..], |name| name.as_str().as_bytes());
+
+    if bytes.len() > MAX_SOURCE_DIRECTORY_NAME_UTF8_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "source directory name requires {} UTF-8 bytes, exceeding the {MAX_SOURCE_DIRECTORY_NAME_UTF8_BYTES} byte wire limit",
+                bytes.len(),
+            ),
+        ));
+    }
+
+    let byte_count = u32::try_from(bytes.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source directory name byte count cannot be represented",
+        )
+    })?;
+
+    write_u8(writer, MESSAGE_SOURCE_DIRECTORY_NAME)?;
+
+    write_u32(writer, byte_count)?;
+
+    writer.write_all(bytes)?;
+
+    writer.flush()
+}
+
+fn read_source_directory_name(reader: &mut impl Read) -> io::Result<Option<SourceDirectoryName>> {
+    let message = read_u8(reader)?;
+
+    if message != MESSAGE_SOURCE_DIRECTORY_NAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected source-directory-name metadata, received 0x{message:02X}",),
+        ));
+    }
+
+    let byte_count = usize::try_from(read_u32(reader)?).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "received source directory name byte count cannot be represented",
+        )
+    })?;
+
+    if byte_count > MAX_SOURCE_DIRECTORY_NAME_UTF8_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "received source directory name contains {byte_count} UTF-8 bytes, exceeding the {MAX_SOURCE_DIRECTORY_NAME_UTF8_BYTES} byte wire limit",
+            ),
+        ));
+    }
+
+    if byte_count == 0 {
+        return Ok(None);
+    }
+
+    let mut bytes = vec![0_u8; byte_count];
+
+    reader.read_exact(&mut bytes)?;
+
+    let value = String::from_utf8(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("received source directory name was not valid UTF-8: {error}",),
+        )
+    })?;
+
+    SourceDirectoryName::parse(value)
+        .map(Some)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("received invalid source directory name: {error}",),
+            )
+        })
+}
+
 fn accept_session(
     listener: &TcpListener,
     progress: Option<&ProgressCounter>,
@@ -2027,6 +2133,8 @@ fn accept_session(
         ));
     }
 
+    let source_directory_name = read_source_directory_name(&mut control_stream)?;
+
     let data_stream_count = usize::try_from(control_handshake.stream_count).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2040,6 +2148,8 @@ fn accept_session(
         session_id: control_handshake.session_id,
 
         data_stream_count,
+
+        source_directory_name,
     };
 
     let mut data_streams: Vec<Option<TcpStream>> = std::iter::repeat_with(|| None)
@@ -7484,21 +7594,24 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DestinationMode, GenerationCommit, LaneEnd, MESSAGE_FRESH_RESUME_VERIFY_REQUEST,
-        MESSAGE_FRESH_RESUME_VERIFY_RESPONSE, MESSAGE_GENERATION_COMMIT, ReceiverReady,
+        DestinationMode, GenerationCommit, LaneEnd, MAX_SOURCE_DIRECTORY_NAME_UTF8_BYTES,
+        MESSAGE_FRESH_RESUME_VERIFY_REQUEST, MESSAGE_FRESH_RESUME_VERIFY_RESPONSE,
+        MESSAGE_GENERATION_COMMIT, MESSAGE_SOURCE_DIRECTORY_NAME, ReceiverReady,
         TINY_PACK_TARGET_BYTES, TransferAck, TransferFault, TransferTask, accept_session,
         apply_fresh_resume_prefix, apply_resume_offer, build_fresh_generation_plan_with_limits,
         build_transfer_plan, catalog_task_file_id, connect_with_retry_config,
         expected_generation_commit, finalize_large_files, generation_commit_wire_bytes,
         negotiate_verified_fresh_resume_files, persist_generation_commit, prepare_destination,
-        read_generation_commit, read_lane_end, read_receiver_ready, read_transfer_ack, read_u8,
-        read_verification_request, rebuild_fresh_generation_execution, receive_once, run,
-        run_update, run_update_with_fault, run_with_fault, send, temporary_path,
+        read_generation_commit, read_lane_end, read_receiver_ready, read_source_directory_name,
+        read_transfer_ack, read_u8, read_verification_request, rebuild_fresh_generation_execution,
+        receive_once, run, run_update, run_update_with_fault, run_with_fault, send, temporary_path,
         tiny_pack_record_wire_bytes, validate_generation_commit, validate_resume_offer,
         validate_source_metadata, verify_content_digest, write_generation_commit, write_lane_end,
-        write_receiver_ready, write_transfer_ack, write_verification_response,
+        write_receiver_ready, write_source_directory_name, write_transfer_ack,
+        write_verification_response,
     };
     use crate::control_plane::{self, ManifestSummary};
+    use crate::destination_layout::SourceDirectoryName;
     use crate::file_metadata;
     use crate::manifest_scan::{self, FileClass, ManifestEntry};
     use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
@@ -8128,6 +8241,64 @@ mod tests {
     }
 
     #[test]
+    fn source_directory_name_metadata_round_trips() {
+        let expected = SourceDirectoryName::parse("Fényképek").unwrap();
+
+        let mut bytes = Vec::new();
+
+        write_source_directory_name(&mut bytes, Some(&expected)).unwrap();
+
+        let actual = read_source_directory_name(&mut Cursor::new(bytes)).unwrap();
+
+        assert_eq!(actual, Some(expected),);
+    }
+
+    #[test]
+    fn source_directory_name_metadata_allows_unavailable_root() {
+        let mut bytes = Vec::new();
+
+        write_source_directory_name(&mut bytes, None).unwrap();
+
+        let actual = read_source_directory_name(&mut Cursor::new(bytes)).unwrap();
+
+        assert_eq!(actual, None);
+    }
+
+    #[test]
+    fn source_directory_name_metadata_rejects_unsafe_wire_value() {
+        let invalid = b"Desktop\\Nested";
+
+        let mut bytes = vec![MESSAGE_SOURCE_DIRECTORY_NAME];
+
+        bytes.extend_from_slice(&u32::try_from(invalid.len()).unwrap().to_be_bytes());
+
+        bytes.extend_from_slice(invalid);
+
+        let error = read_source_directory_name(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+
+        assert!(error.to_string().contains("invalid source directory name",),);
+    }
+
+    #[test]
+    fn source_directory_name_metadata_rejects_oversized_wire_value() {
+        let oversized = vec![b'a'; MAX_SOURCE_DIRECTORY_NAME_UTF8_BYTES + 1];
+
+        let mut bytes = vec![MESSAGE_SOURCE_DIRECTORY_NAME];
+
+        bytes.extend_from_slice(&u32::try_from(oversized.len()).unwrap().to_be_bytes());
+
+        bytes.extend_from_slice(&oversized);
+
+        let error = read_source_directory_name(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+
+        assert!(error.to_string().contains("wire limit"),);
+    }
+
+    #[test]
     fn receiver_derives_session_from_control_handshake() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
 
@@ -8136,6 +8307,8 @@ mod tests {
         let session_id = 0x1234_5678_9ABC_DEF0;
 
         let receiver = thread::spawn(move || accept_session(&listener, None));
+
+        let source_directory_name = SourceDirectoryName::parse("Desktop").unwrap();
 
         let mut control_stream = TcpStream::connect(address).unwrap();
 
@@ -8154,6 +8327,8 @@ mod tests {
             },
         )
         .unwrap();
+
+        write_source_directory_name(&mut control_stream, Some(&source_directory_name)).unwrap();
 
         let mut data_stream_one = TcpStream::connect(address).unwrap();
 
@@ -8195,7 +8370,12 @@ mod tests {
 
         assert_eq!(accepted_session.session_id, session_id);
 
-        assert_eq!(accepted_session.data_stream_count, 2);
+        assert_eq!(accepted_session.data_stream_count, 2,);
+
+        assert_eq!(
+            accepted_session.source_directory_name,
+            Some(source_directory_name),
+        );
 
         assert_eq!(accepted_data.len(), 2);
 
