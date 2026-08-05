@@ -16,6 +16,82 @@ const REQUEST_USER_AGENT: &str = concat!("networkcopy-speed/", env!("CARGO_PKG_V
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
+const RELEASE_DOWNLOAD_PREFIX: &str =
+    "https://github.com/Nemeth-Tamas/networkcopy-speed/releases/download/";
+
+const SHA256_DIGEST_PREFIX: &str = "sha256:";
+
+const SHA256_HEX_LENGTH: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReleaseArtifactKind {
+    Manager,
+
+    Agent,
+
+    Cli,
+
+    GuiHungarian,
+
+    GuiEnglish,
+}
+
+impl ReleaseArtifactKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Manager => "Manager",
+
+            Self::Agent => "Agent",
+
+            Self::Cli => "CLI",
+
+            Self::GuiHungarian => "GUI-HU",
+
+            Self::GuiEnglish => "GUI-EN",
+        }
+    }
+
+    fn expected_asset_names(self, version: StableVersion) -> [String; 2] {
+        let role = self.label();
+
+        [
+            format!(
+                "NetworkCopy-Speed-v{}.{}.{}-{role}-Windows-x64.exe",
+                version.major, version.minor, version.patch,
+            ),
+            format!("NetworkCopy-Speed-{role}-Windows-x64.exe",),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseAssetInfo {
+    pub id: u64,
+
+    pub name: String,
+
+    pub state: String,
+
+    pub size: u64,
+
+    pub digest: Option<String>,
+
+    pub download_url: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectedReleaseAsset {
+    pub id: u64,
+
+    pub name: String,
+
+    pub size: u64,
+
+    pub sha256_hex: String,
+
+    pub download_url: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReleaseInfo {
     pub tag_name: String,
@@ -23,6 +99,8 @@ pub struct ReleaseInfo {
     pub name: String,
 
     pub html_url: String,
+
+    pub assets: Vec<ReleaseAssetInfo>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,12 +122,30 @@ struct StableVersion {
 }
 
 #[derive(Debug, Deserialize, Eq, PartialEq)]
+struct GitHubReleaseAssetResponse {
+    id: u64,
+
+    name: String,
+
+    state: String,
+
+    size: u64,
+
+    digest: Option<String>,
+
+    browser_download_url: String,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
 struct GitHubReleaseResponse {
     tag_name: String,
 
     name: Option<String>,
 
     html_url: String,
+
+    #[serde(default)]
+    assets: Vec<GitHubReleaseAssetResponse>,
 }
 
 pub fn check_latest(current_version: &str) -> io::Result<ReleaseCheck> {
@@ -81,6 +177,24 @@ pub fn check_latest(current_version: &str) -> io::Result<ReleaseCheck> {
 
     let latest = parse_stable_version(&response.tag_name)?;
 
+    let assets = response
+        .assets
+        .into_iter()
+        .map(|asset| ReleaseAssetInfo {
+            id: asset.id,
+
+            name: asset.name,
+
+            state: asset.state,
+
+            size: asset.size,
+
+            digest: asset.digest,
+
+            download_url: asset.browser_download_url,
+        })
+        .collect();
+
     let display_name = response
         .name
         .filter(|name| !name.trim().is_empty())
@@ -95,10 +209,153 @@ pub fn check_latest(current_version: &str) -> io::Result<ReleaseCheck> {
             name: display_name,
 
             html_url: response.html_url,
+
+            assets,
         },
 
         update_available: latest > current,
     })
+}
+
+pub fn select_release_asset(
+    release: &ReleaseInfo,
+    artifact_kind: ReleaseArtifactKind,
+) -> io::Result<SelectedReleaseAsset> {
+    let version = parse_stable_version(&release.tag_name)?;
+
+    let expected_names = artifact_kind.expected_asset_names(version);
+
+    let mut selected = None;
+
+    for expected_name in &expected_names {
+        let matching = release
+            .assets
+            .iter()
+            .filter(|asset| asset.name == *expected_name)
+            .collect::<Vec<_>>();
+
+        match matching.as_slice() {
+            [] => {}
+
+            [asset] => {
+                selected = Some(*asset);
+
+                break;
+            }
+
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "GitHub release {} contains more than one asset named {expected_name:?}",
+                        release.tag_name,
+                    ),
+                ));
+            }
+        }
+    }
+
+    let asset = selected.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "GitHub release {} does not contain the {} executable; expected {:?} or {:?}",
+                release.tag_name,
+                artifact_kind.label(),
+                expected_names[0],
+                expected_names[1],
+            ),
+        )
+    })?;
+
+    if asset.id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("release asset {:?} has an invalid zero ID", asset.name,),
+        ));
+    }
+
+    if asset.state != "uploaded" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "release asset {:?} is in state {:?}, not \"uploaded\"",
+                asset.name, asset.state,
+            ),
+        ));
+    }
+
+    if asset.size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "release asset {:?} has an invalid zero-byte size",
+                asset.name,
+            ),
+        ));
+    }
+
+    validate_asset_download_url(&asset.download_url)?;
+
+    let digest = asset.digest.as_deref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "release asset {:?} does not provide a GitHub SHA-256 digest",
+                asset.name,
+            ),
+        )
+    })?;
+
+    let sha256_hex = parse_sha256_digest(digest)?;
+
+    Ok(SelectedReleaseAsset {
+        id: asset.id,
+
+        name: asset.name.clone(),
+
+        size: asset.size,
+
+        sha256_hex,
+
+        download_url: asset.download_url.clone(),
+    })
+}
+
+fn parse_sha256_digest(digest: &str) -> io::Result<String> {
+    let hex = digest.strip_prefix(SHA256_DIGEST_PREFIX).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("release asset digest does not use the {SHA256_DIGEST_PREFIX:?} prefix",),
+        )
+    })?;
+
+    if hex.len() != SHA256_HEX_LENGTH || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "release asset SHA-256 digest must contain exactly 64 hexadecimal characters",
+        ));
+    }
+
+    Ok(hex.to_ascii_lowercase())
+}
+
+fn validate_asset_download_url(download_url: &str) -> io::Result<()> {
+    if download_url.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "release asset download URL contains a null character",
+        ));
+    }
+
+    if !download_url.starts_with(RELEASE_DOWNLOAD_PREFIX) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("GitHub returned an unexpected release asset URL: {download_url}",),
+        ));
+    }
+
+    Ok(())
 }
 
 pub fn open_release_page(release_url: &str) -> io::Result<()> {
@@ -230,8 +487,46 @@ fn wide(value: &OsStr) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHubReleaseResponse, parse_release_response, parse_stable_version, validate_release_url,
+        GitHubReleaseResponse, ReleaseArtifactKind, ReleaseAssetInfo, ReleaseInfo,
+        parse_release_response, parse_sha256_digest, parse_stable_version, select_release_asset,
+        validate_release_url,
     };
+    use std::io;
+
+    fn test_release(assets: Vec<ReleaseAssetInfo>) -> ReleaseInfo {
+        ReleaseInfo {
+            tag_name: "v2.4.0".to_string(),
+
+            name: "NetworkCopy v2.4.0".to_string(),
+
+            html_url: "https://github.com/Nemeth-Tamas/networkcopy-speed/releases/tag/v2.4.0"
+                .to_string(),
+
+            assets,
+        }
+    }
+
+    fn test_asset(name: &str, digest: Option<String>) -> ReleaseAssetInfo {
+        ReleaseAssetInfo {
+            id: 42,
+
+            name: name.to_string(),
+
+            state: "uploaded".to_string(),
+
+            size: 12_345_678,
+
+            digest,
+
+            download_url: format!(
+                "https://github.com/Nemeth-Tamas/networkcopy-speed/releases/download/v2.4.0/{name}",
+            ),
+        }
+    }
+
+    fn test_digest() -> String {
+        format!("sha256:{}", "ab".repeat(32),)
+    }
 
     #[test]
     fn stable_versions_ignore_dev_suffixes() {
@@ -275,6 +570,8 @@ mod tests {
 
                 html_url: "https://github.com/Nemeth-Tamas/networkcopy-speed/releases/tag/v2.3.0"
                     .to_string(),
+
+                assets: Vec::new(),
             },
         );
     }
@@ -289,5 +586,90 @@ mod tests {
             )
             .is_ok(),
         );
+    }
+
+    #[test]
+    fn selects_versioned_manager_asset() {
+        let release = test_release(vec![test_asset(
+            "NetworkCopy-Speed-v2.4.0-Manager-Windows-x64.exe",
+            Some(test_digest()),
+        )]);
+
+        let selected = select_release_asset(&release, ReleaseArtifactKind::Manager).unwrap();
+
+        assert_eq!(
+            selected.name,
+            "NetworkCopy-Speed-v2.4.0-Manager-Windows-x64.exe",
+        );
+
+        assert_eq!(selected.sha256_hex, "ab".repeat(32),);
+    }
+
+    #[test]
+    fn accepts_unversioned_official_gui_asset() {
+        let release = test_release(vec![test_asset(
+            "NetworkCopy-Speed-GUI-EN-Windows-x64.exe",
+            Some(test_digest()),
+        )]);
+
+        let selected = select_release_asset(&release, ReleaseArtifactKind::GuiEnglish).unwrap();
+
+        assert_eq!(selected.name, "NetworkCopy-Speed-GUI-EN-Windows-x64.exe",);
+    }
+
+    #[test]
+    fn versioned_asset_is_preferred_over_unversioned_alias() {
+        let release = test_release(vec![
+            test_asset(
+                "NetworkCopy-Speed-GUI-HU-Windows-x64.exe",
+                Some(test_digest()),
+            ),
+            test_asset(
+                "NetworkCopy-Speed-v2.4.0-GUI-HU-Windows-x64.exe",
+                Some(test_digest()),
+            ),
+        ]);
+
+        let selected = select_release_asset(&release, ReleaseArtifactKind::GuiHungarian).unwrap();
+
+        assert_eq!(
+            selected.name,
+            "NetworkCopy-Speed-v2.4.0-GUI-HU-Windows-x64.exe",
+        );
+    }
+
+    #[test]
+    fn wrong_application_asset_is_rejected() {
+        let release = test_release(vec![test_asset(
+            "NetworkCopy-Speed-v2.4.0-Agent-Windows-x64.exe",
+            Some(test_digest()),
+        )]);
+
+        let error = select_release_asset(&release, ReleaseArtifactKind::Manager).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound,);
+
+        assert!(error.to_string().contains("Manager"),);
+    }
+
+    #[test]
+    fn missing_asset_digest_is_rejected() {
+        let release = test_release(vec![test_asset(
+            "NetworkCopy-Speed-v2.4.0-CLI-Windows-x64.exe",
+            None,
+        )]);
+
+        let error = select_release_asset(&release, ReleaseArtifactKind::Cli).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+
+        assert!(error.to_string().contains("SHA-256 digest"),);
+    }
+
+    #[test]
+    fn malformed_sha256_digest_is_rejected() {
+        assert!(parse_sha256_digest("sha256:not-a-real-digest",).is_err(),);
+
+        assert!(parse_sha256_digest(&format!("sha256:{}", "12".repeat(32),),).is_ok(),);
     }
 }
