@@ -1,3 +1,4 @@
+use crate::destination_layout::DestinationLayout;
 use crate::gui_transfer::{GuiConnectionMode, GuiTransferRequest};
 use std::collections::BTreeMap;
 use std::env;
@@ -255,35 +256,45 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
 }
 
 fn encode_request(request: &GuiTransferRequest) -> io::Result<String> {
-    let (direction, connection, path, worker_count, calibration_mib, update_existing) =
-        match request {
-            GuiTransferRequest::Send {
-                connection,
-                source_root,
-                worker_count,
-                calibration_mib,
-            } => (
-                "send",
-                *connection,
-                source_root.as_path(),
-                *worker_count,
-                *calibration_mib,
-                false,
-            ),
+    let (
+        direction,
+        connection,
+        path,
+        worker_count,
+        calibration_mib,
+        update_existing,
+        destination_layout,
+    ) = match request {
+        GuiTransferRequest::Send {
+            connection,
+            source_root,
+            worker_count,
+            calibration_mib,
+        } => (
+            "send",
+            *connection,
+            source_root.as_path(),
+            *worker_count,
+            *calibration_mib,
+            false,
+            DestinationLayout::Exact,
+        ),
 
-            GuiTransferRequest::Receive {
-                connection,
-                destination_root,
-                update_existing,
-            } => (
-                "receive",
-                *connection,
-                destination_root.as_path(),
-                0,
-                0,
-                *update_existing,
-            ),
-        };
+        GuiTransferRequest::Receive {
+            connection,
+            destination_root,
+            destination_layout,
+            update_existing,
+        } => (
+            "receive",
+            *connection,
+            destination_root.as_path(),
+            0,
+            0,
+            *update_existing,
+            *destination_layout,
+        ),
+    };
 
     let (connection_name, address) = match connection {
         GuiConnectionMode::Direct => ("direct", String::new()),
@@ -293,14 +304,16 @@ fn encode_request(request: &GuiTransferRequest) -> io::Result<String> {
 
     Ok(format!(
         "{SESSION_MAGIC}\n\
-             direction={direction}\n\
-             connection={connection_name}\n\
-             address={address}\n\
-             path_utf16={}\n\
-             worker_count={worker_count}\n\
-             calibration_mib={calibration_mib}\n\
-             update_existing={update_existing}\n",
-        encode_path(path,),
+         direction={direction}\n\
+         connection={connection_name}\n\
+         address={address}\n\
+         path_utf16={}\n\
+         worker_count={worker_count}\n\
+         calibration_mib={calibration_mib}\n\
+         update_existing={update_existing}\n\
+         destination_layout={}\n",
+        encode_path(path),
+        destination_layout.code(),
     ))
 }
 
@@ -357,6 +370,22 @@ fn decode_request(contents: &str) -> io::Result<GuiTransferRequest> {
         None => false,
     };
 
+    let destination_layout = match fields.get("destination_layout") {
+        Some(value) => {
+            let code = value.parse::<u8>().map_err(|error| {
+                invalid_data(format!(
+                    "invalid GUI session field 'destination_layout': {error}",
+                ))
+            })?;
+
+            DestinationLayout::from_code(code).map_err(|error| {
+                invalid_data(format!("invalid saved destination layout: {error}",))
+            })?
+        }
+
+        None => DestinationLayout::Exact,
+    };
+
     match direction {
         "send" => {
             let worker_count = parse_field::<usize>(&fields, "worker_count")?;
@@ -381,7 +410,11 @@ fn decode_request(contents: &str) -> io::Result<GuiTransferRequest> {
 
         "receive" => Ok(GuiTransferRequest::Receive {
             connection,
+
             destination_root: path,
+
+            destination_layout,
+
             update_existing,
         }),
 
@@ -446,6 +479,7 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{decode_request, encode_request};
+    use crate::destination_layout::DestinationLayout;
     use crate::gui_transfer::{GuiConnectionMode, GuiTransferRequest};
     use std::net::SocketAddr;
     use std::path::PathBuf;
@@ -477,6 +511,8 @@ mod tests {
 
             destination_root: PathBuf::from(r"C:\NetworkCopy Received"),
 
+            destination_layout: DestinationLayout::SourceNameUnderRoot,
+
             update_existing: true,
         };
 
@@ -486,7 +522,9 @@ mod tests {
 
         assert_eq!(decoded, request,);
 
-        let legacy = encoded.replace("update_existing=true\n", "");
+        let legacy = encoded
+            .replace("update_existing=true\n", "")
+            .replace("destination_layout=1\n", "");
 
         let legacy_decoded = decode_request(&legacy).unwrap();
 
@@ -495,7 +533,9 @@ mod tests {
             GuiTransferRequest::Receive {
                 connection: GuiConnectionMode::Address(address),
 
-                destination_root: PathBuf::from(r"C:\NetworkCopy Received"),
+                destination_root: PathBuf::from(r"C:\NetworkCopy Received",),
+
+                destination_layout: DestinationLayout::Exact,
 
                 update_existing: false,
             },

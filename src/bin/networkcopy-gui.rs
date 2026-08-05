@@ -4,6 +4,7 @@
 )]
 
 use eframe::egui;
+use networkcopy_speed::destination_layout::DestinationLayout;
 use networkcopy_speed::gui_session;
 use networkcopy_speed::gui_transfer::{
     GuiConnectionMode, GuiTransferControl, GuiTransferDiagnostic, GuiTransferProgress,
@@ -182,6 +183,15 @@ struct Text {
     destination_folder: &'static str,
     source_hint: &'static str,
     destination_hint: &'static str,
+
+    destination_layout: &'static str,
+
+    exact_destination: &'static str,
+
+    destination_root_layout: &'static str,
+
+    destination_layout_hint: &'static str,
+
     update_existing: &'static str,
     update_existing_hint: &'static str,
     browse: &'static str,
@@ -201,6 +211,9 @@ struct Text {
     resume_folder: &'static str,
     resume_connection: &'static str,
     resume_update_mode: &'static str,
+
+    resume_destination_layout: &'static str,
+
     enabled: &'static str,
     disabled: &'static str,
     resume_continue: &'static str,
@@ -291,6 +304,14 @@ impl Text {
 
         destination_hint: "Válassza ki a fogadási mappát…",
 
+        destination_layout: "Fogadási elrendezés",
+
+        exact_destination: "Pontos célmappa",
+
+        destination_root_layout: "Célgyökér",
+
+        destination_layout_hint: "Pontos célmappánál a fájlok közvetlenül a kiválasztott mappába kerülnek. Célgyökér módban a küldött mappa neve automatikusan hozzáadódik, például D:\\Mentés\\Desktop.",
+
         update_existing: "Meglévő célmappa frissítése",
 
         update_existing_hint: "Új célmappánál az azonos közepes fájlokat egyszer küldi át, majd helyben újra felhasználja. Frissítéskor a módosult közepes és nagy fájlok meglévő tartalmából csak a szükséges eltéréseket küldi át. A célfájlt csak sikeres ellenőrzés után cseréli le.",
@@ -328,6 +349,8 @@ impl Text {
         resume_connection: "Kapcsolat",
 
         resume_update_mode: "Meglévő mappa frissítése",
+
+        resume_destination_layout: "Fogadási elrendezés",
 
         enabled: "Bekapcsolva",
 
@@ -465,6 +488,14 @@ impl Text {
 
         destination_hint: "Choose the receiving folder…",
 
+        destination_layout: "Receiver layout",
+
+        exact_destination: "Exact destination",
+
+        destination_root_layout: "Destination root",
+
+        destination_layout_hint: "Exact destination places the files directly in the selected folder. Destination root automatically appends the sender's folder name, for example D:\\Backup\\Desktop.",
+
         update_existing: "Update existing destination",
 
         update_existing_hint: "For a fresh destination, identical medium files are transferred once and then reused locally. During updates, existing content from changed medium and large files is reused so only the necessary differences cross the network. Destination files are replaced only after verification succeeds.",
@@ -502,6 +533,8 @@ impl Text {
         resume_connection: "Connection",
 
         resume_update_mode: "Update existing destination",
+
+        resume_destination_layout: "Receiver layout",
 
         enabled: "Enabled",
 
@@ -613,6 +646,9 @@ struct NetworkCopyGui {
     connection: ConnectionChoice,
     source_folder: String,
     destination_folder: String,
+
+    destination_layout: DestinationLayout,
+
     update_existing: bool,
     receiver_address: String,
     bind_address: String,
@@ -678,6 +714,8 @@ impl NetworkCopyGui {
             source_folder: String::new(),
 
             destination_folder: String::new(),
+
+            destination_layout: DestinationLayout::Exact,
 
             update_existing: false,
 
@@ -819,6 +857,30 @@ impl NetworkCopyGui {
             text.choose_destination,
         );
 
+        ui.add_space(12.0);
+
+        ui.label(text.destination_layout);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(
+                &mut self.destination_layout,
+                DestinationLayout::Exact,
+                text.exact_destination,
+            );
+
+            ui.selectable_value(
+                &mut self.destination_layout,
+                DestinationLayout::SourceNameUnderRoot,
+                text.destination_root_layout,
+            );
+        });
+
+        ui.label(
+            egui::RichText::new(text.destination_layout_hint)
+                .small()
+                .color(muted_text()),
+        );
+
         ui.add_space(14.0);
 
         ui.checkbox(&mut self.update_existing, text.update_existing)
@@ -881,6 +943,8 @@ impl NetworkCopyGui {
 
                     destination_root: PathBuf::from(destination),
 
+                    destination_layout: self.destination_layout,
+
                     update_existing: self.update_existing,
                 })
             }
@@ -909,11 +973,14 @@ impl NetworkCopyGui {
             GuiTransferRequest::Receive {
                 connection,
                 destination_root,
+                destination_layout,
                 update_existing,
             } => {
                 self.mode = TransferMode::Receive;
 
                 self.destination_folder = destination_root.display().to_string();
+
+                self.destination_layout = *destination_layout;
 
                 self.update_existing = *update_existing;
 
@@ -1862,32 +1929,36 @@ fn warning_text() -> egui::Color32 {
 }
 
 fn resume_request_summary(ui: &mut egui::Ui, text: Text, request: &GuiTransferRequest) {
-    let (direction, folder, connection, send_options, update_existing) = match request {
-        GuiTransferRequest::Send {
-            connection,
-            source_root,
-            worker_count,
-            calibration_mib,
-        } => (
-            text.send,
-            source_root,
-            *connection,
-            Some((*worker_count, *calibration_mib)),
-            None,
-        ),
+    let (direction, folder, connection, send_options, update_existing, destination_layout) =
+        match request {
+            GuiTransferRequest::Send {
+                connection,
+                source_root,
+                worker_count,
+                calibration_mib,
+            } => (
+                text.send,
+                source_root,
+                *connection,
+                Some((*worker_count, *calibration_mib)),
+                None,
+                None,
+            ),
 
-        GuiTransferRequest::Receive {
-            connection,
-            destination_root,
-            update_existing,
-        } => (
-            text.receive,
-            destination_root,
-            *connection,
-            None,
-            Some(*update_existing),
-        ),
-    };
+            GuiTransferRequest::Receive {
+                connection,
+                destination_root,
+                destination_layout,
+                update_existing,
+            } => (
+                text.receive,
+                destination_root,
+                *connection,
+                None,
+                Some(*update_existing),
+                Some(*destination_layout),
+            ),
+        };
 
     let connection = match connection {
         GuiConnectionMode::Direct => text.direct_connection.to_string(),
@@ -1918,6 +1989,18 @@ fn resume_request_summary(ui: &mut egui::Ui, text: Text, request: &GuiTransferRe
             ui.label(connection);
 
             ui.end_row();
+
+            if let Some(layout) = destination_layout {
+                ui.label(text.resume_destination_layout);
+
+                ui.label(match layout {
+                    DestinationLayout::Exact => text.exact_destination,
+
+                    DestinationLayout::SourceNameUnderRoot => text.destination_root_layout,
+                });
+
+                ui.end_row();
+            }
 
             if let Some(update_existing) = update_existing {
                 ui.label(text.resume_update_mode);
@@ -1980,6 +2063,10 @@ fn localized_phase(language: Language, phase: &str) -> String {
         "Finalizing destination" => "Célmappa véglegesítése".to_string(),
 
         _ => {
+            if let Some(source_name) = phase.strip_prefix("Receiving source folder ") {
+                return format!("Forrásmappa fogadása — {source_name}",);
+            }
+
             if let Some(streams) = phase
                 .strip_prefix("Calibration send - ")
                 .and_then(|value| value.strip_suffix(" streams"))

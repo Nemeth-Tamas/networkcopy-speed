@@ -346,11 +346,11 @@ available for exact-destination transfers by sending no folder-name metadata.
 
 - [x] transmit the selected source folder name as validated protocol metadata;
 - [x] resolve validated source-folder metadata beneath the selected receiver root;
-- [ ] expose Exact destination and Destination root selection in the HU/EN GUI;
+- [x] expose Exact destination and Destination root selection in the HU/EN GUI;
 - [ ] keep a root-mode receiver listening after each completed transfer;
 - [ ] allow cancellation while waiting or while a transfer is active;
-- [ ] retain the existing one-folder standalone sender workflow;
-- [ ] migrate interrupted standalone GUI session persistence.
+- [x] retain the existing one-folder standalone sender workflow;
+- [x] migrate interrupted standalone GUI session persistence.
 
 ### User-approved executable updates
 

@@ -1613,21 +1613,6 @@ pub(crate) fn receive_on_listener_with_progress(
     receive_on_listener_internal(listener, destination_root, Some(progress))
 }
 
-pub(crate) fn receive_on_listener_with_progress_and_mode(
-    listener: &TcpListener,
-    destination_root: &Path,
-    progress: ProgressCounter,
-    destination_mode: DestinationMode,
-) -> io::Result<ReceiveReport> {
-    receive_on_listener_with_progress_mode_and_layout(
-        listener,
-        destination_root,
-        progress,
-        destination_mode,
-        DestinationLayout::Exact,
-    )
-}
-
 pub(crate) fn receive_on_listener_with_progress_mode_and_layout(
     listener: &TcpListener,
     destination_root: &Path,

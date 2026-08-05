@@ -1,5 +1,6 @@
 use crate::calibrated_transfer::{self, CalibratedReceiveReport, CalibratedSendReport};
 use crate::console_progress::{ProgressCounter, ProgressSnapshot};
+use crate::destination_layout::DestinationLayout;
 use crate::direct_address::DIRECT_TRANSFER_PORT;
 use crate::direct_discovery;
 use crate::direct_transfer;
@@ -34,6 +35,8 @@ pub enum GuiTransferRequest {
         connection: GuiConnectionMode,
 
         destination_root: PathBuf,
+
+        destination_layout: DestinationLayout,
 
         update_existing: bool,
     },
@@ -294,6 +297,7 @@ pub fn run_gui_transfer_with_control(
         GuiTransferRequest::Receive {
             connection,
             destination_root,
+            destination_layout,
             update_existing,
         } => {
             let destination_mode = if update_existing {
@@ -306,11 +310,24 @@ pub fn run_gui_transfer_with_control(
                 GuiConnectionMode::Direct => {
                     prepare_direct_receiver()?;
 
-                    direct_transfer::receive_once_with_progress_and_mode(
-                        &destination_root,
-                        control.progress.clone(),
-                        destination_mode,
-                    )?
+                    match destination_layout {
+                        DestinationLayout::Exact => {
+                            direct_transfer::receive_once_with_progress_and_mode(
+                                &destination_root,
+                                control.progress.clone(),
+                                destination_mode,
+                            )
+                        }
+
+                        DestinationLayout::SourceNameUnderRoot => {
+                            direct_transfer::receive_once_with_progress_mode_and_layout(
+                                &destination_root,
+                                control.progress.clone(),
+                                destination_mode,
+                                destination_layout,
+                            )
+                        }
+                    }
                 }
 
                 GuiConnectionMode::Address(bind_address) => {
@@ -318,14 +335,28 @@ pub fn run_gui_transfer_with_control(
 
                     let listener = TcpListener::bind(bind_address)?;
 
-                    calibrated_transfer::receive_once_with_progress_and_mode(
-                        listener,
-                        &destination_root,
-                        control.progress.clone(),
-                        destination_mode,
-                    )?
+                    match destination_layout {
+                        DestinationLayout::Exact => {
+                            calibrated_transfer::receive_once_with_progress_and_mode(
+                                listener,
+                                &destination_root,
+                                control.progress.clone(),
+                                destination_mode,
+                            )
+                        }
+
+                        DestinationLayout::SourceNameUnderRoot => {
+                            calibrated_transfer::receive_once_with_progress_mode_and_layout(
+                                listener,
+                                &destination_root,
+                                control.progress.clone(),
+                                destination_mode,
+                                destination_layout,
+                            )
+                        }
+                    }
                 }
-            };
+            }?;
 
             Ok(receive_summary(report))
         }
@@ -569,6 +600,7 @@ mod tests {
         DiagnosticInput, GuiConnectionMode, GuiTransferControl, GuiTransferDiagnostic,
         GuiTransferDirection, GuiTransferRequest, diagnose_transfer, run_gui_transfer,
     };
+    use crate::destination_layout::DestinationLayout;
     use std::env;
 
     #[test]
@@ -778,6 +810,8 @@ mod tests {
 
                 destination_root: receiver_destination,
 
+                destination_layout: DestinationLayout::Exact,
+
                 update_existing: false,
             })
         });
@@ -929,6 +963,8 @@ mod tests {
 
                 destination_root: first_destination,
 
+                destination_layout: DestinationLayout::Exact,
+
                 update_existing: false,
             })
         });
@@ -963,6 +999,8 @@ mod tests {
                 connection: GuiConnectionMode::Address(second_address),
 
                 destination_root: second_destination,
+
+                destination_layout: DestinationLayout::Exact,
 
                 update_existing: true,
             })
@@ -1034,6 +1072,8 @@ mod tests {
 
                 destination_root: first_destination,
 
+                destination_layout: DestinationLayout::Exact,
+
                 update_existing: false,
             })
         });
@@ -1073,6 +1113,8 @@ mod tests {
                 connection: GuiConnectionMode::Address(second_address),
 
                 destination_root: second_destination,
+
+                destination_layout: DestinationLayout::Exact,
 
                 update_existing: true,
             })
