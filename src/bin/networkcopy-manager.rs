@@ -5928,6 +5928,7 @@ fn run_update_handoff_wait_if_requested() -> Result<bool, String> {
     match &report.publication {
         release_update::UpdateInstallationPublication::PublishedSideBySide {
             installed_executable,
+            ..
         } => {
             eprintln!(
                 "Manager update helper validated {}, observed parent process {} as {:?}, prepared \

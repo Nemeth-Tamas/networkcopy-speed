@@ -280,9 +280,15 @@ pub struct PreparedUpdateInstallation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UpdateInstallationPublication {
-    PublishedSideBySide { installed_executable: PathBuf },
+    PublishedSideBySide {
+        installed_executable: PathBuf,
 
-    ReplacedInPlace { installed_executable: PathBuf },
+        created: bool,
+    },
+
+    ReplacedInPlace {
+        installed_executable: PathBuf,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -647,7 +653,31 @@ pub fn run_update_handoff_wait_mode(
 
     let mut report = complete_update_handoff_after_parent_exit(handoff, parent_wait)?;
 
-    let startup_confirmation = relaunch_installed_update(&report.handoff, &report.publication)?;
+    let startup_confirmation = match relaunch_installed_update(&report.handoff, &report.publication)
+    {
+        Ok(startup_confirmation) => startup_confirmation,
+
+        Err(startup_error) => {
+            return match rollback_failed_update_startup(
+                &report.handoff,
+                &report.installation,
+                &report.publication,
+            ) {
+                Ok(()) => Err(io::Error::new(
+                    startup_error.kind(),
+                    format!("{startup_error}; the failed update installation was rolled back",),
+                )),
+
+                Err(rollback_error) => Err(io::Error::new(
+                    startup_error.kind(),
+                    format!(
+                        "{startup_error}; automatic update rollback also failed: \
+                             {rollback_error}",
+                    ),
+                )),
+            };
+        }
+    };
 
     report.startup_confirmation = Some(startup_confirmation);
 
@@ -860,44 +890,169 @@ fn relaunch_installed_update(
 
     let process_id = child.id();
 
-    let marker = wait_for_update_startup_marker(
-        &mut child,
-        &handoff.startup_marker,
-        handoff,
-        UPDATE_STARTUP_CONFIRM_TIMEOUT,
-    )?;
+    let startup_result = (|| {
+        let marker = wait_for_update_startup_marker(
+            &mut child,
+            &handoff.startup_marker,
+            handoff,
+            UPDATE_STARTUP_CONFIRM_TIMEOUT,
+        )?;
 
-    if marker.process_id != process_id {
+        if marker.process_id != process_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "startup marker records process {}, but the launched Manager is process \
+                     {process_id}",
+                    marker.process_id,
+                ),
+            ));
+        }
+
+        verify_prepared_installation_file(
+            installed_executable,
+            "installed update executable after startup confirmation",
+            handoff.expected_size,
+            &handoff.expected_sha256_hex,
+        )?;
+
+        Ok(UpdateStartupReport {
+            process_id,
+
+            installed_executable: installed_executable.to_path_buf(),
+
+            startup_marker: handoff.startup_marker.clone(),
+        })
+    })();
+
+    match startup_result {
+        Ok(report) => Ok(report),
+
+        Err(startup_error) => match stop_failed_update_process(&mut child) {
+            Ok(()) => Err(startup_error),
+
+            Err(stop_error) => Err(io::Error::new(
+                startup_error.kind(),
+                format!(
+                    "{startup_error}; failed relaunched Manager process {process_id} also \
+                         could not be stopped: {stop_error}",
+                ),
+            )),
+        },
+    }
+}
+
+fn stop_failed_update_process(child: &mut Child) -> io::Result<()> {
+    if child
+        .try_wait()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed Manager process status could not be inspected: {error}",),
+            )
+        })?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    if let Err(kill_error) = child.kill() {
+        if child
+            .try_wait()
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("failed Manager process status could not be rechecked: {error}",),
+                )
+            })?
+            .is_some()
+        {
+            return Ok(());
+        }
+
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+            kill_error.kind(),
             format!(
-                "startup marker records process {}, but the launched Manager is process \
-                 {process_id}",
-                marker.process_id,
+                "failed Manager process {} could not be terminated: {kill_error}",
+                child.id(),
             ),
         ));
     }
 
-    verify_prepared_installation_file(
-        installed_executable,
-        "installed update executable after startup confirmation",
-        handoff.expected_size,
-        &handoff.expected_sha256_hex,
-    )?;
+    child.wait().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "terminated Manager process {} could not be reaped: {error}",
+                child.id(),
+            ),
+        )
+    })?;
 
-    Ok(UpdateStartupReport {
-        process_id,
+    Ok(())
+}
 
-        installed_executable: installed_executable.to_path_buf(),
+fn rollback_failed_update_startup(
+    handoff: &UpdateHandoffPlan,
+    installation: &PreparedUpdateInstallation,
+    publication: &UpdateInstallationPublication,
+) -> io::Result<()> {
+    match publication {
+        UpdateInstallationPublication::PublishedSideBySide {
+            installed_executable,
+            created,
+        } => {
+            if installed_executable != &handoff.install_path {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "published official executable {:?} does not match rollback path {:?}",
+                        installed_executable, handoff.install_path,
+                    ),
+                ));
+            }
 
-        startup_marker: handoff.startup_marker.clone(),
-    })
+            if *created {
+                verify_prepared_installation_file(
+                    installed_executable,
+                    "official update executable before startup rollback",
+                    handoff.expected_size,
+                    &handoff.expected_sha256_hex,
+                )?;
+
+                remove_file_if_exists(installed_executable)?;
+            }
+        }
+
+        UpdateInstallationPublication::ReplacedInPlace {
+            installed_executable,
+        } => {
+            if installed_executable != &handoff.install_path {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "replaced custom executable {:?} does not match rollback path {:?}",
+                        installed_executable, handoff.install_path,
+                    ),
+                ));
+            }
+
+            rollback_custom_named_update(handoff, installation)?;
+        }
+    }
+
+    remove_file_if_exists(&update_startup_marker_partial_path(&handoff.startup_marker))?;
+
+    remove_file_if_exists(&handoff.startup_marker)?;
+
+    Ok(())
 }
 
 fn publication_installed_executable(publication: &UpdateInstallationPublication) -> &Path {
     match publication {
         UpdateInstallationPublication::PublishedSideBySide {
             installed_executable,
+            ..
         }
         | UpdateInstallationPublication::ReplacedInPlace {
             installed_executable,
@@ -1476,6 +1631,8 @@ fn publish_officially_named_update(
 
             return Ok(UpdateInstallationPublication::PublishedSideBySide {
                 installed_executable: handoff.install_path.clone(),
+
+                created: false,
             });
         }
 
@@ -1516,6 +1673,8 @@ fn publish_officially_named_update(
 
     Ok(UpdateInstallationPublication::PublishedSideBySide {
         installed_executable: handoff.install_path.clone(),
+
+        created: true,
     })
 }
 
@@ -3776,9 +3935,10 @@ mod tests {
         open_parent_process, parse_release_response, parse_sha256_digest, parse_stable_version,
         partial_staged_executable_path, prepare_update_installation_files,
         publish_prepared_update_installation, read_update_handoff_plan, read_update_startup_marker,
-        rollback_custom_named_update, select_release_asset, stage_update_from_reader,
-        update_startup_marker_partial_path, validate_release_url, verify_update_handoff_executable,
-        write_update_handoff_plan, write_update_startup_marker_file,
+        rollback_custom_named_update, rollback_failed_update_startup, select_release_asset,
+        stage_update_from_reader, update_startup_marker_partial_path, validate_release_url,
+        verify_update_handoff_executable, write_update_handoff_plan,
+        write_update_startup_marker_file,
     };
     use sha2::{Digest, Sha256};
     use std::ffi::OsStr;
@@ -4628,6 +4788,8 @@ mod tests {
             report.publication,
             UpdateInstallationPublication::PublishedSideBySide {
                 installed_executable: plan.install_path.clone(),
+
+                created: true,
             },
         );
 
@@ -4650,6 +4812,186 @@ mod tests {
         );
 
         assert_eq!(report.installation.candidate_sha256_hex, update_sha256_hex,);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_failure_removes_new_official_executable() {
+        let current_payload = b"old official manager";
+
+        let update_payload = b"new official manager";
+
+        let update_sha256_hex = test_sha256_hex(update_payload);
+
+        let (root, mut plan) = test_update_plan(
+            "startup-rollback-official-created",
+            update_payload.len() as u64,
+            &update_sha256_hex,
+        );
+
+        plan.naming = UpdateInstallNaming::PublishedAssetName;
+
+        plan.current_executable = root.join("NetworkCopy-Speed-v2.3.0-Manager-Windows-x64.exe");
+
+        plan.install_path = root.join(&plan.selected_asset.name);
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        fs::write(&plan.current_executable, current_payload).unwrap();
+
+        fs::write(&plan.staged_executable, update_payload).unwrap();
+
+        let verified = VerifiedStagedUpdate {
+            executable: plan.staged_executable.clone(),
+
+            size: update_payload.len() as u64,
+
+            sha256_hex: update_sha256_hex,
+        };
+
+        let handoff = build_update_handoff_plan(&plan, &verified, 1234).unwrap();
+
+        let report =
+            complete_update_handoff_after_parent_exit(handoff, ParentProcessWaitOutcome::Exited)
+                .unwrap();
+
+        fs::write(&plan.startup_marker, b"failed marker").unwrap();
+
+        fs::write(
+            update_startup_marker_partial_path(&plan.startup_marker),
+            b"failed partial marker",
+        )
+        .unwrap();
+
+        rollback_failed_update_startup(&report.handoff, &report.installation, &report.publication)
+            .unwrap();
+
+        assert!(!plan.install_path.exists(),);
+
+        assert_eq!(
+            fs::read(&plan.current_executable,).unwrap(),
+            current_payload,
+        );
+
+        assert_eq!(fs::read(&plan.backup_executable,).unwrap(), current_payload,);
+
+        assert!(!plan.startup_marker.exists(),);
+
+        assert!(!update_startup_marker_partial_path(&plan.startup_marker,).exists(),);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_failure_preserves_reused_official_executable() {
+        let current_payload = b"old official manager";
+
+        let update_payload = b"new official manager";
+
+        let update_sha256_hex = test_sha256_hex(update_payload);
+
+        let (root, mut plan) = test_update_plan(
+            "startup-rollback-official-reused",
+            update_payload.len() as u64,
+            &update_sha256_hex,
+        );
+
+        plan.naming = UpdateInstallNaming::PublishedAssetName;
+
+        plan.current_executable = root.join("NetworkCopy-Speed-v2.3.0-Manager-Windows-x64.exe");
+
+        plan.install_path = root.join(&plan.selected_asset.name);
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        fs::write(&plan.current_executable, current_payload).unwrap();
+
+        fs::write(&plan.staged_executable, update_payload).unwrap();
+
+        fs::write(&plan.install_path, update_payload).unwrap();
+
+        let verified = VerifiedStagedUpdate {
+            executable: plan.staged_executable.clone(),
+
+            size: update_payload.len() as u64,
+
+            sha256_hex: update_sha256_hex,
+        };
+
+        let handoff = build_update_handoff_plan(&plan, &verified, 1234).unwrap();
+
+        let report =
+            complete_update_handoff_after_parent_exit(handoff, ParentProcessWaitOutcome::Exited)
+                .unwrap();
+
+        assert_eq!(
+            report.publication,
+            UpdateInstallationPublication::PublishedSideBySide {
+                installed_executable: plan.install_path.clone(),
+
+                created: false,
+            },
+        );
+
+        rollback_failed_update_startup(&report.handoff, &report.installation, &report.publication)
+            .unwrap();
+
+        assert_eq!(fs::read(&plan.install_path).unwrap(), update_payload,);
+
+        assert_eq!(
+            fs::read(&plan.current_executable,).unwrap(),
+            current_payload,
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_failure_restores_custom_named_executable() {
+        let current_payload = b"old custom manager";
+
+        let update_payload = b"new custom manager";
+
+        let update_sha256_hex = test_sha256_hex(update_payload);
+
+        let (root, plan) = test_update_plan(
+            "startup-rollback-custom",
+            update_payload.len() as u64,
+            &update_sha256_hex,
+        );
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        fs::write(&plan.current_executable, current_payload).unwrap();
+
+        fs::write(&plan.staged_executable, update_payload).unwrap();
+
+        let verified = VerifiedStagedUpdate {
+            executable: plan.staged_executable.clone(),
+
+            size: update_payload.len() as u64,
+
+            sha256_hex: update_sha256_hex,
+        };
+
+        let handoff = build_update_handoff_plan(&plan, &verified, 1234).unwrap();
+
+        let report =
+            complete_update_handoff_after_parent_exit(handoff, ParentProcessWaitOutcome::Exited)
+                .unwrap();
+
+        assert_eq!(fs::read(&plan.current_executable,).unwrap(), update_payload,);
+
+        rollback_failed_update_startup(&report.handoff, &report.installation, &report.publication)
+            .unwrap();
+
+        assert_eq!(
+            fs::read(&plan.current_executable,).unwrap(),
+            current_payload,
+        );
+
+        assert_eq!(fs::read(&plan.backup_executable,).unwrap(), current_payload,);
 
         let _ = fs::remove_dir_all(root);
     }

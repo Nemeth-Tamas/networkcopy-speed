@@ -344,6 +344,10 @@ exact installed path with a hidden startup-confirmation argument. The installed
 Manager independently validates its path, size, and SHA-256, constructs its
 application state, and atomically writes a process-bound startup marker. The
 helper accepts completion only while that relaunched process remains alive.
+A launch error, early exit, invalid marker, timeout, or post-startup executable
+verification failure stops the failed child before rollback. A newly created
+official path is removed, while a custom-named executable is restored from the
+verified `previous.exe` backup. Pre-existing official destinations are preserved.
 
 After a Manager update is prepared, the running Manager exposes a two-step
 **Install update** confirmation. Final confirmation saves persistence again,
@@ -447,7 +451,10 @@ or payload transfer stops the loop without starting another receiver.
 - [x] relaunch the exact installed executable and require a process-bound startup
       marker after installed-path, size, SHA-256, and Manager-construction checks;
 - [ ] delete backups and staging files only after startup confirmation;
-- [ ] roll back safely when replacement, migration, or startup fails.
+- [x] terminate a failed relaunched Manager and restore the pre-update custom-name
+      executable or remove only the official path created by that transaction;
+- [ ] recover and clean stale update transactions after interrupted helper or
+      cleanup work;
 
 ### Acceptance
 
