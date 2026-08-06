@@ -8,7 +8,7 @@ use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_secon
 use crate::destination_inventory;
 use crate::destination_layout::{self, DestinationLayout, SourceDirectoryName};
 use crate::file_metadata;
-use crate::manifest_scan::{self, FileClass, ManifestEntry};
+use crate::manifest_scan::{self, DirectoryEntry, FileClass, ManifestEntry};
 use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
 use crate::session_cdc_catalog::{
     self, CatalogCandidate, CatalogGeneration, CatalogLimits, CatalogPlan,
@@ -23,7 +23,7 @@ use crate::update_verification::{self, FILE_DIGEST_BYTES, FileDigest};
 use crate::windows_file_replace;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::windows::fs::MetadataExt;
@@ -1193,8 +1193,9 @@ fn send_internal(
     let scan_elapsed = scan_result.report.elapsed;
 
     let manifest = Arc::new(scan_result.manifest);
+    let directories = Arc::new(scan_result.directories);
 
-    let summary = control_plane::summarize_manifest(&manifest)?;
+    let summary = control_plane::summarize_manifest(&manifest, &directories)?;
 
     if let Some(progress) = &progress {
         progress.check_cancelled()?;
@@ -1247,7 +1248,8 @@ fn send_internal(
     let connection_elapsed = connection_started.elapsed();
     let manifest_started = Instant::now();
 
-    let manifest_wire_bytes = control_plane::send_manifest(&mut control_stream, &manifest)?;
+    let manifest_wire_bytes =
+        control_plane::send_manifest(&mut control_stream, &manifest, &directories)?;
 
     let manifest_elapsed = manifest_started.elapsed();
 
@@ -1705,7 +1707,10 @@ fn run_server_with_mode_and_layout(
         ));
     }
 
-    let (manifest, summary, _) = control_plane::receive_manifest_entries(&mut control_stream)?;
+    let (manifest, directories, summary, _) =
+        control_plane::receive_manifest_entries(&mut control_stream)?;
+
+    validate_existing_manifest_directory_paths(&destination_root, &directories)?;
 
     if let Some(progress) = &progress {
         progress.set_label("Transfer receive");
@@ -1777,6 +1782,8 @@ fn run_server_with_mode_and_layout(
         destination_mode,
         preparation_verified_file_ids,
     )?;
+
+    materialize_manifest_directories(&destination_root, &directories)?;
 
     let completed_stripes = resume_journal
         .completed_stripes()
@@ -2441,6 +2448,158 @@ fn negotiate_verified_unchanged_files(
     }
 
     Ok(matching_file_ids)
+}
+
+fn validate_directory_target(path: &Path, metadata: &Metadata) -> io::Result<()> {
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "destination directory path is a reparse point and cannot be used safely: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "destination entry conflicts with a required directory: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_existing_manifest_directory_paths(
+    destination_root: &Path,
+    directories: &[DirectoryEntry],
+) -> io::Result<()> {
+    let root_metadata = match fs::symlink_metadata(destination_root) {
+        Ok(metadata) => metadata,
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to inspect destination root {}: {error}",
+                    destination_root.display()
+                ),
+            ));
+        }
+    };
+
+    validate_directory_target(destination_root, &root_metadata)?;
+
+    for entry in directories {
+        manifest_scan::validate_relative_path(&entry.relative_path)?;
+
+        let mut current = destination_root.to_path_buf();
+
+        for component in entry.relative_path.iter() {
+            current.push(component);
+
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) => {
+                    validate_directory_target(&current, &metadata)?;
+                }
+
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    break;
+                }
+
+                Err(error) => {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to inspect destination directory target {}: {error}",
+                            current.display()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn materialize_manifest_directories(
+    destination_root: &Path,
+    directories: &[DirectoryEntry],
+) -> io::Result<()> {
+    validate_existing_manifest_directory_paths(destination_root, directories)?;
+
+    let root_metadata = fs::symlink_metadata(destination_root).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to inspect prepared destination root {}: {error}",
+                destination_root.display()
+            ),
+        )
+    })?;
+
+    validate_directory_target(destination_root, &root_metadata)?;
+
+    for entry in directories {
+        manifest_scan::validate_relative_path(&entry.relative_path)?;
+
+        let mut current = destination_root.to_path_buf();
+
+        for component in entry.relative_path.iter() {
+            current.push(component);
+
+            let metadata = match fs::symlink_metadata(&current) {
+                Ok(metadata) => metadata,
+
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if let Err(create_error) = fs::create_dir(&current)
+                        && create_error.kind() != io::ErrorKind::AlreadyExists
+                    {
+                        return Err(io::Error::new(
+                            create_error.kind(),
+                            format!(
+                                "failed to create manifest directory {}: {create_error}",
+                                current.display()
+                            ),
+                        ));
+                    }
+
+                    fs::symlink_metadata(&current).map_err(|inspect_error| {
+                        io::Error::new(
+                            inspect_error.kind(),
+                            format!(
+                                "failed to inspect created manifest directory {}: {inspect_error}",
+                                current.display()
+                            ),
+                        )
+                    })?
+                }
+
+                Err(error) => {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "failed to inspect manifest directory {}: {error}",
+                            current.display()
+                        ),
+                    ));
+                }
+            };
+
+            validate_directory_target(&current, &metadata)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn prepare_destination(
@@ -6945,6 +7104,8 @@ fn write_receiver_ready(writer: &mut impl Write, ready: &ReceiverReady) -> io::R
 
     write_u64(writer, ready.summary.entries)?;
 
+    write_u64(writer, ready.summary.directories)?;
+
     write_u64(writer, ready.summary.total_file_bytes)?;
 
     write_u64(writer, ready.summary.fingerprint)?;
@@ -7017,6 +7178,7 @@ fn read_receiver_ready_after_message(
 
     let summary = ManifestSummary {
         entries: read_u64(reader)?,
+        directories: read_u64(reader)?,
         total_file_bytes: read_u64(reader)?,
         fingerprint: read_u64(reader)?,
     };
@@ -7656,20 +7818,21 @@ mod tests {
         apply_fresh_resume_prefix, apply_resume_offer, build_fresh_generation_plan_with_limits,
         build_transfer_plan, catalog_task_file_id, connect_with_retry_config,
         expected_generation_commit, finalize_large_files, generation_commit_wire_bytes,
-        negotiate_verified_fresh_resume_files, persist_generation_commit, prepare_destination,
-        read_generation_commit, read_lane_end, read_receiver_ready, read_source_directory_name,
-        read_transfer_ack, read_u8, read_verification_request, rebuild_fresh_generation_execution,
-        receive_once, run, run_update, run_update_with_fault, run_with_fault,
-        run_with_fault_and_layout, send, temporary_path, tiny_pack_record_wire_bytes,
-        validate_generation_commit, validate_resume_offer, validate_source_metadata,
-        verify_content_digest, write_generation_commit, write_lane_end, write_receiver_ready,
-        write_source_directory_name, write_transfer_ack, write_verification_response,
+        materialize_manifest_directories, negotiate_verified_fresh_resume_files,
+        persist_generation_commit, prepare_destination, read_generation_commit, read_lane_end,
+        read_receiver_ready, read_source_directory_name, read_transfer_ack, read_u8,
+        read_verification_request, rebuild_fresh_generation_execution, receive_once, run,
+        run_update, run_update_with_fault, run_with_fault, run_with_fault_and_layout, send,
+        temporary_path, tiny_pack_record_wire_bytes, validate_generation_commit,
+        validate_resume_offer, validate_source_metadata, verify_content_digest,
+        write_generation_commit, write_lane_end, write_receiver_ready, write_source_directory_name,
+        write_transfer_ack, write_verification_response,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::destination_layout::DestinationLayout;
     use crate::destination_layout::SourceDirectoryName;
     use crate::file_metadata;
-    use crate::manifest_scan::{self, FileClass, ManifestEntry};
+    use crate::manifest_scan::{self, DirectoryEntry, FileClass, ManifestEntry};
     use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
     use crate::session_cdc_catalog::CatalogLimits;
     use std::collections::BTreeSet;
@@ -8747,6 +8910,7 @@ mod tests {
         let expected = ReceiverReady {
             summary: ManifestSummary {
                 entries: 7,
+                directories: 3,
                 total_file_bytes: 12_345,
                 fingerprint: 0x1234_5678_9ABC_DEF0,
             },
@@ -9112,7 +9276,8 @@ mod tests {
 
         let scan = manifest_scan::run(&source, 2).unwrap();
 
-        let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+        let summary =
+            control_plane::summarize_manifest(&scan.manifest, &scan.directories).unwrap();
 
         let large_file_id = scan
             .manifest
@@ -9525,7 +9690,8 @@ mod tests {
 
         let scan = manifest_scan::run(&source, 2).unwrap();
 
-        let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+        let summary =
+            control_plane::summarize_manifest(&scan.manifest, &scan.directories).unwrap();
 
         let basis_file_id = scan
             .manifest
@@ -9692,7 +9858,8 @@ mod tests {
                     .all(|entry| { entry.class == FileClass::Medium }),
             );
 
-            let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+            let summary =
+                control_plane::summarize_manifest(&scan.manifest, &scan.directories).unwrap();
 
             let basis_file_id = scan
                 .manifest
@@ -9871,7 +10038,8 @@ mod tests {
 
             let scan = manifest_scan::run(&source, 2).unwrap();
 
-            let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+            let summary =
+                control_plane::summarize_manifest(&scan.manifest, &scan.directories).unwrap();
 
             let basis_file_id = scan
                 .manifest
@@ -10006,7 +10174,8 @@ mod tests {
                     .all(|entry| { entry.class == FileClass::Large }),
             );
 
-            let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+            let summary =
+                control_plane::summarize_manifest(&scan.manifest, &scan.directories).unwrap();
 
             let first_fault = TransferFault::fail_after_checkpointed_stripes(1).unwrap();
 
@@ -10091,7 +10260,8 @@ mod tests {
 
         assert_eq!(scan.manifest.len(), 1);
 
-        let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+        let summary =
+            control_plane::summarize_manifest(&scan.manifest, &scan.directories).unwrap();
 
         let entry = &scan.manifest[0];
 
@@ -10406,6 +10576,8 @@ mod tests {
         let summary = ManifestSummary {
             entries: manifest.len() as u64,
 
+            directories: 0,
+
             total_file_bytes: manifest.iter().map(|entry| entry.file_size).sum(),
 
             fingerprint: 0x1234_5678_9ABC_DEF0,
@@ -10592,7 +10764,7 @@ mod tests {
 
         assert_eq!(scan.manifest.len(), 1);
 
-        let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+        let summary = control_plane::summarize_manifest(&scan.manifest, &scan.directories).unwrap();
 
         let entry = &scan.manifest[0];
 
@@ -10664,7 +10836,7 @@ mod tests {
 
         let scan = crate::manifest_scan::run(&source_root, 1).unwrap();
 
-        let summary = control_plane::summarize_manifest(&scan.manifest).unwrap();
+        let summary = control_plane::summarize_manifest(&scan.manifest, &scan.directories).unwrap();
 
         let transfer_plan = build_transfer_plan(&scan.manifest, 1).unwrap();
 
@@ -10725,5 +10897,97 @@ mod tests {
         let actual = read_transfer_ack(&mut Cursor::new(bytes)).unwrap();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn loopback_preserves_empty_directories() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let root = env::temp_dir().join(format!(
+            "networkcopy-empty-directory-loopback-{}-{unique}",
+            process::id()
+        ));
+
+        let source = root.join("source");
+        let destination = root.join("destination");
+
+        fs::create_dir_all(source.join("empty")).unwrap();
+        fs::create_dir_all(source.join("nested").join("level").join("deep-empty")).unwrap();
+        fs::create_dir_all(source.join("árvíztűrő").join("üres")).unwrap();
+
+        fs::write(source.join("payload.txt"), b"payload").unwrap();
+
+        let transfer_result = run(&source, &destination, 2, 2);
+
+        let report = transfer_result.unwrap();
+
+        assert_eq!(report.files_copied, 1);
+        assert_eq!(report.bytes_copied, 7);
+
+        assert!(destination.join("empty").is_dir());
+        assert!(
+            destination
+                .join("nested")
+                .join("level")
+                .join("deep-empty")
+                .is_dir()
+        );
+        assert!(destination.join("árvíztűrő").join("üres").is_dir());
+
+        assert_eq!(
+            fs::read(destination.join("payload.txt")).unwrap(),
+            b"payload"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_materialization_is_idempotent_and_rejects_files() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let root = env::temp_dir().join(format!(
+            "networkcopy-directory-materialization-{}-{unique}",
+            process::id()
+        ));
+
+        fs::create_dir_all(&root).unwrap();
+
+        let directories = vec![
+            DirectoryEntry {
+                relative_path: PathBuf::from("empty"),
+            },
+            DirectoryEntry {
+                relative_path: PathBuf::from("nested").join("level").join("empty"),
+            },
+            DirectoryEntry {
+                relative_path: PathBuf::from("árvíztűrő").join("üres"),
+            },
+        ];
+
+        materialize_manifest_directories(&root, &directories).unwrap();
+        materialize_manifest_directories(&root, &directories).unwrap();
+
+        assert!(root.join("empty").is_dir());
+        assert!(root.join("nested").join("level").join("empty").is_dir());
+        assert!(root.join("árvíztűrő").join("üres").is_dir());
+
+        fs::write(root.join("blocked"), b"file").unwrap();
+
+        let conflicting = vec![DirectoryEntry {
+            relative_path: PathBuf::from("blocked").join("child"),
+        }];
+
+        let error = materialize_manifest_directories(&root, &conflicting).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

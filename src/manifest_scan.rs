@@ -488,6 +488,39 @@ pub(crate) fn validate_relative_path(path: &Path) -> io::Result<()> {
         ));
     }
 
+    let path_units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let separator = u16::from(b'\\');
+
+    if path_units.iter().any(|unit| {
+        *unit < 32
+            || matches!(
+                *unit,
+                0x0022 | 0x002A | 0x002F | 0x003A | 0x003C | 0x003E | 0x003F | 0x007C
+            )
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "relative path contains a Windows-invalid character: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    if path_units.last() == Some(&separator)
+        || path_units
+            .windows(2)
+            .any(|pair| pair[0] == separator && pair[1] == separator)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "relative path contains malformed separators: {}",
+                path.display()
+            ),
+        ));
+    }
+
     for component in path.components() {
         if !matches!(component, Component::Normal(_)) {
             return Err(io::Error::new(
@@ -518,6 +551,24 @@ pub(crate) fn validate_tree_entries(
                 format!(
                     "duplicate file path in manifest: {}",
                     entry.relative_path.display()
+                ),
+            ));
+        }
+    }
+
+    for entry in manifest {
+        if let Some(parent_file) = entry
+            .relative_path
+            .ancestors()
+            .skip(1)
+            .find(|ancestor| !ancestor.as_os_str().is_empty() && file_paths.contains(ancestor))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "manifest file {} is nested beneath file {}",
+                    entry.relative_path.display(),
+                    parent_file.display()
                 ),
             ));
         }
@@ -877,6 +928,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_file_nested_beneath_file_path() {
+        let manifest = vec![
+            manifest_entry(PathBuf::from("blocked")),
+            manifest_entry(PathBuf::from("blocked").join("payload.bin")),
+        ];
+
+        assert!(validate_tree_entries(&manifest, &[]).is_err());
+    }
+
+    #[test]
     fn rejects_unsafe_relative_paths() {
         assert!(validate_relative_path(Path::new("alpha")).is_ok());
         assert!(validate_relative_path(Path::new(r"alpha\beta")).is_ok());
@@ -889,6 +950,11 @@ mod tests {
             Path::new(r"\rooted"),
             Path::new(r"..\escape"),
             Path::new(r"alpha\..\escape"),
+            Path::new(r"alpha\\beta"),
+            Path::new("alpha\\"),
+            Path::new("alpha/beta"),
+            Path::new("alpha:stream"),
+            Path::new("alpha|beta"),
         ] {
             assert!(
                 validate_relative_path(unsafe_path).is_err(),

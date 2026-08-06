@@ -1,11 +1,11 @@
 use crate::copy_bench::format_bytes;
-use crate::manifest_scan::{self, FileClass, ManifestEntry};
+use crate::manifest_scan::{self, DirectoryEntry, FileClass, ManifestEntry};
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Once;
 use std::thread;
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // explicit protocol-version check instead of failing as invalid data.
 const PROTOCOL_MAGIC: [u8; 4] = *b"NCS4";
 
-const PROTOCOL_VERSION: u16 = 12;
+const PROTOCOL_VERSION: u16 = 13;
 
 const ROLE_CONTROL: u8 = 1;
 const ROLE_DATA: u8 = 2;
@@ -34,6 +34,9 @@ static UNSUPPORTED_SOCKET_OPTION_WARNING: Once = Once::new();
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+const MANIFEST_KIND_DIRECTORY: u8 = 1;
+const MANIFEST_KIND_FILE: u8 = 2;
+
 pub const DEFAULT_DATA_STREAMS: usize = 4;
 
 #[derive(Debug)]
@@ -41,6 +44,7 @@ pub struct ControlPlaneReport {
     pub worker_count: usize,
     pub data_stream_count: usize,
     pub manifest_entries: u64,
+    pub manifest_directories: u64,
     pub manifest_file_bytes: u64,
     pub manifest_wire_bytes: u64,
     pub scan_elapsed: Duration,
@@ -59,18 +63,26 @@ impl ControlPlaneReport {
             self.manifest_wire_bytes as f64 / 1_000_000.0 / manifest_seconds
         };
 
+        let total_entries = self
+            .manifest_entries
+            .saturating_add(self.manifest_directories);
+
         let entries_per_second = if manifest_seconds == 0.0 {
             0.0
         } else {
-            self.manifest_entries as f64 / manifest_seconds
+            total_entries as f64 / manifest_seconds
         };
 
         println!("TCP control-plane probe complete");
         println!("  Scanner workers:      {}", self.worker_count);
         println!("  TCP data streams:     {}", self.data_stream_count);
         println!(
-            "  Manifest entries:     {}",
+            "  Manifest files:       {}",
             format_bytes(self.manifest_entries)
+        );
+        println!(
+            "  Manifest directories: {}",
+            format_bytes(self.manifest_directories)
         );
         println!(
             "  Represented data:     {} bytes",
@@ -121,6 +133,7 @@ pub(crate) struct Handshake {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ManifestSummary {
     pub(crate) entries: u64,
+    pub(crate) directories: u64,
     pub(crate) total_file_bytes: u64,
     pub(crate) fingerprint: u64,
 }
@@ -159,7 +172,7 @@ pub fn run(
     let scan_result = manifest_scan::run(root, worker_count)?;
 
     let scan_elapsed = scan_result.report.elapsed;
-    let expected_summary = summarize_manifest(&scan_result.manifest)?;
+    let expected_summary = summarize_manifest(&scan_result.manifest, &scan_result.directories)?;
 
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
 
@@ -205,7 +218,11 @@ pub fn run(
     let connect_elapsed = connect_started.elapsed();
     let manifest_started = Instant::now();
 
-    let manifest_wire_bytes = send_manifest(&mut control_stream, &scan_result.manifest)?;
+    let manifest_wire_bytes = send_manifest(
+        &mut control_stream,
+        &scan_result.manifest,
+        &scan_result.directories,
+    )?;
 
     let client_ack = read_manifest_ack(&mut control_stream)?;
 
@@ -250,6 +267,7 @@ pub fn run(
         worker_count,
         data_stream_count,
         manifest_entries: expected_summary.entries,
+        manifest_directories: expected_summary.directories,
         manifest_file_bytes: expected_summary.total_file_bytes,
         manifest_wire_bytes,
         scan_elapsed,
@@ -486,17 +504,25 @@ pub(crate) fn read_handshake(reader: &mut impl Read) -> io::Result<Handshake> {
     })
 }
 
-pub(crate) fn send_manifest(stream: &mut TcpStream, manifest: &[ManifestEntry]) -> io::Result<u64> {
-    let expected_summary = summarize_manifest(manifest)?;
+pub(crate) fn send_manifest(
+    stream: &mut TcpStream,
+    manifest: &[ManifestEntry],
+    directories: &[DirectoryEntry],
+) -> io::Result<u64> {
+    let expected_summary = summarize_manifest(manifest, directories)?;
 
     let buffered = BufWriter::with_capacity(CONTROL_BUFFER_BYTES, stream);
-
     let mut writer = CountingWriter::new(buffered);
 
     write_u8(&mut writer, MESSAGE_MANIFEST)?;
     write_u64(&mut writer, expected_summary.entries)?;
+    write_u64(&mut writer, expected_summary.directories)?;
     write_u64(&mut writer, expected_summary.total_file_bytes)?;
     write_u64(&mut writer, expected_summary.fingerprint)?;
+
+    for directory in directories {
+        write_directory_entry(&mut writer, directory)?;
+    }
 
     for entry in manifest {
         write_manifest_entry(&mut writer, entry)?;
@@ -508,9 +534,13 @@ pub(crate) fn send_manifest(stream: &mut TcpStream, manifest: &[ManifestEntry]) 
 
 pub(crate) fn receive_manifest_entries(
     stream: &mut TcpStream,
-) -> io::Result<(Vec<ManifestEntry>, ManifestSummary, u64)> {
+) -> io::Result<(
+    Vec<ManifestEntry>,
+    Vec<DirectoryEntry>,
+    ManifestSummary,
+    u64,
+)> {
     let buffered = BufReader::with_capacity(CONTROL_BUFFER_BYTES, stream);
-
     let mut reader = CountingReader::new(buffered);
 
     let message_type = read_u8(&mut reader)?;
@@ -527,15 +557,32 @@ pub(crate) fn receive_manifest_entries(
 
     let claimed_summary = ManifestSummary {
         entries: read_u64(&mut reader)?,
+        directories: read_u64(&mut reader)?,
         total_file_bytes: read_u64(&mut reader)?,
         fingerprint: read_u64(&mut reader)?,
     };
 
     let mut actual_summary = ManifestSummary {
         entries: 0,
+        directories: 0,
         total_file_bytes: 0,
         fingerprint: FNV_OFFSET_BASIS,
     };
+
+    let mut directories = Vec::new();
+
+    for _ in 0..claimed_summary.directories {
+        let entry = read_directory_entry(&mut reader)?;
+
+        actual_summary.directories = actual_summary
+            .directories
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("received directory count overflowed"))?;
+
+        actual_summary.fingerprint = hash_directory_entry(actual_summary.fingerprint, &entry);
+
+        directories.push(entry);
+    }
 
     let mut manifest = Vec::new();
 
@@ -557,6 +604,8 @@ pub(crate) fn receive_manifest_entries(
         manifest.push(entry);
     }
 
+    manifest_scan::validate_tree_entries(&manifest, &directories)?;
+
     if actual_summary != claimed_summary {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -568,26 +617,26 @@ pub(crate) fn receive_manifest_entries(
         ));
     }
 
-    Ok((manifest, actual_summary, reader.bytes_read()))
+    Ok((manifest, directories, actual_summary, reader.bytes_read()))
 }
 
 fn receive_manifest(stream: &mut TcpStream) -> io::Result<(ManifestSummary, u64)> {
-    let (_, summary, wire_bytes) = receive_manifest_entries(stream)?;
+    let (_, _, summary, wire_bytes) = receive_manifest_entries(stream)?;
 
     Ok((summary, wire_bytes))
 }
 
-fn write_manifest_entry(writer: &mut impl Write, entry: &ManifestEntry) -> io::Result<()> {
-    validate_relative_path(&entry.relative_path)?;
+fn write_relative_path(writer: &mut impl Write, relative_path: &Path) -> io::Result<()> {
+    manifest_scan::validate_relative_path(relative_path)?;
 
-    let path_units: Vec<u16> = entry.relative_path.as_os_str().encode_wide().collect();
+    let path_units: Vec<u16> = relative_path.as_os_str().encode_wide().collect();
 
     if path_units.is_empty() || path_units.len() > MAX_PATH_UTF16_UNITS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
                 "manifest path has invalid UTF-16 length: {}",
-                entry.relative_path.display()
+                relative_path.display()
             ),
         ));
     }
@@ -603,13 +652,10 @@ fn write_manifest_entry(writer: &mut impl Write, entry: &ManifestEntry) -> io::R
         write_u16(writer, unit)?;
     }
 
-    write_u64(writer, entry.file_size)?;
-    write_u64(writer, entry.last_write_time)?;
-    write_u32(writer, entry.file_attributes)?;
-    write_u8(writer, class_to_wire(entry.class))
+    Ok(())
 }
 
-fn read_manifest_entry(reader: &mut impl Read) -> io::Result<ManifestEntry> {
+fn read_relative_path(reader: &mut impl Read) -> io::Result<PathBuf> {
     let path_unit_count = read_u32(reader)? as usize;
 
     if path_unit_count == 0 || path_unit_count > MAX_PATH_UTF16_UNITS {
@@ -630,8 +676,32 @@ fn read_manifest_entry(reader: &mut impl Read) -> io::Result<ManifestEntry> {
 
     let relative_path = PathBuf::from(OsString::from_wide(&path_units));
 
-    validate_relative_path(&relative_path)?;
+    manifest_scan::validate_relative_path(&relative_path)?;
 
+    Ok(relative_path)
+}
+
+fn write_directory_entry(writer: &mut impl Write, entry: &DirectoryEntry) -> io::Result<()> {
+    write_relative_path(writer, &entry.relative_path)
+}
+
+fn read_directory_entry(reader: &mut impl Read) -> io::Result<DirectoryEntry> {
+    Ok(DirectoryEntry {
+        relative_path: read_relative_path(reader)?,
+    })
+}
+
+fn write_manifest_entry(writer: &mut impl Write, entry: &ManifestEntry) -> io::Result<()> {
+    write_relative_path(writer, &entry.relative_path)?;
+
+    write_u64(writer, entry.file_size)?;
+    write_u64(writer, entry.last_write_time)?;
+    write_u32(writer, entry.file_attributes)?;
+    write_u8(writer, class_to_wire(entry.class))
+}
+
+fn read_manifest_entry(reader: &mut impl Read) -> io::Result<ManifestEntry> {
+    let relative_path = read_relative_path(reader)?;
     let file_size = read_u64(reader)?;
     let last_write_time = read_u64(reader)?;
     let file_attributes = read_u32(reader)?;
@@ -646,38 +716,27 @@ fn read_manifest_entry(reader: &mut impl Read) -> io::Result<ManifestEntry> {
     })
 }
 
-fn validate_relative_path(path: &Path) -> io::Result<()> {
-    if path.as_os_str().is_empty() || path.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "manifest path is not a safe relative path: {}",
-                path.display()
-            ),
-        ));
-    }
+pub(crate) fn summarize_manifest(
+    manifest: &[ManifestEntry],
+    directories: &[DirectoryEntry],
+) -> io::Result<ManifestSummary> {
+    manifest_scan::validate_tree_entries(manifest, directories)?;
 
-    for component in path.components() {
-        if !matches!(component, Component::Normal(_)) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "manifest path contains an unsafe component: {}",
-                    path.display()
-                ),
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-pub(crate) fn summarize_manifest(manifest: &[ManifestEntry]) -> io::Result<ManifestSummary> {
     let mut summary = ManifestSummary {
         entries: 0,
+        directories: 0,
         total_file_bytes: 0,
         fingerprint: FNV_OFFSET_BASIS,
     };
+
+    for directory in directories {
+        summary.directories = summary
+            .directories
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("manifest directory count overflowed"))?;
+
+        summary.fingerprint = hash_directory_entry(summary.fingerprint, directory);
+    }
 
     for entry in manifest {
         summary.entries = summary
@@ -696,7 +755,19 @@ pub(crate) fn summarize_manifest(manifest: &[ManifestEntry]) -> io::Result<Manif
     Ok(summary)
 }
 
+fn hash_directory_entry(mut hash: u64, entry: &DirectoryEntry) -> u64 {
+    hash = hash_bytes(hash, &[MANIFEST_KIND_DIRECTORY]);
+
+    for unit in entry.relative_path.as_os_str().encode_wide() {
+        hash = hash_bytes(hash, &unit.to_be_bytes());
+    }
+
+    hash
+}
+
 fn hash_manifest_entry(mut hash: u64, entry: &ManifestEntry) -> u64 {
+    hash = hash_bytes(hash, &[MANIFEST_KIND_FILE]);
+
     for unit in entry.relative_path.as_os_str().encode_wide() {
         hash = hash_bytes(hash, &unit.to_be_bytes());
     }
@@ -740,6 +811,7 @@ fn class_from_wire(value: u8) -> io::Result<FileClass> {
 fn write_manifest_ack(writer: &mut impl Write, ack: ManifestAck) -> io::Result<()> {
     write_u8(writer, MESSAGE_MANIFEST_ACK)?;
     write_u64(writer, ack.summary.entries)?;
+    write_u64(writer, ack.summary.directories)?;
     write_u64(writer, ack.summary.total_file_bytes)?;
     write_u64(writer, ack.summary.fingerprint)?;
     write_u64(writer, ack.manifest_wire_bytes)?;
@@ -763,6 +835,7 @@ fn read_manifest_ack(reader: &mut impl Read) -> io::Result<ManifestAck> {
     Ok(ManifestAck {
         summary: ManifestSummary {
             entries: read_u64(reader)?,
+            directories: read_u64(reader)?,
             total_file_bytes: read_u64(reader)?,
             fingerprint: read_u64(reader)?,
         },
@@ -920,7 +993,7 @@ mod tests {
         let actual = read_handshake(&mut cursor).unwrap();
 
         assert_eq!(actual, expected);
-        assert_eq!(PROTOCOL_VERSION, 12);
+        assert_eq!(PROTOCOL_VERSION, 13);
     }
 
     #[test]
@@ -929,7 +1002,7 @@ mod tests {
 
         bytes.extend_from_slice(&PROTOCOL_MAGIC);
 
-        bytes.extend_from_slice(&11_u16.to_be_bytes());
+        bytes.extend_from_slice(&12_u16.to_be_bytes());
 
         let error = read_handshake(&mut Cursor::new(bytes)).unwrap_err();
 
@@ -937,9 +1010,9 @@ mod tests {
 
         let message = error.to_string();
 
-        assert!(message.contains("version 11"),);
+        assert!(message.contains("version 12"));
 
-        assert!(message.contains("requires version 12"),);
+        assert!(message.contains("requires version 13"));
     }
 
     #[test]
@@ -960,8 +1033,11 @@ mod tests {
         let root = env::temp_dir().join(format!("networkcopy-control-{}-{unique}", process::id()));
 
         let nested = root.join("árvíztűrő");
+        let nested_empty = nested.join("üres");
+        let top_level_empty = root.join("empty");
 
-        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&nested_empty).unwrap();
+        fs::create_dir_all(&top_level_empty).unwrap();
         fs::write(root.join("root.txt"), b"root").unwrap();
         fs::write(nested.join("tükörfúrógép.bin"), vec![0xA5_u8; 300 * 1024]).unwrap();
 
@@ -972,6 +1048,7 @@ mod tests {
         cleanup_result.unwrap();
 
         assert_eq!(report.manifest_entries, 2);
+        assert_eq!(report.manifest_directories, 3);
         assert_eq!(report.data_stream_count, 3);
         assert!(report.manifest_wire_bytes > 0);
     }
