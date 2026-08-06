@@ -24,10 +24,16 @@ The repository contains:
 
 ## Current status
 
-Current stable release and source version:
+Current stable release:
 
 ```text
 2.4.1
+```
+
+Current development version:
+
+```text
+2.5.0-dev
 ```
 
 v2.4 strengthens unattended setup with exact queue-binding recovery,
