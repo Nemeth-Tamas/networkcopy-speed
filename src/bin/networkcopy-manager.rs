@@ -5843,6 +5843,8 @@ fn configure_style(context: &egui::Context) {
 
 const UPDATE_HANDOFF_WAIT_ARGUMENT: &str = release_update::UPDATE_HANDOFF_WAIT_ARGUMENT;
 
+const UPDATE_STARTUP_CONFIRM_ARGUMENT: &str = release_update::UPDATE_STARTUP_CONFIRM_ARGUMENT;
+
 fn parse_update_handoff_wait_argument(
     arguments: impl IntoIterator<Item = OsString>,
 ) -> Result<Option<PathBuf>, String> {
@@ -5871,6 +5873,45 @@ fn parse_update_handoff_wait_argument(
     Ok(Some(PathBuf::from(handoff_path)))
 }
 
+fn parse_update_startup_confirmation_argument(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Result<Option<PathBuf>, String> {
+    let mut arguments = arguments.into_iter();
+
+    let _program_name = arguments.next();
+
+    let Some(first_argument) = arguments.next() else {
+        return Ok(None);
+    };
+
+    if first_argument.as_os_str() != OsStr::new(UPDATE_STARTUP_CONFIRM_ARGUMENT) {
+        return Ok(None);
+    }
+
+    let handoff_path = arguments.next().ok_or_else(|| {
+        format!("{UPDATE_STARTUP_CONFIRM_ARGUMENT} requires an absolute handoff-plan path",)
+    })?;
+
+    if arguments.next().is_some() {
+        return Err(format!(
+            "{UPDATE_STARTUP_CONFIRM_ARGUMENT} accepts exactly one handoff-plan path",
+        ));
+    }
+
+    Ok(Some(PathBuf::from(handoff_path)))
+}
+
+fn prepare_update_startup_confirmation_if_requested()
+-> Result<Option<release_update::UpdateStartupConfirmation>, String> {
+    let Some(handoff_path) = parse_update_startup_confirmation_argument(env::args_os())? else {
+        return Ok(None);
+    };
+
+    release_update::prepare_update_startup_confirmation(&handoff_path, ReleaseArtifactKind::Manager)
+        .map(Some)
+        .map_err(|error| format!("Manager update startup confirmation failed: {error}",))
+}
+
 fn run_update_handoff_wait_if_requested() -> Result<bool, String> {
     let Some(handoff_path) = parse_update_handoff_wait_argument(env::args_os())? else {
         return Ok(false);
@@ -5880,19 +5921,25 @@ fn run_update_handoff_wait_if_requested() -> Result<bool, String> {
         release_update::run_update_handoff_wait_mode(&handoff_path, ReleaseArtifactKind::Manager)
             .map_err(|error| format!("Manager update handoff wait failed: {error}"))?;
 
+    let startup = report.startup_confirmation.as_ref().ok_or_else(|| {
+        "Manager update helper completed without startup confirmation".to_string()
+    })?;
+
     match &report.publication {
         release_update::UpdateInstallationPublication::PublishedSideBySide {
             installed_executable,
         } => {
             eprintln!(
                 "Manager update helper validated {}, observed parent process {} as {:?}, prepared \
-                 backup {}, and published the verified officially named executable {} beside the \
-                 previous Manager. The new Manager was not launched.",
+                 backup {}, published the verified officially named executable {}, relaunched it \
+                 as process {}, and received healthy-startup marker {}.",
                 report.handoff.staged_executable.display(),
                 report.handoff.parent_process_id,
                 report.parent_wait,
                 report.installation.backup_executable.display(),
                 installed_executable.display(),
+                startup.process_id,
+                startup.startup_marker.display(),
             );
         }
 
@@ -5901,13 +5948,15 @@ fn run_update_handoff_wait_if_requested() -> Result<bool, String> {
         } => {
             eprintln!(
                 "Manager update helper validated {}, observed parent process {} as {:?}, prepared \
-                 backup {}, and atomically replaced the custom-named executable {} while \
-                 preserving its exact path. The new Manager was not launched.",
+                 backup {}, atomically replaced the custom-named executable {}, relaunched it as \
+                 process {}, and received healthy-startup marker {}.",
                 report.handoff.staged_executable.display(),
                 report.handoff.parent_process_id,
                 report.parent_wait,
                 report.installation.backup_executable.display(),
                 installed_executable.display(),
+                startup.process_id,
+                startup.startup_marker.display(),
             );
         }
     }
@@ -5928,6 +5977,16 @@ fn main() -> eframe::Result {
         }
     }
 
+    let startup_confirmation = match prepare_update_startup_confirmation_if_requested() {
+        Ok(confirmation) => confirmation,
+
+        Err(error) => {
+            eprintln!("{error}");
+
+            std::process::exit(2);
+        }
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 900.0])
@@ -5943,10 +6002,18 @@ fn main() -> eframe::Result {
     eframe::run_native(
         APP_NAME,
         options,
-        Box::new(|creation_context| {
+        Box::new(move |creation_context| {
             configure_style(&creation_context.egui_ctx);
 
-            Ok(Box::new(NetworkCopyManager::new()))
+            let application = NetworkCopyManager::new();
+
+            if let Some(confirmation) = startup_confirmation.as_ref() {
+                release_update::write_update_startup_marker(confirmation).map_err(
+                    |error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) },
+                )?;
+            }
+
+            Ok(Box::new(application))
         }),
     )
 }
@@ -5955,10 +6022,11 @@ fn main() -> eframe::Result {
 mod tests {
     use super::{
         DirectManagementRoute, MAX_TRANSFER_HISTORY, ManagedEndpointRole, ManagedStartFailureKind,
-        PairedTransferHistoryEntry, build_batch_queue_requests, join_remote_path, paired_outcome,
-        parent_remote_path, parse_update_handoff_wait_argument, peer_cleanup_target,
-        preflight_queue_route, queue_state_for_outcome, queue_state_for_start_failure,
-        remember_history, resolve_management_endpoints, select_bound_recovery_item,
+        PairedTransferHistoryEntry, UPDATE_STARTUP_CONFIRM_ARGUMENT, build_batch_queue_requests,
+        join_remote_path, paired_outcome, parent_remote_path, parse_update_handoff_wait_argument,
+        parse_update_startup_confirmation_argument, peer_cleanup_target, preflight_queue_route,
+        queue_state_for_outcome, queue_state_for_start_failure, remember_history,
+        resolve_management_endpoints, select_bound_recovery_item,
         select_or_clear_discovered_endpoint, transfer_matches_queue_request,
     };
     use networkcopy_speed::management_active_binding::ActiveQueueBinding;
@@ -6034,6 +6102,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(parsed, None);
+    }
+
+    #[test]
+    fn update_startup_confirmation_argument_accepts_exact_path() {
+        let handoff = PathBuf::from(r"C:\Updates\handoff-plan.bin");
+
+        let parsed = parse_update_startup_confirmation_argument([
+            OsString::from("networkcopy-manager.exe"),
+            OsString::from(UPDATE_STARTUP_CONFIRM_ARGUMENT),
+            handoff.clone().into_os_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(parsed, Some(handoff));
+    }
+
+    #[test]
+    fn update_startup_confirmation_argument_rejects_missing_path() {
+        let error = parse_update_startup_confirmation_argument([
+            OsString::from("networkcopy-manager.exe"),
+            OsString::from(UPDATE_STARTUP_CONFIRM_ARGUMENT),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("requires"));
+    }
+
+    #[test]
+    fn update_startup_confirmation_argument_rejects_trailing_arguments() {
+        let error = parse_update_startup_confirmation_argument([
+            OsString::from("networkcopy-manager.exe"),
+            OsString::from(UPDATE_STARTUP_CONFIRM_ARGUMENT),
+            OsString::from(r"C:\Updates\handoff-plan.bin"),
+            OsString::from("unexpected"),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("exactly one"));
     }
 
     #[test]

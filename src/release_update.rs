@@ -6,9 +6,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use std::process::{self, Command};
+use std::process::{self, Child, Command};
 use std::ptr::{null, null_mut};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_INVALID_PARAMETER, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
@@ -62,6 +63,14 @@ const UPDATE_HANDOFF_PARTIAL_SUFFIX: &str = ".partial";
 
 const UPDATE_STARTUP_MARKER_FILE: &str = "startup-ok.marker";
 
+const UPDATE_STARTUP_MARKER_MAGIC: [u8; 4] = *b"NCS1";
+
+const UPDATE_STARTUP_MARKER_VERSION: u16 = 1;
+
+const UPDATE_STARTUP_MARKER_BYTES: usize = 4 + 2 + 4 + 8 + SHA256_HEX_LENGTH;
+
+const UPDATE_STARTUP_MARKER_PARTIAL_SUFFIX: &str = ".partial";
+
 const UPDATE_PARTIAL_SUFFIX: &str = ".partial";
 
 const UPDATE_DOWNLOAD_BUFFER_SIZE: usize = 64 * 1024;
@@ -70,7 +79,13 @@ const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 const UPDATE_PARENT_EXIT_TIMEOUT: Duration = Duration::from_secs(120);
 
+const UPDATE_STARTUP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(20);
+
+const UPDATE_STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 pub const UPDATE_HANDOFF_WAIT_ARGUMENT: &str = "--update-handoff-wait";
+
+pub const UPDATE_STARTUP_CONFIRM_ARGUMENT: &str = "--update-startup-confirm";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleaseArtifactKind {
@@ -237,6 +252,8 @@ pub struct UpdateHandoffWaitReport {
     pub installation: PreparedUpdateInstallation,
 
     pub publication: UpdateInstallationPublication,
+
+    pub startup_confirmation: Option<UpdateStartupReport>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -266,6 +283,31 @@ pub enum UpdateInstallationPublication {
     PublishedSideBySide { installed_executable: PathBuf },
 
     ReplacedInPlace { installed_executable: PathBuf },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateStartupConfirmation {
+    pub handoff: UpdateHandoffPlan,
+
+    pub process_id: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateStartupReport {
+    pub process_id: u32,
+
+    pub installed_executable: PathBuf,
+
+    pub startup_marker: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UpdateStartupMarker {
+    process_id: u32,
+
+    expected_size: u64,
+
+    expected_sha256_hex: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -603,7 +645,13 @@ pub fn run_update_handoff_wait_mode(
         None => ParentProcessWaitOutcome::AlreadyExited,
     };
 
-    complete_update_handoff_after_parent_exit(handoff, parent_wait)
+    let mut report = complete_update_handoff_after_parent_exit(handoff, parent_wait)?;
+
+    let startup_confirmation = relaunch_installed_update(&report.handoff, &report.publication)?;
+
+    report.startup_confirmation = Some(startup_confirmation);
+
+    Ok(report)
 }
 
 fn complete_update_handoff_after_parent_exit(
@@ -622,6 +670,8 @@ fn complete_update_handoff_after_parent_exit(
         installation,
 
         publication,
+
+        startup_confirmation: None,
     })
 }
 
@@ -714,6 +764,538 @@ fn build_update_handoff_wait_command(handoff: &UpdateHandoffPlan) -> Command {
         .current_dir(&handoff.staging_directory);
 
     command
+}
+
+pub fn prepare_update_startup_confirmation(
+    handoff_path: &Path,
+    expected_artifact_kind: ReleaseArtifactKind,
+) -> io::Result<UpdateStartupConfirmation> {
+    let handoff = read_update_handoff_plan(handoff_path)?;
+
+    if handoff.artifact_kind != expected_artifact_kind {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update startup confirmation targets {}, but this application expects {}",
+                handoff.artifact_kind.label(),
+                expected_artifact_kind.label(),
+            ),
+        ));
+    }
+
+    validate_installed_update_identity(&handoff)?;
+
+    Ok(UpdateStartupConfirmation {
+        handoff,
+
+        process_id: process::id(),
+    })
+}
+
+pub fn write_update_startup_marker(confirmation: &UpdateStartupConfirmation) -> io::Result<()> {
+    if confirmation.process_id != process::id() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "startup confirmation belongs to process {}, but the running process is {}",
+                confirmation.process_id,
+                process::id(),
+            ),
+        ));
+    }
+
+    validate_installed_update_identity(&confirmation.handoff)?;
+
+    let marker = UpdateStartupMarker {
+        process_id: confirmation.process_id,
+
+        expected_size: confirmation.handoff.expected_size,
+
+        expected_sha256_hex: confirmation.handoff.expected_sha256_hex.clone(),
+    };
+
+    write_update_startup_marker_file(&confirmation.handoff.startup_marker, &marker)
+}
+
+fn relaunch_installed_update(
+    handoff: &UpdateHandoffPlan,
+    publication: &UpdateInstallationPublication,
+) -> io::Result<UpdateStartupReport> {
+    let installed_executable = publication_installed_executable(publication);
+
+    if installed_executable != handoff.install_path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "published executable {:?} does not match the handoff install path {:?}",
+                installed_executable, handoff.install_path,
+            ),
+        ));
+    }
+
+    verify_prepared_installation_file(
+        installed_executable,
+        "installed update executable before relaunch",
+        handoff.expected_size,
+        &handoff.expected_sha256_hex,
+    )?;
+
+    let partial_marker = update_startup_marker_partial_path(&handoff.startup_marker);
+
+    remove_file_if_exists(&partial_marker)?;
+
+    remove_file_if_exists(&handoff.startup_marker)?;
+
+    let mut command = build_update_startup_command(handoff)?;
+
+    let mut child = command.spawn().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "installed update executable {:?} could not be launched: {error}",
+                installed_executable,
+            ),
+        )
+    })?;
+
+    let process_id = child.id();
+
+    let marker = wait_for_update_startup_marker(
+        &mut child,
+        &handoff.startup_marker,
+        handoff,
+        UPDATE_STARTUP_CONFIRM_TIMEOUT,
+    )?;
+
+    if marker.process_id != process_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "startup marker records process {}, but the launched Manager is process \
+                 {process_id}",
+                marker.process_id,
+            ),
+        ));
+    }
+
+    verify_prepared_installation_file(
+        installed_executable,
+        "installed update executable after startup confirmation",
+        handoff.expected_size,
+        &handoff.expected_sha256_hex,
+    )?;
+
+    Ok(UpdateStartupReport {
+        process_id,
+
+        installed_executable: installed_executable.to_path_buf(),
+
+        startup_marker: handoff.startup_marker.clone(),
+    })
+}
+
+fn publication_installed_executable(publication: &UpdateInstallationPublication) -> &Path {
+    match publication {
+        UpdateInstallationPublication::PublishedSideBySide {
+            installed_executable,
+        }
+        | UpdateInstallationPublication::ReplacedInPlace {
+            installed_executable,
+        } => installed_executable,
+    }
+}
+
+fn build_update_startup_command(handoff: &UpdateHandoffPlan) -> io::Result<Command> {
+    let install_directory = handoff.install_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "installed update executable has no parent directory",
+        )
+    })?;
+
+    let mut command = Command::new(&handoff.install_path);
+
+    command
+        .arg(UPDATE_STARTUP_CONFIRM_ARGUMENT)
+        .arg(&handoff.handoff_plan)
+        .current_dir(install_directory);
+
+    Ok(command)
+}
+
+fn wait_for_update_startup_marker(
+    child: &mut Child,
+    marker_path: &Path,
+    handoff: &UpdateHandoffPlan,
+    timeout: Duration,
+) -> io::Result<UpdateStartupMarker> {
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "update startup-confirmation deadline overflowed",
+        )
+    })?;
+
+    loop {
+        match read_update_startup_marker(marker_path) {
+            Ok(marker) => {
+                if marker.process_id != child.id() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "startup marker records process {}, but the launched Manager is \
+                             process {}",
+                            marker.process_id,
+                            child.id(),
+                        ),
+                    ));
+                }
+
+                if marker.expected_size != handoff.expected_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "startup marker records {} bytes, expected {}",
+                            marker.expected_size, handoff.expected_size,
+                        ),
+                    ));
+                }
+
+                if marker.expected_sha256_hex != handoff.expected_sha256_hex {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "startup marker SHA-256 does not match the update handoff",
+                    ));
+                }
+
+                if let Some(status) = child.try_wait().map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("launched Manager process status could not be inspected: {error}",),
+                    )
+                })? {
+                    return Err(io::Error::other(format!(
+                        "the installed Manager exited with status {status} immediately after \
+                         writing its startup marker",
+                    )));
+                }
+
+                return Ok(marker);
+            }
+
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+
+            Err(error) => return Err(error),
+        }
+
+        if let Some(status) = child.try_wait().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("launched Manager process status could not be inspected: {error}",),
+            )
+        })? {
+            return Err(io::Error::other(format!(
+                "the installed Manager exited with status {status} before confirming startup",
+            )));
+        }
+
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the installed Manager did not confirm startup within {} seconds",
+                    timeout.as_secs(),
+                ),
+            ));
+        }
+
+        thread::sleep(UPDATE_STARTUP_POLL_INTERVAL);
+    }
+}
+
+fn validate_installed_update_identity(handoff: &UpdateHandoffPlan) -> io::Result<()> {
+    let running_executable = env::current_exe().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "the running executable path could not be determined during update startup: \
+                 {error}",
+            ),
+        )
+    })?;
+
+    let canonical_running = fs::canonicalize(&running_executable).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "running executable {:?} could not be canonicalized: {error}",
+                running_executable,
+            ),
+        )
+    })?;
+
+    let canonical_installed = fs::canonicalize(&handoff.install_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "installed update executable {:?} could not be canonicalized: {error}",
+                handoff.install_path,
+            ),
+        )
+    })?;
+
+    if canonical_running != canonical_installed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update startup confirmation is running from {:?}, expected {:?}",
+                canonical_running, canonical_installed,
+            ),
+        ));
+    }
+
+    verify_prepared_installation_file(
+        &handoff.install_path,
+        "running installed update executable",
+        handoff.expected_size,
+        &handoff.expected_sha256_hex,
+    )
+}
+
+fn write_update_startup_marker_file(
+    marker_path: &Path,
+    marker: &UpdateStartupMarker,
+) -> io::Result<()> {
+    let encoded = encode_update_startup_marker(marker)?;
+
+    let partial_marker = update_startup_marker_partial_path(marker_path);
+
+    remove_file_if_exists(&partial_marker)?;
+
+    match fs::metadata(marker_path) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("update startup marker already exists: {marker_path:?}",),
+            ));
+        }
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("update startup marker {marker_path:?} could not be inspected: {error}",),
+            ));
+        }
+    }
+
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&partial_marker)
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "partial startup marker {:?} could not be created: {error}",
+                        partial_marker,
+                    ),
+                )
+            })?;
+
+        file.write_all(&encoded).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "partial startup marker {:?} could not be written: {error}",
+                    partial_marker,
+                ),
+            )
+        })?;
+
+        file.flush().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "partial startup marker {:?} could not be flushed: {error}",
+                    partial_marker,
+                ),
+            )
+        })?;
+
+        file.sync_all().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "partial startup marker {:?} could not be synchronized: {error}",
+                    partial_marker,
+                ),
+            )
+        })?;
+
+        drop(file);
+
+        crate::windows_file_replace::move_new(&partial_marker, marker_path)
+    })();
+
+    if let Err(error) = result {
+        if let Err(cleanup_error) = remove_file_if_exists(&partial_marker) {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; partial startup marker {:?} also could not be removed: \
+                     {cleanup_error}",
+                    partial_marker,
+                ),
+            ));
+        }
+
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+fn read_update_startup_marker(marker_path: &Path) -> io::Result<UpdateStartupMarker> {
+    let file = fs::File::open(marker_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("update startup marker {marker_path:?} could not be opened: {error}",),
+        )
+    })?;
+
+    let mut reader = file.take((UPDATE_STARTUP_MARKER_BYTES + 1) as u64);
+
+    let mut encoded = Vec::new();
+
+    reader.read_to_end(&mut encoded).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("update startup marker {marker_path:?} could not be read: {error}",),
+        )
+    })?;
+
+    decode_update_startup_marker(&encoded)
+}
+
+fn encode_update_startup_marker(marker: &UpdateStartupMarker) -> io::Result<Vec<u8>> {
+    validate_update_startup_marker(marker)?;
+
+    let mut encoded = Vec::with_capacity(UPDATE_STARTUP_MARKER_BYTES);
+
+    encoded.extend_from_slice(&UPDATE_STARTUP_MARKER_MAGIC);
+
+    encoded.extend_from_slice(&UPDATE_STARTUP_MARKER_VERSION.to_le_bytes());
+
+    encoded.extend_from_slice(&marker.process_id.to_le_bytes());
+
+    encoded.extend_from_slice(&marker.expected_size.to_le_bytes());
+
+    encoded.extend_from_slice(marker.expected_sha256_hex.as_bytes());
+
+    Ok(encoded)
+}
+
+fn decode_update_startup_marker(encoded: &[u8]) -> io::Result<UpdateStartupMarker> {
+    if encoded.len() != UPDATE_STARTUP_MARKER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update startup marker contains {} bytes, expected {}",
+                encoded.len(),
+                UPDATE_STARTUP_MARKER_BYTES,
+            ),
+        ));
+    }
+
+    if encoded[..4] != UPDATE_STARTUP_MARKER_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "update startup marker has an invalid magic value",
+        ));
+    }
+
+    let version = u16::from_le_bytes([encoded[4], encoded[5]]);
+
+    if version != UPDATE_STARTUP_MARKER_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("update startup marker version {version} is unsupported",),
+        ));
+    }
+
+    let process_id = u32::from_le_bytes([encoded[6], encoded[7], encoded[8], encoded[9]]);
+
+    let expected_size = u64::from_le_bytes([
+        encoded[10],
+        encoded[11],
+        encoded[12],
+        encoded[13],
+        encoded[14],
+        encoded[15],
+        encoded[16],
+        encoded[17],
+    ]);
+
+    let expected_sha256_hex = String::from_utf8(encoded[18..].to_vec()).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("update startup marker SHA-256 is not valid UTF-8: {error}",),
+        )
+    })?;
+
+    let marker = UpdateStartupMarker {
+        process_id,
+
+        expected_size,
+
+        expected_sha256_hex,
+    };
+
+    validate_update_startup_marker(&marker)?;
+
+    Ok(marker)
+}
+
+fn validate_update_startup_marker(marker: &UpdateStartupMarker) -> io::Result<()> {
+    if marker.process_id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "update startup marker contains an invalid zero process ID",
+        ));
+    }
+
+    if marker.expected_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "update startup marker contains an invalid zero-byte size",
+        ));
+    }
+
+    if marker.expected_sha256_hex.len() != SHA256_HEX_LENGTH
+        || !marker
+            .expected_sha256_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "update startup marker SHA-256 must contain exactly 64 lowercase hexadecimal \
+             characters",
+        ));
+    }
+
+    Ok(())
+}
+
+fn update_startup_marker_partial_path(marker_path: &Path) -> PathBuf {
+    let mut partial = marker_path.as_os_str().to_os_string();
+
+    partial.push(UPDATE_STARTUP_MARKER_PARTIAL_SUFFIX);
+
+    PathBuf::from(partial)
 }
 
 pub fn prepare_update_installation_files(
@@ -1661,6 +2243,8 @@ fn prepare_update_staging_directory(plan: &UpdateInstallPlan) -> io::Result<()> 
 
     let partial_backup = update_backup_partial_path(&plan.staging_directory);
 
+    let partial_startup_marker = update_startup_marker_partial_path(&plan.startup_marker);
+
     for path in [
         &plan.staged_executable,
         &partial_executable,
@@ -1669,6 +2253,7 @@ fn prepare_update_staging_directory(plan: &UpdateInstallPlan) -> io::Result<()> 
         &plan.handoff_plan,
         &partial_handoff,
         &plan.startup_marker,
+        &partial_startup_marker,
     ] {
         remove_file_if_exists(path)?;
     }
@@ -3181,16 +3766,19 @@ fn wide(value: &OsStr) -> Vec<u16> {
 mod tests {
     use super::{
         GitHubReleaseResponse, ParentProcessWaitOutcome, ReleaseArtifactKind, ReleaseAssetInfo,
-        ReleaseInfo, SelectedReleaseAsset, UPDATE_HANDOFF_WAIT_ARGUMENT, UpdateInstallNaming,
-        UpdateInstallPlan, UpdateInstallationPublication, VerifiedStagedUpdate,
+        ReleaseInfo, SelectedReleaseAsset, UPDATE_HANDOFF_WAIT_ARGUMENT,
+        UPDATE_STARTUP_CONFIRM_ARGUMENT, UpdateInstallNaming, UpdateInstallPlan,
+        UpdateInstallationPublication, UpdateStartupMarker, VerifiedStagedUpdate,
         build_update_handoff_plan, build_update_handoff_wait_command, build_update_install_plan,
-        complete_update_handoff_after_parent_exit, decode_update_handoff_plan, encode_lower_hex,
-        encode_update_handoff_plan, is_official_release_file_name, open_parent_process,
-        parse_release_response, parse_sha256_digest, parse_stable_version,
+        build_update_startup_command, complete_update_handoff_after_parent_exit,
+        decode_update_handoff_plan, decode_update_startup_marker, encode_lower_hex,
+        encode_update_handoff_plan, encode_update_startup_marker, is_official_release_file_name,
+        open_parent_process, parse_release_response, parse_sha256_digest, parse_stable_version,
         partial_staged_executable_path, prepare_update_installation_files,
-        publish_prepared_update_installation, read_update_handoff_plan,
+        publish_prepared_update_installation, read_update_handoff_plan, read_update_startup_marker,
         rollback_custom_named_update, select_release_asset, stage_update_from_reader,
-        validate_release_url, verify_update_handoff_executable, write_update_handoff_plan,
+        update_startup_marker_partial_path, validate_release_url, verify_update_handoff_executable,
+        write_update_handoff_plan, write_update_startup_marker_file,
     };
     use sha2::{Digest, Sha256};
     use std::ffi::OsStr;
@@ -3901,6 +4489,87 @@ mod tests {
             command.get_current_dir(),
             Some(handoff.staging_directory.as_path()),
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_marker_is_atomically_written_and_read_back() {
+        let expected_sha256_hex = "ab".repeat(32);
+
+        let (root, plan) = test_update_plan("startup-marker", 1234, &expected_sha256_hex);
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        let marker = UpdateStartupMarker {
+            process_id: process::id(),
+
+            expected_size: 1234,
+
+            expected_sha256_hex,
+        };
+
+        write_update_startup_marker_file(&plan.startup_marker, &marker).unwrap();
+
+        let read_back = read_update_startup_marker(&plan.startup_marker).unwrap();
+
+        assert_eq!(read_back, marker);
+
+        assert!(!update_startup_marker_partial_path(&plan.startup_marker,).exists(),);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_marker_rejects_trailing_data() {
+        let marker = UpdateStartupMarker {
+            process_id: 1234,
+
+            expected_size: 5678,
+
+            expected_sha256_hex: "ab".repeat(32),
+        };
+
+        let mut encoded = encode_update_startup_marker(&marker).unwrap();
+
+        encoded.push(0);
+
+        let error = decode_update_startup_marker(&encoded).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        assert!(error.to_string().contains("expected"),);
+    }
+
+    #[test]
+    fn startup_command_targets_installed_manager_and_exact_plan() {
+        let sha256_hex = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+        let (root, install_plan) = test_update_plan("startup-command", 3, sha256_hex);
+
+        let verified = VerifiedStagedUpdate {
+            executable: install_plan.staged_executable.clone(),
+
+            size: 3,
+
+            sha256_hex: sha256_hex.to_string(),
+        };
+
+        let handoff = build_update_handoff_plan(&install_plan, &verified, 1234).unwrap();
+
+        let command = build_update_startup_command(&handoff).unwrap();
+
+        assert_eq!(command.get_program(), handoff.install_path.as_os_str(),);
+
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                OsStr::new(UPDATE_STARTUP_CONFIRM_ARGUMENT),
+                handoff.handoff_plan.as_os_str(),
+            ],
+        );
+
+        assert_eq!(command.get_current_dir(), handoff.install_path.parent(),);
 
         let _ = fs::remove_dir_all(root);
     }

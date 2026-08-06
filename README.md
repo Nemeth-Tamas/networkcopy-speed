@@ -339,15 +339,19 @@ exited does the helper prepare the synchronized `previous.exe` backup and the
 separately verified installation candidate. Officially named releases are
 published beside the old executable without overwriting a conflicting file.
 Custom-named releases atomically replace the exited Manager while preserving its
-exact filename. Neither path relaunches the Manager yet.
+exact filename. After either publication policy succeeds, the helper launches the
+exact installed path with a hidden startup-confirmation argument. The installed
+Manager independently validates its path, size, and SHA-256, constructs its
+application state, and atomically writes a process-bound startup marker. The
+helper accepts completion only while that relaunched process remains alive.
 
 After a Manager update is prepared, the running Manager exposes a two-step
 **Install update** confirmation. Final confirmation saves persistence again,
 launches the verified staged Manager in handoff-helper mode, and requests a
 clean close of the original Manager window. The helper waits for that process to
-exit, prepares the verified installation transaction, and publishes either a
-side-by-side officially named executable or an in-place custom-named executable.
-Post-install relaunch and startup confirmation remain separate later steps.
+exit, prepares and publishes the verified installation, relaunches the exact
+installed executable, and waits up to 20 seconds for its validated startup
+marker.
 
 After the original Manager exits, the installation layer writes and synchronizes
 a partial copy of the installed executable, atomically publishes that exact copy
@@ -440,7 +444,8 @@ or payload transfer stops the loop without starting another receiver.
       filename;
 - [x] restore `previous.exe` through a separate verified rollback candidate when
       custom-name post-replacement verification fails;
-- [ ] relaunch the installed executable and confirm successful startup;
+- [x] relaunch the exact installed executable and require a process-bound startup
+      marker after installed-path, size, SHA-256, and Manager-construction checks;
 - [ ] delete backups and staging files only after startup confirmation;
 - [ ] roll back safely when replacement, migration, or startup fails.
 
