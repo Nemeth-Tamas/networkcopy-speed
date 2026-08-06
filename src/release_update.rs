@@ -40,6 +40,10 @@ const UPDATE_STAGING_DIRECTORY: &str = "Updates";
 
 const UPDATE_BACKUP_FILE: &str = "previous.exe";
 
+const UPDATE_BACKUP_PARTIAL_FILE: &str = "previous.exe.partial";
+
+const UPDATE_INSTALL_CANDIDATE_SUFFIX: &str = ".networkcopy-update.partial";
+
 const UPDATE_HANDOFF_FILE: &str = "handoff-plan.bin";
 
 const UPDATE_HANDOFF_MAGIC: [u8; 4] = *b"NCH1";
@@ -234,6 +238,21 @@ pub struct UpdateHandoffLaunchReport {
     pub helper_process_id: u32,
 
     pub parent_process_id: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedUpdateInstallation {
+    pub backup_executable: PathBuf,
+
+    pub install_candidate: PathBuf,
+
+    pub backup_size: u64,
+
+    pub backup_sha256_hex: String,
+
+    pub candidate_size: u64,
+
+    pub candidate_sha256_hex: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -669,6 +688,481 @@ fn build_update_handoff_wait_command(handoff: &UpdateHandoffPlan) -> Command {
     command
 }
 
+pub fn prepare_update_installation_files(
+    handoff: &UpdateHandoffPlan,
+) -> io::Result<PreparedUpdateInstallation> {
+    validate_update_handoff_plan(handoff)?;
+
+    let backup_partial = update_backup_partial_path(&handoff.staging_directory);
+
+    let install_candidate = update_install_candidate_path(handoff)?;
+
+    validate_update_installation_paths(handoff, &backup_partial, &install_candidate)?;
+
+    remove_file_if_exists(&backup_partial)?;
+
+    remove_file_if_exists(&install_candidate)?;
+
+    let backup_copy = copy_verified_file(&handoff.current_executable, &backup_partial, None)?;
+
+    if let Err(error) =
+        crate::windows_file_replace::replace(&backup_partial, &handoff.backup_executable)
+    {
+        if let Err(cleanup_error) = remove_file_if_exists(&backup_partial) {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; incomplete backup {:?} also could not be removed: \
+                     {cleanup_error}",
+                    backup_partial,
+                ),
+            ));
+        }
+
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "verified update backup {:?} could not be published: {error}",
+                handoff.backup_executable,
+            ),
+        ));
+    }
+
+    let published_backup =
+        inspect_file_digest(&handoff.backup_executable, "published update backup")?;
+
+    if published_backup != backup_copy {
+        let mismatch = io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "published update backup {:?} did not match its verified partial copy",
+                handoff.backup_executable,
+            ),
+        );
+
+        if let Err(cleanup_error) = remove_file_if_exists(&handoff.backup_executable) {
+            return Err(io::Error::new(
+                mismatch.kind(),
+                format!("{mismatch}; invalid backup also could not be removed: {cleanup_error}",),
+            ));
+        }
+
+        return Err(mismatch);
+    }
+
+    let candidate_copy = copy_verified_file(
+        &handoff.staged_executable,
+        &install_candidate,
+        Some((handoff.expected_size, handoff.expected_sha256_hex.as_str())),
+    )?;
+
+    Ok(PreparedUpdateInstallation {
+        backup_executable: handoff.backup_executable.clone(),
+
+        install_candidate,
+
+        backup_size: backup_copy.size,
+
+        backup_sha256_hex: backup_copy.sha256_hex,
+
+        candidate_size: candidate_copy.size,
+
+        candidate_sha256_hex: candidate_copy.sha256_hex,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VerifiedFileCopy {
+    size: u64,
+
+    sha256_hex: String,
+}
+
+fn update_backup_partial_path(staging_directory: &Path) -> PathBuf {
+    staging_directory.join(UPDATE_BACKUP_PARTIAL_FILE)
+}
+
+fn update_install_candidate_path(handoff: &UpdateHandoffPlan) -> io::Result<PathBuf> {
+    let install_parent = handoff.install_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "update install path has no parent directory",
+        )
+    })?;
+
+    let install_file_name = handoff.install_path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "update install path has no file name",
+        )
+    })?;
+
+    let mut candidate_file_name = install_file_name.to_os_string();
+
+    candidate_file_name.push(UPDATE_INSTALL_CANDIDATE_SUFFIX);
+
+    Ok(install_parent.join(candidate_file_name))
+}
+
+fn validate_update_installation_paths(
+    handoff: &UpdateHandoffPlan,
+    backup_partial: &Path,
+    install_candidate: &Path,
+) -> io::Result<()> {
+    if !backup_partial.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "partial update backup path must be absolute",
+        ));
+    }
+
+    if !install_candidate.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "update install-candidate path must be absolute",
+        ));
+    }
+
+    if backup_partial.parent() != Some(handoff.staging_directory.as_path()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "partial update backup must be directly inside the staging directory",
+        ));
+    }
+
+    if install_candidate.parent() != handoff.install_path.parent() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "update install candidate must be beside the final install path",
+        ));
+    }
+
+    for (reserved, label) in [
+        (&handoff.current_executable, "current executable"),
+        (&handoff.install_path, "final install path"),
+        (&handoff.staged_executable, "staged executable"),
+        (&handoff.backup_executable, "published backup"),
+        (&handoff.handoff_plan, "handoff plan"),
+        (&handoff.startup_marker, "startup marker"),
+    ] {
+        if install_candidate == reserved {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("update install candidate aliases the {label}"),
+            ));
+        }
+    }
+
+    for (reserved, label) in [
+        (&handoff.staged_executable, "staged executable"),
+        (&handoff.backup_executable, "published backup"),
+        (&handoff.handoff_plan, "handoff plan"),
+        (&handoff.startup_marker, "startup marker"),
+    ] {
+        if backup_partial == reserved {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("partial update backup aliases the {label}"),
+            ));
+        }
+    }
+
+    if backup_partial == install_candidate {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "partial update backup aliases the install candidate",
+        ));
+    }
+
+    Ok(())
+}
+
+fn copy_verified_file(
+    source: &Path,
+    destination: &Path,
+    expected: Option<(u64, &str)>,
+) -> io::Result<VerifiedFileCopy> {
+    match copy_verified_file_inner(source, destination, expected) {
+        Ok(copy) => Ok(copy),
+
+        Err(error) => {
+            if let Err(cleanup_error) = remove_file_if_exists(destination) {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!(
+                        "{error}; incomplete copied file {:?} also could not be removed: \
+                         {cleanup_error}",
+                        destination,
+                    ),
+                ));
+            }
+
+            Err(error)
+        }
+    }
+}
+
+fn copy_verified_file_inner(
+    source: &Path,
+    destination: &Path,
+    expected: Option<(u64, &str)>,
+) -> io::Result<VerifiedFileCopy> {
+    let mut source_file = fs::File::open(source).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("update source file {source:?} could not be opened: {error}"),
+        )
+    })?;
+
+    let source_metadata = source_file.metadata().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("update source file {source:?} could not be inspected: {error}"),
+        )
+    })?;
+
+    if !source_metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("update source is not a regular file: {source:?}"),
+        ));
+    }
+
+    let source_size = source_metadata.len();
+
+    if source_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("update source file is empty: {source:?}"),
+        ));
+    }
+
+    if let Some((expected_size, _expected_sha256_hex)) = expected
+        && source_size != expected_size
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update source file {source:?} contains {source_size} bytes, expected \
+                 {expected_size}",
+            ),
+        ));
+    }
+
+    let mut destination_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("update copy destination {destination:?} could not be created: {error}",),
+            )
+        })?;
+
+    let mut hasher = Sha256::new();
+
+    let mut total_size = 0_u64;
+
+    let mut buffer = [0_u8; UPDATE_DOWNLOAD_BUFFER_SIZE];
+
+    loop {
+        let read = source_file.read(&mut buffer).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("update source file {source:?} could not be read: {error}"),
+            )
+        })?;
+
+        if read == 0 {
+            break;
+        }
+
+        total_size = total_size.checked_add(read as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "copied update file size overflowed u64",
+            )
+        })?;
+
+        if let Some((expected_size, _expected_sha256_hex)) = expected
+            && total_size > expected_size
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "update source file {source:?} exceeded its expected size of \
+                     {expected_size} bytes",
+                ),
+            ));
+        }
+
+        destination_file
+            .write_all(&buffer[..read])
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "update copy destination {destination:?} could not be written: \
+                         {error}",
+                    ),
+                )
+            })?;
+
+        hasher.update(&buffer[..read]);
+    }
+
+    if total_size != source_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update source file {source:?} yielded {total_size} bytes after reporting \
+                 {source_size}",
+            ),
+        ));
+    }
+
+    let final_source_size = source_file
+        .metadata()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "update source file {source:?} could not be re-inspected after copying: \
+                 {error}",
+                ),
+            )
+        })?
+        .len();
+
+    if final_source_size != source_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update source file {source:?} changed size while being copied: \
+                 {source_size} became {final_source_size}",
+            ),
+        ));
+    }
+
+    let sha256_hex = encode_lower_hex(&hasher.finalize());
+
+    if let Some((_expected_size, expected_sha256_hex)) = expected
+        && sha256_hex != expected_sha256_hex
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "copied update file SHA-256 mismatch: expected {expected_sha256_hex}, \
+                 received {sha256_hex}",
+            ),
+        ));
+    }
+
+    destination_file.flush().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("update copy destination {destination:?} could not be flushed: {error}",),
+        )
+    })?;
+
+    destination_file.sync_all().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "update copy destination {destination:?} could not be synchronized: \
+                 {error}",
+            ),
+        )
+    })?;
+
+    drop(destination_file);
+
+    let copied = VerifiedFileCopy {
+        size: total_size,
+
+        sha256_hex,
+    };
+
+    let inspected = inspect_file_digest(destination, "copied update file")?;
+
+    if inspected != copied {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("copied update file {destination:?} did not match the bytes written to it",),
+        ));
+    }
+
+    Ok(copied)
+}
+
+fn inspect_file_digest(path: &Path, label: &str) -> io::Result<VerifiedFileCopy> {
+    let mut file = fs::File::open(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("{label} {path:?} could not be opened: {error}"),
+        )
+    })?;
+
+    let metadata = file.metadata().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("{label} {path:?} could not be inspected: {error}"),
+        )
+    })?;
+
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} is not a regular file: {path:?}"),
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+
+    let mut total_size = 0_u64;
+
+    let mut buffer = [0_u8; UPDATE_DOWNLOAD_BUFFER_SIZE];
+
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("{label} {path:?} could not be read: {error}"),
+            )
+        })?;
+
+        if read == 0 {
+            break;
+        }
+
+        total_size = total_size.checked_add(read as u64).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{label} size overflowed u64"),
+            )
+        })?;
+
+        hasher.update(&buffer[..read]);
+    }
+
+    if total_size != metadata.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{label} {path:?} yielded {total_size} bytes after reporting {}",
+                metadata.len(),
+            ),
+        ));
+    }
+
+    Ok(VerifiedFileCopy {
+        size: total_size,
+
+        sha256_hex: encode_lower_hex(&hasher.finalize()),
+    })
+}
+
 fn stage_update_from_reader<R: Read>(
     plan: &UpdateInstallPlan,
     reader: &mut R,
@@ -795,10 +1289,13 @@ fn prepare_update_staging_directory(plan: &UpdateInstallPlan) -> io::Result<()> 
 
     let partial_handoff = partial_handoff_plan_path(plan);
 
+    let partial_backup = update_backup_partial_path(&plan.staging_directory);
+
     for path in [
         &plan.staged_executable,
         &partial_executable,
         &plan.backup_executable,
+        &partial_backup,
         &plan.handoff_plan,
         &partial_handoff,
         &plan.startup_marker,
@@ -2316,12 +2813,14 @@ mod tests {
         GitHubReleaseResponse, ReleaseArtifactKind, ReleaseAssetInfo, ReleaseInfo,
         SelectedReleaseAsset, UPDATE_HANDOFF_WAIT_ARGUMENT, UpdateInstallNaming, UpdateInstallPlan,
         VerifiedStagedUpdate, build_update_handoff_plan, build_update_handoff_wait_command,
-        build_update_install_plan, decode_update_handoff_plan, encode_update_handoff_plan,
-        is_official_release_file_name, open_parent_process, parse_release_response,
-        parse_sha256_digest, parse_stable_version, partial_staged_executable_path,
+        build_update_install_plan, decode_update_handoff_plan, encode_lower_hex,
+        encode_update_handoff_plan, is_official_release_file_name, open_parent_process,
+        parse_release_response, parse_sha256_digest, parse_stable_version,
+        partial_staged_executable_path, prepare_update_installation_files,
         read_update_handoff_plan, select_release_asset, stage_update_from_reader,
         validate_release_url, verify_update_handoff_executable, write_update_handoff_plan,
     };
+    use sha2::{Digest, Sha256};
     use std::ffi::OsStr;
     use std::fs;
     use std::io;
@@ -2362,6 +2861,10 @@ mod tests {
 
     fn test_digest() -> String {
         format!("sha256:{}", "ab".repeat(32),)
+    }
+
+    fn test_sha256_hex(bytes: &[u8]) -> String {
+        encode_lower_hex(&Sha256::digest(bytes))
     }
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -3026,6 +3529,181 @@ mod tests {
             command.get_current_dir(),
             Some(handoff.staging_directory.as_path()),
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installation_files_preserve_custom_name_without_publishing() {
+        let current_payload = b"old custom manager";
+
+        let update_payload = b"new custom manager";
+
+        let update_sha256_hex = test_sha256_hex(update_payload);
+
+        let (root, plan) = test_update_plan(
+            "installation-custom-name",
+            update_payload.len() as u64,
+            &update_sha256_hex,
+        );
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        fs::write(&plan.current_executable, current_payload).unwrap();
+
+        fs::write(&plan.staged_executable, update_payload).unwrap();
+
+        let verified = VerifiedStagedUpdate {
+            executable: plan.staged_executable.clone(),
+
+            size: update_payload.len() as u64,
+
+            sha256_hex: update_sha256_hex.clone(),
+        };
+
+        let handoff = build_update_handoff_plan(&plan, &verified, 1234).unwrap();
+
+        let prepared = prepare_update_installation_files(&handoff).unwrap();
+
+        assert_eq!(
+            prepared.install_candidate,
+            root.join("current.exe.networkcopy-update.partial"),
+        );
+
+        assert_eq!(fs::read(&plan.current_executable).unwrap(), current_payload,);
+
+        assert_eq!(
+            fs::read(&prepared.backup_executable).unwrap(),
+            current_payload,
+        );
+
+        assert_eq!(
+            fs::read(&prepared.install_candidate).unwrap(),
+            update_payload,
+        );
+
+        assert_eq!(fs::read(&plan.staged_executable).unwrap(), update_payload,);
+
+        assert_eq!(prepared.backup_sha256_hex, test_sha256_hex(current_payload),);
+
+        assert_eq!(prepared.candidate_sha256_hex, update_sha256_hex);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installation_files_prepare_published_name_without_touching_old_executable() {
+        let current_payload = b"old official manager";
+
+        let update_payload = b"new official manager";
+
+        let update_sha256_hex = test_sha256_hex(update_payload);
+
+        let (root, mut plan) = test_update_plan(
+            "installation-published-name",
+            update_payload.len() as u64,
+            &update_sha256_hex,
+        );
+
+        let current_file_name = "NetworkCopy-Speed-v2.3.0-Manager-Windows-x64.exe";
+
+        let install_file_name = plan.selected_asset.name.clone();
+
+        plan.naming = UpdateInstallNaming::PublishedAssetName;
+
+        plan.current_executable = root.join(current_file_name);
+
+        plan.install_path = root.join(&install_file_name);
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        fs::write(&plan.current_executable, current_payload).unwrap();
+
+        fs::write(&plan.staged_executable, update_payload).unwrap();
+
+        let verified = VerifiedStagedUpdate {
+            executable: plan.staged_executable.clone(),
+
+            size: update_payload.len() as u64,
+
+            sha256_hex: update_sha256_hex,
+        };
+
+        let handoff = build_update_handoff_plan(&plan, &verified, 1234).unwrap();
+
+        let prepared = prepare_update_installation_files(&handoff).unwrap();
+
+        assert_eq!(
+            prepared.install_candidate,
+            root.join(format!("{install_file_name}.networkcopy-update.partial",)),
+        );
+
+        assert_eq!(fs::read(&plan.current_executable).unwrap(), current_payload,);
+
+        assert!(!plan.install_path.exists());
+
+        assert_eq!(
+            fs::read(&prepared.backup_executable).unwrap(),
+            current_payload,
+        );
+
+        assert_eq!(
+            fs::read(&prepared.install_candidate).unwrap(),
+            update_payload,
+        );
+
+        assert_eq!(fs::read(&plan.staged_executable).unwrap(), update_payload,);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn installation_files_reject_tampered_candidate_and_keep_backup() {
+        let current_payload = b"old manager";
+
+        let expected_update = b"expected update";
+
+        let tampered_update = b"tampered update";
+
+        assert_eq!(expected_update.len(), tampered_update.len());
+
+        let expected_sha256_hex = test_sha256_hex(expected_update);
+
+        let (root, plan) = test_update_plan(
+            "installation-tampered",
+            expected_update.len() as u64,
+            &expected_sha256_hex,
+        );
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        fs::write(&plan.current_executable, current_payload).unwrap();
+
+        fs::write(&plan.staged_executable, tampered_update).unwrap();
+
+        let verified = VerifiedStagedUpdate {
+            executable: plan.staged_executable.clone(),
+
+            size: expected_update.len() as u64,
+
+            sha256_hex: expected_sha256_hex,
+        };
+
+        let handoff = build_update_handoff_plan(&plan, &verified, 1234).unwrap();
+
+        let error = prepare_update_installation_files(&handoff).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        assert!(error.to_string().contains("SHA-256 mismatch"));
+
+        assert_eq!(fs::read(&plan.current_executable).unwrap(), current_payload,);
+
+        assert_eq!(fs::read(&plan.backup_executable).unwrap(), current_payload,);
+
+        assert!(!root.join("current.exe.networkcopy-update.partial").exists(),);
+
+        assert_eq!(fs::read(&plan.staged_executable).unwrap(), tampered_update,);
 
         let _ = fs::remove_dir_all(root);
     }

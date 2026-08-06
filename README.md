@@ -344,6 +344,14 @@ clean close of the original Manager window. This checkpoint proves the
 cross-process handoff boundary only; the helper still exits without replacing or
 relaunching an executable.
 
+The installation layer can now prepare a non-destructive transaction without
+publishing it. It writes and synchronizes a partial copy of the currently
+installed executable, atomically publishes that exact copy as `previous.exe`,
+and writes a separately verified new-executable candidate beside the final
+install destination. Both copies are read back and SHA-256 checked. The current
+executable, final install path, and running staged helper remain unchanged.
+This preparation primitive is not invoked by the helper yet.
+
 ### Queue recovery hardening
 
 - [x] assign each running endpoint agent a random process identity;
@@ -412,6 +420,13 @@ or payload transfer stops the loop without starting another receiver.
       two-step approval and save persistence immediately before handoff;
 - [x] request a clean close of the original Manager only after the helper process
       has been created successfully;
+- [x] prepare an exact synchronized backup through a partial file and atomically
+      publish it as `previous.exe`;
+- [x] copy the staged executable to a separately verified candidate beside the
+      final destination without moving or modifying the running helper;
+- [x] leave the installed executable and final install path unchanged while
+      preparing the transaction;
+- [ ] invoke transaction preparation only after the recorded parent process exits;
 - [ ] launch an officially named new executable beside an officially named old one;
 - [ ] replace a renamed executable in place while preserving its custom filename;
 - [ ] relaunch the installed executable and confirm successful startup;
