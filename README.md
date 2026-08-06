@@ -349,6 +349,13 @@ verification failure stops the failed child before rollback. A newly created
 official path is removed, while a custom-named executable is restored from the
 verified `previous.exe` backup. Pre-existing official destinations are preserved.
 
+The installed Manager opens the staged helper's exact process object before
+publishing its startup marker and arms a detached cleanup worker. After the
+helper exits, that worker revalidates the installed executable and process-bound
+marker, removes the known candidate, rollback, backup, marker, handoff, and
+staged-helper files, and removes the staging directory only when it is empty.
+Unknown staging entries stop cleanup without deleting any transaction files.
+
 After a Manager update is prepared, the running Manager exposes a two-step
 **Install update** confirmation. Final confirmation saves persistence again,
 launches the verified staged Manager in handoff-helper mode, and requests a
@@ -450,7 +457,9 @@ or payload transfer stops the loop without starting another receiver.
       custom-name post-replacement verification fails;
 - [x] relaunch the exact installed executable and require a process-bound startup
       marker after installed-path, size, SHA-256, and Manager-construction checks;
-- [ ] delete backups and staging files only after startup confirmation;
+- [x] arm installed-process cleanup before startup confirmation, wait for the
+      exact staged helper process to exit, and then remove only known transaction
+      files and the empty staging directory;
 - [x] terminate a failed relaunched Manager and restore the pre-update custom-name
       executable or remove only the official path created by that transaction;
 - [ ] recover and clean stale update transactions after interrupted helper or

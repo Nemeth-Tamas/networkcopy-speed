@@ -5875,7 +5875,7 @@ fn parse_update_handoff_wait_argument(
 
 fn parse_update_startup_confirmation_argument(
     arguments: impl IntoIterator<Item = OsString>,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<(PathBuf, u32)>, String> {
     let mut arguments = arguments.into_iter();
 
     let _program_name = arguments.next();
@@ -5889,27 +5889,57 @@ fn parse_update_startup_confirmation_argument(
     }
 
     let handoff_path = arguments.next().ok_or_else(|| {
-        format!("{UPDATE_STARTUP_CONFIRM_ARGUMENT} requires an absolute handoff-plan path",)
+        format!(
+            "{UPDATE_STARTUP_CONFIRM_ARGUMENT} requires an absolute handoff-plan path and \
+                 helper process ID",
+        )
     })?;
 
-    if arguments.next().is_some() {
+    let helper_process_id = arguments.next().ok_or_else(|| {
+        format!("{UPDATE_STARTUP_CONFIRM_ARGUMENT} requires a helper process ID",)
+    })?;
+
+    let helper_process_id = helper_process_id
+        .to_str()
+        .ok_or_else(|| {
+            format!("{UPDATE_STARTUP_CONFIRM_ARGUMENT} helper process ID is not valid text",)
+        })?
+        .parse::<u32>()
+        .map_err(|error| {
+            format!("{UPDATE_STARTUP_CONFIRM_ARGUMENT} helper process ID is invalid: {error}",)
+        })?;
+
+    if helper_process_id == 0 {
         return Err(format!(
-            "{UPDATE_STARTUP_CONFIRM_ARGUMENT} accepts exactly one handoff-plan path",
+            "{UPDATE_STARTUP_CONFIRM_ARGUMENT} helper process ID must not be zero",
         ));
     }
 
-    Ok(Some(PathBuf::from(handoff_path)))
+    if arguments.next().is_some() {
+        return Err(format!(
+            "{UPDATE_STARTUP_CONFIRM_ARGUMENT} accepts exactly one handoff-plan path and one \
+             helper process ID",
+        ));
+    }
+
+    Ok(Some((PathBuf::from(handoff_path), helper_process_id)))
 }
 
 fn prepare_update_startup_confirmation_if_requested()
 -> Result<Option<release_update::UpdateStartupConfirmation>, String> {
-    let Some(handoff_path) = parse_update_startup_confirmation_argument(env::args_os())? else {
+    let Some((handoff_path, helper_process_id)) =
+        parse_update_startup_confirmation_argument(env::args_os())?
+    else {
         return Ok(None);
     };
 
-    release_update::prepare_update_startup_confirmation(&handoff_path, ReleaseArtifactKind::Manager)
-        .map(Some)
-        .map_err(|error| format!("Manager update startup confirmation failed: {error}",))
+    release_update::prepare_update_startup_confirmation(
+        &handoff_path,
+        ReleaseArtifactKind::Manager,
+        helper_process_id,
+    )
+    .map(Some)
+    .map_err(|error| format!("Manager update startup confirmation failed: {error}",))
 }
 
 fn run_update_handoff_wait_if_requested() -> Result<bool, String> {
@@ -5933,7 +5963,8 @@ fn run_update_handoff_wait_if_requested() -> Result<bool, String> {
             eprintln!(
                 "Manager update helper validated {}, observed parent process {} as {:?}, prepared \
                  backup {}, published the verified officially named executable {}, relaunched it \
-                 as process {}, and received healthy-startup marker {}.",
+                 as process {}, received healthy-startup marker {}, and confirmed that \
+                 installed-process cleanup was armed.",
                 report.handoff.staged_executable.display(),
                 report.handoff.parent_process_id,
                 report.parent_wait,
@@ -5950,7 +5981,8 @@ fn run_update_handoff_wait_if_requested() -> Result<bool, String> {
             eprintln!(
                 "Manager update helper validated {}, observed parent process {} as {:?}, prepared \
                  backup {}, atomically replaced the custom-named executable {}, relaunched it as \
-                 process {}, and received healthy-startup marker {}.",
+                 process {}, received healthy-startup marker {}, and confirmed that \
+                 installed-process cleanup was armed.",
                 report.handoff.staged_executable.display(),
                 report.handoff.parent_process_id,
                 report.parent_wait,
@@ -6106,17 +6138,18 @@ mod tests {
     }
 
     #[test]
-    fn update_startup_confirmation_argument_accepts_exact_path() {
+    fn update_startup_confirmation_argument_accepts_path_and_helper() {
         let handoff = PathBuf::from(r"C:\Updates\handoff-plan.bin");
 
         let parsed = parse_update_startup_confirmation_argument([
             OsString::from("networkcopy-manager.exe"),
             OsString::from(UPDATE_STARTUP_CONFIRM_ARGUMENT),
             handoff.clone().into_os_string(),
+            OsString::from("4321"),
         ])
         .unwrap();
 
-        assert_eq!(parsed, Some(handoff));
+        assert_eq!(parsed, Some((handoff, 4321)),);
     }
 
     #[test]
@@ -6136,11 +6169,25 @@ mod tests {
             OsString::from("networkcopy-manager.exe"),
             OsString::from(UPDATE_STARTUP_CONFIRM_ARGUMENT),
             OsString::from(r"C:\Updates\handoff-plan.bin"),
+            OsString::from("4321"),
             OsString::from("unexpected"),
         ])
         .unwrap_err();
 
         assert!(error.contains("exactly one"));
+    }
+
+    #[test]
+    fn update_startup_confirmation_argument_rejects_invalid_helper_pid() {
+        let error = parse_update_startup_confirmation_argument([
+            OsString::from("networkcopy-manager.exe"),
+            OsString::from(UPDATE_STARTUP_CONFIRM_ARGUMENT),
+            OsString::from(r"C:\Updates\handoff-plan.bin"),
+            OsString::from("not-a-pid"),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("process ID is invalid"),);
     }
 
     #[test]

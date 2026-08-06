@@ -8,6 +8,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Child, Command};
 use std::ptr::{null, null_mut};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
@@ -296,6 +297,8 @@ pub struct UpdateStartupConfirmation {
     pub handoff: UpdateHandoffPlan,
 
     pub process_id: u32,
+
+    pub helper_process_id: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -799,6 +802,7 @@ fn build_update_handoff_wait_command(handoff: &UpdateHandoffPlan) -> Command {
 pub fn prepare_update_startup_confirmation(
     handoff_path: &Path,
     expected_artifact_kind: ReleaseArtifactKind,
+    helper_process_id: u32,
 ) -> io::Result<UpdateStartupConfirmation> {
     let handoff = read_update_handoff_plan(handoff_path)?;
 
@@ -813,12 +817,28 @@ pub fn prepare_update_startup_confirmation(
         ));
     }
 
+    if helper_process_id == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "update startup helper process ID must not be zero",
+        ));
+    }
+
+    if helper_process_id == process::id() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "installed update cannot treat its own process as the cleanup helper",
+        ));
+    }
+
     validate_installed_update_identity(&handoff)?;
 
     Ok(UpdateStartupConfirmation {
         handoff,
 
         process_id: process::id(),
+
+        helper_process_id,
     })
 }
 
@@ -834,7 +854,50 @@ pub fn write_update_startup_marker(confirmation: &UpdateStartupConfirmation) -> 
         ));
     }
 
+    if confirmation.helper_process_id == 0 || confirmation.helper_process_id == process::id() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "startup confirmation contains an invalid helper process ID",
+        ));
+    }
+
     validate_installed_update_identity(&confirmation.handoff)?;
+
+    let helper_process = open_parent_process(confirmation.helper_process_id)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            format!(
+                "update helper process {} exited before cleanup could be armed",
+                confirmation.helper_process_id,
+            ),
+        )
+    })?;
+
+    let cleanup_handoff = confirmation.handoff.clone();
+
+    let (cleanup_sender, cleanup_receiver) = mpsc::sync_channel::<()>(0);
+
+    let cleanup_thread = thread::Builder::new()
+        .name("networkcopy-update-cleanup".to_string())
+        .spawn(move || {
+            if cleanup_receiver.recv().is_err() {
+                return;
+            }
+
+            let cleanup_result =
+                wait_for_update_helper_exit(&helper_process, UPDATE_PARENT_EXIT_TIMEOUT)
+                    .and_then(|()| finalize_successful_update(&cleanup_handoff));
+
+            if let Err(error) = cleanup_result {
+                eprintln!("Manager update cleanup could not finish: {error}",);
+            }
+        })
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("update cleanup worker could not be started: {error}",),
+            )
+        })?;
 
     let marker = UpdateStartupMarker {
         process_id: confirmation.process_id,
@@ -844,7 +907,200 @@ pub fn write_update_startup_marker(confirmation: &UpdateStartupConfirmation) -> 
         expected_sha256_hex: confirmation.handoff.expected_sha256_hex.clone(),
     };
 
-    write_update_startup_marker_file(&confirmation.handoff.startup_marker, &marker)
+    if let Err(error) =
+        write_update_startup_marker_file(&confirmation.handoff.startup_marker, &marker)
+    {
+        drop(cleanup_sender);
+
+        let _ = cleanup_thread.join();
+
+        return Err(error);
+    }
+
+    if cleanup_sender.send(()).is_err() {
+        let marker_cleanup = remove_file_if_exists(&confirmation.handoff.startup_marker);
+
+        let partial_cleanup = remove_file_if_exists(&update_startup_marker_partial_path(
+            &confirmation.handoff.startup_marker,
+        ));
+
+        let _ = cleanup_thread.join();
+
+        return Err(io::Error::other(format!(
+            "update cleanup worker stopped before it could be armed; marker cleanup: {}; \
+             partial-marker cleanup: {}",
+            cleanup_result_label(marker_cleanup),
+            cleanup_result_label(partial_cleanup),
+        )));
+    }
+
+    drop(cleanup_thread);
+
+    Ok(())
+}
+
+fn cleanup_result_label(result: io::Result<()>) -> String {
+    match result {
+        Ok(()) => "successful".to_string(),
+
+        Err(error) => format!("failed: {error}"),
+    }
+}
+
+fn finalize_successful_update(handoff: &UpdateHandoffPlan) -> io::Result<()> {
+    validate_update_handoff_plan(handoff)?;
+
+    verify_prepared_installation_file(
+        &handoff.install_path,
+        "installed executable before successful update cleanup",
+        handoff.expected_size,
+        &handoff.expected_sha256_hex,
+    )?;
+
+    let marker = read_update_startup_marker(&handoff.startup_marker)?;
+
+    if marker.process_id != process::id() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "successful-update marker belongs to process {}, but cleanup is running in \
+                 process {}",
+                marker.process_id,
+                process::id(),
+            ),
+        ));
+    }
+
+    if marker.expected_size != handoff.expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "successful-update marker records {} bytes, expected {}",
+                marker.expected_size, handoff.expected_size,
+            ),
+        ));
+    }
+
+    if marker.expected_sha256_hex != handoff.expected_sha256_hex {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "successful-update marker SHA-256 does not match the handoff",
+        ));
+    }
+
+    let cleanup_paths = successful_update_cleanup_paths(handoff)?;
+
+    validate_successful_cleanup_directory(handoff, &cleanup_paths)?;
+
+    for path in &cleanup_paths {
+        remove_file_if_exists(path)?;
+    }
+
+    match fs::remove_dir(&handoff.staging_directory) {
+        Ok(()) => Ok(()),
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!(
+                "successful update staging directory {:?} could not be removed after all known \
+                 files were deleted: {error}",
+                handoff.staging_directory,
+            ),
+        )),
+    }
+}
+
+fn successful_update_cleanup_paths(handoff: &UpdateHandoffPlan) -> io::Result<Vec<PathBuf>> {
+    let install_candidate = update_install_candidate_path(handoff)?;
+
+    let rollback_candidate = update_rollback_candidate_path(handoff)?;
+
+    let staged_partial = update_staged_partial_path(handoff);
+
+    let backup_partial = update_backup_partial_path(&handoff.staging_directory);
+
+    let handoff_partial = handoff.staging_directory.join(format!(
+        "{UPDATE_HANDOFF_FILE}{UPDATE_HANDOFF_PARTIAL_SUFFIX}",
+    ));
+
+    let startup_marker_partial = update_startup_marker_partial_path(&handoff.startup_marker);
+
+    Ok(vec![
+        install_candidate,
+        rollback_candidate,
+        staged_partial,
+        backup_partial,
+        handoff_partial,
+        startup_marker_partial,
+        handoff.staged_executable.clone(),
+        handoff.backup_executable.clone(),
+        handoff.startup_marker.clone(),
+        handoff.handoff_plan.clone(),
+    ])
+}
+
+fn validate_successful_cleanup_directory(
+    handoff: &UpdateHandoffPlan,
+    cleanup_paths: &[PathBuf],
+) -> io::Result<()> {
+    let entries = match fs::read_dir(&handoff.staging_directory) {
+        Ok(entries) => entries,
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "successful update staging directory {:?} could not be inspected: \
+                         {error}",
+                    handoff.staging_directory,
+                ),
+            ));
+        }
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "successful update staging directory {:?} could not be enumerated: {error}",
+                    handoff.staging_directory,
+                ),
+            )
+        })?;
+
+        let path = entry.path();
+
+        let known = cleanup_paths
+            .iter()
+            .any(|cleanup_path| cleanup_path == &path);
+
+        if !known {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "successful update staging directory contains an unknown entry that will not \
+                     be deleted: {path:?}",
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn update_staged_partial_path(handoff: &UpdateHandoffPlan) -> PathBuf {
+    let mut partial = handoff.staged_executable.as_os_str().to_os_string();
+
+    partial.push(UPDATE_PARTIAL_SUFFIX);
+
+    PathBuf::from(partial)
 }
 
 fn relaunch_installed_update(
@@ -1073,6 +1329,7 @@ fn build_update_startup_command(handoff: &UpdateHandoffPlan) -> io::Result<Comma
     command
         .arg(UPDATE_STARTUP_CONFIRM_ARGUMENT)
         .arg(&handoff.handoff_plan)
+        .arg(process::id().to_string())
         .current_dir(install_directory);
 
     Ok(command)
@@ -3435,6 +3692,10 @@ impl Drop for OwnedProcessHandle {
     }
 }
 
+// SAFETY: The owned Windows process handle can be waited on and closed from a
+// different thread. Ownership remains unique and Drop closes it exactly once.
+unsafe impl Send for OwnedProcessHandle {}
+
 fn open_parent_process(parent_process_id: u32) -> io::Result<Option<OwnedProcessHandle>> {
     if parent_process_id == 0 {
         return Err(io::Error::new(
@@ -3475,14 +3736,29 @@ fn wait_for_parent_process_exit(
     parent_process: &OwnedProcessHandle,
     timeout: Duration,
 ) -> io::Result<()> {
+    wait_for_process_exit(parent_process, timeout, "original application")
+}
+
+fn wait_for_update_helper_exit(
+    helper_process: &OwnedProcessHandle,
+    timeout: Duration,
+) -> io::Result<()> {
+    wait_for_process_exit(helper_process, timeout, "update helper")
+}
+
+fn wait_for_process_exit(
+    process_handle: &OwnedProcessHandle,
+    timeout: Duration,
+    process_label: &str,
+) -> io::Result<()> {
     let timeout_milliseconds = u32::try_from(timeout.as_millis()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "update parent-process timeout cannot be represented in milliseconds",
+            format!("{process_label} timeout cannot be represented in milliseconds",),
         )
     })?;
 
-    let wait_result = unsafe { WaitForSingleObject(parent_process.0, timeout_milliseconds) };
+    let wait_result = unsafe { WaitForSingleObject(process_handle.0, timeout_milliseconds) };
 
     match wait_result {
         WAIT_OBJECT_0 => Ok(()),
@@ -3490,7 +3766,7 @@ fn wait_for_parent_process_exit(
         WAIT_TIMEOUT => Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
-                "the original application did not exit within {} seconds",
+                "the {process_label} did not exit within {} seconds",
                 timeout.as_secs(),
             ),
         )),
@@ -3500,14 +3776,14 @@ fn wait_for_parent_process_exit(
 
             Err(io::Error::new(
                 error.kind(),
-                format!("waiting for the original application failed: {error}"),
+                format!("waiting for the {process_label} failed: {error}",),
             ))
         }
 
         unexpected => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "waiting for the original application returned unexpected status \
+                "waiting for the {process_label} returned unexpected status \
                  0x{unexpected:08X}",
             ),
         )),
@@ -3931,12 +4207,13 @@ mod tests {
         build_update_handoff_plan, build_update_handoff_wait_command, build_update_install_plan,
         build_update_startup_command, complete_update_handoff_after_parent_exit,
         decode_update_handoff_plan, decode_update_startup_marker, encode_lower_hex,
-        encode_update_handoff_plan, encode_update_startup_marker, is_official_release_file_name,
-        open_parent_process, parse_release_response, parse_sha256_digest, parse_stable_version,
-        partial_staged_executable_path, prepare_update_installation_files,
-        publish_prepared_update_installation, read_update_handoff_plan, read_update_startup_marker,
-        rollback_custom_named_update, rollback_failed_update_startup, select_release_asset,
-        stage_update_from_reader, update_startup_marker_partial_path, validate_release_url,
+        encode_update_handoff_plan, encode_update_startup_marker, finalize_successful_update,
+        is_official_release_file_name, open_parent_process, parse_release_response,
+        parse_sha256_digest, parse_stable_version, partial_staged_executable_path,
+        prepare_update_installation_files, publish_prepared_update_installation,
+        read_update_handoff_plan, read_update_startup_marker, rollback_custom_named_update,
+        rollback_failed_update_startup, select_release_asset, stage_update_from_reader,
+        successful_update_cleanup_paths, update_startup_marker_partial_path, validate_release_url,
         verify_update_handoff_executable, write_update_handoff_plan,
         write_update_startup_marker_file,
     };
@@ -4721,15 +4998,165 @@ mod tests {
 
         assert_eq!(command.get_program(), handoff.install_path.as_os_str(),);
 
+        let helper_process_id = process::id().to_string();
+
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             vec![
-                OsStr::new(UPDATE_STARTUP_CONFIRM_ARGUMENT),
+                OsStr::new(UPDATE_STARTUP_CONFIRM_ARGUMENT,),
                 handoff.handoff_plan.as_os_str(),
+                OsStr::new(&helper_process_id),
             ],
         );
 
         assert_eq!(command.get_current_dir(), handoff.install_path.parent(),);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successful_update_cleanup_removes_known_transaction_files() {
+        let current_payload = b"old official manager";
+
+        let update_payload = b"new official manager";
+
+        let update_sha256_hex = test_sha256_hex(update_payload);
+
+        let (root, mut plan) = test_update_plan(
+            "successful-cleanup",
+            update_payload.len() as u64,
+            &update_sha256_hex,
+        );
+
+        plan.naming = UpdateInstallNaming::PublishedAssetName;
+
+        plan.current_executable = root.join("NetworkCopy-Speed-v2.3.0-Manager-Windows-x64.exe");
+
+        plan.install_path = root.join(&plan.selected_asset.name);
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        fs::write(&plan.current_executable, current_payload).unwrap();
+
+        fs::write(&plan.staged_executable, update_payload).unwrap();
+
+        let verified = VerifiedStagedUpdate {
+            executable: plan.staged_executable.clone(),
+
+            size: update_payload.len() as u64,
+
+            sha256_hex: update_sha256_hex.clone(),
+        };
+
+        let handoff = build_update_handoff_plan(&plan, &verified, 1234).unwrap();
+
+        let report =
+            complete_update_handoff_after_parent_exit(handoff, ParentProcessWaitOutcome::Exited)
+                .unwrap();
+
+        let marker = UpdateStartupMarker {
+            process_id: process::id(),
+
+            expected_size: update_payload.len() as u64,
+
+            expected_sha256_hex: update_sha256_hex,
+        };
+
+        write_update_startup_marker_file(&plan.startup_marker, &marker).unwrap();
+
+        for path in successful_update_cleanup_paths(&report.handoff).unwrap() {
+            if path.exists() {
+                continue;
+            }
+
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+
+            fs::write(path, b"known cleanup file").unwrap();
+        }
+
+        finalize_successful_update(&report.handoff).unwrap();
+
+        assert!(!plan.staging_directory.exists(),);
+
+        assert_eq!(
+            fs::read(&plan.current_executable,).unwrap(),
+            current_payload,
+        );
+
+        assert_eq!(fs::read(&plan.install_path).unwrap(), update_payload,);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successful_update_cleanup_rejects_unknown_staging_entry() {
+        let current_payload = b"old official manager";
+
+        let update_payload = b"new official manager";
+
+        let update_sha256_hex = test_sha256_hex(update_payload);
+
+        let (root, mut plan) = test_update_plan(
+            "successful-cleanup-unknown",
+            update_payload.len() as u64,
+            &update_sha256_hex,
+        );
+
+        plan.naming = UpdateInstallNaming::PublishedAssetName;
+
+        plan.current_executable = root.join("NetworkCopy-Speed-v2.3.0-Manager-Windows-x64.exe");
+
+        plan.install_path = root.join(&plan.selected_asset.name);
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        fs::write(&plan.current_executable, current_payload).unwrap();
+
+        fs::write(&plan.staged_executable, update_payload).unwrap();
+
+        let verified = VerifiedStagedUpdate {
+            executable: plan.staged_executable.clone(),
+
+            size: update_payload.len() as u64,
+
+            sha256_hex: update_sha256_hex.clone(),
+        };
+
+        let handoff = build_update_handoff_plan(&plan, &verified, 1234).unwrap();
+
+        let report =
+            complete_update_handoff_after_parent_exit(handoff, ParentProcessWaitOutcome::Exited)
+                .unwrap();
+
+        let marker = UpdateStartupMarker {
+            process_id: process::id(),
+
+            expected_size: update_payload.len() as u64,
+
+            expected_sha256_hex: update_sha256_hex,
+        };
+
+        write_update_startup_marker_file(&plan.startup_marker, &marker).unwrap();
+
+        let unknown = plan.staging_directory.join("do-not-delete-me.txt");
+
+        fs::write(&unknown, b"unrelated user data").unwrap();
+
+        let error = finalize_successful_update(&report.handoff).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+
+        assert!(unknown.exists());
+
+        assert!(plan.staged_executable.exists(),);
+
+        assert!(plan.backup_executable.exists(),);
+
+        assert!(plan.startup_marker.exists(),);
+
+        assert!(plan.install_path.exists(),);
 
         let _ = fs::remove_dir_all(root);
     }
