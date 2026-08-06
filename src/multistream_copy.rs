@@ -9276,8 +9276,7 @@ mod tests {
 
         let scan = manifest_scan::run(&source, 2).unwrap();
 
-        let summary =
-            control_plane::summarize_manifest(&scan.manifest, &scan.directories).unwrap();
+        let summary = control_plane::summarize_manifest(&scan.manifest, &scan.directories).unwrap();
 
         let large_file_id = scan
             .manifest
@@ -9690,8 +9689,7 @@ mod tests {
 
         let scan = manifest_scan::run(&source, 2).unwrap();
 
-        let summary =
-            control_plane::summarize_manifest(&scan.manifest, &scan.directories).unwrap();
+        let summary = control_plane::summarize_manifest(&scan.manifest, &scan.directories).unwrap();
 
         let basis_file_id = scan
             .manifest
@@ -10260,8 +10258,7 @@ mod tests {
 
         assert_eq!(scan.manifest.len(), 1);
 
-        let summary =
-            control_plane::summarize_manifest(&scan.manifest, &scan.directories).unwrap();
+        let summary = control_plane::summarize_manifest(&scan.manifest, &scan.directories).unwrap();
 
         let entry = &scan.manifest[0];
 

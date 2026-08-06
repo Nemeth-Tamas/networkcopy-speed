@@ -46,6 +46,9 @@ const REMOTE_BROWSER_HEIGHT: f32 = 460.0;
 
 const MAX_TRANSFER_HISTORY: usize = 20;
 
+const HISTORY_DRAG_EDGE_MARGIN: f32 = 48.0;
+const HISTORY_DRAG_EDGE_SPEED: f32 = 720.0;
+
 const STATE_SAVE_INTERVAL: Duration = Duration::from_millis(750);
 
 type DiscoveryResult = Result<Vec<DiscoveredAgent>, String>;
@@ -432,6 +435,10 @@ struct NetworkCopyManager {
 
     show_history: bool,
 
+    main_scroll_offset: f32,
+
+    history_drag_scroll_active: bool,
+
     discovery_receiver: Option<Receiver<DiscoveryResult>>,
 
     direct_discovery_receiver: Option<Receiver<DirectDiscoveryResult>>,
@@ -537,6 +544,10 @@ impl NetworkCopyManager {
             show_queue: true,
 
             show_history: false,
+
+            main_scroll_offset: 0.0,
+
+            history_drag_scroll_active: false,
 
             discovery_receiver: None,
 
@@ -4683,6 +4694,79 @@ impl NetworkCopyManager {
                 "The selected history entry was copied into the transfer setup.".to_string();
         }
     }
+
+    fn update_history_drag_scroll(
+        &mut self,
+        ui: &mut egui::Ui,
+        history_rect: Option<egui::Rect>,
+        current_offset: f32,
+        content_height: f32,
+        viewport: egui::Rect,
+    ) {
+        let (
+            primary_pressed,
+            primary_down,
+            press_origin,
+            pointer_position,
+            decidedly_dragging,
+            smooth_scroll_delta_y,
+            stable_dt,
+        ) = ui.input(|input| {
+            (
+                input.pointer.primary_pressed(),
+                input.pointer.primary_down(),
+                input.pointer.press_origin(),
+                input.pointer.interact_pos(),
+                input.pointer.is_decidedly_dragging(),
+                input.smooth_scroll_delta.y,
+                input.stable_dt,
+            )
+        });
+
+        if !primary_down {
+            self.history_drag_scroll_active = false;
+        } else if primary_pressed {
+            self.history_drag_scroll_active = history_rect
+                .is_some_and(|rect| press_origin.is_some_and(|origin| rect.contains(origin)));
+        }
+
+        let maximum_offset = (content_height - viewport.height()).max(0.0);
+
+        self.main_scroll_offset = current_offset.clamp(0.0, maximum_offset);
+
+        let selection_drag_active = self.history_drag_scroll_active
+            && primary_down
+            && decidedly_dragging
+            && ui.ctx().dragged_id().is_some();
+
+        let offset_delta = history_drag_scroll_delta(
+            selection_drag_active,
+            pointer_position,
+            viewport,
+            smooth_scroll_delta_y,
+            stable_dt,
+        );
+
+        if offset_delta == 0.0 {
+            return;
+        }
+
+        let new_offset = (self.main_scroll_offset + offset_delta).clamp(0.0, maximum_offset);
+
+        if (new_offset - self.main_scroll_offset).abs() <= f32::EPSILON {
+            return;
+        }
+
+        self.main_scroll_offset = new_offset;
+
+        if smooth_scroll_delta_y != 0.0 {
+            ui.input_mut(|input| {
+                input.smooth_scroll_delta.y = 0.0;
+            });
+        }
+
+        ui.ctx().request_repaint();
+    }
 }
 
 impl eframe::App for NetworkCopyManager {
@@ -4702,10 +4786,14 @@ impl eframe::App for NetworkCopyManager {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical()
+            let scroll_output = egui::ScrollArea::vertical()
+                .id_salt("manager-main-scroll")
+                .vertical_scroll_offset(self.main_scroll_offset)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
+
+                    let mut history_rect = None;
 
                     self.render_app_header(ui);
 
@@ -4849,7 +4937,11 @@ impl eframe::App for NetworkCopyManager {
                         if self.show_history {
                             ui.add_space(8.0);
 
-                            self.render_history(ui);
+                            let history_response = ui.scope(|ui| {
+                                self.render_history(ui);
+                            });
+
+                            history_rect = Some(history_response.response.rect);
                         }
                     });
 
@@ -4864,7 +4956,17 @@ impl eframe::App for NetworkCopyManager {
                     }
 
                     ui.add_space(16.0);
+
+                    history_rect
                 });
+
+            self.update_history_drag_scroll(
+                ui,
+                scroll_output.inner,
+                scroll_output.state.offset.y,
+                scroll_output.content_size.y,
+                scroll_output.inner_rect,
+            );
         });
 
         self.persist_state_if_needed(ui.ctx());
@@ -5783,6 +5885,48 @@ fn parse_endpoint(value: &str, description: &str) -> Result<SocketAddr, String> 
         .map_err(|error| format!("Invalid {description} address: {error}"))
 }
 
+fn history_drag_scroll_delta(
+    active: bool,
+    pointer_position: Option<egui::Pos2>,
+    viewport: egui::Rect,
+    smooth_scroll_delta_y: f32,
+    stable_dt: f32,
+) -> f32 {
+    if !active {
+        return 0.0;
+    }
+
+    // egui scroll deltas describe content motion, while ScrollArea offsets
+    // increase when moving down through the document.
+    let mut offset_delta = -smooth_scroll_delta_y;
+
+    let Some(pointer_position) = pointer_position else {
+        return offset_delta;
+    };
+
+    if pointer_position.x < viewport.left() || pointer_position.x > viewport.right() {
+        return offset_delta;
+    }
+
+    let frame_seconds = stable_dt.clamp(0.0, 1.0 / 15.0);
+
+    if pointer_position.y < viewport.top() + HISTORY_DRAG_EDGE_MARGIN {
+        let proximity = ((viewport.top() + HISTORY_DRAG_EDGE_MARGIN - pointer_position.y)
+            / HISTORY_DRAG_EDGE_MARGIN)
+            .clamp(0.0, 1.0);
+
+        offset_delta -= HISTORY_DRAG_EDGE_SPEED * proximity * frame_seconds;
+    } else if pointer_position.y > viewport.bottom() - HISTORY_DRAG_EDGE_MARGIN {
+        let proximity = ((pointer_position.y - (viewport.bottom() - HISTORY_DRAG_EDGE_MARGIN))
+            / HISTORY_DRAG_EDGE_MARGIN)
+            .clamp(0.0, 1.0);
+
+        offset_delta += HISTORY_DRAG_EDGE_SPEED * proximity * frame_seconds;
+    }
+
+    offset_delta
+}
+
 fn format_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
 
@@ -6100,12 +6244,14 @@ mod tests {
     use super::{
         DirectManagementRoute, MAX_TRANSFER_HISTORY, ManagedEndpointRole, ManagedStartFailureKind,
         PairedTransferHistoryEntry, UPDATE_STARTUP_CONFIRM_ARGUMENT, build_batch_queue_requests,
-        join_remote_path, paired_outcome, parent_remote_path, parse_update_handoff_wait_argument,
-        parse_update_startup_confirmation_argument, peer_cleanup_target, preflight_queue_route,
-        queue_state_for_outcome, queue_state_for_start_failure, remember_history,
-        resolve_management_endpoints, select_bound_recovery_item,
-        select_or_clear_discovered_endpoint, transfer_matches_queue_request,
+        history_drag_scroll_delta, join_remote_path, paired_outcome, parent_remote_path,
+        parse_update_handoff_wait_argument, parse_update_startup_confirmation_argument,
+        peer_cleanup_target, preflight_queue_route, queue_state_for_outcome,
+        queue_state_for_start_failure, remember_history, resolve_management_endpoints,
+        select_bound_recovery_item, select_or_clear_discovered_endpoint,
+        transfer_matches_queue_request,
     };
+    use eframe::egui;
     use networkcopy_speed::management_active_binding::ActiveQueueBinding;
     use networkcopy_speed::management_discovery::{AgentCapabilities, AgentState, DiscoveredAgent};
     use networkcopy_speed::management_instance::AgentInstanceId;
@@ -6247,6 +6393,54 @@ mod tests {
     #[test]
     fn drive_root_has_no_browser_parent() {
         assert_eq!(parent_remote_path(r"C:\"), None,);
+    }
+
+    #[test]
+    fn history_drag_scroll_preserves_wheel_and_edge_directions() {
+        let viewport = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 200.0));
+
+        let center = Some(egui::pos2(50.0, 100.0));
+
+        assert_eq!(
+            history_drag_scroll_delta(false, center, viewport, -120.0, 1.0 / 60.0,),
+            0.0,
+        );
+
+        assert_eq!(
+            history_drag_scroll_delta(true, center, viewport, -120.0, 1.0 / 60.0,),
+            120.0,
+        );
+
+        assert_eq!(
+            history_drag_scroll_delta(true, center, viewport, 0.0, 1.0 / 60.0,),
+            0.0,
+        );
+
+        let top_edge =
+            history_drag_scroll_delta(true, Some(egui::pos2(50.0, 1.0)), viewport, 0.0, 1.0 / 60.0);
+
+        assert!(top_edge < 0.0);
+
+        let bottom_edge = history_drag_scroll_delta(
+            true,
+            Some(egui::pos2(50.0, 199.0)),
+            viewport,
+            0.0,
+            1.0 / 60.0,
+        );
+
+        assert!(bottom_edge > 0.0);
+
+        assert_eq!(
+            history_drag_scroll_delta(
+                true,
+                Some(egui::pos2(150.0, 1.0)),
+                viewport,
+                0.0,
+                1.0 / 60.0,
+            ),
+            0.0,
+        );
     }
 
     #[test]
