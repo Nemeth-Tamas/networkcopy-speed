@@ -311,6 +311,23 @@ pub struct UpdateStartupReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UpdateRecoveryOutcome {
+    NoTransaction,
+
+    DeferredActiveStartup {
+        staging_directory: PathBuf,
+
+        process_id: u32,
+    },
+
+    Cleaned {
+        staging_directory: PathBuf,
+
+        startup_marker_present: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct UpdateStartupMarker {
     process_id: u32,
 
@@ -947,6 +964,248 @@ fn cleanup_result_label(result: io::Result<()>) -> String {
     }
 }
 
+pub fn recover_interrupted_update_cleanup(
+    current_version: &str,
+    expected_artifact_kind: ReleaseArtifactKind,
+) -> io::Result<UpdateRecoveryOutcome> {
+    let current_executable = env::current_exe().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "the running executable path could not be determined during update \
+                     recovery: {error}",
+            ),
+        )
+    })?;
+
+    let local_app_data = env::var_os("LOCALAPPDATA").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "LOCALAPPDATA is unavailable for update recovery",
+        )
+    })?;
+
+    let local_app_data = PathBuf::from(local_app_data);
+
+    if !local_app_data.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "LOCALAPPDATA path is not absolute during update recovery: {:?}",
+                local_app_data,
+            ),
+        ));
+    }
+
+    let version = parse_stable_version(current_version)?;
+
+    let normalized_version = format!("v{}.{}.{}", version.major, version.minor, version.patch,);
+
+    let staging_directory = local_app_data
+        .join(UPDATE_DATA_DIRECTORY)
+        .join(UPDATE_STAGING_DIRECTORY)
+        .join(expected_artifact_kind.storage_key())
+        .join(normalized_version);
+
+    let handoff_path = staging_directory.join(UPDATE_HANDOFF_FILE);
+
+    recover_interrupted_update_cleanup_from_handoff(
+        &current_executable,
+        &handoff_path,
+        expected_artifact_kind,
+    )
+}
+
+fn recover_interrupted_update_cleanup_from_handoff(
+    current_executable: &Path,
+    handoff_path: &Path,
+    expected_artifact_kind: ReleaseArtifactKind,
+) -> io::Result<UpdateRecoveryOutcome> {
+    match fs::metadata(handoff_path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "stale update handoff is not a regular file: {:?}",
+                        handoff_path,
+                    ),
+                ));
+            }
+        }
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(UpdateRecoveryOutcome::NoTransaction);
+        }
+
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "stale update handoff {:?} could not be inspected: {error}",
+                    handoff_path,
+                ),
+            ));
+        }
+    }
+
+    let handoff = read_update_handoff_plan(handoff_path)?;
+
+    if handoff.artifact_kind != expected_artifact_kind {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "stale update transaction targets {}, but recovery expects {}",
+                handoff.artifact_kind.label(),
+                expected_artifact_kind.label(),
+            ),
+        ));
+    }
+
+    let expected_staging_directory = handoff_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "stale update handoff path has no parent directory",
+        )
+    })?;
+
+    if handoff.handoff_plan.as_path() != handoff_path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "stale update handoff records {:?}, but recovery opened {:?}",
+                handoff.handoff_plan, handoff_path,
+            ),
+        ));
+    }
+
+    if handoff.staging_directory.as_path() != expected_staging_directory {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "stale update handoff records staging directory {:?}, expected {:?}",
+                handoff.staging_directory, expected_staging_directory,
+            ),
+        ));
+    }
+
+    validate_recovery_installed_identity(current_executable, &handoff)?;
+
+    let startup_marker_present = match read_update_startup_marker(&handoff.startup_marker) {
+        Ok(marker) => {
+            validate_startup_marker_for_handoff(&marker, &handoff)?;
+
+            if marker.process_id == process::id() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stale update marker unexpectedly belongs to the running recovery \
+                         process",
+                ));
+            }
+
+            if open_parent_process(marker.process_id)?.is_some() {
+                return Ok(UpdateRecoveryOutcome::DeferredActiveStartup {
+                    staging_directory: handoff.staging_directory.clone(),
+
+                    process_id: marker.process_id,
+                });
+            }
+
+            true
+        }
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+
+        Err(error) => return Err(error),
+    };
+
+    remove_successful_update_transaction_files(&handoff)?;
+
+    Ok(UpdateRecoveryOutcome::Cleaned {
+        staging_directory: handoff.staging_directory,
+
+        startup_marker_present,
+    })
+}
+
+fn validate_recovery_installed_identity(
+    current_executable: &Path,
+    handoff: &UpdateHandoffPlan,
+) -> io::Result<()> {
+    if !current_executable.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "running executable path is not absolute during update recovery: {:?}",
+                current_executable,
+            ),
+        ));
+    }
+
+    let canonical_current = fs::canonicalize(current_executable).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "running executable {:?} could not be canonicalized during recovery: \
+                         {error}",
+                current_executable,
+            ),
+        )
+    })?;
+
+    let canonical_installed = fs::canonicalize(&handoff.install_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "recorded installed executable {:?} could not be canonicalized during \
+                         recovery: {error}",
+                handoff.install_path,
+            ),
+        )
+    })?;
+
+    if canonical_current != canonical_installed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "stale update transaction belongs to {:?}, but the running executable is {:?}",
+                canonical_installed, canonical_current,
+            ),
+        ));
+    }
+
+    verify_prepared_installation_file(
+        current_executable,
+        "running executable during stale update recovery",
+        handoff.expected_size,
+        &handoff.expected_sha256_hex,
+    )
+}
+
+fn validate_startup_marker_for_handoff(
+    marker: &UpdateStartupMarker,
+    handoff: &UpdateHandoffPlan,
+) -> io::Result<()> {
+    if marker.expected_size != handoff.expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "update startup marker records {} bytes, expected {}",
+                marker.expected_size, handoff.expected_size,
+            ),
+        ));
+    }
+
+    if marker.expected_sha256_hex != handoff.expected_sha256_hex {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "update startup marker SHA-256 does not match the handoff",
+        ));
+    }
+
+    Ok(())
+}
+
 fn finalize_successful_update(handoff: &UpdateHandoffPlan) -> io::Result<()> {
     validate_update_handoff_plan(handoff)?;
 
@@ -958,6 +1217,8 @@ fn finalize_successful_update(handoff: &UpdateHandoffPlan) -> io::Result<()> {
     )?;
 
     let marker = read_update_startup_marker(&handoff.startup_marker)?;
+
+    validate_startup_marker_for_handoff(&marker, handoff)?;
 
     if marker.process_id != process::id() {
         return Err(io::Error::new(
@@ -971,22 +1232,11 @@ fn finalize_successful_update(handoff: &UpdateHandoffPlan) -> io::Result<()> {
         ));
     }
 
-    if marker.expected_size != handoff.expected_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "successful-update marker records {} bytes, expected {}",
-                marker.expected_size, handoff.expected_size,
-            ),
-        ));
-    }
+    remove_successful_update_transaction_files(handoff)
+}
 
-    if marker.expected_sha256_hex != handoff.expected_sha256_hex {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "successful-update marker SHA-256 does not match the handoff",
-        ));
-    }
+fn remove_successful_update_transaction_files(handoff: &UpdateHandoffPlan) -> io::Result<()> {
+    validate_update_handoff_plan(handoff)?;
 
     let cleanup_paths = successful_update_cleanup_paths(handoff)?;
 
@@ -1028,13 +1278,15 @@ fn successful_update_cleanup_paths(handoff: &UpdateHandoffPlan) -> io::Result<Ve
     let startup_marker_partial = update_startup_marker_partial_path(&handoff.startup_marker);
 
     Ok(vec![
+        // This must remain first. A still-running Windows executable cannot be
+        // removed, so cleanup stops before touching any other transaction file.
+        handoff.staged_executable.clone(),
         install_candidate,
         rollback_candidate,
         staged_partial,
         backup_partial,
         handoff_partial,
         startup_marker_partial,
-        handoff.staged_executable.clone(),
         handoff.backup_executable.clone(),
         handoff.startup_marker.clone(),
         handoff.handoff_plan.clone(),
@@ -4203,15 +4455,16 @@ mod tests {
         GitHubReleaseResponse, ParentProcessWaitOutcome, ReleaseArtifactKind, ReleaseAssetInfo,
         ReleaseInfo, SelectedReleaseAsset, UPDATE_HANDOFF_WAIT_ARGUMENT,
         UPDATE_STARTUP_CONFIRM_ARGUMENT, UpdateInstallNaming, UpdateInstallPlan,
-        UpdateInstallationPublication, UpdateStartupMarker, VerifiedStagedUpdate,
-        build_update_handoff_plan, build_update_handoff_wait_command, build_update_install_plan,
-        build_update_startup_command, complete_update_handoff_after_parent_exit,
-        decode_update_handoff_plan, decode_update_startup_marker, encode_lower_hex,
-        encode_update_handoff_plan, encode_update_startup_marker, finalize_successful_update,
-        is_official_release_file_name, open_parent_process, parse_release_response,
-        parse_sha256_digest, parse_stable_version, partial_staged_executable_path,
-        prepare_update_installation_files, publish_prepared_update_installation,
-        read_update_handoff_plan, read_update_startup_marker, rollback_custom_named_update,
+        UpdateInstallationPublication, UpdateRecoveryOutcome, UpdateStartupMarker,
+        VerifiedStagedUpdate, build_update_handoff_plan, build_update_handoff_wait_command,
+        build_update_install_plan, build_update_startup_command,
+        complete_update_handoff_after_parent_exit, decode_update_handoff_plan,
+        decode_update_startup_marker, encode_lower_hex, encode_update_handoff_plan,
+        encode_update_startup_marker, finalize_successful_update, is_official_release_file_name,
+        open_parent_process, parse_release_response, parse_sha256_digest, parse_stable_version,
+        partial_staged_executable_path, prepare_update_installation_files,
+        publish_prepared_update_installation, read_update_handoff_plan, read_update_startup_marker,
+        recover_interrupted_update_cleanup_from_handoff, rollback_custom_named_update,
         rollback_failed_update_startup, select_release_asset, stage_update_from_reader,
         successful_update_cleanup_paths, update_startup_marker_partial_path, validate_release_url,
         verify_update_handoff_executable, write_update_handoff_plan,
@@ -5157,6 +5410,213 @@ mod tests {
         assert!(plan.startup_marker.exists(),);
 
         assert!(plan.install_path.exists(),);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_cleanup_recovery_ignores_missing_transaction() {
+        let expected_sha256_hex = "ab".repeat(32);
+
+        let (root, plan) = test_update_plan("recovery-missing", 1234, &expected_sha256_hex);
+
+        let outcome = recover_interrupted_update_cleanup_from_handoff(
+            &plan.current_executable,
+            &plan.handoff_plan,
+            ReleaseArtifactKind::Manager,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, UpdateRecoveryOutcome::NoTransaction,);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_cleanup_recovery_uses_healthy_restart_without_marker() {
+        let current_payload = b"old custom manager";
+
+        let update_payload = b"new custom manager";
+
+        let update_sha256_hex = test_sha256_hex(update_payload);
+
+        let (root, plan) = test_update_plan(
+            "recovery-markerless",
+            update_payload.len() as u64,
+            &update_sha256_hex,
+        );
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        fs::write(&plan.current_executable, current_payload).unwrap();
+
+        fs::write(&plan.staged_executable, update_payload).unwrap();
+
+        let verified = VerifiedStagedUpdate {
+            executable: plan.staged_executable.clone(),
+
+            size: update_payload.len() as u64,
+
+            sha256_hex: update_sha256_hex,
+        };
+
+        let handoff = write_update_handoff_plan(&plan, &verified, 1234).unwrap();
+
+        complete_update_handoff_after_parent_exit(handoff, ParentProcessWaitOutcome::Exited)
+            .unwrap();
+
+        assert!(!plan.startup_marker.exists(),);
+
+        assert_eq!(fs::read(&plan.current_executable,).unwrap(), update_payload,);
+
+        let outcome = recover_interrupted_update_cleanup_from_handoff(
+            &plan.current_executable,
+            &plan.handoff_plan,
+            ReleaseArtifactKind::Manager,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            UpdateRecoveryOutcome::Cleaned {
+                staging_directory: plan.staging_directory.clone(),
+
+                startup_marker_present: false,
+            },
+        );
+
+        assert!(!plan.staging_directory.exists(),);
+
+        assert_eq!(fs::read(&plan.current_executable,).unwrap(), update_payload,);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_cleanup_recovery_accepts_exited_marker_process() {
+        let current_payload = b"old custom manager";
+
+        let update_payload = b"new custom manager";
+
+        let update_sha256_hex = test_sha256_hex(update_payload);
+
+        let (root, plan) = test_update_plan(
+            "recovery-stale-marker",
+            update_payload.len() as u64,
+            &update_sha256_hex,
+        );
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        fs::write(&plan.current_executable, current_payload).unwrap();
+
+        fs::write(&plan.staged_executable, update_payload).unwrap();
+
+        let verified = VerifiedStagedUpdate {
+            executable: plan.staged_executable.clone(),
+
+            size: update_payload.len() as u64,
+
+            sha256_hex: update_sha256_hex.clone(),
+        };
+
+        let handoff = write_update_handoff_plan(&plan, &verified, 1234).unwrap();
+
+        complete_update_handoff_after_parent_exit(handoff, ParentProcessWaitOutcome::Exited)
+            .unwrap();
+
+        let marker = UpdateStartupMarker {
+            process_id: u32::MAX,
+
+            expected_size: update_payload.len() as u64,
+
+            expected_sha256_hex: update_sha256_hex,
+        };
+
+        write_update_startup_marker_file(&plan.startup_marker, &marker).unwrap();
+
+        let outcome = recover_interrupted_update_cleanup_from_handoff(
+            &plan.current_executable,
+            &plan.handoff_plan,
+            ReleaseArtifactKind::Manager,
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            UpdateRecoveryOutcome::Cleaned {
+                staging_directory: plan.staging_directory.clone(),
+
+                startup_marker_present: true,
+            },
+        );
+
+        assert!(!plan.staging_directory.exists(),);
+
+        assert_eq!(fs::read(&plan.current_executable,).unwrap(), update_payload,);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_cleanup_recovery_preserves_current_process_marker() {
+        let current_payload = b"old custom manager";
+
+        let update_payload = b"new custom manager";
+
+        let update_sha256_hex = test_sha256_hex(update_payload);
+
+        let (root, plan) = test_update_plan(
+            "recovery-current-marker",
+            update_payload.len() as u64,
+            &update_sha256_hex,
+        );
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        fs::write(&plan.current_executable, current_payload).unwrap();
+
+        fs::write(&plan.staged_executable, update_payload).unwrap();
+
+        let verified = VerifiedStagedUpdate {
+            executable: plan.staged_executable.clone(),
+
+            size: update_payload.len() as u64,
+
+            sha256_hex: update_sha256_hex.clone(),
+        };
+
+        let handoff = write_update_handoff_plan(&plan, &verified, 1234).unwrap();
+
+        complete_update_handoff_after_parent_exit(handoff, ParentProcessWaitOutcome::Exited)
+            .unwrap();
+
+        let marker = UpdateStartupMarker {
+            process_id: process::id(),
+
+            expected_size: update_payload.len() as u64,
+
+            expected_sha256_hex: update_sha256_hex,
+        };
+
+        write_update_startup_marker_file(&plan.startup_marker, &marker).unwrap();
+
+        let error = recover_interrupted_update_cleanup_from_handoff(
+            &plan.current_executable,
+            &plan.handoff_plan,
+            ReleaseArtifactKind::Manager,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+
+        assert!(plan.staging_directory.exists(),);
+
+        assert!(plan.staged_executable.exists(),);
+
+        assert!(plan.backup_executable.exists(),);
+
+        assert!(plan.startup_marker.exists(),);
 
         let _ = fs::remove_dir_all(root);
     }

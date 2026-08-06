@@ -356,6 +356,15 @@ marker, removes the known candidate, rollback, backup, marker, handoff, and
 staged-helper files, and removes the staging directory only when it is empty.
 Unknown staging entries stop cleanup without deleting any transaction files.
 
+On a later ordinary Manager start, recovery runs only after Manager application
+construction succeeds. It inspects only the deterministic staging directory for
+the running version, requires the handoff install path and SHA-256 to match the
+running executable, and accepts either a validated marker from an exited startup
+process or the healthy ordinary restart itself. The staged helper is deleted
+first, so a still-running helper prevents any partial cleanup. Unknown entries,
+path mismatches, digest mismatches, and active marker processes preserve the
+transaction unchanged.
+
 After a Manager update is prepared, the running Manager exposes a two-step
 **Install update** confirmation. Final confirmation saves persistence again,
 launches the verified staged Manager in handoff-helper mode, and requests a
@@ -462,8 +471,8 @@ or payload transfer stops the loop without starting another receiver.
       files and the empty staging directory;
 - [x] terminate a failed relaunched Manager and restore the pre-update custom-name
       executable or remove only the official path created by that transaction;
-- [ ] recover and clean stale update transactions after interrupted helper or
-      cleanup work;
+- [x] recover interrupted cleanup on a later healthy ordinary startup while
+      preserving active, mismatched, malformed, or unknown transaction state.
 
 ### Acceptance
 

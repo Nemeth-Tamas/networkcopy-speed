@@ -6044,6 +6044,50 @@ fn main() -> eframe::Result {
                 release_update::write_update_startup_marker(confirmation).map_err(
                     |error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) },
                 )?;
+            } else {
+                match release_update::recover_interrupted_update_cleanup(
+                    env!("CARGO_PKG_VERSION"),
+                    ReleaseArtifactKind::Manager,
+                ) {
+                    Ok(release_update::UpdateRecoveryOutcome::NoTransaction) => {}
+
+                    Ok(release_update::UpdateRecoveryOutcome::DeferredActiveStartup {
+                        staging_directory,
+                        process_id,
+                    }) => {
+                        eprintln!(
+                            "Manager preserved stale update transaction {} because startup \
+                             process {} is still running.",
+                            staging_directory.display(),
+                            process_id,
+                        );
+                    }
+
+                    Ok(release_update::UpdateRecoveryOutcome::Cleaned {
+                        staging_directory,
+                        startup_marker_present,
+                    }) => {
+                        let marker_description = if startup_marker_present {
+                            "validated startup marker"
+                        } else {
+                            "healthy ordinary Manager restart"
+                        };
+
+                        eprintln!(
+                            "Manager recovered and cleaned interrupted update transaction {} \
+                             using its {}.",
+                            staging_directory.display(),
+                            marker_description,
+                        );
+                    }
+
+                    Err(error) => {
+                        eprintln!(
+                            "Manager preserved an interrupted update transaction because safe \
+                             recovery could not be proven: {error}",
+                        );
+                    }
+                }
             }
 
             Ok(Box::new(application))
