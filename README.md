@@ -474,7 +474,14 @@ or payload transfer stops the loop without starting another receiver.
 - [ ] complete managed Direct Link physical acceptance;
 - [ ] complete Manager multi-source destination-root acceptance;
 - [ ] complete repeated standalone root-receiver acceptance;
-- [ ] complete renamed and officially named executable update acceptance.
+- [x] complete renamed and officially named executable update acceptance.
+
+The Manager executable updater completed live GitHub release acceptance on
+2026-08-06. An officially named v2.3.99 Manager installed v2.4.0 beside itself
+without modifying the old executable. A custom-renamed v2.3.99 Manager replaced
+itself in place while preserving its exact filename. Both installed executables
+matched the published v2.4.0 SHA-256 digest, relaunched successfully, confirmed
+healthy startup, and removed all staging and transaction files.
 
 ### Planned v2.5 performance work
 
