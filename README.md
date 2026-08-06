@@ -334,23 +334,25 @@ The staged Manager recognizes a hidden `--update-handoff-wait` helper mode.
 Before waiting, it proves that it is running from the exact staged path named by
 the `NCH1` plan, independently checks its file size and SHA-256 digest, and opens
 a synchronization handle to the recorded original Manager process. It waits for
-that process object for at most 120 seconds and then exits without copying,
-renaming, deleting, backing up, replacing, or launching any executable.
+that process object for at most 120 seconds. Only after the original Manager has
+exited does the helper prepare the synchronized `previous.exe` backup and the
+separately verified installation candidate. It still does not publish, replace,
+delete, or launch any installed executable.
 
-After a Manager update is prepared, the running Manager now exposes a two-step
+After a Manager update is prepared, the running Manager exposes a two-step
 **Install update** confirmation. Final confirmation saves persistence again,
-launches the verified staged Manager in wait-only helper mode, and requests a
-clean close of the original Manager window. This checkpoint proves the
-cross-process handoff boundary only; the helper still exits without replacing or
-relaunching an executable.
+launches the verified staged Manager in handoff-helper mode, and requests a
+clean close of the original Manager window. The helper now waits for that process
+to exit and prepares the verified installation transaction, but still stops
+before publishing or relaunching the new executable.
 
-The installation layer can now prepare a non-destructive transaction without
-publishing it. It writes and synchronizes a partial copy of the currently
-installed executable, atomically publishes that exact copy as `previous.exe`,
-and writes a separately verified new-executable candidate beside the final
-install destination. Both copies are read back and SHA-256 checked. The current
-executable, final install path, and running staged helper remain unchanged.
-This preparation primitive is not invoked by the helper yet.
+The installation layer prepares a non-destructive transaction without publishing
+it. After the original Manager exits, the helper writes and synchronizes a
+partial copy of the installed executable, atomically publishes that exact copy
+as `previous.exe`, and writes a separately verified new-executable candidate
+beside the final install destination. Both copies are read back and SHA-256
+checked. The current executable, final install path, and running staged helper
+remain unchanged.
 
 ### Queue recovery hardening
 
@@ -426,7 +428,7 @@ or payload transfer stops the loop without starting another receiver.
       final destination without moving or modifying the running helper;
 - [x] leave the installed executable and final install path unchanged while
       preparing the transaction;
-- [ ] invoke transaction preparation only after the recorded parent process exits;
+- [x] invoke transaction preparation only after the recorded parent process exits;
 - [ ] launch an officially named new executable beside an officially named old one;
 - [ ] replace a renamed executable in place while preserving its custom filename;
 - [ ] relaunch the installed executable and confirm successful startup;

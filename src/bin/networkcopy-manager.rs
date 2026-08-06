@@ -5881,11 +5881,15 @@ fn run_update_handoff_wait_if_requested() -> Result<bool, String> {
             .map_err(|error| format!("Manager update handoff wait failed: {error}"))?;
 
     eprintln!(
-        "Manager update helper validated {} and observed parent process {} as {:?}. \
-         No installation files were modified.",
+        "Manager update helper validated {}, observed parent process {} as {:?}, prepared backup \
+         {}, and prepared verified install candidate {}. The final install path {} was not \
+         modified.",
         report.handoff.staged_executable.display(),
         report.handoff.parent_process_id,
         report.parent_wait,
+        report.installation.backup_executable.display(),
+        report.installation.install_candidate.display(),
+        report.handoff.install_path.display(),
     );
 
     Ok(true)
