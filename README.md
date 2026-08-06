@@ -336,23 +336,27 @@ the `NCH1` plan, independently checks its file size and SHA-256 digest, and open
 a synchronization handle to the recorded original Manager process. It waits for
 that process object for at most 120 seconds. Only after the original Manager has
 exited does the helper prepare the synchronized `previous.exe` backup and the
-separately verified installation candidate. It still does not publish, replace,
-delete, or launch any installed executable.
+separately verified installation candidate. For officially named releases it
+then atomically publishes the new version beside the old executable without
+overwriting an existing conflicting file. Custom-name replacement remains
+deferred, and neither path relaunches the Manager yet.
 
 After a Manager update is prepared, the running Manager exposes a two-step
 **Install update** confirmation. Final confirmation saves persistence again,
 launches the verified staged Manager in handoff-helper mode, and requests a
-clean close of the original Manager window. The helper now waits for that process
-to exit and prepares the verified installation transaction, but still stops
-before publishing or relaunching the new executable.
+clean close of the original Manager window. The helper waits for that process to
+exit, prepares the verified installation transaction, and publishes officially
+named releases beside the previous executable. Custom-name replacement and all
+post-install relaunch work remain separate later steps.
 
-The installation layer prepares a non-destructive transaction without publishing
-it. After the original Manager exits, the helper writes and synchronizes a
-partial copy of the installed executable, atomically publishes that exact copy
+After the original Manager exits, the installation layer writes and synchronizes
+a partial copy of the installed executable, atomically publishes that exact copy
 as `previous.exe`, and writes a separately verified new-executable candidate
 beside the final install destination. Both copies are read back and SHA-256
-checked. The current executable, final install path, and running staged helper
-remain unchanged.
+checked. Officially named updates are then moved into their new versioned path
+with write-through semantics and without replacing an existing destination. The
+old officially named executable remains untouched. Custom-name installations
+retain their prepared candidate without modifying the installed executable.
 
 ### Queue recovery hardening
 
@@ -429,7 +433,8 @@ or payload transfer stops the loop without starting another receiver.
 - [x] leave the installed executable and final install path unchanged while
       preparing the transaction;
 - [x] invoke transaction preparation only after the recorded parent process exits;
-- [ ] launch an officially named new executable beside an officially named old one;
+- [x] publish an officially named new executable beside an officially named old
+      one without overwriting a conflicting destination;
 - [ ] replace a renamed executable in place while preserving its custom filename;
 - [ ] relaunch the installed executable and confirm successful startup;
 - [ ] delete backups and staging files only after startup confirmation;

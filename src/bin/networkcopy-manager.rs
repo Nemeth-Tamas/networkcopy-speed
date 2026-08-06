@@ -5880,17 +5880,36 @@ fn run_update_handoff_wait_if_requested() -> Result<bool, String> {
         release_update::run_update_handoff_wait_mode(&handoff_path, ReleaseArtifactKind::Manager)
             .map_err(|error| format!("Manager update handoff wait failed: {error}"))?;
 
-    eprintln!(
-        "Manager update helper validated {}, observed parent process {} as {:?}, prepared backup \
-         {}, and prepared verified install candidate {}. The final install path {} was not \
-         modified.",
-        report.handoff.staged_executable.display(),
-        report.handoff.parent_process_id,
-        report.parent_wait,
-        report.installation.backup_executable.display(),
-        report.installation.install_candidate.display(),
-        report.handoff.install_path.display(),
-    );
+    match &report.publication {
+        release_update::UpdateInstallationPublication::PublishedSideBySide {
+            installed_executable,
+        } => {
+            eprintln!(
+                "Manager update helper validated {}, observed parent process {} as {:?}, prepared \
+                 backup {}, and published the verified officially named executable {} beside the \
+                 previous Manager. The new Manager was not launched.",
+                report.handoff.staged_executable.display(),
+                report.handoff.parent_process_id,
+                report.parent_wait,
+                report.installation.backup_executable.display(),
+                installed_executable.display(),
+            );
+        }
+
+        release_update::UpdateInstallationPublication::DeferredCustomName => {
+            eprintln!(
+                "Manager update helper validated {}, observed parent process {} as {:?}, prepared \
+                 backup {}, and prepared verified install candidate {}. Custom-name replacement \
+                 remains deferred, so {} was not modified.",
+                report.handoff.staged_executable.display(),
+                report.handoff.parent_process_id,
+                report.parent_wait,
+                report.installation.backup_executable.display(),
+                report.installation.install_candidate.display(),
+                report.handoff.install_path.display(),
+            );
+        }
+    }
 
     Ok(true)
 }

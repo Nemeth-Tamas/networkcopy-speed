@@ -37,6 +37,37 @@ pub(crate) fn replace(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn move_new(source: &Path, destination: &Path) -> io::Result<()> {
+    let source_wide = null_terminated(source);
+
+    let destination_wide = null_terminated(destination);
+
+    // SAFETY: Both strings are valid, NUL-terminated UTF-16 path buffers
+    // that remain alive for the complete Windows API call.
+    let result = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+
+    if result == 0 {
+        let error = io::Error::last_os_error();
+
+        return Err(io::Error::new(
+            error.kind(),
+            format!(
+                "failed to publish new file {} from {}: {error}",
+                destination.display(),
+                source.display(),
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 fn null_terminated(path: &Path) -> Vec<u16> {
     path.as_os_str()
         .encode_wide()
@@ -46,7 +77,7 @@ fn null_terminated(path: &Path) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::replace;
+    use super::{move_new, replace};
     use std::env;
     use std::fs;
     use std::path::PathBuf;
@@ -72,6 +103,50 @@ mod tests {
         assert_eq!(fs::read(&destination).unwrap(), b"new contents",);
 
         assert!(!source.exists(),);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn move_new_publishes_file_without_replacement() {
+        let root = temporary_root();
+
+        fs::create_dir_all(&root).unwrap();
+
+        let source = root.join("new-version.partial");
+
+        let destination = root.join("new-version.exe");
+
+        fs::write(&source, b"new executable").unwrap();
+
+        move_new(&source, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new executable",);
+
+        assert!(!source.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn move_new_preserves_existing_destination() {
+        let root = temporary_root();
+
+        fs::create_dir_all(&root).unwrap();
+
+        let source = root.join("new-version.partial");
+
+        let destination = root.join("new-version.exe");
+
+        fs::write(&source, b"new executable").unwrap();
+
+        fs::write(&destination, b"unrelated existing file").unwrap();
+
+        assert!(move_new(&source, &destination).is_err());
+
+        assert_eq!(fs::read(&source).unwrap(), b"new executable",);
+
+        assert_eq!(fs::read(&destination).unwrap(), b"unrelated existing file",);
 
         fs::remove_dir_all(root).unwrap();
     }

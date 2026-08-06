@@ -233,6 +233,8 @@ pub struct UpdateHandoffWaitReport {
     pub parent_wait: ParentProcessWaitOutcome,
 
     pub installation: PreparedUpdateInstallation,
+
+    pub publication: UpdateInstallationPublication,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -255,6 +257,13 @@ pub struct PreparedUpdateInstallation {
     pub candidate_size: u64,
 
     pub candidate_sha256_hex: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UpdateInstallationPublication {
+    PublishedSideBySide { installed_executable: PathBuf },
+
+    DeferredCustomName,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -601,12 +610,16 @@ fn complete_update_handoff_after_parent_exit(
 ) -> io::Result<UpdateHandoffWaitReport> {
     let installation = prepare_update_installation_files(&handoff)?;
 
+    let publication = publish_prepared_update_installation(&handoff, &installation)?;
+
     Ok(UpdateHandoffWaitReport {
         handoff,
 
         parent_wait,
 
         installation,
+
+        publication,
     })
 }
 
@@ -782,6 +795,175 @@ pub fn prepare_update_installation_files(
 
         candidate_sha256_hex: candidate_copy.sha256_hex,
     })
+}
+
+fn publish_prepared_update_installation(
+    handoff: &UpdateHandoffPlan,
+    installation: &PreparedUpdateInstallation,
+) -> io::Result<UpdateInstallationPublication> {
+    validate_update_handoff_plan(handoff)?;
+
+    if installation.backup_executable != handoff.backup_executable {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "prepared backup path {:?} does not match the handoff backup path {:?}",
+                installation.backup_executable, handoff.backup_executable,
+            ),
+        ));
+    }
+
+    let expected_candidate = update_install_candidate_path(handoff)?;
+
+    if installation.install_candidate != expected_candidate {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "prepared install candidate {:?} does not match the expected path {:?}",
+                installation.install_candidate, expected_candidate,
+            ),
+        ));
+    }
+
+    verify_prepared_installation_file(
+        &installation.backup_executable,
+        "prepared update backup",
+        installation.backup_size,
+        &installation.backup_sha256_hex,
+    )?;
+
+    if installation.candidate_size != handoff.expected_size
+        || installation.candidate_sha256_hex != handoff.expected_sha256_hex
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "prepared install-candidate report does not match the handoff size and SHA-256",
+        ));
+    }
+
+    verify_prepared_installation_file(
+        &installation.install_candidate,
+        "prepared update install candidate",
+        handoff.expected_size,
+        &handoff.expected_sha256_hex,
+    )?;
+
+    match handoff.naming {
+        UpdateInstallNaming::PreserveCurrentName => {
+            Ok(UpdateInstallationPublication::DeferredCustomName)
+        }
+
+        UpdateInstallNaming::PublishedAssetName => {
+            publish_officially_named_update(handoff, installation)
+        }
+    }
+}
+
+fn publish_officially_named_update(
+    handoff: &UpdateHandoffPlan,
+    installation: &PreparedUpdateInstallation,
+) -> io::Result<UpdateInstallationPublication> {
+    if handoff.install_path == handoff.current_executable {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "official-name publication cannot replace the current executable in place",
+        ));
+    }
+
+    match fs::metadata(&handoff.install_path) {
+        Ok(_) => {
+            if let Err(error) = verify_prepared_installation_file(
+                &handoff.install_path,
+                "existing official update executable",
+                handoff.expected_size,
+                &handoff.expected_sha256_hex,
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "official update destination {:?} already exists and does not match the \
+                         verified update: {error}",
+                        handoff.install_path,
+                    ),
+                ));
+            }
+
+            remove_file_if_exists(&installation.install_candidate)?;
+
+            return Ok(UpdateInstallationPublication::PublishedSideBySide {
+                installed_executable: handoff.install_path.clone(),
+            });
+        }
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "official update destination {:?} could not be inspected: {error}",
+                    handoff.install_path,
+                ),
+            ));
+        }
+    }
+
+    crate::windows_file_replace::move_new(&installation.install_candidate, &handoff.install_path)?;
+
+    if let Err(error) = verify_prepared_installation_file(
+        &handoff.install_path,
+        "published official update executable",
+        handoff.expected_size,
+        &handoff.expected_sha256_hex,
+    ) {
+        if let Err(cleanup_error) = remove_file_if_exists(&handoff.install_path) {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; invalid published executable {:?} also could not be removed: \
+                     {cleanup_error}",
+                    handoff.install_path,
+                ),
+            ));
+        }
+
+        return Err(error);
+    }
+
+    Ok(UpdateInstallationPublication::PublishedSideBySide {
+        installed_executable: handoff.install_path.clone(),
+    })
+}
+
+fn verify_prepared_installation_file(
+    path: &Path,
+    label: &str,
+    expected_size: u64,
+    expected_sha256_hex: &str,
+) -> io::Result<()> {
+    let inspected = inspect_file_digest(path, label)?;
+
+    if inspected.size != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{label} {path:?} contains {} bytes, expected {expected_size}",
+                inspected.size,
+            ),
+        ));
+    }
+
+    if inspected.sha256_hex != expected_sha256_hex {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{label} {path:?} has SHA-256 {}, expected {expected_sha256_hex}",
+                inspected.sha256_hex,
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2825,8 +3007,8 @@ mod tests {
     use super::{
         GitHubReleaseResponse, ParentProcessWaitOutcome, ReleaseArtifactKind, ReleaseAssetInfo,
         ReleaseInfo, SelectedReleaseAsset, UPDATE_HANDOFF_WAIT_ARGUMENT, UpdateInstallNaming,
-        UpdateInstallPlan, VerifiedStagedUpdate, build_update_handoff_plan,
-        build_update_handoff_wait_command, build_update_install_plan,
+        UpdateInstallPlan, UpdateInstallationPublication, VerifiedStagedUpdate,
+        build_update_handoff_plan, build_update_handoff_wait_command, build_update_install_plan,
         complete_update_handoff_after_parent_exit, decode_update_handoff_plan, encode_lower_hex,
         encode_update_handoff_plan, is_official_release_file_name, open_parent_process,
         parse_release_response, parse_sha256_digest, parse_stable_version,
@@ -3548,7 +3730,7 @@ mod tests {
     }
 
     #[test]
-    fn handoff_completion_prepares_files_after_parent_exit() {
+    fn handoff_completion_publishes_official_name_after_parent_exit() {
         let current_payload = b"old official manager";
 
         let update_payload = b"new official manager";
@@ -3556,7 +3738,7 @@ mod tests {
         let update_sha256_hex = test_sha256_hex(update_payload);
 
         let (root, mut plan) = test_update_plan(
-            "handoff-completion",
+            "handoff-completion-official",
             update_payload.len() as u64,
             &update_sha256_hex,
         );
@@ -3597,9 +3779,76 @@ mod tests {
 
         assert_eq!(report.parent_wait, ParentProcessWaitOutcome::Exited,);
 
+        assert_eq!(
+            report.publication,
+            UpdateInstallationPublication::PublishedSideBySide {
+                installed_executable: plan.install_path.clone(),
+            },
+        );
+
         assert_eq!(fs::read(&plan.current_executable).unwrap(), current_payload,);
 
-        assert!(!plan.install_path.exists());
+        assert_eq!(fs::read(&plan.install_path).unwrap(), update_payload,);
+
+        assert_eq!(
+            fs::read(&report.installation.backup_executable).unwrap(),
+            current_payload,
+        );
+
+        assert!(!report.installation.install_candidate.exists(),);
+
+        assert_eq!(fs::read(&plan.staged_executable).unwrap(), update_payload,);
+
+        assert_eq!(
+            report.installation.backup_sha256_hex,
+            test_sha256_hex(current_payload),
+        );
+
+        assert_eq!(report.installation.candidate_sha256_hex, update_sha256_hex,);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn handoff_completion_defers_custom_name_replacement() {
+        let current_payload = b"old custom manager";
+
+        let update_payload = b"new custom manager";
+
+        let update_sha256_hex = test_sha256_hex(update_payload);
+
+        let (root, plan) = test_update_plan(
+            "handoff-completion-custom",
+            update_payload.len() as u64,
+            &update_sha256_hex,
+        );
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        fs::write(&plan.current_executable, current_payload).unwrap();
+
+        fs::write(&plan.staged_executable, update_payload).unwrap();
+
+        let verified = VerifiedStagedUpdate {
+            executable: plan.staged_executable.clone(),
+
+            size: update_payload.len() as u64,
+
+            sha256_hex: update_sha256_hex,
+        };
+
+        let handoff = build_update_handoff_plan(&plan, &verified, 1234).unwrap();
+
+        let report =
+            complete_update_handoff_after_parent_exit(handoff, ParentProcessWaitOutcome::Exited)
+                .unwrap();
+
+        assert_eq!(
+            report.publication,
+            UpdateInstallationPublication::DeferredCustomName,
+        );
+
+        assert_eq!(fs::read(&plan.current_executable).unwrap(), current_payload,);
 
         assert_eq!(
             fs::read(&report.installation.backup_executable).unwrap(),
@@ -3613,17 +3862,71 @@ mod tests {
 
         assert_eq!(fs::read(&plan.staged_executable).unwrap(), update_payload,);
 
-        assert_eq!(
-            report.installation.backup_sha256_hex,
-            test_sha256_hex(current_payload),
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn handoff_completion_preserves_conflicting_official_destination() {
+        let current_payload = b"old official manager";
+
+        let update_payload = b"new official manager";
+
+        let conflicting_payload = b"unrelated existing executable";
+
+        let update_sha256_hex = test_sha256_hex(update_payload);
+
+        let (root, mut plan) = test_update_plan(
+            "handoff-completion-conflict",
+            update_payload.len() as u64,
+            &update_sha256_hex,
         );
 
-        assert_eq!(report.installation.candidate_sha256_hex, update_sha256_hex,);
+        plan.naming = UpdateInstallNaming::PublishedAssetName;
+
+        plan.current_executable = root.join("NetworkCopy-Speed-v2.3.0-Manager-Windows-x64.exe");
+
+        plan.install_path = root.join(&plan.selected_asset.name);
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        fs::write(&plan.current_executable, current_payload).unwrap();
+
+        fs::write(&plan.staged_executable, update_payload).unwrap();
+
+        fs::write(&plan.install_path, conflicting_payload).unwrap();
+
+        let verified = VerifiedStagedUpdate {
+            executable: plan.staged_executable.clone(),
+
+            size: update_payload.len() as u64,
+
+            sha256_hex: update_sha256_hex,
+        };
+
+        let handoff = build_update_handoff_plan(&plan, &verified, 1234).unwrap();
+
+        let error =
+            complete_update_handoff_after_parent_exit(handoff, ParentProcessWaitOutcome::Exited)
+                .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+
+        assert_eq!(fs::read(&plan.current_executable).unwrap(), current_payload,);
+
+        assert_eq!(fs::read(&plan.install_path).unwrap(), conflicting_payload,);
+
+        assert_eq!(fs::read(&plan.backup_executable).unwrap(), current_payload,);
 
         assert_eq!(
-            report.installation.install_candidate,
-            root.join(format!("{install_file_name}.networkcopy-update.partial",)),
+            fs::read(root.join(format!(
+                "{}.networkcopy-update.partial",
+                plan.selected_asset.name,
+            )),)
+            .unwrap(),
+            update_payload,
         );
+
+        assert_eq!(fs::read(&plan.staged_executable).unwrap(), update_payload,);
 
         let _ = fs::remove_dir_all(root);
     }
