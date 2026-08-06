@@ -1,10 +1,10 @@
 use crate::copy_bench::format_bytes;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -36,9 +36,15 @@ pub struct ManifestEntry {
     pub class: FileClass,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryEntry {
+    pub relative_path: PathBuf,
+}
+
 #[derive(Debug)]
 pub struct ScanResult {
     pub manifest: Vec<ManifestEntry>,
+    pub directories: Vec<DirectoryEntry>,
     pub report: ScanReport,
 }
 
@@ -125,6 +131,7 @@ impl ScanReport {
 #[derive(Debug)]
 struct WorkerResult {
     manifest: Vec<ManifestEntry>,
+    directories: Vec<DirectoryEntry>,
     directories_scanned: u64,
     reparse_points_skipped: u64,
 }
@@ -132,6 +139,7 @@ struct WorkerResult {
 #[derive(Debug)]
 struct DirectoryScan {
     manifest: Vec<ManifestEntry>,
+    directories: Vec<DirectoryEntry>,
     discovered_directories: Vec<PathBuf>,
     reparse_points_skipped: u64,
 }
@@ -313,6 +321,7 @@ pub fn run(root: &Path, worker_count: usize) -> io::Result<ScanResult> {
     })?;
 
     let mut manifest = Vec::new();
+    let mut directories = Vec::new();
     let mut directories_scanned = 0_u64;
     let mut reparse_points_skipped = 0_u64;
 
@@ -328,9 +337,17 @@ pub fn run(root: &Path, worker_count: usize) -> io::Result<ScanResult> {
             })?;
 
         manifest.extend(worker_result.manifest);
+        directories.extend(worker_result.directories);
     }
 
     manifest.sort_unstable_by(|left, right| {
+        left.relative_path
+            .as_os_str()
+            .encode_wide()
+            .cmp(right.relative_path.as_os_str().encode_wide())
+    });
+
+    directories.sort_unstable_by(|left, right| {
         left.relative_path
             .as_os_str()
             .encode_wide()
@@ -345,11 +362,20 @@ pub fn run(root: &Path, worker_count: usize) -> io::Result<ScanResult> {
         started.elapsed(),
     )?;
 
-    Ok(ScanResult { manifest, report })
+    let result = ScanResult {
+        manifest,
+        directories,
+        report,
+    };
+
+    validate_tree_entries(&result.manifest, &result.directories)?;
+
+    Ok(result)
 }
 
 fn scan_worker(root: &Path, queue: Arc<DirectoryQueue>) -> io::Result<WorkerResult> {
     let mut manifest = Vec::new();
+    let mut directories = Vec::new();
     let mut directories_scanned = 0_u64;
     let mut reparse_points_skipped = 0_u64;
 
@@ -376,12 +402,14 @@ fn scan_worker(root: &Path, queue: Arc<DirectoryQueue>) -> io::Result<WorkerResu
             .ok_or_else(|| io::Error::other("reparse-point count overflowed in scanner worker"))?;
 
         manifest.extend(directory_scan.manifest);
+        directories.extend(directory_scan.directories);
 
         queue.complete_directory(directory_scan.discovered_directories)?;
     }
 
     Ok(WorkerResult {
         manifest,
+        directories,
         directories_scanned,
         reparse_points_skipped,
     })
@@ -389,6 +417,7 @@ fn scan_worker(root: &Path, queue: Arc<DirectoryQueue>) -> io::Result<WorkerResu
 
 fn scan_directory(root: &Path, directory: &Path) -> io::Result<DirectoryScan> {
     let mut manifest = Vec::new();
+    let mut directories = Vec::new();
     let mut discovered_directories = Vec::new();
     let mut reparse_points_skipped = 0_u64;
 
@@ -408,6 +437,9 @@ fn scan_directory(root: &Path, directory: &Path) -> io::Result<DirectoryScan> {
         let path = entry.path();
 
         if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            let relative_path = relative_path_from_root(root, &path)?;
+
+            directories.push(DirectoryEntry { relative_path });
             discovered_directories.push(path);
             continue;
         }
@@ -416,10 +448,7 @@ fn scan_directory(root: &Path, directory: &Path) -> io::Result<DirectoryScan> {
             continue;
         }
 
-        let relative_path = path
-            .strip_prefix(root)
-            .map_err(|_| io::Error::other(format!("entry escaped scan root: {}", path.display())))?
-            .to_path_buf();
+        let relative_path = relative_path_from_root(root, &path)?;
 
         let file_size = metadata.len();
 
@@ -434,9 +463,99 @@ fn scan_directory(root: &Path, directory: &Path) -> io::Result<DirectoryScan> {
 
     Ok(DirectoryScan {
         manifest,
+        directories,
         discovered_directories,
         reparse_points_skipped,
     })
+}
+
+fn relative_path_from_root(root: &Path, path: &Path) -> io::Result<PathBuf> {
+    let relative_path = path
+        .strip_prefix(root)
+        .map_err(|_| io::Error::other(format!("entry escaped scan root: {}", path.display())))?
+        .to_path_buf();
+
+    validate_relative_path(&relative_path)?;
+
+    Ok(relative_path)
+}
+
+pub(crate) fn validate_relative_path(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("path is not a safe relative path: {}", path.display()),
+        ));
+    }
+
+    for component in path.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "relative path contains an unsafe component: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_tree_entries(
+    manifest: &[ManifestEntry],
+    directories: &[DirectoryEntry],
+) -> io::Result<()> {
+    let mut file_paths: HashSet<&Path> = HashSet::with_capacity(manifest.len());
+
+    for entry in manifest {
+        validate_relative_path(&entry.relative_path)?;
+
+        if !file_paths.insert(entry.relative_path.as_path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "duplicate file path in manifest: {}",
+                    entry.relative_path.display()
+                ),
+            ));
+        }
+    }
+
+    let mut directory_paths: HashSet<&Path> = HashSet::with_capacity(directories.len());
+
+    for entry in directories {
+        validate_relative_path(&entry.relative_path)?;
+
+        let directory_path = entry.relative_path.as_path();
+
+        if !directory_paths.insert(directory_path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "duplicate directory path in manifest: {}",
+                    directory_path.display()
+                ),
+            ));
+        }
+
+        if let Some(file_path) = directory_path
+            .ancestors()
+            .find(|ancestor| !ancestor.as_os_str().is_empty() && file_paths.contains(ancestor))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "manifest directory {} collides with file {}",
+                    directory_path.display(),
+                    file_path.display()
+                ),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn classify_file(file_size: u64) -> FileClass {
@@ -528,15 +647,25 @@ fn build_report(
 #[cfg(test)]
 mod tests {
     use super::{
-        FileClass, LARGE_FILE_MIN_BYTES, TINY_FILE_MAX_BYTES, classify_file, run,
-        validate_worker_count,
+        DirectoryEntry, FileClass, LARGE_FILE_MIN_BYTES, ManifestEntry, TINY_FILE_MAX_BYTES,
+        classify_file, run, validate_relative_path, validate_tree_entries, validate_worker_count,
     };
     use std::collections::HashSet;
     use std::env;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn manifest_entry(relative_path: PathBuf) -> ManifestEntry {
+        ManifestEntry {
+            relative_path,
+            file_size: 0,
+            last_write_time: 0,
+            file_attributes: 0,
+            class: FileClass::Tiny,
+        }
+    }
 
     #[test]
     fn classifies_file_size_boundaries() {
@@ -632,5 +761,140 @@ mod tests {
                 PathBuf::from("árvíz.txt"),
             ]
         );
+    }
+
+    #[test]
+    fn captures_empty_directories_in_deterministic_order() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let root = env::temp_dir().join(format!(
+            "networkcopy-directory-manifest-{}-{unique}",
+            process::id()
+        ));
+
+        fs::create_dir_all(root.join("zeta")).unwrap();
+        fs::create_dir_all(root.join("alpha").join("beta")).unwrap();
+        fs::create_dir_all(root.join("árvíztűrő").join("üres")).unwrap();
+
+        fs::write(root.join("alpha").join("payload.txt"), b"payload").unwrap();
+
+        let scan_result = run(&root, 4);
+        let cleanup_result = fs::remove_dir_all(&root);
+
+        let result = scan_result.unwrap();
+        cleanup_result.unwrap();
+
+        assert_eq!(result.report.files_scanned, 1);
+        assert_eq!(result.report.directories_scanned, 6);
+
+        let directory_paths: Vec<PathBuf> = result
+            .directories
+            .into_iter()
+            .map(|entry| entry.relative_path)
+            .collect();
+
+        assert_eq!(
+            directory_paths,
+            vec![
+                PathBuf::from("alpha"),
+                PathBuf::from("alpha").join("beta"),
+                PathBuf::from("zeta"),
+                PathBuf::from("árvíztűrő"),
+                PathBuf::from("árvíztűrő").join("üres"),
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_unique_file_and_directory_entries() {
+        let manifest = vec![
+            manifest_entry(PathBuf::from("root.txt")),
+            manifest_entry(PathBuf::from("alpha").join("payload.bin")),
+        ];
+
+        let directories = vec![
+            DirectoryEntry {
+                relative_path: PathBuf::from("alpha"),
+            },
+            DirectoryEntry {
+                relative_path: PathBuf::from("empty"),
+            },
+            DirectoryEntry {
+                relative_path: PathBuf::from("nested").join("empty"),
+            },
+        ];
+
+        validate_tree_entries(&manifest, &directories).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_file_entries() {
+        let manifest = vec![
+            manifest_entry(PathBuf::from("duplicate.txt")),
+            manifest_entry(PathBuf::from("duplicate.txt")),
+        ];
+
+        assert!(validate_tree_entries(&manifest, &[]).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_directory_entries() {
+        let directories = vec![
+            DirectoryEntry {
+                relative_path: PathBuf::from("duplicate"),
+            },
+            DirectoryEntry {
+                relative_path: PathBuf::from("duplicate"),
+            },
+        ];
+
+        assert!(validate_tree_entries(&[], &directories).is_err());
+    }
+
+    #[test]
+    fn rejects_file_directory_path_collision() {
+        let manifest = vec![manifest_entry(PathBuf::from("collision"))];
+
+        let directories = vec![DirectoryEntry {
+            relative_path: PathBuf::from("collision"),
+        }];
+
+        assert!(validate_tree_entries(&manifest, &directories).is_err());
+    }
+
+    #[test]
+    fn rejects_directory_nested_beneath_file_path() {
+        let manifest = vec![manifest_entry(PathBuf::from("blocked"))];
+
+        let directories = vec![DirectoryEntry {
+            relative_path: PathBuf::from("blocked").join("nested"),
+        }];
+
+        assert!(validate_tree_entries(&manifest, &directories).is_err());
+    }
+
+    #[test]
+    fn rejects_unsafe_relative_paths() {
+        assert!(validate_relative_path(Path::new("alpha")).is_ok());
+        assert!(validate_relative_path(Path::new(r"alpha\beta")).is_ok());
+        assert!(validate_relative_path(Path::new(r"árvíztűrő\üres")).is_ok());
+
+        for unsafe_path in [
+            Path::new(""),
+            Path::new(r"C:\absolute"),
+            Path::new(r"C:drive-relative"),
+            Path::new(r"\rooted"),
+            Path::new(r"..\escape"),
+            Path::new(r"alpha\..\escape"),
+        ] {
+            assert!(
+                validate_relative_path(unsafe_path).is_err(),
+                "unsafe path was accepted: {}",
+                unsafe_path.display()
+            );
+        }
     }
 }
