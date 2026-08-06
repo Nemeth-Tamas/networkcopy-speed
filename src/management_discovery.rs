@@ -1,9 +1,11 @@
 use crate::management_control;
 use crate::management_direct;
+use crate::management_instance::AgentInstanceId;
 use crate::management_jobs::ManagementJobRegistry;
 use crate::management_protocol::{
     MANAGEMENT_CONTROL_PORT, MANAGEMENT_DISCOVERY_PORT, MANAGEMENT_PROTOCOL_VERSION,
 };
+use std::collections::BTreeMap;
 use std::env;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -12,6 +14,7 @@ use std::ptr;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     FreeMibTable, GetUnicastIpAddressTable, MIB_UNICASTIPADDRESS_ROW, MIB_UNICASTIPADDRESS_TABLE,
@@ -141,6 +144,24 @@ pub struct DiscoveredAgent {
     pub state: AgentState,
 
     pub capabilities: AgentCapabilities,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum DiscoveredAgentIdentity {
+    Instance(AgentInstanceId),
+
+    Endpoint {
+        hostname: String,
+
+        endpoint: SocketAddr,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedDiscoveredAgent {
+    agent: DiscoveredAgent,
+
+    identity: DiscoveredAgentIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -458,7 +479,9 @@ pub fn run_agent() -> io::Result<()> {
 pub fn discover() -> io::Result<Vec<DiscoveredAgent>> {
     let targets = discovery_targets()?;
 
-    discover_targets(&targets, DISCOVERY_TIMEOUT)
+    let agents = discover_targets(&targets, DISCOVERY_TIMEOUT)?;
+
+    deduplicate_agent_instances(agents)
 }
 
 fn discovery_targets() -> io::Result<Vec<SocketAddr>> {
@@ -720,6 +743,165 @@ fn discover_targets(targets: &[SocketAddr], timeout: Duration) -> io::Result<Vec
     Ok(agents)
 }
 
+fn deduplicate_agent_instances(agents: Vec<DiscoveredAgent>) -> io::Result<Vec<DiscoveredAgent>> {
+    let mut hostname_counts = BTreeMap::<String, usize>::new();
+
+    for agent in &agents {
+        *hostname_counts.entry(agent.hostname.clone()).or_default() += 1;
+    }
+
+    let mut resolved = Vec::with_capacity(agents.len());
+
+    let mut workers = Vec::new();
+
+    for agent in agents {
+        let hostname_count = hostname_counts
+            .get(&agent.hostname)
+            .copied()
+            .unwrap_or_default();
+
+        if hostname_count < 2 {
+            let identity = DiscoveredAgentIdentity::Endpoint {
+                hostname: agent.hostname.clone(),
+
+                endpoint: agent.endpoint,
+            };
+
+            resolved.push(ResolvedDiscoveredAgent { agent, identity });
+
+            continue;
+        }
+
+        let worker = thread::Builder::new()
+            .name("networkcopy-management-discovery-identity".to_string())
+            .spawn(move || resolve_discovered_agent_identity(agent))?;
+
+        workers.push(worker);
+    }
+
+    for worker in workers {
+        let resolved_agent = worker
+            .join()
+            .map_err(|_| io::Error::other("management discovery identity worker panicked"))?;
+
+        resolved.push(resolved_agent);
+    }
+
+    Ok(deduplicate_resolved_agents(resolved))
+}
+
+fn resolve_discovered_agent_identity(agent: DiscoveredAgent) -> ResolvedDiscoveredAgent {
+    let endpoint = agent.endpoint;
+
+    let identity = management_control::agent_snapshot(endpoint)
+        .map(|snapshot| DiscoveredAgentIdentity::Instance(snapshot.agent_instance_id))
+        .unwrap_or_else(|_| DiscoveredAgentIdentity::Endpoint {
+            hostname: agent.hostname.clone(),
+
+            endpoint,
+        });
+
+    ResolvedDiscoveredAgent { agent, identity }
+}
+
+fn deduplicate_resolved_agents(agents: Vec<ResolvedDiscoveredAgent>) -> Vec<DiscoveredAgent> {
+    let route_catalog = agents
+        .iter()
+        .map(|resolved| (resolved.identity.clone(), resolved.agent.endpoint))
+        .collect::<Vec<_>>();
+
+    let mut groups = BTreeMap::<DiscoveredAgentIdentity, Vec<ResolvedDiscoveredAgent>>::new();
+
+    for resolved in agents {
+        groups
+            .entry(resolved.identity.clone())
+            .or_default()
+            .push(resolved);
+    }
+
+    let mut deduplicated = Vec::with_capacity(groups.len());
+
+    for (identity, mut candidates) in groups {
+        candidates.sort_by_key(|candidate| candidate.agent.endpoint.to_string());
+
+        let preferred_index = preferred_candidate_index(&identity, &candidates, &route_catalog);
+
+        deduplicated.push(candidates.swap_remove(preferred_index).agent);
+    }
+
+    deduplicated.sort_by(|left, right| {
+        left.hostname
+            .cmp(&right.hostname)
+            .then_with(|| left.endpoint.to_string().cmp(&right.endpoint.to_string()))
+    });
+
+    deduplicated
+}
+
+fn preferred_candidate_index(
+    identity: &DiscoveredAgentIdentity,
+    candidates: &[ResolvedDiscoveredAgent],
+    route_catalog: &[(DiscoveredAgentIdentity, SocketAddr)],
+) -> usize {
+    debug_assert!(!candidates.is_empty());
+
+    let mut preferred_index = 0_usize;
+
+    let mut preferred_score =
+        route_affinity_score(identity, candidates[0].agent.endpoint, route_catalog);
+
+    for (index, candidate) in candidates.iter().enumerate().skip(1) {
+        let score = route_affinity_score(identity, candidate.agent.endpoint, route_catalog);
+
+        if score > preferred_score {
+            preferred_index = index;
+            preferred_score = score;
+        }
+    }
+
+    preferred_index
+}
+
+fn route_affinity_score(
+    identity: &DiscoveredAgentIdentity,
+    endpoint: SocketAddr,
+    route_catalog: &[(DiscoveredAgentIdentity, SocketAddr)],
+) -> (u32, u32) {
+    let SocketAddr::V4(candidate_endpoint) = endpoint else {
+        return (0, 0);
+    };
+
+    let mut maximum_prefix = 0_u32;
+
+    let mut total_prefix = 0_u32;
+
+    for (other_identity, other_endpoint) in route_catalog {
+        if other_identity == identity {
+            continue;
+        }
+
+        let SocketAddr::V4(other_endpoint) = *other_endpoint else {
+            continue;
+        };
+
+        let prefix = common_ipv4_prefix_bits(*candidate_endpoint.ip(), *other_endpoint.ip());
+
+        maximum_prefix = maximum_prefix.max(prefix);
+
+        total_prefix = total_prefix.saturating_add(prefix);
+    }
+
+    (maximum_prefix, total_prefix)
+}
+
+fn common_ipv4_prefix_bits(left: Ipv4Addr, right: Ipv4Addr) -> u32 {
+    let left_bits = u32::from_be_bytes(left.octets());
+
+    let right_bits = u32::from_be_bytes(right.octets());
+
+    (left_bits ^ right_bits).leading_zeros()
+}
+
 fn respond_once(
     socket: &UdpSocket,
     descriptor: &LocalAgentDescriptor,
@@ -811,7 +993,8 @@ fn create_nonce() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentCapabilities, AgentState, DiscoveryPacket, LocalAgentDescriptor, WSAENETUNREACH,
+        AgentCapabilities, AgentState, DiscoveredAgent, DiscoveredAgentIdentity, DiscoveryPacket,
+        LocalAgentDescriptor, ResolvedDiscoveredAgent, WSAENETUNREACH, deduplicate_resolved_agents,
         directed_broadcast_address, discover_target, is_skippable_discovery_send_error,
         respond_once,
     };
@@ -858,6 +1041,7 @@ mod tests {
     fn loopback_address_is_not_probed() {
         assert_eq!(directed_broadcast_address(Ipv4Addr::LOCALHOST, 8,), None,);
     }
+    use crate::management_instance::AgentInstanceId;
     use crate::management_jobs::ManagementJobRegistry;
     use crate::management_protocol::{MANAGEMENT_CONTROL_PORT, MANAGEMENT_PROTOCOL_VERSION};
     use std::io;
@@ -930,6 +1114,79 @@ mod tests {
         let error = DiscoveryPacket::decode(&encoded).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+    }
+
+    #[test]
+    fn duplicate_instance_prefers_shared_lan_route() {
+        let local_instance = AgentInstanceId::from_raw(1).unwrap();
+
+        let remote_instance = AgentInstanceId::from_raw(2).unwrap();
+
+        let actual = deduplicate_resolved_agents(vec![
+            resolved_test_agent("LOCAL-PC", Ipv4Addr::new(172, 20, 224, 1), local_instance),
+            resolved_test_agent("LOCAL-PC", Ipv4Addr::new(192, 168, 124, 1), local_instance),
+            resolved_test_agent("LOCAL-PC", Ipv4Addr::new(192, 168, 2, 200), local_instance),
+            resolved_test_agent(
+                "REMOTE-PC",
+                Ipv4Addr::new(192, 168, 2, 103),
+                remote_instance,
+            ),
+        ]);
+
+        assert_eq!(actual.len(), 2);
+
+        let local = actual
+            .iter()
+            .find(|agent| agent.hostname == "LOCAL-PC")
+            .unwrap();
+
+        assert_eq!(
+            local.endpoint,
+            SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(192, 168, 2, 200),
+                MANAGEMENT_CONTROL_PORT,
+            )),
+        );
+    }
+
+    #[test]
+    fn identical_hostnames_with_distinct_instances_remain() {
+        let actual = deduplicate_resolved_agents(vec![
+            resolved_test_agent(
+                "SAME-NAME",
+                Ipv4Addr::new(192, 168, 2, 10),
+                AgentInstanceId::from_raw(10).unwrap(),
+            ),
+            resolved_test_agent(
+                "SAME-NAME",
+                Ipv4Addr::new(192, 168, 2, 20),
+                AgentInstanceId::from_raw(20).unwrap(),
+            ),
+        ]);
+
+        assert_eq!(actual.len(), 2);
+    }
+
+    fn resolved_test_agent(
+        hostname: &str,
+        address: Ipv4Addr,
+        instance_id: AgentInstanceId,
+    ) -> ResolvedDiscoveredAgent {
+        ResolvedDiscoveredAgent {
+            agent: DiscoveredAgent {
+                hostname: hostname.to_string(),
+
+                endpoint: SocketAddr::V4(SocketAddrV4::new(address, MANAGEMENT_CONTROL_PORT)),
+
+                protocol_version: MANAGEMENT_PROTOCOL_VERSION,
+
+                state: AgentState::Idle,
+
+                capabilities: AgentCapabilities::SEND_RECEIVE,
+            },
+
+            identity: DiscoveredAgentIdentity::Instance(instance_id),
+        }
     }
 
     #[test]
