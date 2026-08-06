@@ -5,7 +5,16 @@ param(
     [switch]$AllowDevelopmentVersion,
 
     [ValidateRange(0, 100)]
-    [int]$TortureRounds = 0
+    [int]$TortureRounds = 0,
+
+    [string]$SignCertificateThumbprint = "",
+
+    [ValidateSet("CurrentUser", "LocalMachine")]
+    [string]$SignCertificateStore = "CurrentUser",
+
+    [string]$TimestampUrl = "",
+
+    [string]$SignToolPath = ""
 )
 
 Set-StrictMode -Version Latest
@@ -25,6 +34,229 @@ function Invoke-Cargo {
     if ($LASTEXITCODE -ne 0) {
         throw "Cargo command failed with exit code $LASTEXITCODE."
     }
+}
+
+function Normalize-CertificateThumbprint {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Thumbprint
+    )
+
+    $normalized = (
+        $Thumbprint -replace "\s", ""
+    ).ToUpperInvariant()
+
+    if ($normalized -notmatch "^[0-9A-F]{40}$") {
+        throw (
+            "The signing certificate thumbprint must contain exactly " +
+            "40 hexadecimal characters."
+        )
+    }
+
+    return $normalized
+}
+
+function Resolve-SignTool {
+    param(
+        [string]$RequestedPath
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedPath)) {
+        if (
+            -not (
+                Test-Path `
+                    -LiteralPath $RequestedPath `
+                    -PathType Leaf
+            )
+        ) {
+            throw "SignTool was not found at '$RequestedPath'."
+        }
+
+        return (Resolve-Path -LiteralPath $RequestedPath).Path
+    }
+
+    $command = Get-Command `
+        "signtool.exe" `
+        -CommandType Application `
+        -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+
+    if (-not $command) {
+        throw (
+            "Signing was requested, but signtool.exe was not found. " +
+            "Install the Windows SDK or provide -SignToolPath."
+        )
+    }
+
+    return $command.Source
+}
+
+function Invoke-SignTool {
+    param(
+        [Parameter(Mandatory)]
+        [string]$ToolPath,
+
+        [Parameter(Mandatory)]
+        [string[]]$Arguments
+    )
+
+    Write-Host
+    Write-Host (
+        "signtool " + ($Arguments -join " ")
+    ) -ForegroundColor Cyan
+
+    & $ToolPath @Arguments
+
+    $exitCode = $LASTEXITCODE
+
+    if ($exitCode -ne 0) {
+        throw "SignTool failed with exit code $exitCode."
+    }
+}
+
+function Assert-AuthenticodeSignature {
+    param(
+        [Parameter(Mandatory)]
+        [System.IO.FileInfo]$Artifact,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedThumbprint
+    )
+
+    $signature = Get-AuthenticodeSignature `
+        -FilePath $Artifact.FullName
+
+    if (
+        $signature.Status -ne
+        [System.Management.Automation.SignatureStatus]::Valid
+    ) {
+        throw (
+            "Authenticode verification failed for '$($Artifact.Name)': " +
+            "$($signature.Status) — $($signature.StatusMessage)"
+        )
+    }
+
+    $signer = $signature.SignerCertificate
+
+    if (-not $signer) {
+        throw (
+            "Authenticode verification found no signer certificate for " +
+            "'$($Artifact.Name)'."
+        )
+    }
+
+    $actualThumbprint =
+        Normalize-CertificateThumbprint $signer.Thumbprint
+
+    if ($actualThumbprint -ne $ExpectedThumbprint) {
+        throw (
+            "Artifact '$($Artifact.Name)' was signed by certificate " +
+            "$actualThumbprint instead of requested certificate " +
+            "$ExpectedThumbprint."
+        )
+    }
+
+    $timeStamper = $signature.TimeStamperCertificate
+
+    if (-not $timeStamper) {
+        throw (
+            "Artifact '$($Artifact.Name)' has no verified Authenticode " +
+            "timestamp certificate."
+        )
+    }
+
+    return [pscustomobject]@{
+        Artifact           = $Artifact.Name
+        Signer             = $signer.Subject
+        Thumbprint         = $actualThumbprint
+        TimestampAuthority = $timeStamper.Subject
+        Status             = $signature.Status
+    }
+}
+
+function Invoke-AuthenticodeSigning {
+    param(
+        [Parameter(Mandatory)]
+        [System.IO.FileInfo[]]$Artifacts,
+
+        [Parameter(Mandatory)]
+        [string]$CertificateThumbprint,
+
+        [Parameter(Mandatory)]
+        [ValidateSet("CurrentUser", "LocalMachine")]
+        [string]$CertificateStore,
+
+        [Parameter(Mandatory)]
+        [string]$TimestampUrl,
+
+        [Parameter(Mandatory)]
+        [string]$ToolPath
+    )
+
+    $signArguments = @(
+        "sign",
+        "/sha1",
+        $CertificateThumbprint,
+        "/s",
+        "My"
+    )
+
+    if ($CertificateStore -eq "LocalMachine") {
+        $signArguments += "/sm"
+    }
+
+    $signArguments += @(
+        "/fd",
+        "SHA256",
+        "/tr",
+        $TimestampUrl,
+        "/td",
+        "SHA256",
+        "/v"
+    )
+
+    foreach ($artifact in $Artifacts) {
+        Invoke-SignTool `
+            -ToolPath $ToolPath `
+            -Arguments (
+                $signArguments + @($artifact.FullName)
+            )
+    }
+
+    Write-Host
+    Write-Host (
+        "Verifying Authenticode signatures..."
+    ) -ForegroundColor Yellow
+
+    $reports = foreach ($artifact in $Artifacts) {
+        Invoke-SignTool `
+            -ToolPath $ToolPath `
+            -Arguments @(
+                "verify",
+                "/pa",
+                "/all",
+                "/v",
+                $artifact.FullName
+            )
+
+        Assert-AuthenticodeSignature `
+            -Artifact $artifact `
+            -ExpectedThumbprint $CertificateThumbprint
+    }
+
+    Write-Host
+    Write-Host (
+        "Authenticode verification complete."
+    ) -ForegroundColor Green
+
+    $reports |
+        Format-Table `
+            Artifact,
+            Signer,
+            Thumbprint,
+            TimestampAuthority,
+            Status `
+            -AutoSize
 }
 
 function Resolve-RepositoryRoot {
@@ -48,6 +280,50 @@ function Resolve-RepositoryRoot {
 $repoRoot = Resolve-RepositoryRoot
 $distRoot = Join-Path $repoRoot "dist"
 $releaseRoot = Join-Path $repoRoot "target\release"
+
+$signingRequested =
+    -not [string]::IsNullOrWhiteSpace(
+        $SignCertificateThumbprint
+    )
+
+$normalizedSigningThumbprint = $null
+$resolvedSignTool = $null
+
+if ($signingRequested) {
+    $normalizedSigningThumbprint =
+        Normalize-CertificateThumbprint `
+            $SignCertificateThumbprint
+
+    $timestampUri = $null
+
+    $timestampValid = [Uri]::TryCreate(
+        $TimestampUrl,
+        [UriKind]::Absolute,
+        [ref]$timestampUri
+    )
+
+    if (
+        -not $timestampValid -or
+        $timestampUri.Scheme -ne [Uri]::UriSchemeHttps
+    ) {
+        throw (
+            "Signing requires an absolute HTTPS RFC 3161 timestamp URL."
+        )
+    }
+
+    $resolvedSignTool =
+        Resolve-SignTool $SignToolPath
+}
+elseif (
+    -not [string]::IsNullOrWhiteSpace($TimestampUrl) -or
+    -not [string]::IsNullOrWhiteSpace($SignToolPath) -or
+    $SignCertificateStore -ne "CurrentUser"
+) {
+    throw (
+        "Signing options were supplied without " +
+        "-SignCertificateThumbprint."
+    )
+}
 
 $hadPreviousTortureRounds =
     Test-Path Env:NETWORKCOPY_TORTURE_ROUNDS
@@ -90,6 +366,20 @@ try {
     }
 
     Write-Host "Version:    $version"
+
+    if ($signingRequested) {
+        Write-Host (
+            "Signing:    certificate " +
+            "$normalizedSigningThumbprint " +
+            "from $SignCertificateStore\My"
+        )
+
+        Write-Host "Timestamp:  $TimestampUrl"
+        Write-Host "SignTool:   $resolvedSignTool"
+    }
+    else {
+        Write-Host "Signing:    disabled"
+    }
 
     if (-not $SkipChecks) {
         Invoke-Cargo @(
@@ -298,6 +588,29 @@ try {
         Get-Item -LiteralPath $guiEnOutput
         Get-Item -LiteralPath $cliOutput
     )
+
+    if ($signingRequested) {
+        Write-Host
+        Write-Host (
+            "Signing all release executables..."
+        ) -ForegroundColor Yellow
+
+        Invoke-AuthenticodeSigning `
+            -Artifacts $artifacts `
+            -CertificateThumbprint $normalizedSigningThumbprint `
+            -CertificateStore $SignCertificateStore `
+            -TimestampUrl $TimestampUrl `
+            -ToolPath $resolvedSignTool
+    }
+    else {
+        Write-Host
+        Write-Warning (
+            "Release executables are unsigned. " +
+            "Unsigned development builds remain supported, but public " +
+            "release artifacts should be signed when a trusted " +
+            "code-signing certificate is available."
+        )
+    }
 
     $checksumPath = Join-Path $distRoot "SHA256SUMS.txt"
 

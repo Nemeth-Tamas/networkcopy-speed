@@ -45,6 +45,11 @@ validated binary handoff, support official and custom executable names, confirm
 healthy startup, roll back failed launches, clean completed transactions, and
 recover interrupted cleanup safely on a later healthy startup.
 
+Release packaging supports optional certificate-store Authenticode signing,
+RFC 3161 SHA-256 timestamping, signature verification before checksums, and
+unsigned local development builds. See
+[Release Trust and Antivirus Guidance](RELEASE-TRUST.md).
+
 v2 supports verified content reuse during both updates
 and fresh folder transfers. Update mode reuses content from older receiver-side
 medium and large files. Fresh transfers use deterministic bounded catalog
