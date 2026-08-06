@@ -24,26 +24,20 @@ The repository contains:
 
 ## Current status
 
-Current stable release:
+Current stable release and source version:
 
 ```text
-2.3.0
+2.4.0
 ```
 
-Current development version:
+v2.4 strengthens unattended setup with exact queue-binding recovery,
+multi-source destination-root batch mapping, persistent standalone root
+receiving, and an explicit user-approved Manager executable updater.
 
-```text
-2.4.0-dev
-```
-
-v2.3 adds persistent queued orchestration, restart-safe queue recovery,
-Automatic LAN, managed Direct Link and Explicit IP routing, Windows transfer
-notifications, an endpoint-agent tray control, and a GitHub Releases update
-checker.
-
-Select several independent source and destination pairs, start the queue, and
-leave the machines to complete the work sequentially. Failed or blocked work
-remains visible and requires an explicit retry, skip, or continuation.
+Manager updates verify the GitHub-reported byte count and SHA-256 digest, use a
+validated binary handoff, support official and custom executable names, confirm
+healthy startup, roll back failed launches, clean completed transactions, and
+recover interrupted cleanup safely on a later healthy startup.
 
 v2 supports verified content reuse during both updates
 and fresh folder transfers. Update mode reuses content from older receiver-side
@@ -284,13 +278,13 @@ only on a known and controlled network.
 Sequential reliability comes before concurrent execution. v2.4 deliberately
 continues to operate one sender/receiver pair at a time.
 
-## v2.4 development roadmap — safer and faster unattended setup
+## v2.4 release — safer and faster unattended setup
 
 v2.4 strengthens queue recovery, adds destination-root batch mapping to the
 Manager and existing bilingual standalone GUI, and turns update checking into
 an explicit, user-approved executable update flow.
 
-### Current v2.4 checkpoint — 2026-08-05
+### v2.4 release highlights
 
 The queue-hardening foundation is now implemented:
 
