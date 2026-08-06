@@ -336,27 +336,28 @@ the `NCH1` plan, independently checks its file size and SHA-256 digest, and open
 a synchronization handle to the recorded original Manager process. It waits for
 that process object for at most 120 seconds. Only after the original Manager has
 exited does the helper prepare the synchronized `previous.exe` backup and the
-separately verified installation candidate. For officially named releases it
-then atomically publishes the new version beside the old executable without
-overwriting an existing conflicting file. Custom-name replacement remains
-deferred, and neither path relaunches the Manager yet.
+separately verified installation candidate. Officially named releases are
+published beside the old executable without overwriting a conflicting file.
+Custom-named releases atomically replace the exited Manager while preserving its
+exact filename. Neither path relaunches the Manager yet.
 
 After a Manager update is prepared, the running Manager exposes a two-step
 **Install update** confirmation. Final confirmation saves persistence again,
 launches the verified staged Manager in handoff-helper mode, and requests a
 clean close of the original Manager window. The helper waits for that process to
-exit, prepares the verified installation transaction, and publishes officially
-named releases beside the previous executable. Custom-name replacement and all
-post-install relaunch work remain separate later steps.
+exit, prepares the verified installation transaction, and publishes either a
+side-by-side officially named executable or an in-place custom-named executable.
+Post-install relaunch and startup confirmation remain separate later steps.
 
 After the original Manager exits, the installation layer writes and synchronizes
 a partial copy of the installed executable, atomically publishes that exact copy
 as `previous.exe`, and writes a separately verified new-executable candidate
 beside the final install destination. Both copies are read back and SHA-256
-checked. Officially named updates are then moved into their new versioned path
-with write-through semantics and without replacing an existing destination. The
-old officially named executable remains untouched. Custom-name installations
-retain their prepared candidate without modifying the installed executable.
+checked. Officially named updates move into a new versioned path without
+replacing an existing destination. Custom-name updates first prove that the
+installed executable still exactly matches the backup and then atomically replace
+it in place. A failed post-replacement verification restores a separately copied
+and verified rollback candidate from `previous.exe`.
 
 ### Queue recovery hardening
 
@@ -435,7 +436,10 @@ or payload transfer stops the loop without starting another receiver.
 - [x] invoke transaction preparation only after the recorded parent process exits;
 - [x] publish an officially named new executable beside an officially named old
       one without overwriting a conflicting destination;
-- [ ] replace a renamed executable in place while preserving its custom filename;
+- [x] replace a renamed executable in place while preserving its exact custom
+      filename;
+- [x] restore `previous.exe` through a separate verified rollback candidate when
+      custom-name post-replacement verification fails;
 - [ ] relaunch the installed executable and confirm successful startup;
 - [ ] delete backups and staging files only after startup confirmation;
 - [ ] roll back safely when replacement, migration, or startup fails.

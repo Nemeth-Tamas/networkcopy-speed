@@ -5896,17 +5896,18 @@ fn run_update_handoff_wait_if_requested() -> Result<bool, String> {
             );
         }
 
-        release_update::UpdateInstallationPublication::DeferredCustomName => {
+        release_update::UpdateInstallationPublication::ReplacedInPlace {
+            installed_executable,
+        } => {
             eprintln!(
                 "Manager update helper validated {}, observed parent process {} as {:?}, prepared \
-                 backup {}, and prepared verified install candidate {}. Custom-name replacement \
-                 remains deferred, so {} was not modified.",
+                 backup {}, and atomically replaced the custom-named executable {} while \
+                 preserving its exact path. The new Manager was not launched.",
                 report.handoff.staged_executable.display(),
                 report.handoff.parent_process_id,
                 report.parent_wait,
                 report.installation.backup_executable.display(),
-                report.installation.install_candidate.display(),
-                report.handoff.install_path.display(),
+                installed_executable.display(),
             );
         }
     }

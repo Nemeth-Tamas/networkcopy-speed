@@ -44,6 +44,8 @@ const UPDATE_BACKUP_PARTIAL_FILE: &str = "previous.exe.partial";
 
 const UPDATE_INSTALL_CANDIDATE_SUFFIX: &str = ".networkcopy-update.partial";
 
+const UPDATE_ROLLBACK_CANDIDATE_SUFFIX: &str = ".networkcopy-rollback.partial";
+
 const UPDATE_HANDOFF_FILE: &str = "handoff-plan.bin";
 
 const UPDATE_HANDOFF_MAGIC: [u8; 4] = *b"NCH1";
@@ -263,7 +265,7 @@ pub struct PreparedUpdateInstallation {
 pub enum UpdateInstallationPublication {
     PublishedSideBySide { installed_executable: PathBuf },
 
-    DeferredCustomName,
+    ReplacedInPlace { installed_executable: PathBuf },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -850,7 +852,7 @@ fn publish_prepared_update_installation(
 
     match handoff.naming {
         UpdateInstallNaming::PreserveCurrentName => {
-            Ok(UpdateInstallationPublication::DeferredCustomName)
+            publish_custom_named_update(handoff, installation)
         }
 
         UpdateInstallNaming::PublishedAssetName => {
@@ -933,6 +935,179 @@ fn publish_officially_named_update(
     Ok(UpdateInstallationPublication::PublishedSideBySide {
         installed_executable: handoff.install_path.clone(),
     })
+}
+
+fn publish_custom_named_update(
+    handoff: &UpdateHandoffPlan,
+    installation: &PreparedUpdateInstallation,
+) -> io::Result<UpdateInstallationPublication> {
+    let rollback_candidate = update_rollback_candidate_path(handoff)?;
+
+    validate_custom_replacement_paths(handoff, installation, &rollback_candidate)?;
+
+    verify_prepared_installation_file(
+        &handoff.current_executable,
+        "custom-name executable before replacement",
+        installation.backup_size,
+        &installation.backup_sha256_hex,
+    )?;
+
+    crate::windows_file_replace::replace(&installation.install_candidate, &handoff.install_path)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "verified custom-name update candidate {:?} could not replace {:?}: {error}",
+                    installation.install_candidate, handoff.install_path,
+                ),
+            )
+        })?;
+
+    if let Err(verification_error) = verify_prepared_installation_file(
+        &handoff.install_path,
+        "installed custom-name update executable",
+        handoff.expected_size,
+        &handoff.expected_sha256_hex,
+    ) {
+        return match rollback_custom_named_update(handoff, installation) {
+            Ok(()) => Err(io::Error::new(
+                verification_error.kind(),
+                format!(
+                    "{verification_error}; the previous custom-named executable was restored \
+                     from its verified backup",
+                ),
+            )),
+
+            Err(rollback_error) => Err(io::Error::new(
+                verification_error.kind(),
+                format!(
+                    "{verification_error}; automatic restoration of the previous executable \
+                     also failed: {rollback_error}",
+                ),
+            )),
+        };
+    }
+
+    Ok(UpdateInstallationPublication::ReplacedInPlace {
+        installed_executable: handoff.install_path.clone(),
+    })
+}
+
+fn rollback_custom_named_update(
+    handoff: &UpdateHandoffPlan,
+    installation: &PreparedUpdateInstallation,
+) -> io::Result<()> {
+    let rollback_candidate = update_rollback_candidate_path(handoff)?;
+
+    validate_custom_replacement_paths(handoff, installation, &rollback_candidate)?;
+
+    verify_prepared_installation_file(
+        &installation.backup_executable,
+        "custom-name rollback backup",
+        installation.backup_size,
+        &installation.backup_sha256_hex,
+    )?;
+
+    remove_file_if_exists(&rollback_candidate)?;
+
+    copy_verified_file(
+        &installation.backup_executable,
+        &rollback_candidate,
+        Some((
+            installation.backup_size,
+            installation.backup_sha256_hex.as_str(),
+        )),
+    )?;
+
+    crate::windows_file_replace::replace(&rollback_candidate, &handoff.install_path).map_err(
+        |error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "verified rollback candidate {:?} could not restore custom-named executable \
+                 {:?}: {error}",
+                    rollback_candidate, handoff.install_path,
+                ),
+            )
+        },
+    )?;
+
+    verify_prepared_installation_file(
+        &handoff.install_path,
+        "restored custom-name executable",
+        installation.backup_size,
+        &installation.backup_sha256_hex,
+    )
+}
+
+fn validate_custom_replacement_paths(
+    handoff: &UpdateHandoffPlan,
+    installation: &PreparedUpdateInstallation,
+    rollback_candidate: &Path,
+) -> io::Result<()> {
+    if handoff.naming != UpdateInstallNaming::PreserveCurrentName {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "custom-name replacement requires PreserveCurrentName naming",
+        ));
+    }
+
+    if handoff.install_path != handoff.current_executable {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "custom-name install path {:?} does not match the current executable {:?}",
+                handoff.install_path, handoff.current_executable,
+            ),
+        ));
+    }
+
+    if rollback_candidate.parent() != handoff.install_path.parent() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "custom-name rollback candidate must be beside the installed executable",
+        ));
+    }
+
+    for (reserved, label) in [
+        (&handoff.current_executable, "current executable"),
+        (&handoff.staged_executable, "staged helper"),
+        (&handoff.backup_executable, "published backup"),
+        (&handoff.handoff_plan, "handoff plan"),
+        (&handoff.startup_marker, "startup marker"),
+        (&installation.install_candidate, "install candidate"),
+    ] {
+        if rollback_candidate == reserved {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("custom-name rollback candidate aliases the {label}"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn update_rollback_candidate_path(handoff: &UpdateHandoffPlan) -> io::Result<PathBuf> {
+    let install_parent = handoff.install_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "custom-name install path has no parent directory",
+        )
+    })?;
+
+    let install_file_name = handoff.install_path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "custom-name install path has no file name",
+        )
+    })?;
+
+    let mut rollback_file_name = install_file_name.to_os_string();
+
+    rollback_file_name.push(UPDATE_ROLLBACK_CANDIDATE_SUFFIX);
+
+    Ok(install_parent.join(rollback_file_name))
 }
 
 fn verify_prepared_installation_file(
@@ -3013,7 +3188,8 @@ mod tests {
         encode_update_handoff_plan, is_official_release_file_name, open_parent_process,
         parse_release_response, parse_sha256_digest, parse_stable_version,
         partial_staged_executable_path, prepare_update_installation_files,
-        read_update_handoff_plan, select_release_asset, stage_update_from_reader,
+        publish_prepared_update_installation, read_update_handoff_plan,
+        rollback_custom_named_update, select_release_asset, stage_update_from_reader,
         validate_release_url, verify_update_handoff_executable, write_update_handoff_plan,
     };
     use sha2::{Digest, Sha256};
@@ -3810,15 +3986,85 @@ mod tests {
     }
 
     #[test]
-    fn handoff_completion_defers_custom_name_replacement() {
+    fn handoff_completion_replaces_custom_name_in_place() {
         let current_payload = b"old custom manager";
 
         let update_payload = b"new custom manager";
 
         let update_sha256_hex = test_sha256_hex(update_payload);
 
-        let (root, plan) = test_update_plan(
+        let (root, mut plan) = test_update_plan(
             "handoff-completion-custom",
+            update_payload.len() as u64,
+            &update_sha256_hex,
+        );
+
+        plan.current_executable = root.join("Árvíztűrő custom Manager final definitely.exe");
+
+        plan.install_path = plan.current_executable.clone();
+
+        plan.naming = UpdateInstallNaming::PreserveCurrentName;
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        fs::write(&plan.current_executable, current_payload).unwrap();
+
+        fs::write(&plan.staged_executable, update_payload).unwrap();
+
+        let verified = VerifiedStagedUpdate {
+            executable: plan.staged_executable.clone(),
+
+            size: update_payload.len() as u64,
+
+            sha256_hex: update_sha256_hex.clone(),
+        };
+
+        let handoff = build_update_handoff_plan(&plan, &verified, 1234).unwrap();
+
+        let report =
+            complete_update_handoff_after_parent_exit(handoff, ParentProcessWaitOutcome::Exited)
+                .unwrap();
+
+        assert_eq!(
+            report.publication,
+            UpdateInstallationPublication::ReplacedInPlace {
+                installed_executable: plan.current_executable.clone(),
+            },
+        );
+
+        assert_eq!(fs::read(&plan.current_executable).unwrap(), update_payload,);
+
+        assert_eq!(
+            fs::read(&report.installation.backup_executable).unwrap(),
+            current_payload,
+        );
+
+        assert!(!report.installation.install_candidate.exists(),);
+
+        assert_eq!(fs::read(&plan.staged_executable).unwrap(), update_payload,);
+
+        assert_eq!(
+            plan.current_executable.file_name().unwrap(),
+            OsStr::new("Árvíztűrő custom Manager final definitely.exe"),
+        );
+
+        assert_eq!(report.installation.candidate_sha256_hex, update_sha256_hex,);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn custom_name_publication_rejects_changed_installed_executable() {
+        let current_payload = b"old custom manager";
+
+        let changed_payload = b"externally changed manager";
+
+        let update_payload = b"new custom manager";
+
+        let update_sha256_hex = test_sha256_hex(update_payload);
+
+        let (root, plan) = test_update_plan(
+            "custom-name-changed-before-publication",
             update_payload.len() as u64,
             &update_sha256_hex,
         );
@@ -3839,28 +4085,84 @@ mod tests {
 
         let handoff = build_update_handoff_plan(&plan, &verified, 1234).unwrap();
 
-        let report =
-            complete_update_handoff_after_parent_exit(handoff, ParentProcessWaitOutcome::Exited)
-                .unwrap();
+        let installation = prepare_update_installation_files(&handoff).unwrap();
+
+        fs::write(&plan.current_executable, changed_payload).unwrap();
+
+        let error = publish_prepared_update_installation(&handoff, &installation).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        assert_eq!(fs::read(&plan.current_executable).unwrap(), changed_payload,);
 
         assert_eq!(
-            report.publication,
-            UpdateInstallationPublication::DeferredCustomName,
-        );
-
-        assert_eq!(fs::read(&plan.current_executable).unwrap(), current_payload,);
-
-        assert_eq!(
-            fs::read(&report.installation.backup_executable).unwrap(),
+            fs::read(&installation.backup_executable).unwrap(),
             current_payload,
         );
 
         assert_eq!(
-            fs::read(&report.installation.install_candidate).unwrap(),
+            fs::read(&installation.install_candidate).unwrap(),
             update_payload,
         );
 
-        assert_eq!(fs::read(&plan.staged_executable).unwrap(), update_payload,);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn custom_name_rollback_restores_verified_backup() {
+        let current_payload = b"old custom manager";
+
+        let update_payload = b"new custom manager";
+
+        let broken_payload = b"broken installed manager";
+
+        let update_sha256_hex = test_sha256_hex(update_payload);
+
+        let (root, plan) = test_update_plan(
+            "custom-name-rollback",
+            update_payload.len() as u64,
+            &update_sha256_hex,
+        );
+
+        fs::create_dir_all(&plan.staging_directory).unwrap();
+
+        fs::write(&plan.current_executable, current_payload).unwrap();
+
+        fs::write(&plan.staged_executable, update_payload).unwrap();
+
+        let verified = VerifiedStagedUpdate {
+            executable: plan.staged_executable.clone(),
+
+            size: update_payload.len() as u64,
+
+            sha256_hex: update_sha256_hex,
+        };
+
+        let handoff = build_update_handoff_plan(&plan, &verified, 1234).unwrap();
+
+        let installation = prepare_update_installation_files(&handoff).unwrap();
+
+        fs::write(&plan.current_executable, broken_payload).unwrap();
+
+        rollback_custom_named_update(&handoff, &installation).unwrap();
+
+        assert_eq!(fs::read(&plan.current_executable).unwrap(), current_payload,);
+
+        assert_eq!(
+            fs::read(&installation.backup_executable).unwrap(),
+            current_payload,
+        );
+
+        assert_eq!(
+            fs::read(&installation.install_candidate).unwrap(),
+            update_payload,
+        );
+
+        assert!(
+            !root
+                .join("current.exe.networkcopy-rollback.partial")
+                .exists(),
+        );
 
         let _ = fs::remove_dir_all(root);
     }
