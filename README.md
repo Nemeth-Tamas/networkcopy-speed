@@ -24,10 +24,16 @@ The repository contains:
 
 ## Current status
 
-Current stable release and source version:
+Current stable release:
 
 ```text
 2.4.0
+```
+
+Current development version:
+
+```text
+2.4.1-dev
 ```
 
 v2.4 strengthens unattended setup with exact queue-binding recovery,
@@ -472,7 +478,7 @@ or payload transfer stops the loop without starting another receiver.
 
 - [ ] complete v2.3 physical three-machine queue acceptance;
 - [ ] complete managed Direct Link physical acceptance;
-- [ ] complete Manager multi-source destination-root acceptance;
+- [x] complete Manager multi-source destination-root acceptance;
 - [ ] complete repeated standalone root-receiver acceptance;
 - [x] complete renamed and officially named executable update acceptance.
 
@@ -482,6 +488,45 @@ without modifying the old executable. A custom-renamed v2.3.99 Manager replaced
 itself in place while preserving its exact filename. Both installed executables
 matched the published v2.4.0 SHA-256 digest, relaunched successfully, confirmed
 healthy startup, and removed all staging and transaction files.
+
+### v2.4.1 post-release hotfix progress
+
+Physical two-machine Manager multi-source destination-root acceptance completed
+on 2026-08-06 over the Explicit IP route. Three sequential queue entries
+transferred 2,331 files and 1,244,706,622 bytes from `192.168.2.200` to
+`192.168.2.103`.
+
+Independent canonical file-only SHA-256 verification produced the same digest on
+both machines:
+
+```text
+BD0E1435F5B32A4EE96985839569C6D89128C84407E836CF9DC3792CF954B52D
+```
+
+The run confirmed correct batch mapping, sequential queue execution, Unicode
+filenames, thousands of small files, large incompressible files, compressible
+files, and exact payload integrity.
+
+The same physical run exposed three post-release issues:
+
+- [x] send Automatic LAN discovery through every usable IPv4 subnet on
+      multi-adapter Windows systems without failing on unreachable virtual
+      adapters;
+- [ ] preserve empty source directories in the destination tree;
+- [ ] allow scrolling while extending a multi-entry Manager history selection.
+
+### Planned v2.5 desktop layout migration
+
+- [ ] capture Windows desktop file and folder positions through the Shell folder
+      view;
+- [ ] record desktop icon size, Auto Arrange state, DPI, work area, and monitor
+      geometry;
+- [ ] transfer the layout as optional migration metadata;
+- [ ] match destination desktop items by stable relative name;
+- [ ] scale and clamp positions safely for different destination resolutions;
+- [ ] restore ordinary desktop file and folder positions after transfer;
+- [ ] handle missing, renamed, redirected, and built-in Shell items without
+      failing the transfer.
 
 ### Planned v2.5 performance work
 

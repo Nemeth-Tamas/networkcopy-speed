@@ -8,9 +8,15 @@ use std::env;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::process;
+use std::ptr;
+use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    FreeMibTable, GetUnicastIpAddressTable, MIB_UNICASTIPADDRESS_ROW, MIB_UNICASTIPADDRESS_TABLE,
+};
+use windows_sys::Win32::Networking::WinSock::AF_INET;
 
 const DISCOVERY_MAGIC: [u8; 4] = *b"NMD1";
 const DISCOVERY_VERSION: u8 = 1;
@@ -26,7 +32,25 @@ const DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(300);
 
 const DISCOVERY_ATTEMPTS: usize = 3;
 
+const NO_ERROR: u32 = 0;
+
+const WSAEADDRNOTAVAIL: i32 = 10049;
+const WSAENETDOWN: i32 = 10050;
+const WSAENETUNREACH: i32 = 10051;
+const WSAEHOSTDOWN: i32 = 10064;
+const WSAEHOSTUNREACH: i32 = 10065;
+
 static NEXT_NONCE: AtomicU64 = AtomicU64::new(1);
+
+struct UnicastAddressTable(*mut MIB_UNICASTIPADDRESS_TABLE);
+
+impl Drop for UnicastAddressTable {
+    fn drop(&mut self) {
+        unsafe {
+            FreeMibTable(self.0.cast());
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -432,15 +456,134 @@ pub fn run_agent() -> io::Result<()> {
 }
 
 pub fn discover() -> io::Result<Vec<DiscoveredAgent>> {
-    let target = SocketAddr::V4(SocketAddrV4::new(
+    let targets = discovery_targets()?;
+
+    discover_targets(&targets, DISCOVERY_TIMEOUT)
+}
+
+fn discovery_targets() -> io::Result<Vec<SocketAddr>> {
+    let mut targets = ipv4_directed_broadcast_targets()?;
+
+    // Retain the original limited broadcast as a fallback for unusual
+    // interface configurations. Directed subnet broadcasts are sent first so
+    // Windows can route each probe through its matching adapter.
+    let limited_broadcast = SocketAddr::V4(SocketAddrV4::new(
         Ipv4Addr::BROADCAST,
         MANAGEMENT_DISCOVERY_PORT,
     ));
 
-    discover_target(target, DISCOVERY_TIMEOUT)
+    if !targets.contains(&limited_broadcast) {
+        targets.push(limited_broadcast);
+    }
+
+    Ok(targets)
 }
 
+fn ipv4_directed_broadcast_targets() -> io::Result<Vec<SocketAddr>> {
+    let mut raw_table = ptr::null_mut();
+
+    let status = unsafe { GetUnicastIpAddressTable(AF_INET, &mut raw_table) };
+
+    if status != NO_ERROR {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+
+    if raw_table.is_null() {
+        return Err(io::Error::other(
+            "GetUnicastIpAddressTable returned a null IPv4 table",
+        ));
+    }
+
+    let table = UnicastAddressTable(raw_table);
+
+    let entry_count = unsafe { (*table.0).NumEntries as usize };
+
+    let first_entry = unsafe { (*table.0).Table.as_ptr() };
+
+    let rows = unsafe { slice::from_raw_parts(first_entry, entry_count) };
+
+    let mut targets = rows
+        .iter()
+        .filter_map(|row| {
+            let address = ipv4_address(row)?;
+
+            let broadcast = directed_broadcast_address(address, row.OnLinkPrefixLength)?;
+
+            Some(SocketAddr::V4(SocketAddrV4::new(
+                broadcast,
+                MANAGEMENT_DISCOVERY_PORT,
+            )))
+        })
+        .collect::<Vec<_>>();
+
+    targets.sort_by_key(|target| target.to_string());
+    targets.dedup();
+
+    Ok(targets)
+}
+
+fn ipv4_address(row: &MIB_UNICASTIPADDRESS_ROW) -> Option<Ipv4Addr> {
+    let family = unsafe { row.Address.si_family };
+
+    if family != AF_INET {
+        return None;
+    }
+
+    let socket_address = unsafe { row.Address.Ipv4 };
+
+    let address_bytes = unsafe { socket_address.sin_addr.S_un.S_addr }.to_ne_bytes();
+
+    Some(Ipv4Addr::from(address_bytes))
+}
+
+fn directed_broadcast_address(address: Ipv4Addr, prefix_length: u8) -> Option<Ipv4Addr> {
+    if prefix_length == 0 || prefix_length > 30 {
+        return None;
+    }
+
+    if address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || address == Ipv4Addr::BROADCAST
+    {
+        return None;
+    }
+
+    let address_bits = u32::from_be_bytes(address.octets());
+
+    let host_mask = u32::MAX >> u32::from(prefix_length);
+
+    let broadcast_bits = address_bits | host_mask;
+
+    let broadcast = Ipv4Addr::from(broadcast_bits.to_be_bytes());
+
+    if broadcast == address {
+        return None;
+    }
+
+    Some(broadcast)
+}
+
+fn is_skippable_discovery_send_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(WSAEADDRNOTAVAIL | WSAENETDOWN | WSAENETUNREACH | WSAEHOSTDOWN | WSAEHOSTUNREACH)
+    )
+}
+
+#[cfg(test)]
 fn discover_target(target: SocketAddr, timeout: Duration) -> io::Result<Vec<DiscoveredAgent>> {
+    discover_targets(&[target], timeout)
+}
+
+fn discover_targets(targets: &[SocketAddr], timeout: Duration) -> io::Result<Vec<DiscoveredAgent>> {
+    if targets.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "management discovery requires at least one target",
+        ));
+    }
+
     if timeout.is_zero() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -476,7 +619,31 @@ fn discover_target(target: SocketAddr, timeout: Duration) -> io::Result<Vec<Disc
         }
 
         if attempts < DISCOVERY_ATTEMPTS && now >= next_probe {
-            socket.send_to(&probe, target)?;
+            let mut sent_to_any_target = false;
+
+            let mut last_skipped_error = None;
+
+            for target in targets {
+                match socket.send_to(&probe, target) {
+                    Ok(_) => {
+                        sent_to_any_target = true;
+                    }
+
+                    Err(error) if is_skippable_discovery_send_error(&error) => {
+                        last_skipped_error = Some(error);
+                    }
+
+                    Err(error) => {
+                        return Err(error);
+                    }
+                }
+            }
+
+            if !sent_to_any_target {
+                return Err(last_skipped_error.unwrap_or_else(|| {
+                    io::Error::other("management discovery could not send to any target")
+                }));
+            }
 
             attempts += 1;
 
@@ -644,9 +811,53 @@ fn create_nonce() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentCapabilities, AgentState, DiscoveryPacket, LocalAgentDescriptor, discover_target,
+        AgentCapabilities, AgentState, DiscoveryPacket, LocalAgentDescriptor, WSAENETUNREACH,
+        directed_broadcast_address, discover_target, is_skippable_discovery_send_error,
         respond_once,
     };
+
+    #[test]
+    fn unreachable_discovery_target_is_skippable() {
+        let error = io::Error::from_raw_os_error(WSAENETUNREACH);
+
+        assert!(is_skippable_discovery_send_error(&error));
+    }
+
+    #[test]
+    fn unexpected_discovery_send_error_is_not_skipped() {
+        let error = io::Error::from_raw_os_error(5);
+
+        assert!(!is_skippable_discovery_send_error(&error));
+    }
+
+    #[test]
+    fn slash_24_directed_broadcast_is_calculated() {
+        assert_eq!(
+            directed_broadcast_address(Ipv4Addr::new(192, 168, 2, 200), 24,),
+            Some(Ipv4Addr::new(192, 168, 2, 255)),
+        );
+    }
+
+    #[test]
+    fn slash_16_directed_broadcast_is_calculated() {
+        assert_eq!(
+            directed_broadcast_address(Ipv4Addr::new(172, 20, 224, 1), 16,),
+            Some(Ipv4Addr::new(172, 20, 255, 255)),
+        );
+    }
+
+    #[test]
+    fn point_to_point_prefix_has_no_broadcast() {
+        assert_eq!(
+            directed_broadcast_address(Ipv4Addr::new(192, 168, 2, 200), 31,),
+            None,
+        );
+    }
+
+    #[test]
+    fn loopback_address_is_not_probed() {
+        assert_eq!(directed_broadcast_address(Ipv4Addr::LOCALHOST, 8,), None,);
+    }
     use crate::management_jobs::ManagementJobRegistry;
     use crate::management_protocol::{MANAGEMENT_CONTROL_PORT, MANAGEMENT_PROTOCOL_VERSION};
     use std::io;
