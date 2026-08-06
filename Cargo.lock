@@ -1439,7 +1439,7 @@ dependencies = [
 
 [[package]]
 name = "networkcopy-speed"
-version = "2.4.1-dev"
+version = "2.4.1"
 dependencies = [
  "blake3",
  "eframe",

@@ -24,16 +24,10 @@ The repository contains:
 
 ## Current status
 
-Current stable release:
+Current stable release and source version:
 
 ```text
-2.4.0
-```
-
-Current development version:
-
-```text
-2.4.1-dev
+2.4.1
 ```
 
 v2.4 strengthens unattended setup with exact queue-binding recovery,
@@ -489,7 +483,19 @@ itself in place while preserving its exact filename. Both installed executables
 matched the published v2.4.0 SHA-256 digest, relaunched successfully, confirmed
 healthy startup, and removed all staging and transaction files.
 
-### v2.4.1 post-release hotfix progress
+### v2.4.1 release
+
+v2.4.1 fixes Automatic LAN discovery on Windows systems with several physical,
+virtual, VPN, container, or WSL network adapters. The Manager now sends
+discovery probes through each usable IPv4 subnet, skips individually unreachable
+adapter routes, identifies duplicate replies by the exact running Agent process,
+and retains the address with the strongest shared-LAN affinity.
+
+Physical acceptance on 2026-08-06 reduced five replies from the local
+multi-adapter Agent to one card at `192.168.2.200:7339`, while independently
+discovering the remote Agent at `192.168.2.103:7339`. Automatic LAN selection
+therefore presented exactly the two real endpoint computers using their common
+physical Ethernet subnet.
 
 Physical two-machine Manager multi-source destination-root acceptance completed
 on 2026-08-06 over the Explicit IP route. Three sequential queue entries
