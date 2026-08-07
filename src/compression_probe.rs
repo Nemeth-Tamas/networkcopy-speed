@@ -139,21 +139,6 @@ pub fn run(source: &Path, level: i32) -> io::Result<CompressionProbeReport> {
     })
 }
 
-pub(crate) fn decide_file_range(
-    file: &File,
-    offset: u64,
-    length: u64,
-    level: i32,
-) -> io::Result<CompressionDecision> {
-    decide_file_range_profiled(
-        file,
-        offset,
-        length,
-        level,
-        None,
-    )
-}
-
 pub(crate) fn decide_file_range_profiled(
     file: &File,
     offset: u64,
@@ -163,23 +148,16 @@ pub(crate) fn decide_file_range_profiled(
 ) -> io::Result<CompressionDecision> {
     validate_level(level)?;
 
-    let end = offset.checked_add(length).ok_or_else(
-        || {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "compression range overflowed",
-            )
-        },
-    )?;
+    let end = offset.checked_add(length).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "compression range overflowed")
+    })?;
 
     let file_length = file.metadata()?.len();
 
     if end > file_length {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!(
-                "compression range {offset}..{end} exceeds file length {file_length}"
-            ),
+            format!("compression range {offset}..{end} exceeds file length {file_length}"),
         ));
     }
 
@@ -193,39 +171,23 @@ pub(crate) fn decide_file_range_profiled(
 
     let measurement_started = Instant::now();
 
-    let measurement =
-        measure_ranges(
-            file,
-            offset,
-            &ranges,
-            level,
-        );
+    let measurement = measure_ranges(file, offset, &ranges, level);
 
-    let measurement_elapsed =
-        measurement_started.elapsed();
+    let measurement_elapsed = measurement_started.elapsed();
 
     {
         let mut cursor = file;
 
-        cursor.seek(SeekFrom::Start(
-            original_position,
-        ))?;
+        cursor.seek(SeekFrom::Start(original_position))?;
     }
 
-    let (sampled_bytes, compressed_bytes) =
-        measurement?;
+    let (sampled_bytes, compressed_bytes) = measurement?;
 
     if let Some(profiler) = profiler {
-        profiler.record_sender_compression(
-            measurement_elapsed,
-            sampled_bytes,
-        );
+        profiler.record_sender_compression(measurement_elapsed, sampled_bytes);
     }
 
-    Ok(choose_decision(
-        sampled_bytes,
-        compressed_bytes,
-    ))
+    Ok(choose_decision(sampled_bytes, compressed_bytes))
 }
 
 fn measure_ranges(

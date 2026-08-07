@@ -22,10 +22,18 @@ The repository contains:
 - a WGPU management application for remote browsing and orchestration;
 - one shared networking and transfer engine used by every front end.
 
-Current stable release and source version:
+## Current status
+
+Current stable release:
 
 ```text
 2.5.0
+```
+
+Current development version:
+
+```text
+2.6.0-dev
 ```
 
 v2.5 adds Windows Desktop layout migration, empty-directory preservation,
@@ -45,7 +53,10 @@ affinity. The reproduced one-machine multi-adapter case correctly retained
 `192.168.1.2:7339` instead of APIPA `169.254.21.253:7339` or the virtual
 `172.20.96.1:7339` route.
 
-The detailed v2.4 history can stay farther down in the README.
+Release packaging supports optional certificate-store Authenticode signing,
+RFC 3161 SHA-256 timestamping, signature verification before checksums, and
+unsigned local development builds. See
+[Release Trust and Antivirus Guidance](RELEASE-TRUST.md).
 
 v2 supports verified content reuse during both updates
 and fresh folder transfers. Update mode reuses content from older receiver-side
@@ -670,8 +681,11 @@ transfer buffer budget.
 
 Planned investigation order:
 
-- [ ] add stage-level timing for source reads, compression/probing, blocked
-      socket writes, socket reads, decompression, and destination writes;
+- [x] add aggregate stage profiling for ordinary, striped, and tiny-pack payload
+      source reads, compression/probing, underlying socket writes, underlying
+      socket reads, decompression, and destination writes;
+- [ ] extend source/destination disk-stage attribution through CDC and exact-reuse
+      paths before using profiler results to tune those specialized paths;
 - [ ] classify the actual transfer interface instead of inferring transport from
       Automatic LAN or Explicit IP mode;
 - [ ] benchmark Windows automatic TCP buffering against explicit 256 KiB,
@@ -693,6 +707,12 @@ Planned investigation order:
       with the limit derived from the global transfer-memory budget;
 - [ ] keep Windows IO Ring research for a later v3 investigation unless profiling
       identifies syscall submission as a meaningful production bottleneck.
+
+Stage timing is reported as aggregate worker time together with processed bytes
+and operation counts. Because transfer lanes operate concurrently, summed stage
+time can legitimately exceed wall-clock transfer duration. The profiler is
+intended to identify where concurrent workers spend time rather than to present
+a serial percentage breakdown.
 
 Direct Link is always a physical Ethernet candidate. Automatic LAN and Explicit
 IP may use Ethernet, Wi-Fi, VPN, or virtual interfaces, so the v2.6 policy must

@@ -116,28 +116,12 @@ impl SharedError {
 }
 
 impl TinyFileMaterializer {
-    pub(crate) fn start(
-        destination_root: Arc<PathBuf>,
-        progress: Option<ProgressCounter>,
-    ) -> io::Result<Self> {
-        let worker_count =
-            recommended_worker_count();
-
-        Self::start_with_worker_count_and_profiler(
-            destination_root,
-            progress,
-            worker_count,
-            None,
-        )
-    }
-
     pub(crate) fn start_profiled(
         destination_root: Arc<PathBuf>,
         progress: Option<ProgressCounter>,
         profiler: Arc<TransferProfiler>,
     ) -> io::Result<Self> {
-        let worker_count =
-            recommended_worker_count();
+        let worker_count = recommended_worker_count();
 
         Self::start_with_worker_count_and_profiler(
             destination_root,
@@ -147,17 +131,13 @@ impl TinyFileMaterializer {
         )
     }
 
+    #[cfg(test)]
     fn start_with_worker_count(
         destination_root: Arc<PathBuf>,
         progress: Option<ProgressCounter>,
         worker_count: usize,
     ) -> io::Result<Self> {
-        Self::start_with_worker_count_and_profiler(
-            destination_root,
-            progress,
-            worker_count,
-            None,
-        )
+        Self::start_with_worker_count_and_profiler(destination_root, progress, worker_count, None)
     }
 
     fn start_with_worker_count_and_profiler(
@@ -170,11 +150,7 @@ impl TinyFileMaterializer {
 
         let queue_capacity = worker_count
             .checked_mul(QUEUED_JOBS_PER_WORKER)
-            .ok_or_else(|| {
-                io::Error::other(
-                    "tiny-file materialization queue size overflowed",
-                )
-            })?;
+            .ok_or_else(|| io::Error::other("tiny-file materialization queue size overflowed"))?;
 
         let inner = Arc::new(MaterializerInner {
             destination_root,
@@ -186,9 +162,7 @@ impl TinyFileMaterializer {
             queue_capacity,
 
             state: Mutex::new(QueueState {
-                jobs: VecDeque::with_capacity(
-                    queue_capacity,
-                ),
+                jobs: VecDeque::with_capacity(queue_capacity),
 
                 shutdown: false,
 
@@ -421,13 +395,8 @@ fn worker_loop(inner: Arc<MaterializerInner>) -> io::Result<()> {
                 )
             })?;
 
-            let write_bytes =
-                u64::try_from(contents.len())
-                    .map_err(|_| {
-                        io::Error::other(
-                            "tiny-file write length cannot be represented",
-                        )
-                    })?;
+            let write_bytes = u64::try_from(contents.len())
+                .map_err(|_| io::Error::other("tiny-file write length cannot be represented"))?;
 
             let write_started = Instant::now();
 
@@ -439,11 +408,7 @@ fn worker_loop(inner: Arc<MaterializerInner>) -> io::Result<()> {
             )?;
 
             if let Some(profiler) = &inner.profiler {
-                profiler
-                    .record_receiver_destination_write(
-                        write_started.elapsed(),
-                        write_bytes,
-                    );
+                profiler.record_receiver_destination_write(write_started.elapsed(), write_bytes);
             }
 
             Ok(())

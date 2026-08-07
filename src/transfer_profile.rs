@@ -51,119 +51,51 @@ struct StageAccumulator {
 }
 
 impl StageAccumulator {
-    fn record(
-        &self,
-        elapsed: Duration,
-        bytes: u64,
-    ) {
-        let elapsed_nanos =
-            u64::try_from(elapsed.as_nanos())
-                .unwrap_or(u64::MAX);
+    fn record(&self, elapsed: Duration, bytes: u64) {
+        let elapsed_nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
 
-        atomic_saturating_add(
-            &self.elapsed_nanos,
-            elapsed_nanos,
-        );
+        atomic_saturating_add(&self.elapsed_nanos, elapsed_nanos);
 
-        atomic_saturating_add(
-            &self.bytes,
-            bytes,
-        );
+        atomic_saturating_add(&self.bytes, bytes);
 
-        atomic_saturating_add(
-            &self.operations,
-            1,
-        );
+        atomic_saturating_add(&self.operations, 1);
     }
 
     fn snapshot(&self) -> StageSample {
         StageSample {
-            elapsed: Duration::from_nanos(
-                self.elapsed_nanos
-                    .load(Ordering::Relaxed),
-            ),
+            elapsed: Duration::from_nanos(self.elapsed_nanos.load(Ordering::Relaxed)),
 
             bytes: self.bytes.load(Ordering::Relaxed),
 
-            operations: self
-                .operations
-                .load(Ordering::Relaxed),
+            operations: self.operations.load(Ordering::Relaxed),
         }
     }
 }
 
-fn atomic_saturating_add(
-    target: &AtomicU64,
-    value: u64,
-) {
-    let _ = target.fetch_update(
-        Ordering::Relaxed,
-        Ordering::Relaxed,
-        |current| {
-            Some(current.saturating_add(value))
-        },
-    );
+fn atomic_saturating_add(target: &AtomicU64, value: u64) {
+    let _ = target.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(value))
+    });
 }
 
 impl TransferProfiler {
-    pub(crate) fn record_sender_source_read(
-        &self,
-        elapsed: Duration,
-        bytes: u64,
-    ) {
-        self.sender_source_read
-            .record(elapsed, bytes);
+    pub(crate) fn record_sender_source_read(&self, elapsed: Duration, bytes: u64) {
+        self.sender_source_read.record(elapsed, bytes);
     }
 
-    pub(crate) fn record_sender_compression(
-        &self,
-        elapsed: Duration,
-        bytes: u64,
-    ) {
-        self.sender_compression
-            .record(elapsed, bytes);
+    pub(crate) fn record_sender_compression(&self, elapsed: Duration, bytes: u64) {
+        self.sender_compression.record(elapsed, bytes);
     }
 
-    pub(crate) fn record_receiver_decompression(
-        &self,
-        elapsed: Duration,
-        bytes: u64,
-    ) {
-        self.receiver_decompression
-            .record(elapsed, bytes);
+    pub(crate) fn record_receiver_decompression(&self, elapsed: Duration, bytes: u64) {
+        self.receiver_decompression.record(elapsed, bytes);
     }
 
-    pub(crate) fn record_receiver_socket_read(
-        &self,
-        elapsed: Duration,
-        bytes: u64,
-    ) {
-        self.receiver_socket_read
-            .record(elapsed, bytes);
+    pub(crate) fn record_receiver_destination_write(&self, elapsed: Duration, bytes: u64) {
+        self.receiver_destination_write.record(elapsed, bytes);
     }
 
-    pub(crate) fn record_receiver_destination_write(
-        &self,
-        elapsed: Duration,
-        bytes: u64,
-    ) {
-        self.receiver_destination_write
-            .record(elapsed, bytes);
-    }
-
-    pub(crate) fn record_sender_socket_write(
-        &self,
-        elapsed: Duration,
-        bytes: u64,
-    ) {
-        self.sender_socket_write
-            .record(elapsed, bytes);
-    }
-
-    pub(crate) fn sender_socket_writer<W>(
-        &self,
-        inner: W,
-    ) -> ProfiledWriter<'_, W>
+    pub(crate) fn sender_socket_writer<W>(&self, inner: W) -> ProfiledWriter<'_, W>
     where
         W: Write,
     {
@@ -174,10 +106,7 @@ impl TransferProfiler {
         }
     }
 
-    pub(crate) fn receiver_socket_reader<R>(
-        &self,
-        inner: R,
-    ) -> ProfiledReader<'_, R>
+    pub(crate) fn receiver_socket_reader<R>(&self, inner: R) -> ProfiledReader<'_, R>
     where
         R: Read,
     {
@@ -188,28 +117,19 @@ impl TransferProfiler {
         }
     }
 
-    pub(crate) fn snapshot(
-        &self,
-    ) -> TransferStageProfile {
+    pub(crate) fn snapshot(&self) -> TransferStageProfile {
         TransferStageProfile {
-            sender_source_read:
-                self.sender_source_read.snapshot(),
+            sender_source_read: self.sender_source_read.snapshot(),
 
-            sender_compression:
-                self.sender_compression.snapshot(),
+            sender_compression: self.sender_compression.snapshot(),
 
-            sender_socket_write:
-                self.sender_socket_write.snapshot(),
+            sender_socket_write: self.sender_socket_write.snapshot(),
 
-            receiver_socket_read:
-                self.receiver_socket_read.snapshot(),
+            receiver_socket_read: self.receiver_socket_read.snapshot(),
 
-            receiver_decompression:
-                self.receiver_decompression.snapshot(),
+            receiver_decompression: self.receiver_decompression.snapshot(),
 
-            receiver_destination_write:
-                self.receiver_destination_write
-                    .snapshot(),
+            receiver_destination_write: self.receiver_destination_write.snapshot(),
         }
     }
 }
@@ -224,20 +144,14 @@ impl<R> Read for ProfiledReader<'_, R>
 where
     R: Read,
 {
-    fn read(
-        &mut self,
-        buffer: &mut [u8],
-    ) -> io::Result<usize> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let started = std::time::Instant::now();
 
         let result = self.inner.read(buffer);
 
         if let Ok(bytes) = result {
-            self.stage.record(
-                started.elapsed(),
-                u64::try_from(bytes)
-                    .unwrap_or(u64::MAX),
-            );
+            self.stage
+                .record(started.elapsed(), u64::try_from(bytes).unwrap_or(u64::MAX));
         }
 
         result
@@ -254,20 +168,14 @@ impl<W> Write for ProfiledWriter<'_, W>
 where
     W: Write,
 {
-    fn write(
-        &mut self,
-        buffer: &[u8],
-    ) -> io::Result<usize> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         let started = std::time::Instant::now();
 
         let result = self.inner.write(buffer);
 
         if let Ok(bytes) = result {
-            self.stage.record(
-                started.elapsed(),
-                u64::try_from(bytes)
-                    .unwrap_or(u64::MAX),
-            );
+            self.stage
+                .record(started.elapsed(), u64::try_from(bytes).unwrap_or(u64::MAX));
         }
 
         result
@@ -279,10 +187,7 @@ where
         let result = self.inner.flush();
 
         if result.is_ok() {
-            self.stage.record(
-                started.elapsed(),
-                0,
-            );
+            self.stage.record(started.elapsed(), 0);
         }
 
         result
@@ -297,47 +202,27 @@ mod tests {
 
     #[test]
     fn stage_samples_accumulate_work() {
-        let profiler =
-            TransferProfiler::default();
+        let profiler = TransferProfiler::default();
 
-        profiler.record_sender_source_read(
-            Duration::from_nanos(10),
-            100,
-        );
+        profiler.record_sender_source_read(Duration::from_nanos(10), 100);
 
-        profiler.record_sender_source_read(
-            Duration::from_nanos(20),
-            200,
-        );
+        profiler.record_sender_source_read(Duration::from_nanos(20), 200);
 
         let profile = profiler.snapshot();
 
-        assert_eq!(
-            profile.sender_source_read.elapsed,
-            Duration::from_nanos(30),
-        );
+        assert_eq!(profile.sender_source_read.elapsed, Duration::from_nanos(30),);
 
-        assert_eq!(
-            profile.sender_source_read.bytes,
-            300,
-        );
+        assert_eq!(profile.sender_source_read.bytes, 300,);
 
-        assert_eq!(
-            profile.sender_source_read.operations,
-            2,
-        );
+        assert_eq!(profile.sender_source_read.operations, 2,);
     }
 
     #[test]
     fn socket_wrappers_count_actual_io() {
-        let profiler =
-            TransferProfiler::default();
+        let profiler = TransferProfiler::default();
 
         {
-            let mut writer =
-                profiler.sender_socket_writer(
-                    Vec::<u8>::new(),
-                );
+            let mut writer = profiler.sender_socket_writer(Vec::<u8>::new());
 
             writer.write_all(b"hello").unwrap();
 
@@ -345,43 +230,25 @@ mod tests {
         }
 
         {
-            let source =
-                Cursor::new(b"world".to_vec());
+            let source = Cursor::new(b"world".to_vec());
 
-            let mut reader =
-                profiler.receiver_socket_reader(
-                    source,
-                );
+            let mut reader = profiler.receiver_socket_reader(source);
 
             let mut contents = [0_u8; 5];
 
-            reader
-                .read_exact(&mut contents)
-                .unwrap();
+            reader.read_exact(&mut contents).unwrap();
 
             assert_eq!(&contents, b"world");
         }
 
         let profile = profiler.snapshot();
 
-        assert_eq!(
-            profile.sender_socket_write.bytes,
-            5,
-        );
+        assert_eq!(profile.sender_socket_write.bytes, 5,);
 
-        assert!(
-            profile.sender_socket_write.operations
-                >= 1,
-        );
+        assert!(profile.sender_socket_write.operations >= 1,);
 
-        assert_eq!(
-            profile.receiver_socket_read.bytes,
-            5,
-        );
+        assert_eq!(profile.receiver_socket_read.bytes, 5,);
 
-        assert!(
-            profile.receiver_socket_read.operations
-                >= 1,
-        );
+        assert!(profile.receiver_socket_read.operations >= 1,);
     }
 }
