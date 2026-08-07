@@ -1,0 +1,4 @@
+# NetworkCopy intentionally keeps transfer hot-path context explicit.
+# Do not force wrapper/context structs solely to satisfy Clippy's default
+# seven-argument style threshold. Other Clippy lints remain unchanged.
+too-many-arguments-threshold = 32
