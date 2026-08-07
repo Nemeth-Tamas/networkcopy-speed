@@ -1708,18 +1708,80 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "reapplies the current live Windows Desktop layout"]
+    #[ignore = "reapplies and verifies the current live Windows Desktop layout"]
     fn live_desktop_restore_is_idempotent() {
-        let snapshot = capture_current_desktop_layout().unwrap();
+        let before = capture_current_desktop_layout().unwrap();
 
-        let report = restore_current_desktop_layout(&snapshot).unwrap();
+        println!();
+        println!("NetworkCopy live Desktop restore acceptance");
+        println!("  Captured items: {}", before.items.len());
+        println!("  Icon size:      {} px", before.icon_size);
+        println!("  Auto Arrange:   {}", before.auto_arrange);
+        println!("  Monitors:       {}", before.monitors.len());
+
+        let report = restore_current_desktop_layout(&before).unwrap();
+
+        println!();
+        println!(
+            "Restore report: {:?}, {} matched / {} missing",
+            report.outcome, report.matched_items, report.missing_items,
+        );
 
         assert_eq!(report.outcome, DesktopLayoutRestoreOutcome::Applied,);
 
         assert_eq!(
-            report.matched_items + report.missing_items,
-            snapshot.items.len(),
+            report.matched_items,
+            before.items.len(),
+            "every captured physical Desktop item should be found during restore",
         );
+
+        assert_eq!(
+            report.missing_items, 0,
+            "same-machine restore should not lose any captured Desktop items",
+        );
+
+        // Explorer applies view changes synchronously through the Shell API,
+        // but give its view a moment to settle before independently capturing
+        // the resulting state again.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        let after = capture_current_desktop_layout().unwrap();
+
+        assert_eq!(
+            after.icon_size, before.icon_size,
+            "Desktop icon size changed after idempotent restore",
+        );
+
+        assert_eq!(
+            after.auto_arrange, before.auto_arrange,
+            "Desktop Auto Arrange state changed after idempotent restore",
+        );
+
+        assert!(
+            same_monitor_environment(&before.monitors, &after.monitors,),
+            "monitor environment changed during live Desktop restore acceptance",
+        );
+
+        let mut before_items = before.items.clone();
+
+        let mut after_items = after.items.clone();
+
+        before_items.sort_by(|left, right| left.name.cmp(&right.name));
+
+        after_items.sort_by(|left, right| left.name.cmp(&right.name));
+
+        assert_eq!(
+            after_items, before_items,
+            "Desktop item positions or identities changed after idempotent restore",
+        );
+
+        println!();
+        println!(
+            "Verified {} Desktop items unchanged after live restore.",
+            after_items.len(),
+        );
+
+        println!("Live Desktop restore acceptance passed.",);
     }
 
     #[test]
