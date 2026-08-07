@@ -1107,12 +1107,73 @@ impl Drop for OwnedCoTaskWide {
 mod tests {
     use super::{
         DesktopLayoutRestoreOutcome, capture_current_desktop_layout, current_desktop_path,
-        plan_desktop_positions, restore_current_desktop_layout, same_monitor_environment,
+        plan_desktop_positions, point_in_rect, restore_current_desktop_layout,
+        same_monitor_environment, translate_to_view_space, virtual_monitor_bounds,
     };
     use crate::desktop_layout::{
         DESKTOP_LAYOUT_FORMAT_VERSION, DesktopItemKind, DesktopLayoutItem, DesktopLayoutSnapshot,
         DesktopMonitor, DesktopPoint, DesktopRect,
     };
+
+    fn synthetic_compact_monitor_environment(source: &[DesktopMonitor]) -> Vec<DesktopMonitor> {
+        let primary = source
+            .iter()
+            .find(|monitor| monitor.primary)
+            .expect("source Desktop must have a primary monitor");
+
+        let origin_x = primary.bounds.left;
+
+        let origin_y = primary.bounds.top;
+
+        let scale_coordinate = |value: i32, origin: i32| -> i32 {
+            let relative = i64::from(value) - i64::from(origin);
+
+            i32::try_from(relative.saturating_mul(3) / 4).unwrap()
+        };
+
+        source
+            .iter()
+            .map(|monitor| DesktopMonitor {
+                bounds: DesktopRect {
+                    left: scale_coordinate(monitor.bounds.left, origin_x),
+
+                    top: scale_coordinate(monitor.bounds.top, origin_y),
+
+                    right: scale_coordinate(monitor.bounds.right, origin_x),
+
+                    bottom: scale_coordinate(monitor.bounds.bottom, origin_y),
+                },
+
+                work_area: DesktopRect {
+                    left: scale_coordinate(monitor.work_area.left, origin_x),
+
+                    top: scale_coordinate(monitor.work_area.top, origin_y),
+
+                    right: scale_coordinate(monitor.work_area.right, origin_x),
+
+                    bottom: scale_coordinate(monitor.work_area.bottom, origin_y),
+                },
+
+                dpi_x: monitor.dpi_x.saturating_mul(3) / 2,
+
+                dpi_y: monitor.dpi_y.saturating_mul(3) / 2,
+
+                primary: monitor.primary,
+            })
+            .collect()
+    }
+
+    fn planned_position_is_visible(position: DesktopPoint, monitors: &[DesktopMonitor]) -> bool {
+        let Some(virtual_bounds) = virtual_monitor_bounds(monitors) else {
+            return false;
+        };
+
+        monitors.iter().any(|monitor| {
+            let work_area = translate_to_view_space(monitor.work_area, virtual_bounds);
+
+            point_in_rect(position, work_area)
+        })
+    }
 
     #[test]
     fn desktop_positions_scale_between_resolutions() {
@@ -1545,6 +1606,105 @@ mod tests {
             &[primary, secondary],
             &[primary, changed],
         ));
+    }
+
+    #[test]
+    #[ignore = "captures the live Desktop and previews a synthetic cross-display migration"]
+    fn live_desktop_migration_preview_is_visible() {
+        let snapshot = capture_current_desktop_layout().unwrap();
+
+        let target_monitors = synthetic_compact_monitor_environment(&snapshot.monitors);
+
+        let positions = plan_desktop_positions(&snapshot, &target_monitors)
+            .expect("synthetic receiver topology should be mappable");
+
+        assert_eq!(positions.len(), snapshot.items.len(),);
+
+        println!();
+        println!("NetworkCopy Desktop migration dry run",);
+
+        println!("  Items:           {}", snapshot.items.len(),);
+
+        println!("  Source monitors: {}", snapshot.monitors.len(),);
+
+        println!("  Target monitors: {}", target_monitors.len(),);
+
+        println!();
+        println!("Source monitor environment:");
+
+        for (index, monitor) in snapshot.monitors.iter().enumerate() {
+            println!(
+                "  {index}: bounds=({}, {})..({}, {}), work=({}, {})..({}, {}), dpi={}x{}, primary={}",
+                monitor.bounds.left,
+                monitor.bounds.top,
+                monitor.bounds.right,
+                monitor.bounds.bottom,
+                monitor.work_area.left,
+                monitor.work_area.top,
+                monitor.work_area.right,
+                monitor.work_area.bottom,
+                monitor.dpi_x,
+                monitor.dpi_y,
+                monitor.primary,
+            );
+        }
+
+        println!();
+        println!("Synthetic receiver environment:");
+
+        for (index, monitor) in target_monitors.iter().enumerate() {
+            println!(
+                "  {index}: bounds=({}, {})..({}, {}), work=({}, {})..({}, {}), dpi={}x{}, primary={}",
+                monitor.bounds.left,
+                monitor.bounds.top,
+                monitor.bounds.right,
+                monitor.bounds.bottom,
+                monitor.work_area.left,
+                monitor.work_area.top,
+                monitor.work_area.right,
+                monitor.work_area.bottom,
+                monitor.dpi_x,
+                monitor.dpi_y,
+                monitor.primary,
+            );
+        }
+
+        println!();
+        println!("Planned icon migration:");
+
+        let mut moved_items = 0_usize;
+
+        for item in &snapshot.items {
+            let planned = *positions
+                .get(&item.name)
+                .expect("captured item must have a planned position");
+
+            if planned != item.position {
+                moved_items += 1;
+            }
+
+            assert!(
+                planned_position_is_visible(planned, &target_monitors,),
+                "planned Desktop position for {:?} is outside every target work area: ({}, {})",
+                item.name,
+                planned.x,
+                planned.y,
+            );
+
+            println!(
+                "  {:?}: {:?}: ({}, {}) -> ({}, {})",
+                item.kind, item.name, item.position.x, item.position.y, planned.x, planned.y,
+            );
+        }
+
+        println!();
+        println!(
+            "Dry run complete: {} / {} items would move",
+            moved_items,
+            snapshot.items.len(),
+        );
+
+        println!("All planned positions are inside a target monitor work area.",);
     }
 
     #[test]
