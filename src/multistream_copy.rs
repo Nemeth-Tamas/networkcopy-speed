@@ -20,10 +20,7 @@ use crate::tcp_connect;
 use crate::tiny_file_pool;
 use crate::tiny_pack_codec::{self, TinyPackEncoding};
 use crate::transfer_memory;
-use crate::transfer_profile::{
-    StageSample, TransferProfiler,
-    TransferStageProfile,
-};
+use crate::transfer_profile::{StageSample, TransferProfiler, TransferStageProfile};
 use crate::update_verification::{self, FILE_DIGEST_BYTES, FileDigest};
 use crate::windows_desktop_layout::{
     self, DesktopLayoutRestoreOutcome, DesktopLayoutRestoreReport,
@@ -318,24 +315,13 @@ impl MultistreamCopyReport {
 
         println!();
 
-        println!(
-            "Sender stage profile (aggregate worker time)",
-        );
+        println!("Sender stage profile (aggregate worker time)",);
 
-        print_stage_sample(
-            "Source reads:",
-            self.stage_profile.sender_source_read,
-        );
+        print_stage_sample("Source reads:", self.stage_profile.sender_source_read);
 
-        print_stage_sample(
-            "Compression/probe:",
-            self.stage_profile.sender_compression,
-        );
+        print_stage_sample("Compression/probe:", self.stage_profile.sender_compression);
 
-        print_stage_sample(
-            "Socket writes:",
-            self.stage_profile.sender_socket_write,
-        );
+        print_stage_sample("Socket writes:", self.stage_profile.sender_socket_write);
 
         println!(
             "  Payload throughput:   {:.2} MB/s ({:.2} MiB/s)",
@@ -562,19 +548,11 @@ impl ReceiveReport {
 
         println!();
 
-        println!(
-            "Receiver stage profile (aggregate worker time)",
-        );
+        println!("Receiver stage profile (aggregate worker time)",);
 
-        print_stage_sample(
-            "Socket reads:",
-            self.stage_profile.receiver_socket_read,
-        );
+        print_stage_sample("Socket reads:", self.stage_profile.receiver_socket_read);
 
-        print_stage_sample(
-            "Decompression:",
-            self.stage_profile.receiver_decompression,
-        );
+        print_stage_sample("Decompression:", self.stage_profile.receiver_decompression);
 
         print_stage_sample(
             "Destination writes:",
@@ -596,10 +574,7 @@ impl ReceiveReport {
     }
 }
 
-fn print_stage_sample(
-    label: &str,
-    sample: StageSample,
-) {
+fn print_stage_sample(label: &str, sample: StageSample) {
     println!(
         "  {label:<22} {:>9.6} s | {:>12} bytes | {} ops",
         sample.elapsed.as_secs_f64(),
@@ -1319,8 +1294,7 @@ fn send_internal(
 
     let total_started = Instant::now();
 
-    let profiler =
-        Arc::new(TransferProfiler::default());
+    let profiler = Arc::new(TransferProfiler::default());
 
     let process_buffer_bytes = if server.is_some() {
         memory_plan.loopback_bytes
@@ -1892,8 +1866,7 @@ fn run_server_with_mode_and_layout(
 
     let session_started = Instant::now();
 
-    let profiler =
-        Arc::new(TransferProfiler::default());
+    let profiler = Arc::new(TransferProfiler::default());
 
     let destination_root = destination_layout::resolve_received_destination(
         destination_layout,
@@ -5795,7 +5768,9 @@ fn send_lane(
 
     let mut reader = CountingReader::new(buffered_reader);
 
-    let buffered_writer = BufWriter::with_capacity(NETWORK_BUFFER_BYTES, writer_stream);
+    let profiled_writer = profiler.sender_socket_writer(writer_stream);
+
+    let buffered_writer = BufWriter::with_capacity(NETWORK_BUFFER_BYTES, profiled_writer);
 
     let mut writer = CountingWriter::new(buffered_writer);
 
@@ -6140,10 +6115,7 @@ fn send_tiny_pack(
 
         let read_started = std::time::Instant::now();
         file.read_exact(destination)?;
-        profiler.record_sender_source_read(
-            read_started.elapsed(),
-            entry.file_size,
-        );
+        profiler.record_sender_source_read(read_started.elapsed(), entry.file_size);
 
         validate_source_metadata(&file, &path, entry)?;
 
@@ -6164,7 +6136,11 @@ fn send_tiny_pack(
 
     let raw_payload = &buffer[..total_bytes];
 
+    let compression_started = Instant::now();
+
     let encoded = tiny_pack_codec::encode(raw_payload, compression_probe::DEFAULT_LEVEL)?;
+
+    profiler.record_sender_compression(compression_started.elapsed(), summary.bytes);
 
     let wire_payload = encoded.wire_payload(raw_payload);
 
@@ -6454,7 +6430,9 @@ fn receive_lane(
 
     let writer_stream = stream.try_clone()?;
 
-    let buffered_reader = BufReader::with_capacity(NETWORK_BUFFER_BYTES, reader_stream);
+    let profiled_reader = profiler.receiver_socket_reader(reader_stream);
+
+    let buffered_reader = BufReader::with_capacity(NETWORK_BUFFER_BYTES, profiled_reader);
 
     let mut reader = CountingReader::new(buffered_reader);
 
@@ -6839,12 +6817,7 @@ fn receive_tiny_pack(
 
     let mut wire_payload = vec![0_u8; wire_bytes];
 
-    let socket_read_started = std::time::Instant::now();
     reader.read_exact(&mut wire_payload)?;
-    profiler.record_receiver_socket_read(
-        socket_read_started.elapsed(),
-        wire_bytes as u64,
-    );
 
     let total_bytes = usize::try_from(summary.bytes).map_err(|_| {
         io::Error::new(
@@ -6853,7 +6826,13 @@ fn receive_tiny_pack(
         )
     })?;
 
+    let decompression_started = Instant::now();
+
     tiny_pack_codec::decode(encoding, &wire_payload, total_bytes, buffer)?;
+
+    if matches!(encoding, TinyPackEncoding::Zstandard) {
+        profiler.record_receiver_decompression(decompression_started.elapsed(), summary.bytes);
+    }
 
     let expected_pack_digest = read_digest(reader)?;
 
@@ -6989,7 +6968,11 @@ fn receive_file_stripe(
         Some(profiler),
     )?;
 
+    let sync_started = Instant::now();
+
     file.sync_all()?;
+
+    profiler.record_receiver_destination_write(sync_started.elapsed(), 0);
 
     Ok(compressed)
 }
@@ -7136,7 +7119,12 @@ fn receive_file(
             Some(profiler),
         )?;
 
+        let flush_started = Instant::now();
+
         file.flush()?;
+
+        profiler.record_receiver_destination_write(flush_started.elapsed(), 0);
+
         Ok(compressed)
     })();
 
