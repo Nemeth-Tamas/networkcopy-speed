@@ -133,16 +133,6 @@ fn restore_on_sta_thread(
 
     let current_monitors = capture_monitors()?;
 
-    if !same_monitor_environment(&snapshot.monitors, &current_monitors) {
-        return Ok(DesktopLayoutRestoreReport {
-            outcome: DesktopLayoutRestoreOutcome::SkippedDisplayMismatch,
-
-            matched_items: 0,
-
-            missing_items: snapshot.items.len(),
-        });
-    }
-
     let desktop_path = current_desktop_path()?;
 
     let folder_view = current_desktop_folder_view()?;
@@ -158,6 +148,22 @@ fn restore_on_sta_thread(
             missing_items: snapshot.items.len(),
         });
     }
+
+    let planned_positions = if snapshot.auto_arrange {
+        HashMap::new()
+    } else {
+        let Some(positions) = plan_desktop_positions(snapshot, &current_monitors) else {
+            return Ok(DesktopLayoutRestoreReport {
+                outcome: DesktopLayoutRestoreOutcome::SkippedDisplayMismatch,
+
+                matched_items: 0,
+
+                missing_items: snapshot.items.len(),
+            });
+        };
+
+        positions
+    };
 
     let mut view_mode = FOLDERVIEWMODE::default();
 
@@ -195,7 +201,8 @@ fn restore_on_sta_thread(
         )
     })?;
 
-    let targets = collect_restore_targets(&folder_view, &desktop_path, snapshot)?;
+    let targets =
+        collect_restore_targets(&folder_view, &desktop_path, snapshot, &planned_positions)?;
 
     let matched_items = targets.len();
 
@@ -245,6 +252,306 @@ fn same_monitor_environment(expected: &[DesktopMonitor], current: &[DesktopMonit
             .all(|monitor| current.iter().any(|candidate| candidate == monitor))
 }
 
+fn plan_desktop_positions(
+    snapshot: &DesktopLayoutSnapshot,
+    current_monitors: &[DesktopMonitor],
+) -> Option<HashMap<String, DesktopPoint>> {
+    if snapshot.monitors.len() != current_monitors.len() || snapshot.monitors.is_empty() {
+        return None;
+    }
+
+    if same_monitor_environment(&snapshot.monitors, current_monitors) {
+        return Some(
+            snapshot
+                .items
+                .iter()
+                .map(|item| (item.name.clone(), item.position))
+                .collect(),
+        );
+    }
+
+    let source_order = ordered_monitor_indices(&snapshot.monitors)?;
+
+    let target_order = ordered_monitor_indices(current_monitors)?;
+
+    if source_order.len() != target_order.len() {
+        return None;
+    }
+
+    let source_virtual = virtual_monitor_bounds(&snapshot.monitors)?;
+
+    let target_virtual = virtual_monitor_bounds(current_monitors)?;
+
+    let mut monitor_mapping = HashMap::with_capacity(source_order.len());
+
+    for (source_index, target_index) in source_order.into_iter().zip(target_order) {
+        monitor_mapping.insert(source_index, target_index);
+    }
+
+    let icon_extent = i32::try_from(snapshot.icon_size).ok()?;
+
+    let mut positions = HashMap::with_capacity(snapshot.items.len());
+
+    for item in &snapshot.items {
+        let source_monitor_index =
+            monitor_for_desktop_point(item.position, &snapshot.monitors, source_virtual)?;
+
+        let target_monitor_index = *monitor_mapping.get(&source_monitor_index)?;
+
+        let source_monitor = snapshot.monitors[source_monitor_index];
+
+        let target_monitor = current_monitors[target_monitor_index];
+
+        let mapped = map_desktop_point(
+            item.position,
+            source_monitor,
+            target_monitor,
+            source_virtual,
+            target_virtual,
+            icon_extent,
+        );
+
+        positions.insert(item.name.clone(), mapped);
+    }
+
+    Some(positions)
+}
+
+fn ordered_monitor_indices(monitors: &[DesktopMonitor]) -> Option<Vec<usize>> {
+    let primary_indices: Vec<usize> = monitors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, monitor)| monitor.primary.then_some(index))
+        .collect();
+
+    if primary_indices.len() != 1 {
+        return None;
+    }
+
+    let primary_index = primary_indices[0];
+
+    let primary = monitors[primary_index];
+
+    let primary_center = monitor_center_twice(primary);
+
+    let mut secondary: Vec<usize> = (0..monitors.len())
+        .filter(|index| *index != primary_index)
+        .collect();
+
+    secondary.sort_by_key(|index| {
+        let center = monitor_center_twice(monitors[*index]);
+
+        let dx = center.0 - primary_center.0;
+
+        let dy = center.1 - primary_center.1;
+
+        (
+            monitor_direction_sector(dx, dy),
+            dx.abs().saturating_add(dy.abs()),
+            dx,
+            dy,
+        )
+    });
+
+    let mut ordered = Vec::with_capacity(monitors.len());
+
+    ordered.push(primary_index);
+
+    ordered.extend(secondary);
+
+    Some(ordered)
+}
+
+fn monitor_center_twice(monitor: DesktopMonitor) -> (i64, i64) {
+    (
+        i64::from(monitor.bounds.left) + i64::from(monitor.bounds.right),
+        i64::from(monitor.bounds.top) + i64::from(monitor.bounds.bottom),
+    )
+}
+
+fn monitor_direction_sector(dx: i64, dy: i64) -> u8 {
+    if dx.abs() >= dy.abs() {
+        if dx < 0 { 0 } else { 2 }
+    } else if dy < 0 {
+        1
+    } else {
+        3
+    }
+}
+
+fn virtual_monitor_bounds(monitors: &[DesktopMonitor]) -> Option<DesktopRect> {
+    let first = monitors.first()?;
+
+    let mut bounds = first.bounds;
+
+    for monitor in &monitors[1..] {
+        bounds.left = bounds.left.min(monitor.bounds.left);
+
+        bounds.top = bounds.top.min(monitor.bounds.top);
+
+        bounds.right = bounds.right.max(monitor.bounds.right);
+
+        bounds.bottom = bounds.bottom.max(monitor.bounds.bottom);
+    }
+
+    Some(bounds)
+}
+
+fn monitor_for_desktop_point(
+    point: DesktopPoint,
+    monitors: &[DesktopMonitor],
+    virtual_bounds: DesktopRect,
+) -> Option<usize> {
+    let mut nearest = None;
+
+    for (index, monitor) in monitors.iter().enumerate() {
+        let bounds = translate_to_view_space(monitor.bounds, virtual_bounds);
+
+        if point_in_rect(point, bounds) {
+            return Some(index);
+        }
+
+        let distance = point_distance_squared(point, bounds);
+
+        match nearest {
+            Some((best_distance, _)) if best_distance <= distance => {}
+
+            _ => {
+                nearest = Some((distance, index));
+            }
+        }
+    }
+
+    nearest.map(|(_, index)| index)
+}
+
+fn translate_to_view_space(rect: DesktopRect, virtual_bounds: DesktopRect) -> DesktopRect {
+    DesktopRect {
+        left: rect.left - virtual_bounds.left,
+
+        top: rect.top - virtual_bounds.top,
+
+        right: rect.right - virtual_bounds.left,
+
+        bottom: rect.bottom - virtual_bounds.top,
+    }
+}
+
+fn point_in_rect(point: DesktopPoint, rect: DesktopRect) -> bool {
+    point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
+}
+
+fn point_distance_squared(point: DesktopPoint, rect: DesktopRect) -> i64 {
+    let x = i64::from(point.x);
+
+    let y = i64::from(point.y);
+
+    let left = i64::from(rect.left);
+
+    let top = i64::from(rect.top);
+
+    let right = i64::from(rect.right.saturating_sub(1));
+
+    let bottom = i64::from(rect.bottom.saturating_sub(1));
+
+    let dx = if x < left {
+        left - x
+    } else if x > right {
+        x - right
+    } else {
+        0
+    };
+
+    let dy = if y < top {
+        top - y
+    } else if y > bottom {
+        y - bottom
+    } else {
+        0
+    };
+
+    dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy))
+}
+
+fn map_desktop_point(
+    point: DesktopPoint,
+    source_monitor: DesktopMonitor,
+    target_monitor: DesktopMonitor,
+    source_virtual: DesktopRect,
+    target_virtual: DesktopRect,
+    icon_extent: i32,
+) -> DesktopPoint {
+    let source_work = translate_to_view_space(source_monitor.work_area, source_virtual);
+
+    let target_work = translate_to_view_space(target_monitor.work_area, target_virtual);
+
+    let mapped_x = scale_axis(
+        point.x,
+        source_work.left,
+        source_work.right,
+        target_work.left,
+        target_work.right,
+    );
+
+    let mapped_y = scale_axis(
+        point.y,
+        source_work.top,
+        source_work.bottom,
+        target_work.top,
+        target_work.bottom,
+    );
+
+    DesktopPoint {
+        x: clamp_icon_axis(mapped_x, target_work.left, target_work.right, icon_extent),
+
+        y: clamp_icon_axis(mapped_y, target_work.top, target_work.bottom, icon_extent),
+    }
+}
+
+fn scale_axis(
+    value: i32,
+    source_start: i32,
+    source_end: i32,
+    target_start: i32,
+    target_end: i32,
+) -> i32 {
+    let source_span = i64::from(
+        source_end
+            .saturating_sub(source_start)
+            .saturating_sub(1)
+            .max(1),
+    );
+
+    let target_span = i64::from(
+        target_end
+            .saturating_sub(target_start)
+            .saturating_sub(1)
+            .max(1),
+    );
+
+    let source_relative = i64::from(value.saturating_sub(source_start)).clamp(0, source_span);
+
+    let scaled = source_relative.saturating_mul(target_span) / source_span;
+
+    i32::try_from(i64::from(target_start).saturating_add(scaled)).unwrap_or_else(|_| {
+        if scaled.is_negative() {
+            i32::MIN
+        } else {
+            i32::MAX
+        }
+    })
+}
+
+fn clamp_icon_axis(value: i32, work_start: i32, work_end: i32, icon_extent: i32) -> i32 {
+    let work_size = work_end.saturating_sub(work_start);
+
+    let extent = icon_extent.clamp(1, work_size.max(1));
+
+    let maximum = work_end.saturating_sub(extent).max(work_start);
+
+    value.clamp(work_start, maximum)
+}
+
 struct RestoreTarget {
     pidl: OwnedPidl,
 
@@ -255,6 +562,7 @@ fn collect_restore_targets(
     folder_view: &IFolderView2,
     desktop_path: &Path,
     snapshot: &DesktopLayoutSnapshot,
+    planned_positions: &HashMap<String, DesktopPoint>,
 ) -> io::Result<Vec<RestoreTarget>> {
     let expected: HashMap<&str, &DesktopLayoutItem> = snapshot
         .items
@@ -300,6 +608,10 @@ fn collect_restore_targets(
             continue;
         }
 
+        let Some(position) = planned_positions.get(&name) else {
+            continue;
+        };
+
         let pidl = unsafe { folder_view.Item(index) }.map_err(|error| {
             windows_error(
                 &format!("failed to obtain Desktop item {index} identifier during restore",),
@@ -313,9 +625,9 @@ fn collect_restore_targets(
             pidl,
 
             position: POINT {
-                x: expected_item.position.x,
+                x: position.x,
 
-                y: expected_item.position.y,
+                y: position.y,
             },
         });
     }
@@ -795,9 +1107,388 @@ impl Drop for OwnedCoTaskWide {
 mod tests {
     use super::{
         DesktopLayoutRestoreOutcome, capture_current_desktop_layout, current_desktop_path,
-        restore_current_desktop_layout, same_monitor_environment,
+        plan_desktop_positions, restore_current_desktop_layout, same_monitor_environment,
     };
-    use crate::desktop_layout::{DesktopMonitor, DesktopRect};
+    use crate::desktop_layout::{
+        DESKTOP_LAYOUT_FORMAT_VERSION, DesktopItemKind, DesktopLayoutItem, DesktopLayoutSnapshot,
+        DesktopMonitor, DesktopPoint, DesktopRect,
+    };
+
+    #[test]
+    fn desktop_positions_scale_between_resolutions() {
+        let snapshot = DesktopLayoutSnapshot {
+            version: DESKTOP_LAYOUT_FORMAT_VERSION,
+
+            icon_size: 48,
+
+            auto_arrange: false,
+
+            monitors: vec![DesktopMonitor {
+                bounds: DesktopRect {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1080,
+                },
+
+                work_area: DesktopRect {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1040,
+                },
+
+                dpi_x: 96,
+                dpi_y: 96,
+                primary: true,
+            }],
+
+            items: vec![DesktopLayoutItem {
+                name: "middle.txt".to_string(),
+
+                kind: DesktopItemKind::File,
+
+                position: DesktopPoint { x: 960, y: 520 },
+            }],
+        };
+
+        let current = [DesktopMonitor {
+            bounds: DesktopRect {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1440,
+            },
+
+            work_area: DesktopRect {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1380,
+            },
+
+            dpi_x: 144,
+            dpi_y: 144,
+            primary: true,
+        }];
+
+        let positions = plan_desktop_positions(&snapshot, &current).unwrap();
+
+        let position = positions.get("middle.txt").unwrap();
+
+        assert!(
+            (1279..=1281).contains(&position.x),
+            "unexpected mapped x {}",
+            position.x,
+        );
+
+        assert!(
+            (689..=691).contains(&position.y),
+            "unexpected mapped y {}",
+            position.y,
+        );
+    }
+
+    #[test]
+    fn desktop_positions_preserve_monitor_sides() {
+        let source_left = DesktopMonitor {
+            bounds: DesktopRect {
+                left: -1920,
+                top: 360,
+                right: 0,
+                bottom: 1440,
+            },
+
+            work_area: DesktopRect {
+                left: -1920,
+                top: 360,
+                right: 0,
+                bottom: 1392,
+            },
+
+            dpi_x: 96,
+            dpi_y: 96,
+            primary: false,
+        };
+
+        let source_primary = DesktopMonitor {
+            bounds: DesktopRect {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1440,
+            },
+
+            work_area: DesktopRect {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1392,
+            },
+
+            dpi_x: 120,
+            dpi_y: 120,
+            primary: true,
+        };
+
+        let source_right = DesktopMonitor {
+            bounds: DesktopRect {
+                left: 2560,
+                top: 360,
+                right: 4480,
+                bottom: 1440,
+            },
+
+            work_area: DesktopRect {
+                left: 2560,
+                top: 360,
+                right: 4480,
+                bottom: 1392,
+            },
+
+            dpi_x: 96,
+            dpi_y: 96,
+            primary: false,
+        };
+
+        let snapshot = DesktopLayoutSnapshot {
+            version: DESKTOP_LAYOUT_FORMAT_VERSION,
+
+            icon_size: 48,
+
+            auto_arrange: false,
+
+            monitors: vec![source_right, source_primary, source_left],
+
+            items: vec![
+                DesktopLayoutItem {
+                    name: "left.txt".to_string(),
+
+                    kind: DesktopItemKind::File,
+
+                    position: DesktopPoint { x: 200, y: 600 },
+                },
+                DesktopLayoutItem {
+                    name: "primary.txt".to_string(),
+
+                    kind: DesktopItemKind::File,
+
+                    position: DesktopPoint { x: 2500, y: 600 },
+                },
+                DesktopLayoutItem {
+                    name: "right.txt".to_string(),
+
+                    kind: DesktopItemKind::File,
+
+                    position: DesktopPoint { x: 4700, y: 600 },
+                },
+            ],
+        };
+
+        let target_left = DesktopMonitor {
+            bounds: DesktopRect {
+                left: -1280,
+                top: 200,
+                right: 0,
+                bottom: 1224,
+            },
+
+            work_area: DesktopRect {
+                left: -1280,
+                top: 200,
+                right: 0,
+                bottom: 1176,
+            },
+
+            dpi_x: 120,
+            dpi_y: 120,
+            primary: false,
+        };
+
+        let target_primary = DesktopMonitor {
+            bounds: DesktopRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+
+            work_area: DesktopRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1032,
+            },
+
+            dpi_x: 96,
+            dpi_y: 96,
+            primary: true,
+        };
+
+        let target_right = DesktopMonitor {
+            bounds: DesktopRect {
+                left: 1920,
+                top: 200,
+                right: 3280,
+                bottom: 1280,
+            },
+
+            work_area: DesktopRect {
+                left: 1920,
+                top: 200,
+                right: 3280,
+                bottom: 1232,
+            },
+
+            dpi_x: 144,
+            dpi_y: 144,
+            primary: false,
+        };
+
+        let positions =
+            plan_desktop_positions(&snapshot, &[target_primary, target_left, target_right])
+                .unwrap();
+
+        let left = positions.get("left.txt").unwrap();
+
+        let primary = positions.get("primary.txt").unwrap();
+
+        let right = positions.get("right.txt").unwrap();
+
+        assert!(left.x < 1280);
+
+        assert!(primary.x >= 1280 && primary.x < 3200,);
+
+        assert!(right.x >= 3200);
+    }
+
+    #[test]
+    fn desktop_positions_are_clamped_visible() {
+        let snapshot = DesktopLayoutSnapshot {
+            version: DESKTOP_LAYOUT_FORMAT_VERSION,
+
+            icon_size: 48,
+
+            auto_arrange: false,
+
+            monitors: vec![DesktopMonitor {
+                bounds: DesktopRect {
+                    left: 0,
+                    top: 0,
+                    right: 3840,
+                    bottom: 2160,
+                },
+
+                work_area: DesktopRect {
+                    left: 0,
+                    top: 0,
+                    right: 3840,
+                    bottom: 2100,
+                },
+
+                dpi_x: 96,
+                dpi_y: 96,
+                primary: true,
+            }],
+
+            items: vec![DesktopLayoutItem {
+                name: "edge.txt".to_string(),
+
+                kind: DesktopItemKind::File,
+
+                position: DesktopPoint {
+                    x: 900_000,
+                    y: 900_000,
+                },
+            }],
+        };
+
+        let current = [DesktopMonitor {
+            bounds: DesktopRect {
+                left: 0,
+                top: 0,
+                right: 1280,
+                bottom: 720,
+            },
+
+            work_area: DesktopRect {
+                left: 0,
+                top: 0,
+                right: 1280,
+                bottom: 680,
+            },
+
+            dpi_x: 96,
+            dpi_y: 96,
+            primary: true,
+        }];
+
+        let positions = plan_desktop_positions(&snapshot, &current).unwrap();
+
+        let position = positions.get("edge.txt").unwrap();
+
+        assert!((0..=1232).contains(&position.x),);
+
+        assert!((0..=632).contains(&position.y),);
+    }
+
+    #[test]
+    fn different_monitor_counts_are_not_mapped() {
+        let snapshot = DesktopLayoutSnapshot {
+            version: DESKTOP_LAYOUT_FORMAT_VERSION,
+
+            icon_size: 48,
+
+            auto_arrange: false,
+
+            monitors: vec![DesktopMonitor {
+                bounds: DesktopRect {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1080,
+                },
+
+                work_area: DesktopRect {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1040,
+                },
+
+                dpi_x: 96,
+                dpi_y: 96,
+                primary: true,
+            }],
+
+            items: Vec::new(),
+        };
+
+        let current = [
+            snapshot.monitors[0],
+            DesktopMonitor {
+                bounds: DesktopRect {
+                    left: 1920,
+                    top: 0,
+                    right: 3840,
+                    bottom: 1080,
+                },
+
+                work_area: DesktopRect {
+                    left: 1920,
+                    top: 0,
+                    right: 3840,
+                    bottom: 1040,
+                },
+
+                dpi_x: 96,
+                dpi_y: 96,
+                primary: false,
+            },
+        ];
+
+        assert!(plan_desktop_positions(&snapshot, &current,).is_none(),);
+    }
 
     #[test]
     fn matching_monitor_environment_ignores_enumeration_order() {

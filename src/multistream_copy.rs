@@ -378,7 +378,7 @@ impl ReceiveReport {
                 }
 
                 DesktopLayoutRestoreOutcome::SkippedDisplayMismatch => {
-                    "not applied - monitor layout or DPI differs"
+                    "not applied - monitor topology cannot be mapped safely"
                 }
 
                 DesktopLayoutRestoreOutcome::SkippedAutoArrangeMismatch => {
