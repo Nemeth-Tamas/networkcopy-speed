@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    FreeMibTable, GetUnicastIpAddressTable, MIB_UNICASTIPADDRESS_ROW, MIB_UNICASTIPADDRESS_TABLE,
+    FreeMibTable, GetIfTable2, GetUnicastIpAddressTable, MIB_IF_ROW2, MIB_IF_TABLE2,
+    MIB_UNICASTIPADDRESS_ROW, MIB_UNICASTIPADDRESS_TABLE,
 };
 use windows_sys::Win32::Networking::WinSock::AF_INET;
 
@@ -37,6 +38,19 @@ const DISCOVERY_ATTEMPTS: usize = 3;
 
 const NO_ERROR: u32 = 0;
 
+const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
+const IF_TYPE_TUNNEL: u32 = 131;
+
+const IF_OPER_STATUS_UP: i32 = 1;
+const MEDIA_CONNECT_STATE_CONNECTED: i32 = 1;
+
+const IF_FLAG_HARDWARE_INTERFACE: u8 = 1 << 0;
+const IF_FLAG_FILTER_INTERFACE: u8 = 1 << 1;
+const IF_FLAG_CONNECTOR_PRESENT: u8 = 1 << 2;
+const IF_FLAG_ENDPOINT_INTERFACE: u8 = 1 << 7;
+
+const MIN_LOCAL_AFFINITY_PREFIX_BITS: u32 = 8;
+
 const WSAEADDRNOTAVAIL: i32 = 10049;
 const WSAENETDOWN: i32 = 10050;
 const WSAENETUNREACH: i32 = 10051;
@@ -48,6 +62,16 @@ static NEXT_NONCE: AtomicU64 = AtomicU64::new(1);
 struct UnicastAddressTable(*mut MIB_UNICASTIPADDRESS_TABLE);
 
 impl Drop for UnicastAddressTable {
+    fn drop(&mut self) {
+        unsafe {
+            FreeMibTable(self.0.cast());
+        }
+    }
+}
+
+struct InterfaceTable(*mut MIB_IF_TABLE2);
+
+impl Drop for InterfaceTable {
     fn drop(&mut self) {
         unsafe {
             FreeMibTable(self.0.cast());
@@ -569,6 +593,109 @@ fn ipv4_address(row: &MIB_UNICASTIPADDRESS_ROW) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::from(address_bytes))
 }
 
+fn local_ipv4_interface_ranks() -> io::Result<BTreeMap<Ipv4Addr, u8>> {
+    let interface_ranks = automatic_lan_interface_ranks()?;
+
+    let mut raw_table = ptr::null_mut();
+
+    let status = unsafe { GetUnicastIpAddressTable(AF_INET, &mut raw_table) };
+
+    if status != NO_ERROR {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+
+    if raw_table.is_null() {
+        return Err(io::Error::other(
+            "GetUnicastIpAddressTable returned a null IPv4 table",
+        ));
+    }
+
+    let table = UnicastAddressTable(raw_table);
+
+    let entry_count = unsafe { (*table.0).NumEntries as usize };
+
+    let first_entry = unsafe { (*table.0).Table.as_ptr() };
+
+    let rows = unsafe { slice::from_raw_parts(first_entry, entry_count) };
+
+    let mut ranks = BTreeMap::<Ipv4Addr, u8>::new();
+
+    for row in rows {
+        let Some(address) = ipv4_address(row) else {
+            continue;
+        };
+
+        let rank = interface_ranks
+            .get(&row.InterfaceIndex)
+            .copied()
+            .unwrap_or_default();
+
+        ranks
+            .entry(address)
+            .and_modify(|existing| {
+                *existing = (*existing).max(rank);
+            })
+            .or_insert(rank);
+    }
+
+    Ok(ranks)
+}
+
+fn automatic_lan_interface_ranks() -> io::Result<BTreeMap<u32, u8>> {
+    let mut raw_table = ptr::null_mut();
+
+    let status = unsafe { GetIfTable2(&mut raw_table) };
+
+    if status != NO_ERROR {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+
+    if raw_table.is_null() {
+        return Err(io::Error::other(
+            "GetIfTable2 returned a null interface table",
+        ));
+    }
+
+    let table = InterfaceTable(raw_table);
+
+    let entry_count = unsafe { (*table.0).NumEntries as usize };
+
+    let first_entry = unsafe { (*table.0).Table.as_ptr() };
+
+    let rows = unsafe { slice::from_raw_parts(first_entry, entry_count) };
+
+    Ok(rows
+        .iter()
+        .map(|row| (row.InterfaceIndex, automatic_lan_interface_rank(row)))
+        .collect())
+}
+
+fn automatic_lan_interface_rank(row: &MIB_IF_ROW2) -> u8 {
+    let flags = row.InterfaceAndOperStatusFlags._bitfield;
+
+    if flags & IF_FLAG_FILTER_INTERFACE != 0
+        || flags & IF_FLAG_ENDPOINT_INTERFACE != 0
+        || row.Type == IF_TYPE_SOFTWARE_LOOPBACK
+        || row.Type == IF_TYPE_TUNNEL
+        || row.OperStatus != IF_OPER_STATUS_UP
+        || row.MediaConnectState != MEDIA_CONNECT_STATE_CONNECTED
+    {
+        return 0;
+    }
+
+    let hardware = flags & IF_FLAG_HARDWARE_INTERFACE != 0;
+
+    let connector = flags & IF_FLAG_CONNECTOR_PRESENT != 0;
+
+    match (hardware, connector) {
+        (true, true) => 3,
+
+        (true, false) => 2,
+
+        (false, _) => 1,
+    }
+}
+
 fn directed_broadcast_address(address: Ipv4Addr, prefix_length: u8) -> Option<Ipv4Addr> {
     if prefix_length == 0 || prefix_length > 30 {
         return None;
@@ -815,6 +942,15 @@ fn resolve_discovered_agent_identity(agent: DiscoveredAgent) -> ResolvedDiscover
 }
 
 fn deduplicate_resolved_agents(agents: Vec<ResolvedDiscoveredAgent>) -> Vec<DiscoveredAgent> {
+    let local_interface_ranks = local_ipv4_interface_ranks().unwrap_or_default();
+
+    deduplicate_resolved_agents_with_local_interface_ranks(agents, &local_interface_ranks)
+}
+
+fn deduplicate_resolved_agents_with_local_interface_ranks(
+    agents: Vec<ResolvedDiscoveredAgent>,
+    local_interface_ranks: &BTreeMap<Ipv4Addr, u8>,
+) -> Vec<DiscoveredAgent> {
     let route_catalog = agents
         .iter()
         .map(|resolved| (resolved.identity.clone(), resolved.agent.endpoint))
@@ -834,7 +970,12 @@ fn deduplicate_resolved_agents(agents: Vec<ResolvedDiscoveredAgent>) -> Vec<Disc
     for (identity, mut candidates) in groups {
         candidates.sort_by_key(|candidate| candidate.agent.endpoint.to_string());
 
-        let preferred_index = preferred_candidate_index(&identity, &candidates, &route_catalog);
+        let preferred_index = preferred_candidate_index(
+            &identity,
+            &candidates,
+            &route_catalog,
+            local_interface_ranks,
+        );
 
         deduplicated.push(candidates.swap_remove(preferred_index).agent);
     }
@@ -852,24 +993,102 @@ fn preferred_candidate_index(
     identity: &DiscoveredAgentIdentity,
     candidates: &[ResolvedDiscoveredAgent],
     route_catalog: &[(DiscoveredAgentIdentity, SocketAddr)],
+    local_interface_ranks: &BTreeMap<Ipv4Addr, u8>,
 ) -> usize {
     debug_assert!(!candidates.is_empty());
 
     let mut preferred_index = 0_usize;
 
-    let mut preferred_score =
-        route_affinity_score(identity, candidates[0].agent.endpoint, route_catalog);
+    let mut preferred_score = candidate_preference_score(
+        identity,
+        candidates[0].agent.endpoint,
+        route_catalog,
+        local_interface_ranks,
+    );
 
     for (index, candidate) in candidates.iter().enumerate().skip(1) {
-        let score = route_affinity_score(identity, candidate.agent.endpoint, route_catalog);
+        let score = candidate_preference_score(
+            identity,
+            candidate.agent.endpoint,
+            route_catalog,
+            local_interface_ranks,
+        );
 
         if score > preferred_score {
             preferred_index = index;
+
             preferred_score = score;
         }
     }
 
     preferred_index
+}
+
+fn candidate_preference_score(
+    identity: &DiscoveredAgentIdentity,
+    endpoint: SocketAddr,
+    route_catalog: &[(DiscoveredAgentIdentity, SocketAddr)],
+    local_interface_ranks: &BTreeMap<Ipv4Addr, u8>,
+) -> (u8, u8, u32, u32, u32) {
+    let SocketAddr::V4(endpoint) = endpoint else {
+        return (0, 0, 0, 0, 0);
+    };
+
+    let address = *endpoint.ip();
+
+    let address_rank = automatic_lan_address_rank(address);
+
+    let (local_interface_rank, local_prefix) =
+        local_network_affinity_score(address, local_interface_ranks);
+
+    let (remote_maximum_prefix, remote_total_prefix) =
+        route_affinity_score(identity, SocketAddr::V4(endpoint), route_catalog);
+
+    (
+        address_rank,
+        local_interface_rank,
+        local_prefix,
+        remote_maximum_prefix,
+        remote_total_prefix,
+    )
+}
+
+fn automatic_lan_address_rank(address: Ipv4Addr) -> u8 {
+    if address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || address == Ipv4Addr::BROADCAST
+    {
+        return 0;
+    }
+
+    if address.is_link_local() { 1 } else { 2 }
+}
+
+fn local_network_affinity_score(
+    candidate: Ipv4Addr,
+    local_interface_ranks: &BTreeMap<Ipv4Addr, u8>,
+) -> (u8, u32) {
+    let mut best_prefix = 0_u32;
+
+    let mut best_interface_rank = 0_u8;
+
+    for (local_address, interface_rank) in local_interface_ranks {
+        let prefix = common_ipv4_prefix_bits(candidate, *local_address);
+
+        if prefix > best_prefix || (prefix == best_prefix && *interface_rank > best_interface_rank)
+        {
+            best_prefix = prefix;
+
+            best_interface_rank = *interface_rank;
+        }
+    }
+
+    if best_prefix < MIN_LOCAL_AFFINITY_PREFIX_BITS {
+        return (0, 0);
+    }
+
+    (best_interface_rank, best_prefix)
 }
 
 fn route_affinity_score(
@@ -1004,9 +1223,9 @@ fn create_nonce() -> u64 {
 mod tests {
     use super::{
         AgentCapabilities, AgentState, DiscoveredAgent, DiscoveredAgentIdentity, DiscoveryPacket,
-        LocalAgentDescriptor, ResolvedDiscoveredAgent, WSAENETUNREACH, deduplicate_resolved_agents,
-        directed_broadcast_address, discover_target, is_skippable_discovery_send_error,
-        respond_once,
+        LocalAgentDescriptor, ResolvedDiscoveredAgent, WSAENETUNREACH,
+        deduplicate_resolved_agents_with_local_interface_ranks, directed_broadcast_address,
+        discover_target, is_skippable_discovery_send_error, respond_once,
     };
 
     #[test]
@@ -1054,6 +1273,7 @@ mod tests {
     use crate::management_instance::AgentInstanceId;
     use crate::management_jobs::ManagementJobRegistry;
     use crate::management_protocol::{MANAGEMENT_CONTROL_PORT, MANAGEMENT_PROTOCOL_VERSION};
+    use std::collections::BTreeMap;
     use std::io;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
     use std::sync::Arc;
@@ -1132,16 +1352,19 @@ mod tests {
 
         let remote_instance = AgentInstanceId::from_raw(2).unwrap();
 
-        let actual = deduplicate_resolved_agents(vec![
-            resolved_test_agent("LOCAL-PC", Ipv4Addr::new(172, 20, 224, 1), local_instance),
-            resolved_test_agent("LOCAL-PC", Ipv4Addr::new(192, 168, 124, 1), local_instance),
-            resolved_test_agent("LOCAL-PC", Ipv4Addr::new(192, 168, 2, 200), local_instance),
-            resolved_test_agent(
-                "REMOTE-PC",
-                Ipv4Addr::new(192, 168, 2, 103),
-                remote_instance,
-            ),
-        ]);
+        let actual = deduplicate_resolved_agents_with_local_interface_ranks(
+            vec![
+                resolved_test_agent("LOCAL-PC", Ipv4Addr::new(172, 20, 224, 1), local_instance),
+                resolved_test_agent("LOCAL-PC", Ipv4Addr::new(192, 168, 124, 1), local_instance),
+                resolved_test_agent("LOCAL-PC", Ipv4Addr::new(192, 168, 2, 200), local_instance),
+                resolved_test_agent(
+                    "REMOTE-PC",
+                    Ipv4Addr::new(192, 168, 2, 103),
+                    remote_instance,
+                ),
+            ],
+            &BTreeMap::new(),
+        );
 
         assert_eq!(actual.len(), 2);
 
@@ -1160,19 +1383,80 @@ mod tests {
     }
 
     #[test]
-    fn identical_hostnames_with_distinct_instances_remain() {
-        let actual = deduplicate_resolved_agents(vec![
-            resolved_test_agent(
-                "SAME-NAME",
-                Ipv4Addr::new(192, 168, 2, 10),
-                AgentInstanceId::from_raw(10).unwrap(),
-            ),
-            resolved_test_agent(
-                "SAME-NAME",
-                Ipv4Addr::new(192, 168, 2, 20),
-                AgentInstanceId::from_raw(20).unwrap(),
-            ),
+    fn duplicate_instance_prefers_physical_lan_over_apipa_and_virtual() {
+        let instance = AgentInstanceId::from_raw(1).unwrap();
+
+        let apipa = Ipv4Addr::new(169, 254, 21, 253);
+
+        let virtual_adapter = Ipv4Addr::new(172, 20, 96, 1);
+
+        let physical_lan = Ipv4Addr::new(192, 168, 1, 2);
+
+        let local_interface_ranks =
+            BTreeMap::from([(apipa, 3), (virtual_adapter, 1), (physical_lan, 3)]);
+
+        let actual = deduplicate_resolved_agents_with_local_interface_ranks(
+            vec![
+                resolved_test_agent("DESKTOP-05LE4I", apipa, instance),
+                resolved_test_agent("DESKTOP-05LE4I", virtual_adapter, instance),
+                resolved_test_agent("DESKTOP-05LE4I", physical_lan, instance),
+            ],
+            &local_interface_ranks,
+        );
+
+        assert_eq!(actual.len(), 1);
+
+        assert_eq!(
+            actual[0].endpoint,
+            SocketAddr::V4(SocketAddrV4::new(physical_lan, MANAGEMENT_CONTROL_PORT,),),
+        );
+    }
+
+    #[test]
+    fn duplicate_remote_instance_prefers_subnet_reached_through_physical_interface() {
+        let remote_instance = AgentInstanceId::from_raw(2).unwrap();
+
+        let local_interface_ranks = BTreeMap::from([
+            (Ipv4Addr::new(172, 20, 96, 1), 1),
+            (Ipv4Addr::new(192, 168, 1, 2), 3),
         ]);
+
+        let actual = deduplicate_resolved_agents_with_local_interface_ranks(
+            vec![
+                resolved_test_agent("REMOTE-PC", Ipv4Addr::new(172, 20, 96, 50), remote_instance),
+                resolved_test_agent("REMOTE-PC", Ipv4Addr::new(192, 168, 1, 50), remote_instance),
+            ],
+            &local_interface_ranks,
+        );
+
+        assert_eq!(actual.len(), 1);
+
+        assert_eq!(
+            actual[0].endpoint,
+            SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(192, 168, 1, 50,),
+                MANAGEMENT_CONTROL_PORT,
+            ),),
+        );
+    }
+
+    #[test]
+    fn identical_hostnames_with_distinct_instances_remain() {
+        let actual = deduplicate_resolved_agents_with_local_interface_ranks(
+            vec![
+                resolved_test_agent(
+                    "SAME-NAME",
+                    Ipv4Addr::new(192, 168, 2, 10),
+                    AgentInstanceId::from_raw(10).unwrap(),
+                ),
+                resolved_test_agent(
+                    "SAME-NAME",
+                    Ipv4Addr::new(192, 168, 2, 20),
+                    AgentInstanceId::from_raw(20).unwrap(),
+                ),
+            ],
+            &BTreeMap::new(),
+        );
 
         assert_eq!(actual.len(), 2);
     }

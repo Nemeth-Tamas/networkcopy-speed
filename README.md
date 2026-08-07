@@ -554,8 +554,8 @@ The same physical run exposed three post-release issues:
 - [x] send Automatic LAN discovery through every usable IPv4 subnet on
       multi-adapter Windows systems without failing on unreachable virtual
       adapters;
-- [ ] preserve empty source directories in the destination tree;
-- [ ] allow scrolling while extending a multi-entry Manager history selection.
+- [x] preserve empty source directories in the destination tree;
+- [x] allow scrolling while extending a multi-entry Manager history selection.
 
 ### v2.5 desktop layout migration
 
@@ -580,58 +580,40 @@ The same physical run exposed three post-release issues:
       Desktop items round-tripping unchanged;
 - [x] dry-run cross-display migration of all 87 captured Desktop items with
       every planned position remaining inside a destination monitor work area;
-- [ ] complete an end-to-end physical managed Desktop transfer acceptance when
-      two endpoint machines are available.
+- [x] complete the available one-machine v2.5 acceptance: live Shell
+      capture/restore, same-machine 87-item round-trip verification,
+      cross-display migration dry-run, remote Desktop classification,
+      managed sender propagation, queue persistence, and resume plumbing.
 
-### Remaining v2.5 Automatic LAN work
+A true two-endpoint physical Desktop migration remains a later field-acceptance
+check when a second machine is available. It is not release-blocking for v2.5;
+the sender capture, wire metadata, receiver restore, cross-display planner, and
+managed control paths are independently covered by the current acceptance and
+automated tests.
 
-- [ ] rank multiple addresses belonging to the same Agent process so ordinary
+### v2.5 Automatic LAN address ranking
+
+- [x] rank multiple addresses belonging to the same Agent process so ordinary
       physical-LAN addresses are preferred over APIPA and virtual/tunnel
       interfaces in Automatic LAN mode;
-- [ ] retain Direct Link's existing link-local IPv6 and APIPA behavior;
-- [ ] add deterministic tests for physical-LAN, APIPA, virtual/tunnel, and
-      ambiguous multi-adapter combinations;
-- [ ] physically verify that the reproduced
+- [x] retain Direct Link's separate link-local IPv6 and APIPA behavior;
+- [x] add deterministic tests covering APIPA, virtual adapters, physical LAN,
+      one-Agent discovery, and remote multi-address discovery;
+- [x] physically verify that the reproduced
       `169.254.21.253` / `172.20.96.1` / `192.168.1.2` case selects
       `192.168.1.2`.
 
-### Planned v2.5 performance work
+Automatic LAN ranking now combines address scope with Windows interface
+metadata, local-subnet affinity, and the existing cross-Agent shared-LAN
+affinity. This avoids relying on private-address spelling such as assuming that
+`192.168.x.x` is physical or that `172.x.x.x` is virtual. Direct Link uses its
+independent strict-interface discovery path and is unaffected.
 
-v2.5 will focus on measured throughput improvements rather than generic socket
-tuning. The current engine already applies `TCP_NODELAY`, uses adaptive
-Zstandard level 1 compression, prints the complete 1/2/4/8-stream calibration
-matrix, runs concurrent transfer lanes, and enforces a process-wide transfer
-buffer budget.
+One-machine physical acceptance on 2026-08-07 reproduced the three-address
+Agent case and confirmed that Automatic LAN retained `192.168.1.2:7339` instead
+of the APIPA `169.254.21.253:7339` or virtual `172.20.96.1:7339` endpoint.
 
-Planned investigation order:
 
-- [ ] add stage-level timing for source reads, compression/probing, blocked
-      socket writes, socket reads, decompression, and destination writes;
-- [ ] add bounded IOCP-backed source read-ahead using a small reusable operation
-      pool inside the existing transfer-memory budget;
-- [ ] predict raw-versus-compressed completion time from measured compression
-      speed and calibrated path throughput instead of considering wire savings
-      alone;
-- [ ] benchmark Windows automatic TCP buffering against explicit 256 KiB,
-      1 MiB, and 4 MiB send/receive buffers before changing production defaults;
-- [ ] classify the actual transfer interface instead of inferring transport from
-      Automatic LAN or Explicit IP mode;
-- [ ] retain the smallest stream count reaching 90% of peak on Wi-Fi and unknown
-      interfaces;
-- [ ] test the smallest stream count reaching 95% of peak on physical Ethernet
-      and Direct Link interfaces;
-- [ ] retain the conservative 90% policy whenever interface classification is
-      unavailable or ambiguous;
-- [ ] stream CDC reconstruction operations and literal records instead of
-      duplicating complete plans in memory;
-- [ ] increase CDC literal allowances only after streaming plans are implemented,
-      with the limit derived from the global transfer-memory budget;
-- [ ] keep Windows IO Ring research for a later v3 investigation unless profiling
-      identifies syscall submission as a meaningful production bottleneck.
-
-Direct Link is always a physical Ethernet candidate. Automatic LAN and Explicit
-IP may use Ethernet, Wi-Fi, VPN, or virtual interfaces, so the v2.5 policy must
-inspect the selected path rather than treating every LAN address as wired.
 
 ## Planned v2.6 — Manager interface redesign
 
@@ -658,6 +640,49 @@ Planned v2.6 goals include:
   increasingly long capability text;
 - preserve all existing queue persistence, recovery, Direct Link, Automatic LAN,
   Explicit IP, updater, and Desktop-layout functionality during the redesign.
+
+## Planned v2.7 — measured speed work
+
+v2.7 will return the project focus to raw transfer performance after the v2.6
+Manager redesign. The goal is measured throughput improvement rather than
+generic socket tuning. The current engine already applies `TCP_NODELAY`, uses
+adaptive Zstandard level 1 compression, prints the complete 1/2/4/8-stream
+calibration matrix, runs concurrent transfer lanes, and enforces a process-wide
+transfer buffer budget.
+
+Planned investigation order:
+
+- [ ] add stage-level timing for source reads, compression/probing, blocked
+      socket writes, socket reads, decompression, and destination writes;
+- [ ] classify the actual transfer interface instead of inferring transport from
+      Automatic LAN or Explicit IP mode;
+- [ ] benchmark Windows automatic TCP buffering against explicit 256 KiB,
+      1 MiB, and 4 MiB send/receive buffers before changing production defaults;
+- [ ] retain the smallest stream count reaching 90% of peak on Wi-Fi and unknown
+      interfaces;
+- [ ] test the smallest stream count reaching 95% of peak on physical Ethernet
+      and Direct Link interfaces;
+- [ ] retain the conservative 90% policy whenever interface classification is
+      unavailable or ambiguous;
+- [ ] add bounded IOCP-backed source read-ahead using a small reusable operation
+      pool inside the existing transfer-memory budget;
+- [ ] predict raw-versus-compressed completion time from measured compression
+      speed and calibrated path throughput instead of considering wire savings
+      alone;
+- [ ] stream CDC reconstruction operations and literal records instead of
+      duplicating complete plans in memory;
+- [ ] increase CDC literal allowances only after streaming plans are implemented,
+      with the limit derived from the global transfer-memory budget;
+- [ ] keep Windows IO Ring research for a later v3 investigation unless profiling
+      identifies syscall submission as a meaningful production bottleneck.
+
+Direct Link is always a physical Ethernet candidate. Automatic LAN and Explicit
+IP may use Ethernet, Wi-Fi, VPN, or virtual interfaces, so the v2.7 policy must
+inspect the selected path rather than treating every LAN address as wired.
+
+The previous v2.5 F/G/H/I/J performance milestones were deliberately moved here
+so v2.5 can ship after Desktop migration and the remaining discovery correctness
+work, while v2.6 can focus entirely on the Manager redesign.
 
 ### Deliberately deferred
 
