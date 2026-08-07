@@ -21,6 +21,9 @@ use crate::tiny_file_pool;
 use crate::tiny_pack_codec::{self, TinyPackEncoding};
 use crate::transfer_memory;
 use crate::update_verification::{self, FILE_DIGEST_BYTES, FileDigest};
+use crate::windows_desktop_layout::{
+    self, DesktopLayoutRestoreOutcome, DesktopLayoutRestoreReport,
+};
 use crate::windows_file_replace;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -319,6 +322,7 @@ pub struct ReceiveReport {
     pub session_id: u64,
     pub data_stream_count: usize,
     pub desktop_layout: Option<DesktopLayoutSnapshot>,
+    pub desktop_layout_restore: Option<DesktopLayoutRestoreReport>,
     pub tiny_materialization_workers: usize,
     pub files_received: u64,
     pub bytes_received: u64,
@@ -363,6 +367,37 @@ impl ReceiveReport {
                 desktop_layout.items.len(),
                 desktop_layout.monitors.len(),
             );
+        }
+
+        if let Some(restore) = self.desktop_layout_restore {
+            let status = match restore.outcome {
+                DesktopLayoutRestoreOutcome::Applied => "restored",
+
+                DesktopLayoutRestoreOutcome::SkippedDestinationNotDesktop => {
+                    "not applied - destination is not the Windows Desktop"
+                }
+
+                DesktopLayoutRestoreOutcome::SkippedDisplayMismatch => {
+                    "not applied - monitor layout or DPI differs"
+                }
+
+                DesktopLayoutRestoreOutcome::SkippedAutoArrangeMismatch => {
+                    "not applied - Auto Arrange state differs"
+                }
+
+                DesktopLayoutRestoreOutcome::Failed => {
+                    "restore failed - file transfer remained successful"
+                }
+            };
+
+            println!("  Desktop restore:      {status}",);
+
+            if restore.outcome == DesktopLayoutRestoreOutcome::Applied {
+                println!(
+                    "  Desktop items:        {} matched / {} missing",
+                    restore.matched_items, restore.missing_items,
+                );
+            }
         }
 
         println!(
@@ -1725,6 +1760,53 @@ fn run_server_with_mode(
     )
 }
 
+fn restore_received_desktop_layout(
+    destination_root: &Path,
+    desktop_layout: Option<&DesktopLayoutSnapshot>,
+) -> Option<DesktopLayoutRestoreReport> {
+    let snapshot = desktop_layout?;
+
+    match windows_desktop_layout::is_current_desktop_path(destination_root) {
+        Ok(true) => match windows_desktop_layout::restore_current_desktop_layout(snapshot) {
+            Ok(report) => Some(report),
+
+            Err(error) => {
+                eprintln!("Desktop layout restore failed; file transfer remains complete: {error}",);
+
+                Some(DesktopLayoutRestoreReport {
+                    outcome: DesktopLayoutRestoreOutcome::Failed,
+
+                    matched_items: 0,
+
+                    missing_items: snapshot.items.len(),
+                })
+            }
+        },
+
+        Ok(false) => Some(DesktopLayoutRestoreReport {
+            outcome: DesktopLayoutRestoreOutcome::SkippedDestinationNotDesktop,
+
+            matched_items: 0,
+
+            missing_items: snapshot.items.len(),
+        }),
+
+        Err(error) => {
+            eprintln!(
+                "failed to determine whether receive destination is the Windows Desktop; layout restore skipped: {error}",
+            );
+
+            Some(DesktopLayoutRestoreReport {
+                outcome: DesktopLayoutRestoreOutcome::Failed,
+
+                matched_items: 0,
+
+                missing_items: snapshot.items.len(),
+            })
+        }
+    }
+}
+
 fn run_server_with_mode_and_layout(
     listener: &TcpListener,
     destination_root: PathBuf,
@@ -2000,6 +2082,11 @@ fn run_server_with_mode_and_layout(
         progress.check_cancelled()?;
     }
 
+    let desktop_layout_restore = restore_received_desktop_layout(
+        destination_root.as_path(),
+        accepted_session.desktop_layout.as_ref(),
+    );
+
     let ack = TransferAck {
         files_copied: report.files_copied,
         bytes_copied: report.bytes_copied,
@@ -2036,6 +2123,8 @@ fn run_server_with_mode_and_layout(
         data_stream_count,
 
         desktop_layout: accepted_session.desktop_layout,
+
+        desktop_layout_restore,
 
         tiny_materialization_workers,
 

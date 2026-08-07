@@ -154,23 +154,6 @@ pub fn send(
     })
 }
 
-pub(crate) fn send_with_progress(
-    receiver_address: SocketAddr,
-    source_root: &Path,
-    worker_count: usize,
-    calibration_bytes: u64,
-    progress: ProgressCounter,
-) -> io::Result<CalibratedSendReport> {
-    send_with_progress_and_desktop_layout(
-        receiver_address,
-        source_root,
-        worker_count,
-        calibration_bytes,
-        progress,
-        None,
-    )
-}
-
 pub(crate) fn send_with_progress_and_desktop_layout(
     receiver_address: SocketAddr,
     source_root: &Path,

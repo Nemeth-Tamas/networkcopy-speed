@@ -117,21 +117,6 @@ pub(crate) fn send(
     send_configured(source_root, worker_count, calibration_bytes, None, None)
 }
 
-pub(crate) fn send_with_progress(
-    source_root: &Path,
-    worker_count: usize,
-    calibration_bytes: u64,
-    progress: ProgressCounter,
-) -> io::Result<CalibratedSendReport> {
-    send_with_progress_and_desktop_layout(
-        source_root,
-        worker_count,
-        calibration_bytes,
-        progress,
-        None,
-    )
-}
-
 pub(crate) fn send_with_progress_and_desktop_layout(
     source_root: &Path,
     worker_count: usize,

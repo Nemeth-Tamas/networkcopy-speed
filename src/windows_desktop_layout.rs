@@ -4,6 +4,7 @@ use crate::desktop_layout::{
     MAX_DESKTOP_LAYOUT_MONITORS,
 };
 use crate::destination_layout::validate_windows_path_component;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs;
 use std::io;
@@ -11,7 +12,7 @@ use std::mem::size_of;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread;
-use windows::Win32::Foundation::{LPARAM, RECT};
+use windows::Win32::Foundation::{LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
 };
@@ -27,7 +28,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     CSIDL_DESKTOP, FOLDERID_Desktop, FOLDERVIEWMODE, IFolderView2, IShellBrowser, IShellItem,
-    IShellWindows, KF_FLAG_DEFAULT, SHGetKnownFolderPath, SID_STopLevelBrowser,
+    IShellView, IShellWindows, KF_FLAG_DEFAULT, SHGetKnownFolderPath, SID_STopLevelBrowser,
     SIGDN_PARENTRELATIVEPARSING, SVGIO_ALLVIEW, SWC_DESKTOP, SWFO_NEEDDISPATCH, ShellWindows,
 };
 use windows::core::{BOOL, Error as WindowsError, Interface, PWSTR};
@@ -37,6 +38,30 @@ const FOLDER_FLAG_AUTO_ARRANGE_MASK: u32 = 0x0000_0001;
 const MONITOR_INFO_PRIMARY_MASK: u32 = 0x0000_0001;
 
 const FILE_ATTRIBUTE_REPARSE_POINT_MASK: u32 = 0x0000_0400;
+
+const SELECT_AND_POSITION_ITEMS_FLAGS: u32 = 0x0000_0080;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DesktopLayoutRestoreOutcome {
+    Applied,
+
+    SkippedDestinationNotDesktop,
+
+    SkippedDisplayMismatch,
+
+    SkippedAutoArrangeMismatch,
+
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DesktopLayoutRestoreReport {
+    pub outcome: DesktopLayoutRestoreOutcome,
+
+    pub matched_items: usize,
+
+    pub missing_items: usize,
+}
 
 pub fn current_desktop_path() -> io::Result<PathBuf> {
     let raw_path = unsafe { SHGetKnownFolderPath(&FOLDERID_Desktop, KF_FLAG_DEFAULT, None) }
@@ -81,6 +106,221 @@ pub fn capture_current_desktop_layout() -> io::Result<DesktopLayoutSnapshot> {
     capture_thread
         .join()
         .map_err(|_| io::Error::other("Windows Desktop capture thread panicked"))?
+}
+
+pub fn restore_current_desktop_layout(
+    snapshot: &DesktopLayoutSnapshot,
+) -> io::Result<DesktopLayoutRestoreReport> {
+    snapshot.validate()?;
+
+    let snapshot = snapshot.clone();
+
+    let restore_thread = thread::Builder::new()
+        .name("networkcopy-desktop-restore".to_string())
+        .spawn(move || restore_on_sta_thread(&snapshot))?;
+
+    restore_thread
+        .join()
+        .map_err(|_| io::Error::other("Windows Desktop restore thread panicked"))?
+}
+
+fn restore_on_sta_thread(
+    snapshot: &DesktopLayoutSnapshot,
+) -> io::Result<DesktopLayoutRestoreReport> {
+    let _dpi_awareness = ThreadDpiAwareness::per_monitor_v2()?;
+
+    let _apartment = ComApartment::initialize()?;
+
+    let current_monitors = capture_monitors()?;
+
+    if !same_monitor_environment(&snapshot.monitors, &current_monitors) {
+        return Ok(DesktopLayoutRestoreReport {
+            outcome: DesktopLayoutRestoreOutcome::SkippedDisplayMismatch,
+
+            matched_items: 0,
+
+            missing_items: snapshot.items.len(),
+        });
+    }
+
+    let desktop_path = current_desktop_path()?;
+
+    let folder_view = current_desktop_folder_view()?;
+
+    let (_, current_auto_arrange) = capture_view_settings(&folder_view)?;
+
+    if snapshot.auto_arrange != current_auto_arrange {
+        return Ok(DesktopLayoutRestoreReport {
+            outcome: DesktopLayoutRestoreOutcome::SkippedAutoArrangeMismatch,
+
+            matched_items: 0,
+
+            missing_items: snapshot.items.len(),
+        });
+    }
+
+    let mut view_mode = FOLDERVIEWMODE::default();
+
+    let mut current_icon_size = 0_i32;
+
+    unsafe { folder_view.GetViewModeAndIconSize(&mut view_mode, &mut current_icon_size) }.map_err(
+        |error| {
+            windows_error(
+                "failed to read current Desktop view mode before restore",
+                error,
+            )
+        },
+    )?;
+
+    let target_icon_size = i32::try_from(snapshot.icon_size).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "captured Desktop icon size cannot be represented by Windows",
+        )
+    })?;
+
+    if current_icon_size != target_icon_size {
+        unsafe { folder_view.SetViewModeAndIconSize(view_mode, target_icon_size) }
+            .map_err(|error| windows_error("failed to restore Desktop icon size", error))?;
+    }
+
+    let shell_view: IShellView = folder_view
+        .cast()
+        .map_err(|error| windows_error("Desktop folder view did not expose IShellView", error))?;
+
+    unsafe { shell_view.Refresh() }.map_err(|error| {
+        windows_error(
+            "failed to refresh the Desktop before restoring icon positions",
+            error,
+        )
+    })?;
+
+    let targets = collect_restore_targets(&folder_view, &desktop_path, snapshot)?;
+
+    let matched_items = targets.len();
+
+    let missing_items = snapshot.items.len().saturating_sub(matched_items);
+
+    if !snapshot.auto_arrange && !targets.is_empty() {
+        let target_count = u32::try_from(targets.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Desktop restore target count cannot be represented",
+            )
+        })?;
+
+        let pidls: Vec<*const ITEMIDLIST> =
+            targets.iter().map(|target| target.pidl.as_ptr()).collect();
+
+        let positions: Vec<POINT> = targets.iter().map(|target| target.position).collect();
+
+        unsafe {
+            folder_view.SelectAndPositionItems(
+                target_count,
+                pidls.as_ptr(),
+                Some(positions.as_ptr()),
+                SELECT_AND_POSITION_ITEMS_FLAGS,
+            )
+        }
+        .map_err(|error| windows_error("failed to restore Desktop icon positions", error))?;
+    }
+
+    unsafe { shell_view.SaveViewState() }.map_err(|error| {
+        windows_error("failed to persist the restored Desktop view state", error)
+    })?;
+
+    Ok(DesktopLayoutRestoreReport {
+        outcome: DesktopLayoutRestoreOutcome::Applied,
+
+        matched_items,
+
+        missing_items,
+    })
+}
+
+fn same_monitor_environment(expected: &[DesktopMonitor], current: &[DesktopMonitor]) -> bool {
+    expected.len() == current.len()
+        && expected
+            .iter()
+            .all(|monitor| current.iter().any(|candidate| candidate == monitor))
+}
+
+struct RestoreTarget {
+    pidl: OwnedPidl,
+
+    position: POINT,
+}
+
+fn collect_restore_targets(
+    folder_view: &IFolderView2,
+    desktop_path: &Path,
+    snapshot: &DesktopLayoutSnapshot,
+) -> io::Result<Vec<RestoreTarget>> {
+    let expected: HashMap<&str, &DesktopLayoutItem> = snapshot
+        .items
+        .iter()
+        .map(|item| (item.name.as_str(), item))
+        .collect();
+
+    let item_count = unsafe { folder_view.ItemCount(SVGIO_ALLVIEW) }.map_err(|error| {
+        windows_error(
+            "failed to enumerate Desktop Shell items during restore",
+            error,
+        )
+    })?;
+
+    if item_count < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Windows returned negative Desktop item count {item_count} during restore",),
+        ));
+    }
+
+    let mut targets = Vec::new();
+
+    for index in 0..item_count {
+        let shell_item: IShellItem = unsafe { folder_view.GetItem(index) }.map_err(|error| {
+            windows_error(
+                &format!("failed to read Desktop Shell item {index} during restore",),
+                error,
+            )
+        })?;
+
+        let name = shell_item_name(&shell_item, index)?;
+
+        let Some(kind) = classify_physical_desktop_child(desktop_path, &name)? else {
+            continue;
+        };
+
+        let Some(expected_item) = expected.get(name.as_str()) else {
+            continue;
+        };
+
+        if expected_item.kind != kind {
+            continue;
+        }
+
+        let pidl = unsafe { folder_view.Item(index) }.map_err(|error| {
+            windows_error(
+                &format!("failed to obtain Desktop item {index} identifier during restore",),
+                error,
+            )
+        })?;
+
+        let pidl = OwnedPidl::new(pidl, index)?;
+
+        targets.push(RestoreTarget {
+            pidl,
+
+            position: POINT {
+                x: expected_item.position.x,
+
+                y: expected_item.position.y,
+            },
+        });
+    }
+
+    Ok(targets)
 }
 
 fn capture_on_sta_thread() -> io::Result<DesktopLayoutSnapshot> {
@@ -553,7 +793,83 @@ impl Drop for OwnedCoTaskWide {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_current_desktop_layout, current_desktop_path};
+    use super::{
+        DesktopLayoutRestoreOutcome, capture_current_desktop_layout, current_desktop_path,
+        restore_current_desktop_layout, same_monitor_environment,
+    };
+    use crate::desktop_layout::{DesktopMonitor, DesktopRect};
+
+    #[test]
+    fn matching_monitor_environment_ignores_enumeration_order() {
+        let primary = DesktopMonitor {
+            bounds: DesktopRect {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1440,
+            },
+
+            work_area: DesktopRect {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1392,
+            },
+
+            dpi_x: 120,
+            dpi_y: 120,
+            primary: true,
+        };
+
+        let secondary = DesktopMonitor {
+            bounds: DesktopRect {
+                left: -1920,
+                top: 360,
+                right: 0,
+                bottom: 1440,
+            },
+
+            work_area: DesktopRect {
+                left: -1920,
+                top: 360,
+                right: 0,
+                bottom: 1392,
+            },
+
+            dpi_x: 96,
+            dpi_y: 96,
+            primary: false,
+        };
+
+        assert!(same_monitor_environment(
+            &[primary, secondary],
+            &[secondary, primary],
+        ));
+
+        let mut changed = secondary;
+
+        changed.dpi_x = 120;
+
+        assert!(!same_monitor_environment(
+            &[primary, secondary],
+            &[primary, changed],
+        ));
+    }
+
+    #[test]
+    #[ignore = "reapplies the current live Windows Desktop layout"]
+    fn live_desktop_restore_is_idempotent() {
+        let snapshot = capture_current_desktop_layout().unwrap();
+
+        let report = restore_current_desktop_layout(&snapshot).unwrap();
+
+        assert_eq!(report.outcome, DesktopLayoutRestoreOutcome::Applied,);
+
+        assert_eq!(
+            report.matched_items + report.missing_items,
+            snapshot.items.len(),
+        );
+    }
 
     #[test]
     #[ignore = "queries the live Windows Explorer desktop"]
