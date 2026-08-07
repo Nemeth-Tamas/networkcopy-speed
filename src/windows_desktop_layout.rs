@@ -11,16 +11,19 @@ use std::mem::size_of;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::thread;
-use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
-    ClientToScreen, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
 };
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
     CoUninitialize, IServiceProvider,
 };
 use windows::Win32::System::Variant::VARIANT;
-use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor,
+    MDT_EFFECTIVE_DPI, SetThreadDpiAwarenessContext,
+};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     CSIDL_DESKTOP, FOLDERID_Desktop, FOLDERVIEWMODE, IFolderView2, IShellBrowser, IShellItem,
@@ -69,17 +72,19 @@ pub fn capture_current_desktop_layout() -> io::Result<DesktopLayoutSnapshot> {
 }
 
 fn capture_on_sta_thread() -> io::Result<DesktopLayoutSnapshot> {
+    let _dpi_awareness = ThreadDpiAwareness::per_monitor_v2()?;
+
     let _apartment = ComApartment::initialize()?;
 
     let desktop_path = current_desktop_path()?;
 
-    let (folder_view, view_window) = current_desktop_folder_view()?;
+    let folder_view = current_desktop_folder_view()?;
 
     let (icon_size, auto_arrange) = capture_view_settings(&folder_view)?;
 
     let monitors = capture_monitors()?;
 
-    let items = capture_desktop_items(&folder_view, view_window, &desktop_path)?;
+    let items = capture_desktop_items(&folder_view, &desktop_path)?;
 
     let snapshot = DesktopLayoutSnapshot {
         version: DESKTOP_LAYOUT_FORMAT_VERSION,
@@ -98,7 +103,7 @@ fn capture_on_sta_thread() -> io::Result<DesktopLayoutSnapshot> {
     Ok(snapshot)
 }
 
-fn current_desktop_folder_view() -> io::Result<(IFolderView2, HWND)> {
+fn current_desktop_folder_view() -> io::Result<IFolderView2> {
     let shell_windows: IShellWindows = unsafe { CoCreateInstance(&ShellWindows, None, CLSCTX_ALL) }
         .map_err(|error| windows_error("failed to connect to Windows ShellWindows", error))?;
 
@@ -138,14 +143,11 @@ fn current_desktop_folder_view() -> io::Result<(IFolderView2, HWND)> {
     let shell_view = unsafe { shell_browser.QueryActiveShellView() }
         .map_err(|error| windows_error("failed to query the active Desktop Shell view", error))?;
 
-    let view_window = unsafe { shell_view.GetWindow() }
-        .map_err(|error| windows_error("failed to obtain the Desktop Shell view window", error))?;
-
     let folder_view: IFolderView2 = shell_view
         .cast()
         .map_err(|error| windows_error("Desktop Shell view did not expose IFolderView2", error))?;
 
-    Ok((folder_view, view_window))
+    Ok(folder_view)
 }
 
 fn capture_view_settings(folder_view: &IFolderView2) -> io::Result<(u32, bool)> {
@@ -173,7 +175,6 @@ fn capture_view_settings(folder_view: &IFolderView2) -> io::Result<(u32, bool)> 
 
 fn capture_desktop_items(
     folder_view: &IFolderView2,
-    view_window: HWND,
     desktop_path: &Path,
 ) -> io::Result<Vec<DesktopLayoutItem>> {
     let item_count = unsafe { folder_view.ItemCount(SVGIO_ALLVIEW) }
@@ -211,21 +212,10 @@ fn capture_desktop_items(
 
         let pidl = OwnedPidl::new(pidl, index)?;
 
-        let mut position =
+        let position =
             unsafe { folder_view.GetItemPosition(pidl.as_ptr()) }.map_err(|error| {
                 windows_error(
                     &format!("failed to read position for Desktop item {name:?}",),
-                    error,
-                )
-            })?;
-
-        unsafe { ClientToScreen(view_window, &mut position) }
-            .ok()
-            .map_err(|error| {
-                windows_error(
-                    &format!(
-                        "failed to convert Desktop item {name:?} position to screen coordinates",
-                    ),
                     error,
                 )
             })?;
@@ -437,6 +427,41 @@ fn desktop_rect(rect: RECT) -> DesktopRect {
 
 fn windows_error(context: &str, error: WindowsError) -> io::Error {
     io::Error::other(format!("{context}: {error}"))
+}
+
+struct ThreadDpiAwareness {
+    previous: *mut c_void,
+}
+
+impl ThreadDpiAwareness {
+    fn per_monitor_v2() -> io::Result<Self> {
+        let previous = unsafe {
+            SetThreadDpiAwarenessContext(
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            )
+        };
+
+        if previous.is_invalid() {
+            return Err(windows_error(
+                "failed to enable per-monitor DPI awareness for Desktop capture",
+                WindowsError::from_thread(),
+            ));
+        }
+
+        Ok(Self {
+            previous: previous.0,
+        })
+    }
+}
+
+impl Drop for ThreadDpiAwareness {
+    fn drop(&mut self) {
+        unsafe {
+            SetThreadDpiAwarenessContext(
+                DPI_AWARENESS_CONTEXT(self.previous),
+            );
+        }
+    }
 }
 
 struct ComApartment;
