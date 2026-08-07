@@ -6,7 +6,11 @@ pub mod implementation {
 
     const STATE_MAGIC_V4: &str = "NCMS4";
 
+    const STATE_MAGIC_V5: &str = "NCMS5";
+
     const ACTIVE_BINDING_PRESENT_PREFIX: &str = "active_binding_present ";
+
+    const QUEUE_PRESERVE_DESKTOP_LAYOUT_PREFIX: &str = "queue_preserve_desktop_layout ";
 
     pub fn load_from_v4(path: &Path) -> io::Result<Option<ManagerPersistedState>> {
         let mut file = match File::open(path) {
@@ -39,11 +43,11 @@ pub mod implementation {
 
         file.read_to_string(&mut text)?;
 
-        decode_state_with_v4(&text).map(Some)
+        decode_state_with_v5(&text).map(Some)
     }
 
     pub fn save_to_v4(path: &Path, state: &ManagerPersistedState) -> io::Result<()> {
-        let encoded = encode_state_with_v4(state)?;
+        let encoded = encode_state_with_v5(state)?;
 
         let parent = path.parent().ok_or_else(|| {
             io::Error::new(
@@ -95,6 +99,140 @@ pub mod implementation {
                 Err(error)
             }
         }
+    }
+
+    fn encode_state_with_v5(state: &ManagerPersistedState) -> io::Result<String> {
+        let encoded_v4 = encode_state_with_v4(state)?;
+
+        let mut lines = encoded_v4.lines().map(str::to_string).collect::<Vec<_>>();
+
+        let first = lines
+            .first_mut()
+            .ok_or_else(|| io::Error::other("NCMS4 encoder produced an empty manager state"))?;
+
+        if first != STATE_MAGIC_V4 {
+            return Err(io::Error::other(
+                "NCMS4 encoder produced an unexpected manager-state format",
+            ));
+        }
+
+        *first = STATE_MAGIC_V5.to_string();
+
+        let mut queue_index = 0_usize;
+
+        let mut line_index = 0_usize;
+
+        while line_index < lines.len() {
+            if lines[line_index].starts_with("queue_update_existing ") {
+                let item = state.queue.items().get(queue_index).ok_or_else(|| {
+                    io::Error::other("NCMS5 encoder found more queue fields than queue items")
+                })?;
+
+                lines.insert(
+                    line_index + 1,
+                    format!(
+                        "{QUEUE_PRESERVE_DESKTOP_LAYOUT_PREFIX}{}",
+                        u8::from(item.preserve_desktop_layout,),
+                    ),
+                );
+
+                queue_index += 1;
+
+                line_index += 1;
+            }
+
+            line_index += 1;
+        }
+
+        if queue_index != state.queue.len() {
+            return Err(io::Error::other(format!(
+                "NCMS5 encoder found {queue_index} queue entries in the legacy state but expected {}",
+                state.queue.len(),
+            )));
+        }
+
+        let mut output = lines.join("\n");
+
+        output.push('\n');
+
+        if output.len() > MAX_STATE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "manager state requires {} bytes, exceeding the {MAX_STATE_BYTES} byte limit",
+                    output.len(),
+                ),
+            ));
+        }
+
+        Ok(output)
+    }
+
+    fn decode_state_with_v5(text: &str) -> io::Result<ManagerPersistedState> {
+        if text.len() > MAX_STATE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "manager state contains {} bytes, exceeding the {MAX_STATE_BYTES} byte limit",
+                    text.len(),
+                ),
+            ));
+        }
+
+        let first_line = text.lines().next().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "manager state was empty")
+        })?;
+
+        if first_line != STATE_MAGIC_V5 {
+            return decode_state_with_v4(text);
+        }
+
+        let mut legacy_lines = Vec::new();
+
+        let mut desktop_layout_flags = Vec::new();
+
+        for (index, line) in text.lines().enumerate() {
+            if index == 0 {
+                legacy_lines.push(STATE_MAGIC_V4.to_string());
+
+                continue;
+            }
+
+            if line.starts_with(QUEUE_PRESERVE_DESKTOP_LAYOUT_PREFIX) {
+                desktop_layout_flags.push(parse_bool_field(line, "queue_preserve_desktop_layout")?);
+
+                continue;
+            }
+
+            legacy_lines.push(line.to_string());
+        }
+
+        let mut legacy_text = legacy_lines.join("\n");
+
+        legacy_text.push('\n');
+
+        let mut state = decode_state_with_v4(&legacy_text)?;
+
+        if desktop_layout_flags.len() != state.queue.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "NCMS5 manager state contained {} Desktop-layout queue flags for {} queue entries",
+                    desktop_layout_flags.len(),
+                    state.queue.len(),
+                ),
+            ));
+        }
+
+        for (item, preserve_desktop_layout) in
+            state.queue.items_mut().iter_mut().zip(desktop_layout_flags)
+        {
+            item.preserve_desktop_layout = preserve_desktop_layout;
+        }
+
+        validate_state(&state).map_err(invalid_data)?;
+
+        Ok(state)
     }
 
     fn encode_state_with_v4(state: &ManagerPersistedState) -> io::Result<String> {
@@ -251,8 +389,8 @@ pub mod implementation {
     #[cfg(test)]
     mod v4_tests {
         use super::{
-            ManagerPersistedState, decode_state, decode_state_with_v4, encode_state,
-            encode_state_with_v4, load_from_v4, save_to_v4,
+            ManagerPersistedState, decode_state, decode_state_with_v4, decode_state_with_v5,
+            encode_state, encode_state_with_v4, encode_state_with_v5, load_from_v4, save_to_v4,
         };
         use crate::management_active_binding::ActiveQueueBinding;
         use crate::management_instance::AgentInstanceId;
@@ -315,6 +453,42 @@ pub mod implementation {
             state.queue = queue;
 
             state
+        }
+
+        #[test]
+        fn version_five_round_trips_desktop_layout_choice() {
+            let mut expected = bound_state();
+
+            expected.queue.items_mut()[0].preserve_desktop_layout = true;
+
+            let encoded = encode_state_with_v5(&expected).unwrap();
+
+            assert!(encoded.starts_with("NCMS5\n"),);
+
+            assert!(encoded.contains("queue_preserve_desktop_layout 1\n",));
+
+            let decoded = decode_state_with_v5(&encoded).unwrap();
+
+            assert_eq!(decoded, expected);
+
+            assert!(decoded.queue.items()[0].preserve_desktop_layout,);
+        }
+
+        #[test]
+        fn version_four_migrates_desktop_layout_choice_off() {
+            let expected = bound_state();
+
+            let encoded = encode_state_with_v4(&expected).unwrap();
+
+            let decoded = decode_state_with_v5(&encoded).unwrap();
+
+            assert!(
+                decoded
+                    .queue
+                    .items()
+                    .iter()
+                    .all(|item| { !item.preserve_desktop_layout }),
+            );
         }
 
         #[test]
@@ -411,7 +585,7 @@ pub mod implementation {
         }
 
         #[test]
-        fn version_four_saves_and_loads_atomically() {
+        fn version_five_saves_and_loads_atomically() {
             let unique = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -430,7 +604,7 @@ pub mod implementation {
 
             let saved = fs::read_to_string(&path).unwrap();
 
-            assert!(saved.starts_with("NCMS4\n",),);
+            assert!(saved.starts_with("NCMS5\n",),);
 
             let loaded = load_from_v4(&path).unwrap().unwrap();
 

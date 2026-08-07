@@ -532,6 +532,8 @@ fn decode_queue_entry(
             kind,
         },
 
+        preserve_desktop_layout: false,
+
         state,
 
         status_message,

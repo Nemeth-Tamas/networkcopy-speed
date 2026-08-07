@@ -244,6 +244,14 @@ struct BrowserResponse {
     result: Result<BrowserPayload, String>,
 }
 
+struct DesktopPathCheckResponse {
+    endpoint: SocketAddr,
+
+    source_root: String,
+
+    result: Result<bool, String>,
+}
+
 struct RemoteBrowserPane {
     endpoint: Option<SocketAddr>,
 
@@ -423,6 +431,16 @@ struct NetworkCopyManager {
 
     update_existing: bool,
 
+    preserve_desktop_layout: bool,
+
+    desktop_layout_available: bool,
+
+    confirmed_desktop_source: Option<(SocketAddr, String)>,
+
+    desktop_path_check_key: Option<(SocketAddr, String)>,
+
+    desktop_path_check_receiver: Option<Receiver<DesktopPathCheckResponse>>,
+
     route_mode: ManagementRouteMode,
 
     show_agents: bool,
@@ -532,6 +550,16 @@ impl NetworkCopyManager {
             calibration_mib: 8,
 
             update_existing: false,
+
+            preserve_desktop_layout: false,
+
+            desktop_layout_available: false,
+
+            confirmed_desktop_source: None,
+
+            desktop_path_check_key: None,
+
+            desktop_path_check_receiver: None,
 
             route_mode: ManagementRouteMode::AutomaticLan,
 
@@ -1006,7 +1034,12 @@ impl NetworkCopyManager {
         let mut updated_queue = self.queue.clone();
 
         for request in requests {
-            if let Err(error) = updated_queue.add(request) {
+            let preserve_desktop_layout =
+                self.preserve_desktop_layout_for(request.sender_agent, &request.source_root);
+
+            if let Err(error) =
+                updated_queue.add_with_desktop_layout(request, preserve_desktop_layout)
+            {
                 self.error = format!(
                     "The batch could not be added atomically. The existing queue was left unchanged: {error}",
                 );
@@ -1039,7 +1072,13 @@ impl NetworkCopyManager {
 
         let source_root = request.source_root.clone();
 
-        match self.queue.add(request) {
+        let preserve_desktop_layout =
+            self.preserve_desktop_layout_for(request.sender_agent, &request.source_root);
+
+        match self
+            .queue
+            .add_with_desktop_layout(request, preserve_desktop_layout)
+        {
             Ok(id) => {
                 self.show_queue = true;
 
@@ -1086,7 +1125,13 @@ impl NetworkCopyManager {
             kind: QueuedTransferKind::Resume { data_stream_count },
         };
 
-        match self.queue.add(request) {
+        let preserve_desktop_layout =
+            self.preserve_desktop_layout_for(request.sender_agent, &request.source_root);
+
+        match self
+            .queue
+            .add_with_desktop_layout(request, preserve_desktop_layout)
+        {
             Ok(id) => {
                 self.show_queue = true;
 
@@ -1222,6 +1267,8 @@ impl NetworkCopyManager {
     fn begin_queued_transfer(&mut self, item: QueuedTransfer) {
         let id = item.id;
 
+        let preserve_desktop_layout = item.preserve_desktop_layout;
+
         let request = item.request;
 
         let source_root = request.source_root.clone();
@@ -1300,7 +1347,11 @@ impl NetworkCopyManager {
 
                 Ok(()) => match kind {
                     QueuedTransferKind::Fresh => {
-                        management_orchestration::start_transfer(managed_request).map_err(|error| {
+                        management_orchestration::start_transfer_with_desktop_layout(
+                            managed_request,
+                            preserve_desktop_layout,
+                        )
+                        .map_err(|error| {
                             ManagedStartFailure::failed(format!(
                                 "Queued managed transfer startup failed: {error}",
                             ))
@@ -1308,9 +1359,10 @@ impl NetworkCopyManager {
                     }
 
                     QueuedTransferKind::Resume { data_stream_count } => {
-                        management_orchestration::resume_transfer(
+                        management_orchestration::resume_transfer_with_desktop_layout(
                             managed_request,
                             data_stream_count,
+                            preserve_desktop_layout,
                         )
                         .map_err(|error| {
                             ManagedStartFailure::failed(format!(
@@ -1811,6 +1863,9 @@ impl NetworkCopyManager {
             return;
         }
 
+        let preserve_desktop_layout =
+            self.preserve_desktop_layout_for(sender_agent, &self.source_root);
+
         let request = ManagedTransferRequest {
             sender_agent,
 
@@ -1846,7 +1901,11 @@ impl NetworkCopyManager {
         self.start_receiver = Some(receiver);
 
         thread::spawn(move || {
-            let result = management_orchestration::start_transfer(request).map_err(|error| {
+            let result = management_orchestration::start_transfer_with_desktop_layout(
+                request,
+                preserve_desktop_layout,
+            )
+            .map_err(|error| {
                 ManagedStartFailure::failed(format!("Managed transfer startup failed: {error}",))
             });
 
@@ -2271,6 +2330,144 @@ impl NetworkCopyManager {
         });
     }
 
+    fn preserve_desktop_layout_for(&self, sender_agent: SocketAddr, source_root: &str) -> bool {
+        self.preserve_desktop_layout
+            && self.confirmed_desktop_source.as_ref().is_some_and(
+                |(confirmed_agent, confirmed_root)| {
+                    *confirmed_agent == sender_agent
+                        && comparable_windows_path(confirmed_root)
+                            == comparable_windows_path(source_root)
+                },
+            )
+    }
+
+    fn refresh_desktop_path_check(&mut self) {
+        let sender_agent = match self.sender_agent.trim().parse::<SocketAddr>() {
+            Ok(endpoint) => endpoint,
+
+            Err(_) => {
+                self.desktop_path_check_key = None;
+
+                self.desktop_path_check_receiver = None;
+
+                self.desktop_layout_available = false;
+
+                return;
+            }
+        };
+
+        let source_root = self.source_root.trim().to_string();
+
+        if source_root.is_empty() {
+            self.desktop_path_check_key = None;
+
+            self.desktop_path_check_receiver = None;
+
+            self.desktop_layout_available = false;
+
+            return;
+        }
+
+        let desired = (sender_agent, source_root.clone());
+
+        if self.confirmed_desktop_source.as_ref().is_some_and(
+            |(confirmed_agent, confirmed_root)| {
+                *confirmed_agent == sender_agent
+                    && comparable_windows_path(confirmed_root)
+                        == comparable_windows_path(&source_root)
+            },
+        ) {
+            self.desktop_path_check_key = Some(desired);
+
+            self.desktop_path_check_receiver = None;
+
+            self.desktop_layout_available = true;
+
+            return;
+        }
+
+        if self.desktop_path_check_key.as_ref() == Some(&desired) {
+            return;
+        }
+
+        self.desktop_path_check_key = Some(desired);
+
+        self.desktop_layout_available = false;
+
+        let (sender, receiver) = mpsc::channel();
+
+        self.desktop_path_check_receiver = Some(receiver);
+
+        thread::spawn(move || {
+            let result = (|| {
+                let hello = management_control::hello(sender_agent)
+                    .map_err(|error| format!("Sender capability query failed: {error}",))?;
+
+                if !hello.capabilities.supports_desktop_layout() {
+                    return Ok(false);
+                }
+
+                management_control::is_desktop_path(sender_agent, &source_root)
+                    .map_err(|error| format!("Sender Desktop-path query failed: {error}",))
+            })();
+
+            let _ = sender.send(DesktopPathCheckResponse {
+                endpoint: sender_agent,
+
+                source_root,
+
+                result,
+            });
+        });
+    }
+
+    fn process_desktop_path_check_message(&mut self) {
+        let message = self
+            .desktop_path_check_receiver
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
+
+        match message {
+            Some(Ok(response)) => {
+                self.desktop_path_check_receiver = None;
+
+                let current =
+                    self.desktop_path_check_key
+                        .as_ref()
+                        .is_some_and(|(endpoint, source_root)| {
+                            *endpoint == response.endpoint
+                                && comparable_windows_path(source_root)
+                                    == comparable_windows_path(&response.source_root)
+                        });
+
+                if !current {
+                    return;
+                }
+
+                match response.result {
+                    Ok(true) => {
+                        self.desktop_layout_available = true;
+
+                        self.confirmed_desktop_source =
+                            Some((response.endpoint, response.source_root));
+                    }
+
+                    Ok(false) | Err(_) => {
+                        self.desktop_layout_available = false;
+                    }
+                }
+            }
+
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.desktop_path_check_receiver = None;
+
+                self.desktop_layout_available = false;
+            }
+
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+    }
+
     fn process_messages(&mut self) {
         self.process_discovery_message();
 
@@ -2295,6 +2492,10 @@ impl NetworkCopyManager {
         self.sender_browser.process_message();
 
         self.receiver_browser.process_message();
+
+        self.process_desktop_path_check_message();
+
+        self.refresh_desktop_path_check();
     }
 
     fn process_discovery_message(&mut self) {
@@ -3015,6 +3216,7 @@ impl NetworkCopyManager {
             || self.poll_receiver.is_some()
             || self.cancel_receiver.is_some()
             || self.peer_cleanup_receiver.is_some()
+            || self.desktop_path_check_receiver.is_some()
             || self.sender_browser.is_loading()
             || self.receiver_browser.is_loading()
             || (self.transfer.is_some() && !self.monitoring_complete)
@@ -3833,6 +4035,26 @@ impl NetworkCopyManager {
                     &mut self.update_existing,
                     "Update and verify existing destination",
                 );
+
+                if self.desktop_path_check_receiver.is_some() {
+                    ui.separator();
+
+                    ui.spinner();
+
+                    ui.label(
+                        "Checking sender Desktop...",
+                    );
+                } else if self.desktop_layout_available {
+                    ui.separator();
+
+                    ui.checkbox(
+                        &mut self.preserve_desktop_layout,
+                        "Preserve Windows Desktop icon layout",
+                    )
+                    .on_hover_text(
+                        "The sender Agent confirmed that this source is its actual Windows Desktop. Icon positions, icon size, Auto Arrange state, monitor geometry, and DPI metadata will be migrated.",
+                    );
+                }
             });
         });
 
@@ -4399,6 +4621,12 @@ impl NetworkCopyManager {
                     } else {
                         "Fresh destination mode"
                     });
+
+                    if item.preserve_desktop_layout {
+                        ui.separator();
+
+                        status_label(ui, "Desktop layout", egui::Color32::from_rgb(95, 194, 255));
+                    }
                 });
 
                 if !item.status_message.is_empty() {

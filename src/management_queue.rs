@@ -114,6 +114,8 @@ pub struct QueuedTransfer {
 
     pub request: QueuedTransferRequest,
 
+    pub preserve_desktop_layout: bool,
+
     pub state: QueuedTransferState,
 
     pub status_message: String,
@@ -202,6 +204,10 @@ impl TransferQueue {
         &self.items
     }
 
+    pub(crate) fn items_mut(&mut self) -> &mut [QueuedTransfer] {
+        &mut self.items
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -240,6 +246,14 @@ impl TransferQueue {
     }
 
     pub fn add(&mut self, request: QueuedTransferRequest) -> Result<QueuedTransferId, String> {
+        self.add_with_desktop_layout(request, false)
+    }
+
+    pub fn add_with_desktop_layout(
+        &mut self,
+        request: QueuedTransferRequest,
+        preserve_desktop_layout: bool,
+    ) -> Result<QueuedTransferId, String> {
         request.validate()?;
 
         if self.items.len() >= MAX_QUEUE_ENTRIES {
@@ -260,6 +274,8 @@ impl TransferQueue {
             id,
 
             request,
+
+            preserve_desktop_layout,
 
             state: QueuedTransferState::Pending,
 
@@ -537,7 +553,18 @@ mod tests {
 
         assert_eq!(pictures.get(), 4);
     }
+    #[test]
+    fn desktop_layout_choice_is_retained_by_queue() {
+        let mut queue = TransferQueue::default();
 
+        let id = queue
+            .add_with_desktop_layout(request("Desktop"), true)
+            .unwrap();
+
+        let item = queue.items().iter().find(|item| item.id == id).unwrap();
+
+        assert!(item.preserve_desktop_layout);
+    }
     #[test]
     fn running_item_cannot_be_removed_or_reordered() {
         let mut queue = TransferQueue::default();
