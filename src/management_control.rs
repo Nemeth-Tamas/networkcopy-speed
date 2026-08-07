@@ -287,12 +287,13 @@ impl ManagementControlServer {
             ManagementMessageKind::StartSendRequest => {
                 let result = crate::management_jobs::decode_start_send_request(&request.payload)
                     .and_then(|started| {
-                        self.jobs.start_send(
+                        self.jobs.start_send_with_desktop_layout(
                             started.receiver_address,
                             &started.source_root,
                             started.worker_count,
                             started.calibration_mib,
                             started.forced_data_stream_count,
+                            started.preserve_desktop_layout,
                         )
                     })
                     .and_then(|job| crate::management_jobs::encode_started_send_response(&job));
@@ -502,13 +503,35 @@ pub fn start_send_with_stream_count(
     calibration_mib: u64,
     forced_data_stream_count: Option<usize>,
 ) -> io::Result<StartedSendJob> {
-    let payload = crate::management_jobs::encode_start_send_request_with_stream_count(
+    start_send_with_stream_count_and_desktop_layout(
+        endpoint,
         receiver_address,
         source_root,
         worker_count,
         calibration_mib,
         forced_data_stream_count,
-    )?;
+        false,
+    )
+}
+
+pub fn start_send_with_stream_count_and_desktop_layout(
+    endpoint: SocketAddr,
+    receiver_address: SocketAddr,
+    source_root: &str,
+    worker_count: usize,
+    calibration_mib: u64,
+    forced_data_stream_count: Option<usize>,
+    preserve_desktop_layout: bool,
+) -> io::Result<StartedSendJob> {
+    let payload =
+        crate::management_jobs::encode_start_send_request_with_stream_count_and_desktop_layout(
+            receiver_address,
+            source_root,
+            worker_count,
+            calibration_mib,
+            forced_data_stream_count,
+            preserve_desktop_layout,
+        )?;
 
     let response = exchange(endpoint, ManagementMessageKind::StartSendRequest, payload)?;
 

@@ -45,10 +45,33 @@ pub struct ManagedTransferRecord {
 }
 
 pub fn start_transfer(request: ManagedTransferRequest) -> io::Result<ManagedTransferRecord> {
+    start_transfer_with_desktop_layout(request, false)
+}
+
+pub fn start_transfer_with_desktop_layout(
+    request: ManagedTransferRequest,
+    preserve_desktop_layout: bool,
+) -> io::Result<ManagedTransferRecord> {
     start_transfer_with(
         request,
+        preserve_desktop_layout,
         management_control::prepare_receive,
-        management_control::start_send,
+        |endpoint,
+         receiver_address,
+         source_root,
+         worker_count,
+         calibration_mib,
+         preserve_desktop_layout| {
+            management_control::start_send_with_stream_count_and_desktop_layout(
+                endpoint,
+                receiver_address,
+                source_root,
+                worker_count,
+                calibration_mib,
+                None,
+                preserve_desktop_layout,
+            )
+        },
         management_control::cancel_job,
     )
 }
@@ -57,19 +80,34 @@ pub fn resume_transfer(
     request: ManagedTransferRequest,
     data_stream_count: usize,
 ) -> io::Result<ManagedTransferRecord> {
+    resume_transfer_with_desktop_layout(request, data_stream_count, false)
+}
+
+pub fn resume_transfer_with_desktop_layout(
+    request: ManagedTransferRequest,
+    data_stream_count: usize,
+    preserve_desktop_layout: bool,
+) -> io::Result<ManagedTransferRecord> {
     network_calibration::validate_matrix_stream_count(data_stream_count)?;
 
     start_transfer_with(
         request,
+        preserve_desktop_layout,
         management_control::prepare_receive,
-        move |endpoint, receiver_address, source_root, worker_count, calibration_mib| {
-            management_control::start_send_with_stream_count(
+        move |endpoint,
+              receiver_address,
+              source_root,
+              worker_count,
+              calibration_mib,
+              preserve_desktop_layout| {
+            management_control::start_send_with_stream_count_and_desktop_layout(
                 endpoint,
                 receiver_address,
                 source_root,
                 worker_count,
                 calibration_mib,
                 Some(data_stream_count),
+                preserve_desktop_layout,
             )
         },
         management_control::cancel_job,
@@ -78,13 +116,15 @@ pub fn resume_transfer(
 
 fn start_transfer_with<PrepareReceiver, StartSender, CancelJob>(
     request: ManagedTransferRequest,
+    preserve_desktop_layout: bool,
     prepare_receiver: PrepareReceiver,
     start_sender: StartSender,
     cancel_job: CancelJob,
 ) -> io::Result<ManagedTransferRecord>
 where
     PrepareReceiver: FnOnce(SocketAddr, &str, bool) -> io::Result<PreparedReceiveJob>,
-    StartSender: FnOnce(SocketAddr, SocketAddr, &str, usize, u64) -> io::Result<StartedSendJob>,
+    StartSender:
+        FnOnce(SocketAddr, SocketAddr, &str, usize, u64, bool) -> io::Result<StartedSendJob>,
     CancelJob: FnOnce(SocketAddr, u64) -> io::Result<u64>,
 {
     if request.sender_agent == request.receiver_agent {
@@ -108,6 +148,7 @@ where
         &request.source_root,
         request.worker_count,
         request.calibration_mib,
+        preserve_desktop_layout,
     ) {
         Ok(job) => job,
 
@@ -220,6 +261,7 @@ mod tests {
 
         let record = start_transfer_with(
             request,
+            true,
             move |receiver_agent, destination, update_existing| {
                 assert_eq!(receiver_agent, expected_receiver,);
 
@@ -237,7 +279,12 @@ mod tests {
                     update_existing,
                 })
             },
-            move |sender_agent, receiver_payload, source, worker_count, calibration_mib| {
+            move |sender_agent,
+                  receiver_payload,
+                  source,
+                  worker_count,
+                  calibration_mib,
+                  preserve_desktop_layout| {
                 assert_eq!(sender_agent, expected_sender,);
 
                 assert_eq!(
@@ -250,6 +297,8 @@ mod tests {
                 assert_eq!(worker_count, 4,);
 
                 assert_eq!(calibration_mib, 8,);
+
+                assert!(preserve_desktop_layout);
 
                 Ok(StartedSendJob {
                     job_id: 29,
@@ -291,6 +340,7 @@ mod tests {
 
         let error = start_transfer_with(
             example_request(),
+            false,
             |_, destination, update_existing| {
                 Ok(PreparedReceiveJob {
                     job_id: 71,
@@ -302,7 +352,7 @@ mod tests {
                     update_existing,
                 })
             },
-            |_, _, _, _, _| {
+            |_, _, _, _, _, _| {
                 Err(io::Error::new(
                     io::ErrorKind::ConnectionRefused,
                     "sender agent unavailable",
@@ -338,10 +388,11 @@ mod tests {
 
         let error = start_transfer_with(
             request,
+            false,
             |_, _, _| -> io::Result<PreparedReceiveJob> {
                 panic!("receiver must not be prepared");
             },
-            |_, _, _, _, _| -> io::Result<StartedSendJob> {
+            |_, _, _, _, _, _| -> io::Result<StartedSendJob> {
                 panic!("sender must not start");
             },
             |_, _| -> io::Result<u64> {
