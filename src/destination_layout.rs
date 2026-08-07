@@ -39,33 +39,35 @@ impl SourceDirectoryName {
 }
 
 fn validate_source_directory_name(value: &str) -> io::Result<()> {
+    validate_windows_path_component(value, "source directory name")
+}
+
+pub(crate) fn validate_windows_path_component(value: &str, description: &str) -> io::Result<()> {
     if value.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "source directory name must not be empty",
+            format!("{description} must not be empty"),
         ));
     }
 
     if matches!(value, "." | "..") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "source directory name must not be dot or dot-dot",
+            format!("{description} must not be dot or dot-dot"),
         ));
     }
 
     if value.ends_with(' ') || value.ends_with('.') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "source directory name must not end with a space or dot",
+            format!("{description} must not end with a space or dot"),
         ));
     }
 
     if value.encode_utf16().count() > MAX_WINDOWS_COMPONENT_UTF16_UNITS {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!(
-                "source directory name exceeds {MAX_WINDOWS_COMPONENT_UTF16_UNITS} UTF-16 units",
-            ),
+            format!("{description} exceeds {MAX_WINDOWS_COMPONENT_UTF16_UNITS} UTF-16 units",),
         ));
     }
 
@@ -78,7 +80,7 @@ fn validate_source_directory_name(value: &str) -> io::Result<()> {
     }) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "source directory name contains a character that is invalid in a Windows filename",
+            format!("{description} contains a character that is invalid in a Windows filename"),
         ));
     }
 
@@ -95,7 +97,7 @@ fn validate_source_directory_name(value: &str) -> io::Result<()> {
     if matches!(device_stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered_device {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("source directory name {value:?} is reserved by Windows",),
+            format!("{description} {value:?} is reserved by Windows"),
         ));
     }
 

@@ -10,6 +10,7 @@ mod content_hash;
 mod control_plane;
 mod copy_bench;
 mod dedup_comparison_bench;
+pub mod desktop_layout;
 mod destination_inventory;
 pub mod destination_layout;
 mod direct_address;
