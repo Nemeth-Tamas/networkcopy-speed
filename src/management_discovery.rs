@@ -95,7 +95,9 @@ pub struct AgentCapabilities {
 impl AgentCapabilities {
     const SEND_BIT: u8 = 0x01;
     const RECEIVE_BIT: u8 = 0x02;
-    const KNOWN_BITS: u8 = Self::SEND_BIT | Self::RECEIVE_BIT;
+    const DESKTOP_LAYOUT_BIT: u8 = 0x04;
+
+    const KNOWN_BITS: u8 = Self::SEND_BIT | Self::RECEIVE_BIT | Self::DESKTOP_LAYOUT_BIT;
 
     pub const SENDER: Self = Self {
         bits: Self::SEND_BIT,
@@ -106,7 +108,11 @@ impl AgentCapabilities {
     };
 
     pub const SEND_RECEIVE: Self = Self {
-        bits: Self::KNOWN_BITS,
+        bits: Self::SEND_BIT | Self::RECEIVE_BIT,
+    };
+
+    pub const SEND_RECEIVE_DESKTOP_LAYOUT: Self = Self {
+        bits: Self::SEND_BIT | Self::RECEIVE_BIT | Self::DESKTOP_LAYOUT_BIT,
     };
 
     pub const fn can_send(self) -> bool {
@@ -115,6 +121,10 @@ impl AgentCapabilities {
 
     pub const fn can_receive(self) -> bool {
         self.bits & Self::RECEIVE_BIT != 0
+    }
+
+    pub const fn supports_desktop_layout(self) -> bool {
+        self.bits & Self::DESKTOP_LAYOUT_BIT != 0
     }
 
     pub(crate) const fn bits(self) -> u8 {
@@ -180,7 +190,7 @@ impl LocalAgentDescriptor {
 
             control_port: MANAGEMENT_CONTROL_PORT,
 
-            capabilities: AgentCapabilities::SEND_RECEIVE,
+            capabilities: AgentCapabilities::SEND_RECEIVE_DESKTOP_LAYOUT,
         })
     }
 }

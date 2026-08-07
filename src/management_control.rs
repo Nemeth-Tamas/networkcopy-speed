@@ -10,11 +10,13 @@ use crate::management_protocol::{
     read_frame, write_frame,
 };
 use crate::management_snapshot::ManagementAgentSnapshot;
+use crate::windows_desktop_layout;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
 use std::net::{
     Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream,
 };
+use std::path::Path;
 use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +28,9 @@ const HELLO_HEADER_BYTES: usize = 8;
 
 const ROOTS_PAYLOAD_VERSION: u16 = 1;
 const ROOTS_HEADER_BYTES: usize = 4;
+
+const DESKTOP_PATH_RESPONSE_VERSION: u16 = 1;
+const DESKTOP_PATH_RESPONSE_BYTES: usize = 4;
 
 const MAX_ROOTS: usize = 26;
 const MAX_ROOT_PATH_BYTES: usize = 1024;
@@ -230,6 +235,26 @@ impl ManagementControlServer {
                     Err(error) => error_response(
                         request.request_id,
                         &format!("failed to enumerate remote directory: {error}"),
+                    )?,
+                }
+            }
+
+            ManagementMessageKind::IsDesktopPathRequest => {
+                let result =
+                    management_directory::decode_request(&request.payload).and_then(|path| {
+                        windows_desktop_layout::is_current_desktop_path(Path::new(&path))
+                    });
+
+                match result {
+                    Ok(is_desktop) => ManagementFrame::new(
+                        request.request_id,
+                        ManagementMessageKind::IsDesktopPathResponse,
+                        encode_desktop_path_response(is_desktop),
+                    )?,
+
+                    Err(error) => error_response(
+                        request.request_id,
+                        &format!("failed to classify remote Desktop path: {error}"),
                     )?,
                 }
             }
@@ -562,6 +587,29 @@ pub fn cancel_job(endpoint: SocketAddr, job_id: u64) -> io::Result<u64> {
     }
 }
 
+pub fn is_desktop_path(endpoint: SocketAddr, path: &str) -> io::Result<bool> {
+    let payload = management_directory::encode_request(path)?;
+
+    let response = exchange(
+        endpoint,
+        ManagementMessageKind::IsDesktopPathRequest,
+        payload,
+    )?;
+
+    match response.kind {
+        ManagementMessageKind::IsDesktopPathResponse => {
+            decode_desktop_path_response(&response.payload)
+        }
+
+        unexpected => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "management agent returned unexpected message {unexpected:?} for IsDesktopPathRequest"
+            ),
+        )),
+    }
+}
+
 pub fn list_directory(
     endpoint: SocketAddr,
     path: &str,
@@ -645,6 +693,65 @@ fn exchange(
     }
 
     Ok(response)
+}
+
+fn encode_desktop_path_response(is_desktop: bool) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(DESKTOP_PATH_RESPONSE_BYTES);
+
+    payload.extend_from_slice(&DESKTOP_PATH_RESPONSE_VERSION.to_le_bytes());
+
+    payload.push(u8::from(is_desktop));
+
+    payload.push(0);
+
+    payload
+}
+
+fn decode_desktop_path_response(payload: &[u8]) -> io::Result<bool> {
+    if payload.len() != DESKTOP_PATH_RESPONSE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Desktop-path response has {} bytes, expected {DESKTOP_PATH_RESPONSE_BYTES}",
+                payload.len(),
+            ),
+        ));
+    }
+
+    let version = u16::from_le_bytes(payload[0..2].try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Desktop-path response version was malformed",
+        )
+    })?);
+
+    if version != DESKTOP_PATH_RESPONSE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported Desktop-path response version {version}",),
+        ));
+    }
+
+    let is_desktop = match payload[2] {
+        0 => false,
+        1 => true,
+
+        unknown => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Desktop-path response used invalid result value {unknown}",),
+            ));
+        }
+    };
+
+    if payload[3] != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Desktop-path response reserved byte was not zero",
+        ));
+    }
+
+    Ok(is_desktop)
 }
 
 fn encode_roots_payload(roots: &[String]) -> io::Result<Vec<u8>> {
@@ -1011,8 +1118,8 @@ mod tests {
     use super::{
         HELLO_PAYLOAD_VERSION, ManagementControlServer, ManagementRoot, agent_snapshot, cancel_job,
         decode_hello_payload, decode_roots_payload, encode_hello_payload, encode_roots_payload,
-        hello, job_status, list_directory as request_directory, list_roots as request_roots,
-        prepare_receive, start_send,
+        hello, is_desktop_path, job_status, list_directory as request_directory,
+        list_roots as request_roots, prepare_receive, start_send,
     };
     use crate::calibrated_transfer;
     use crate::management_directory::ManagementEntryKind;
@@ -1021,6 +1128,7 @@ mod tests {
     use crate::management_jobs::{ManagementJobPhase, ManagementJobRegistry};
     use crate::management_orchestration::{self, ManagedTransferRequest};
     use crate::management_protocol::MANAGEMENT_PROTOCOL_VERSION;
+    use crate::windows_desktop_layout::current_desktop_path;
     use std::fs;
     use std::io;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener};
@@ -1034,7 +1142,7 @@ mod tests {
         let server = ManagementControlServer::bind_at(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
             "LOOPBACK-PC".to_string(),
-            AgentCapabilities::SEND_RECEIVE,
+            AgentCapabilities::SEND_RECEIVE_DESKTOP_LAYOUT,
         )
         .unwrap();
 
@@ -1058,7 +1166,33 @@ mod tests {
 
         assert!(response.capabilities.can_send(),);
 
-        assert!(response.capabilities.can_receive(),);
+        assert!(response.capabilities.supports_desktop_layout(),);
+    }
+
+    #[test]
+    fn loopback_desktop_path_query_recognizes_current_desktop() {
+        let server = ManagementControlServer::bind_at(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            "DESKTOP-QUERY-PC".to_string(),
+            AgentCapabilities::SEND_RECEIVE_DESKTOP_LAYOUT,
+        )
+        .unwrap();
+
+        let endpoint = server.local_addr().unwrap();
+
+        let desktop = current_desktop_path().unwrap();
+
+        let desktop = desktop.to_string_lossy().into_owned();
+
+        let server_thread = thread::spawn(move || {
+            server.serve_one().unwrap();
+        });
+
+        let is_desktop = is_desktop_path(endpoint, &desktop).unwrap();
+
+        server_thread.join().unwrap();
+
+        assert!(is_desktop);
     }
 
     #[test]

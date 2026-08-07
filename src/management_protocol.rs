@@ -22,6 +22,9 @@ pub enum ManagementMessageKind {
     ListDirectoryRequest = 0x12,
     ListDirectoryResponse = 0x13,
 
+    IsDesktopPathRequest = 0x14,
+    IsDesktopPathResponse = 0x15,
+
     PrepareReceiveRequest = 0x20,
     PrepareReceiveResponse = 0x21,
 
@@ -53,6 +56,9 @@ impl TryFrom<u8> for ManagementMessageKind {
 
             0x12 => Self::ListDirectoryRequest,
             0x13 => Self::ListDirectoryResponse,
+
+            0x14 => Self::IsDesktopPathRequest,
+            0x15 => Self::IsDesktopPathResponse,
 
             0x20 => Self::PrepareReceiveRequest,
             0x21 => Self::PrepareReceiveResponse,
