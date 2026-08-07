@@ -1,6 +1,6 @@
 [package]
 name = "networkcopy-speed"
-version = "2.5.0-dev"
+version = "2.5.0"
 edition = "2024"
 
 [features]

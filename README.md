@@ -22,33 +22,30 @@ The repository contains:
 - a WGPU management application for remote browsing and orchestration;
 - one shared networking and transfer engine used by every front end.
 
-## Current status
-
-Current stable release:
+Current stable release and source version:
 
 ```text
-2.4.1
+2.5.0
 ```
 
-Current development version:
+v2.5 adds Windows Desktop layout migration, empty-directory preservation,
+improved Manager history selection, stronger multi-adapter Automatic LAN
+address ranking, and optional release signing support.
 
-```text
-2.5.0-dev
-```
+Desktop migration can preserve ordinary Desktop file and folder positions,
+icon size, Auto Arrange state, monitor geometry, work areas, and DPI. The
+feature is available in both the standalone GUI and managed transfers, with
+remote Desktop recognition performed by the sender Agent. Layout metadata is
+optional and bounded, and restore failures do not turn an otherwise successful
+file transfer into a failed transfer.
 
-v2.4 strengthens unattended setup with exact queue-binding recovery,
-multi-source destination-root batch mapping, persistent standalone root
-receiving, and an explicit user-approved Manager executable updater.
+Automatic LAN discovery now combines exact Agent process identity,
+Windows-interface metadata, local-subnet affinity, and cross-Agent shared-LAN
+affinity. The reproduced one-machine multi-adapter case correctly retained
+`192.168.1.2:7339` instead of APIPA `169.254.21.253:7339` or the virtual
+`172.20.96.1:7339` route.
 
-Manager updates verify the GitHub-reported byte count and SHA-256 digest, use a
-validated binary handoff, support official and custom executable names, confirm
-healthy startup, roll back failed launches, clean completed transactions, and
-recover interrupted cleanup safely on a later healthy startup.
-
-Release packaging supports optional certificate-store Authenticode signing,
-RFC 3161 SHA-256 timestamping, signature verification before checksums, and
-unsigned local development builds. See
-[Release Trust and Antivirus Guidance](RELEASE-TRUST.md).
+The detailed v2.4 history can stay farther down in the README.
 
 v2 supports verified content reuse during both updates
 and fresh folder transfers. Update mode reuses content from older receiver-side
@@ -557,6 +554,27 @@ The same physical run exposed three post-release issues:
 - [x] preserve empty source directories in the destination tree;
 - [x] allow scrolling while extending a multi-entry Manager history selection.
 
+## v2.5 release — Desktop migration and reliability
+
+v2.5 completes the planned reliability and Desktop-migration work available
+under the current one-machine acceptance environment. Performance profiling,
+IOCP read-ahead, stream-policy benchmarking, compression timing, and streaming
+CDC work have moved to v2.6 so that v2.7 can focus exclusively on the Manager
+interface redesign.
+
+### v2.5 release highlights
+
+- Windows Desktop icon-layout migration for standalone and managed transfers;
+- proportional cross-resolution and cross-DPI position mapping with visible-area
+  clamping;
+- sender-Agent recognition of redirected/current Windows Desktop folders;
+- persistent managed Desktop-layout intent through `NCMS5` queue state;
+- explicit preservation of empty source directories;
+- Manager history drag-selection scrolling and edge auto-scroll;
+- stronger Automatic LAN address ranking for multi-adapter Windows systems;
+- optional Authenticode release signing and RFC 3161 SHA-256 timestamp support;
+- protocol v14 with bounded optional `NCDL` Desktop-layout metadata.
+
 ### v2.5 desktop layout migration
 
 - [x] capture Windows desktop file and folder positions through the Shell folder
@@ -615,15 +633,15 @@ of the APIPA `169.254.21.253:7339` or virtual `172.20.96.1:7339` endpoint.
 
 
 
-## Planned v2.6 — Manager interface redesign
+## Planned v2.7 — Manager interface redesign
 
-v2.6 is planned as a substantial Manager information-architecture and UI/UX
+v2.7 is planned as a substantial Manager information-architecture and UI/UX
 redesign rather than another incremental control-panel expansion. The current
 Manager remains functional but has become crowded as discovery, routing, remote
 browsing, batch construction, queue management, transfer monitoring, history,
 updates, and advanced transfer options have accumulated.
 
-Planned v2.6 goals include:
+Planned v2.7 goals include:
 
 - reorganize the Manager around clearer setup, endpoints/routes, queue, active
   transfer, and history workflows;
@@ -641,10 +659,10 @@ Planned v2.6 goals include:
 - preserve all existing queue persistence, recovery, Direct Link, Automatic LAN,
   Explicit IP, updater, and Desktop-layout functionality during the redesign.
 
-## Planned v2.7 — measured speed work
+## Planned v2.6 — measured speed work
 
-v2.7 will return the project focus to raw transfer performance after the v2.6
-Manager redesign. The goal is measured throughput improvement rather than
+v2.6 will return the project focus to raw transfer performance after the v2.5
+Desktop-layout release. The goal is measured throughput improvement rather than
 generic socket tuning. The current engine already applies `TCP_NODELAY`, uses
 adaptive Zstandard level 1 compression, prints the complete 1/2/4/8-stream
 calibration matrix, runs concurrent transfer lanes, and enforces a process-wide
@@ -677,12 +695,12 @@ Planned investigation order:
       identifies syscall submission as a meaningful production bottleneck.
 
 Direct Link is always a physical Ethernet candidate. Automatic LAN and Explicit
-IP may use Ethernet, Wi-Fi, VPN, or virtual interfaces, so the v2.7 policy must
+IP may use Ethernet, Wi-Fi, VPN, or virtual interfaces, so the v2.6 policy must
 inspect the selected path rather than treating every LAN address as wired.
 
 The previous v2.5 F/G/H/I/J performance milestones were deliberately moved here
 so v2.5 can ship after Desktop migration and the remaining discovery correctness
-work, while v2.6 can focus entirely on the Manager redesign.
+work, while v2.7 can focus entirely on the Manager redesign.
 
 ### Deliberately deferred
 
