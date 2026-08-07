@@ -1449,6 +1449,7 @@ dependencies = [
  "sha2",
  "socket2",
  "ureq",
+ "windows",
  "windows-sys 0.61.2",
  "winresource",
  "zstd",

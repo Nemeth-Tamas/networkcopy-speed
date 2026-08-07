@@ -63,6 +63,7 @@ mod tiny_pack_codec;
 mod transfer_memory;
 mod update_verification;
 pub mod windows_agent_tray;
+pub mod windows_desktop_layout;
 pub mod windows_elevation;
 mod windows_file_replace;
 mod windows_icon;
