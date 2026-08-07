@@ -61,6 +61,7 @@ mod tiny_file_pool;
 mod tiny_file_write_bench;
 mod tiny_pack_codec;
 mod transfer_memory;
+pub mod transfer_profile;
 mod update_verification;
 pub mod windows_agent_tray;
 pub mod windows_desktop_layout;

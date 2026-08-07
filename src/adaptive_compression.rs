@@ -2,9 +2,11 @@ use crate::compression_probe::{self, CompressionDecision};
 use crate::console_progress::ProgressCounter;
 use crate::content_hash::{self, ContentHasher};
 use crate::striped_file;
+use crate::transfer_profile::TransferProfiler;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::ops::Range;
+use std::time::Instant;
 
 const MODE_RAW: u8 = 0;
 const MODE_ZSTD: u8 = 1;
@@ -43,12 +45,34 @@ impl PayloadEncoder {
         decision: CompressionDecision,
         progress: Option<&ProgressCounter>,
     ) -> io::Result<bool> {
+        self.send_sequential_with_progress_profiled(
+            writer,
+            reader,
+            byte_count,
+            raw_buffer,
+            decision,
+            progress,
+            None,
+        )
+    }
+
+    pub(crate) fn send_sequential_with_progress_profiled(
+        &mut self,
+        writer: &mut impl Write,
+        reader: &mut impl Read,
+        byte_count: u64,
+        raw_buffer: &mut [u8],
+        decision: CompressionDecision,
+        progress: Option<&ProgressCounter>,
+        profiler: Option<&TransferProfiler>,
+    ) -> io::Result<bool> {
         self.send_payload(
             writer,
             byte_count,
             raw_buffer,
             decision,
             progress,
+            profiler,
             |chunk, _| reader.read_exact(chunk),
         )
     }
@@ -62,12 +86,36 @@ impl PayloadEncoder {
         decision: CompressionDecision,
         progress: Option<&ProgressCounter>,
     ) -> io::Result<bool> {
-        let byte_count = range.end.checked_sub(range.start).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "positional send range ends before it starts",
-            )
-        })?;
+        self.send_positional_with_progress_profiled(
+            writer,
+            file,
+            range,
+            raw_buffer,
+            decision,
+            progress,
+            None,
+        )
+    }
+
+    pub(crate) fn send_positional_with_progress_profiled(
+        &mut self,
+        writer: &mut impl Write,
+        file: &File,
+        range: Range<u64>,
+        raw_buffer: &mut [u8],
+        decision: CompressionDecision,
+        progress: Option<&ProgressCounter>,
+        profiler: Option<&TransferProfiler>,
+    ) -> io::Result<bool> {
+        let byte_count =
+            range.end.checked_sub(range.start).ok_or_else(
+                || {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "positional send range ends before it starts",
+                    )
+                },
+            )?;
 
         let offset = range.start;
 
@@ -77,12 +125,21 @@ impl PayloadEncoder {
             raw_buffer,
             decision,
             progress,
+            profiler,
             |chunk, transferred| {
                 let read_offset = offset
                     .checked_add(transferred)
-                    .ok_or_else(|| io::Error::other("compressed read offset overflowed"))?;
+                    .ok_or_else(|| {
+                        io::Error::other(
+                            "compressed read offset overflowed",
+                        )
+                    })?;
 
-                read_exact_at(file, chunk, read_offset)
+                read_exact_at(
+                    file,
+                    chunk,
+                    read_offset,
+                )
             },
         )
     }
@@ -94,6 +151,7 @@ impl PayloadEncoder {
         raw_buffer: &mut [u8],
         decision: CompressionDecision,
         progress: Option<&ProgressCounter>,
+        profiler: Option<&TransferProfiler>,
         mut fill_chunk: F,
     ) -> io::Result<bool>
     where
@@ -123,7 +181,18 @@ impl PayloadEncoder {
 
             let raw_chunk = &mut raw_buffer[..requested];
 
+            let read_started = Instant::now();
+
             fill_chunk(raw_chunk, transferred)?;
+
+            if let Some(profiler) = profiler {
+                profiler.record_sender_source_read(
+                    read_started.elapsed(),
+                    u64::try_from(requested)
+                        .unwrap_or(u64::MAX),
+                );
+            }
+
             hasher.update(raw_chunk);
 
             match decision {
@@ -132,14 +201,27 @@ impl PayloadEncoder {
                 }
 
                 CompressionDecision::Compress => {
+                    let compression_started = Instant::now();
+
                     let compressed_length = self
                         .compressor
-                        .compress_to_buffer(raw_chunk, &mut self.compressed_buffer)
+                        .compress_to_buffer(
+                            raw_chunk,
+                            &mut self.compressed_buffer,
+                        )
                         .map_err(|error| {
                             io::Error::other(format!(
                                 "Zstandard payload compression failed: {error}"
                             ))
                         })?;
+
+                    if let Some(profiler) = profiler {
+                        profiler.record_sender_compression(
+                            compression_started.elapsed(),
+                            u64::try_from(requested)
+                                .unwrap_or(u64::MAX),
+                        );
+                    }
 
                     write_u32(
                         writer,
@@ -202,12 +284,34 @@ impl PayloadDecoder {
         context: &str,
         progress: Option<&ProgressCounter>,
     ) -> io::Result<bool> {
+        self.receive_sequential_with_progress_profiled(
+            reader,
+            writer,
+            byte_count,
+            raw_buffer,
+            context,
+            progress,
+            None,
+        )
+    }
+
+    pub(crate) fn receive_sequential_with_progress_profiled(
+        &mut self,
+        reader: &mut impl Read,
+        writer: &mut impl Write,
+        byte_count: u64,
+        raw_buffer: &mut [u8],
+        context: &str,
+        progress: Option<&ProgressCounter>,
+        profiler: Option<&TransferProfiler>,
+    ) -> io::Result<bool> {
         self.receive_payload(
             reader,
             byte_count,
             raw_buffer,
             context,
             progress,
+            profiler,
             |chunk, _| writer.write_all(chunk),
         )
     }
@@ -221,12 +325,36 @@ impl PayloadDecoder {
         context: &str,
         progress: Option<&ProgressCounter>,
     ) -> io::Result<bool> {
-        let byte_count = range.end.checked_sub(range.start).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "positional receive range ends before it starts",
-            )
-        })?;
+        self.receive_positional_with_progress_profiled(
+            reader,
+            file,
+            range,
+            raw_buffer,
+            context,
+            progress,
+            None,
+        )
+    }
+
+    pub(crate) fn receive_positional_with_progress_profiled(
+        &mut self,
+        reader: &mut impl Read,
+        file: &File,
+        range: Range<u64>,
+        raw_buffer: &mut [u8],
+        context: &str,
+        progress: Option<&ProgressCounter>,
+        profiler: Option<&TransferProfiler>,
+    ) -> io::Result<bool> {
+        let byte_count =
+            range.end.checked_sub(range.start).ok_or_else(
+                || {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "positional receive range ends before it starts",
+                    )
+                },
+            )?;
 
         let offset = range.start;
 
@@ -236,12 +364,21 @@ impl PayloadDecoder {
             raw_buffer,
             context,
             progress,
+            profiler,
             |chunk, transferred| {
                 let write_offset = offset
                     .checked_add(transferred)
-                    .ok_or_else(|| io::Error::other("decompressed write offset overflowed"))?;
+                    .ok_or_else(|| {
+                        io::Error::other(
+                            "decompressed write offset overflowed",
+                        )
+                    })?;
 
-                striped_file::write_all_at(file, chunk, write_offset)
+                striped_file::write_all_at(
+                    file,
+                    chunk,
+                    write_offset,
+                )
             },
         )
     }
@@ -253,6 +390,7 @@ impl PayloadDecoder {
         raw_buffer: &mut [u8],
         context: &str,
         progress: Option<&ProgressCounter>,
+        profiler: Option<&TransferProfiler>,
         mut write_chunk: F,
     ) -> io::Result<bool>
     where
@@ -285,7 +423,17 @@ impl PayloadDecoder {
 
                     hasher.update(chunk);
 
+                    let write_started = Instant::now();
+
                     write_chunk(chunk, transferred)?;
+
+                    if let Some(profiler) = profiler {
+                        profiler.record_receiver_destination_write(
+                            write_started.elapsed(),
+                            u64::try_from(requested)
+                                .unwrap_or(u64::MAX),
+                        );
+                    }
 
                     let requested_bytes = u64::try_from(requested).map_err(|_| {
                         io::Error::other("raw payload length cannot be represented")
@@ -339,6 +487,8 @@ impl PayloadDecoder {
 
                     reader.read_exact(&mut self.compressed_buffer)?;
 
+                    let decompression_started = Instant::now();
+
                     let decompressed_length = self
                         .decompressor
                         .decompress_to_buffer(
@@ -351,6 +501,14 @@ impl PayloadDecoder {
                                 format!("Zstandard payload decompression failed: {error}"),
                             )
                         })?;
+
+                    if let Some(profiler) = profiler {
+                        profiler.record_receiver_decompression(
+                            decompression_started.elapsed(),
+                            u64::try_from(raw_length)
+                                .unwrap_or(u64::MAX),
+                        );
+                    }
 
                     if decompressed_length != raw_length {
                         return Err(io::Error::new(
@@ -365,7 +523,17 @@ impl PayloadDecoder {
 
                     hasher.update(chunk);
 
+                    let write_started = Instant::now();
+
                     write_chunk(chunk, transferred)?;
+
+                    if let Some(profiler) = profiler {
+                        profiler.record_receiver_destination_write(
+                            write_started.elapsed(),
+                            u64::try_from(raw_length)
+                                .unwrap_or(u64::MAX),
+                        );
+                    }
 
                     let raw_length_bytes = u64::try_from(raw_length).map_err(|_| {
                         io::Error::other("decompressed payload length cannot be represented")
@@ -476,6 +644,7 @@ fn verify_digest(
 mod tests {
     use super::{COMPRESSION_CHUNK_BYTES, PayloadDecoder, PayloadEncoder};
     use crate::compression_probe::CompressionDecision;
+    use crate::transfer_profile::TransferProfiler;
     use std::io::Cursor;
 
     #[test]
@@ -571,5 +740,119 @@ mod tests {
 
         assert!(!received_compressed);
         assert_eq!(destination, contents);
+    }
+
+    #[test]
+    fn profiled_payload_records_stage_work() {
+        let contents =
+            vec![
+                0x5A_u8;
+                COMPRESSION_CHUNK_BYTES * 2 + 137
+            ];
+
+        let profiler =
+            TransferProfiler::default();
+
+        let mut encoder =
+            PayloadEncoder::new(1).unwrap();
+
+        let mut source =
+            Cursor::new(&contents);
+
+        let mut wire = Vec::new();
+
+        let mut encode_buffer =
+            vec![
+                0_u8;
+                COMPRESSION_CHUNK_BYTES
+            ];
+
+        encoder
+            .send_sequential_with_progress_profiled(
+                &mut wire,
+                &mut source,
+                contents.len() as u64,
+                &mut encode_buffer,
+                CompressionDecision::Compress,
+                None,
+                Some(&profiler),
+            )
+            .unwrap();
+
+        let sender =
+            profiler.snapshot();
+
+        assert_eq!(
+            sender.sender_source_read.bytes,
+            contents.len() as u64,
+        );
+
+        assert_eq!(
+            sender.sender_compression.bytes,
+            contents.len() as u64,
+        );
+
+        assert!(
+            sender.sender_source_read.operations
+                > 0,
+        );
+
+        assert!(
+            sender.sender_compression.operations
+                > 0,
+        );
+
+        let mut decoder =
+            PayloadDecoder::new().unwrap();
+
+        let mut wire_reader =
+            Cursor::new(wire);
+
+        let mut destination = Vec::new();
+
+        let mut decode_buffer =
+            vec![
+                0_u8;
+                COMPRESSION_CHUNK_BYTES
+            ];
+
+        decoder
+            .receive_sequential_with_progress_profiled(
+                &mut wire_reader,
+                &mut destination,
+                contents.len() as u64,
+                &mut decode_buffer,
+                "profiled payload",
+                None,
+                Some(&profiler),
+            )
+            .unwrap();
+
+        assert_eq!(destination, contents);
+
+        let profile =
+            profiler.snapshot();
+
+        assert_eq!(
+            profile.receiver_decompression.bytes,
+            contents.len() as u64,
+        );
+
+        assert_eq!(
+            profile.receiver_destination_write.bytes,
+            contents.len() as u64,
+        );
+
+        assert!(
+            profile.receiver_decompression.operations
+                > 0,
+        );
+
+        assert!(
+            profile
+                .receiver_destination_write
+                .operations
+                > 0,
+        );
     }
 }

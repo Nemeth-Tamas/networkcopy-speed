@@ -1,5 +1,6 @@
 use crate::console_progress::ProgressCounter;
 use crate::tiny_file_materialize;
+use crate::transfer_profile::TransferProfiler;
 use std::collections::VecDeque;
 use std::io;
 use std::ops::Range;
@@ -7,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_MATERIALIZATION_WORKERS: usize = 2;
 const QUEUED_JOBS_PER_WORKER: usize = 64;
@@ -46,6 +47,7 @@ pub(crate) struct TinyFileMaterializeRequest {
 struct MaterializerInner {
     destination_root: Arc<PathBuf>,
     progress: Option<ProgressCounter>,
+    profiler: Option<Arc<TransferProfiler>>,
     queue_capacity: usize,
     state: Mutex<QueueState>,
     changed: Condvar,
@@ -118,9 +120,31 @@ impl TinyFileMaterializer {
         destination_root: Arc<PathBuf>,
         progress: Option<ProgressCounter>,
     ) -> io::Result<Self> {
-        let worker_count = recommended_worker_count();
+        let worker_count =
+            recommended_worker_count();
 
-        Self::start_with_worker_count(destination_root, progress, worker_count)
+        Self::start_with_worker_count_and_profiler(
+            destination_root,
+            progress,
+            worker_count,
+            None,
+        )
+    }
+
+    pub(crate) fn start_profiled(
+        destination_root: Arc<PathBuf>,
+        progress: Option<ProgressCounter>,
+        profiler: Arc<TransferProfiler>,
+    ) -> io::Result<Self> {
+        let worker_count =
+            recommended_worker_count();
+
+        Self::start_with_worker_count_and_profiler(
+            destination_root,
+            progress,
+            worker_count,
+            Some(profiler),
+        )
     }
 
     fn start_with_worker_count(
@@ -128,21 +152,49 @@ impl TinyFileMaterializer {
         progress: Option<ProgressCounter>,
         worker_count: usize,
     ) -> io::Result<Self> {
+        Self::start_with_worker_count_and_profiler(
+            destination_root,
+            progress,
+            worker_count,
+            None,
+        )
+    }
+
+    fn start_with_worker_count_and_profiler(
+        destination_root: Arc<PathBuf>,
+        progress: Option<ProgressCounter>,
+        worker_count: usize,
+        profiler: Option<Arc<TransferProfiler>>,
+    ) -> io::Result<Self> {
         validate_worker_count(worker_count)?;
 
         let queue_capacity = worker_count
             .checked_mul(QUEUED_JOBS_PER_WORKER)
-            .ok_or_else(|| io::Error::other("tiny-file materialization queue size overflowed"))?;
+            .ok_or_else(|| {
+                io::Error::other(
+                    "tiny-file materialization queue size overflowed",
+                )
+            })?;
 
         let inner = Arc::new(MaterializerInner {
             destination_root,
+
             progress,
+
+            profiler,
+
             queue_capacity,
+
             state: Mutex::new(QueueState {
-                jobs: VecDeque::with_capacity(queue_capacity),
+                jobs: VecDeque::with_capacity(
+                    queue_capacity,
+                ),
+
                 shutdown: false,
+
                 failure: None,
             }),
+
             changed: Condvar::new(),
         });
 
@@ -369,12 +421,32 @@ fn worker_loop(inner: Arc<MaterializerInner>) -> io::Result<()> {
                 )
             })?;
 
+            let write_bytes =
+                u64::try_from(contents.len())
+                    .map_err(|_| {
+                        io::Error::other(
+                            "tiny-file write length cannot be represented",
+                        )
+                    })?;
+
+            let write_started = Instant::now();
+
             tiny_file_materialize::write_verified(
                 inner.destination_root.as_path(),
                 job.file_id,
                 &job.relative_path,
                 contents,
-            )
+            )?;
+
+            if let Some(profiler) = &inner.profiler {
+                profiler
+                    .record_receiver_destination_write(
+                        write_started.elapsed(),
+                        write_bytes,
+                    );
+            }
+
+            Ok(())
         })();
 
         if let Err(error) = result {

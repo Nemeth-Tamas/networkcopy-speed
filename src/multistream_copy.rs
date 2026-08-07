@@ -20,6 +20,10 @@ use crate::tcp_connect;
 use crate::tiny_file_pool;
 use crate::tiny_pack_codec::{self, TinyPackEncoding};
 use crate::transfer_memory;
+use crate::transfer_profile::{
+    StageSample, TransferProfiler,
+    TransferStageProfile,
+};
 use crate::update_verification::{self, FILE_DIGEST_BYTES, FileDigest};
 use crate::windows_desktop_layout::{
     self, DesktopLayoutRestoreOutcome, DesktopLayoutRestoreReport,
@@ -145,6 +149,8 @@ pub struct MultistreamCopyReport {
     pub manifest_elapsed: Duration,
     pub data_elapsed: Duration,
     pub total_elapsed: Duration,
+
+    pub stage_profile: TransferStageProfile,
 }
 
 impl MultistreamCopyReport {
@@ -309,6 +315,28 @@ impl MultistreamCopyReport {
             "  Total time:           {:.6} s",
             self.total_elapsed.as_secs_f64()
         );
+
+        println!();
+
+        println!(
+            "Sender stage profile (aggregate worker time)",
+        );
+
+        print_stage_sample(
+            "Source reads:",
+            self.stage_profile.sender_source_read,
+        );
+
+        print_stage_sample(
+            "Compression/probe:",
+            self.stage_profile.sender_compression,
+        );
+
+        print_stage_sample(
+            "Socket writes:",
+            self.stage_profile.sender_socket_write,
+        );
+
         println!(
             "  Payload throughput:   {:.2} MB/s ({:.2} MiB/s)",
             decimal_megabytes_per_second(self.bytes_copied, self.data_elapsed,),
@@ -351,6 +379,8 @@ pub struct ReceiveReport {
     pub tiny_bytes_packed: u64,
     pub tiny_pack_wire_bytes: u64,
     pub elapsed: Duration,
+
+    pub stage_profile: TransferStageProfile,
 }
 
 impl ReceiveReport {
@@ -530,6 +560,29 @@ impl ReceiveReport {
 
         println!("  Integrity:            BLAKE3 verified");
 
+        println!();
+
+        println!(
+            "Receiver stage profile (aggregate worker time)",
+        );
+
+        print_stage_sample(
+            "Socket reads:",
+            self.stage_profile.receiver_socket_read,
+        );
+
+        print_stage_sample(
+            "Decompression:",
+            self.stage_profile.receiver_decompression,
+        );
+
+        print_stage_sample(
+            "Destination writes:",
+            self.stage_profile.receiver_destination_write,
+        );
+
+        println!();
+
         println!(
             "  Session time:         {:.6} s",
             self.elapsed.as_secs_f64()
@@ -541,6 +594,18 @@ impl ReceiveReport {
             binary_mebibytes_per_second(self.bytes_received, self.elapsed,)
         );
     }
+}
+
+fn print_stage_sample(
+    label: &str,
+    sample: StageSample,
+) {
+    println!(
+        "  {label:<22} {:>9.6} s | {:>12} bytes | {} ops",
+        sample.elapsed.as_secs_f64(),
+        format_bytes(sample.bytes),
+        sample.operations,
+    );
 }
 
 fn wire_savings_percent(logical_bytes: u64, wire_bytes: u64) -> f64 {
@@ -1254,6 +1319,9 @@ fn send_internal(
 
     let total_started = Instant::now();
 
+    let profiler =
+        Arc::new(TransferProfiler::default());
+
     let process_buffer_bytes = if server.is_some() {
         memory_plan.loopback_bytes
     } else {
@@ -1500,6 +1568,7 @@ fn send_internal(
             manifest.as_slice(),
             generation_plan,
             progress.clone(),
+            profiler.as_ref(),
         )?
     } else {
         send_lane_group(
@@ -1510,6 +1579,7 @@ fn send_internal(
             progress.clone(),
             None,
             LaneEnd::Stream,
+            profiler.as_ref(),
         )?
     };
 
@@ -1676,6 +1746,8 @@ fn send_internal(
         manifest_elapsed,
         data_elapsed,
         total_elapsed: total_started.elapsed(),
+
+        stage_profile: profiler.snapshot(),
     })
 }
 
@@ -1819,6 +1891,9 @@ fn run_server_with_mode_and_layout(
         accept_session(listener, progress.as_ref())?;
 
     let session_started = Instant::now();
+
+    let profiler =
+        Arc::new(TransferProfiler::default());
 
     let destination_root = destination_layout::resolve_received_destination(
         destination_layout,
@@ -1996,9 +2071,10 @@ fn run_server_with_mode_and_layout(
 
     let destination_root = Arc::new(destination_root);
 
-    let tiny_materializer = tiny_file_pool::TinyFileMaterializer::start(
+    let tiny_materializer = tiny_file_pool::TinyFileMaterializer::start_profiled(
         Arc::clone(&destination_root),
         progress.clone(),
+        Arc::clone(&profiler),
     )?;
 
     let tiny_materialization_workers = tiny_materializer.worker_count();
@@ -2016,6 +2092,7 @@ fn run_server_with_mode_and_layout(
             &tiny_materializer_handle,
             progress.clone(),
             generation_plan,
+            profiler.as_ref(),
         )
     } else {
         receive_lane_group(
@@ -2030,6 +2107,7 @@ fn run_server_with_mode_and_layout(
             true,
             None,
             LaneEnd::Stream,
+            profiler.as_ref(),
         )
     };
 
@@ -2179,6 +2257,8 @@ fn run_server_with_mode_and_layout(
         tiny_pack_wire_bytes: ack.tiny_pack_wire_bytes,
 
         elapsed: session_started.elapsed(),
+
+        stage_profile: profiler.snapshot(),
     })
 }
 
@@ -5340,6 +5420,7 @@ fn send_lane_group(
     progress: Option<ProgressCounter>,
     session_basis_file_ids: Option<&[usize]>,
     lane_end: LaneEnd,
+    profiler: &TransferProfiler,
 ) -> io::Result<LaneReport> {
     if data_streams.len() != lanes.len() {
         return Err(io::Error::new(
@@ -5366,6 +5447,7 @@ fn send_lane_group(
                             lane_progress,
                             session_basis_file_ids,
                             lane_end,
+                            profiler,
                         )
                     })?,
             );
@@ -5384,6 +5466,7 @@ fn send_fresh_generation_plan(
     manifest: &[ManifestEntry],
     plan: &FreshGenerationPlan,
     progress: Option<ProgressCounter>,
+    profiler: &TransferProfiler,
 ) -> io::Result<LaneReport> {
     let remaining_generation_count = plan
         .catalog
@@ -5422,6 +5505,7 @@ fn send_fresh_generation_plan(
             progress.clone(),
             Some(&generation.basis_file_ids),
             LaneEnd::Generation(generation.index),
+            profiler,
         )?;
 
         if let Some(progress) = &progress {
@@ -5447,6 +5531,7 @@ fn send_fresh_generation_plan(
         progress,
         None,
         LaneEnd::Stream,
+        profiler,
     )?);
 
     merge_lane_reports(reports)
@@ -5465,6 +5550,7 @@ fn receive_lane_group(
     cdc_enabled: bool,
     session_basis_file_ids: Option<&[usize]>,
     lane_end: LaneEnd,
+    profiler: &TransferProfiler,
 ) -> io::Result<LaneReport> {
     if data_streams.len() != lanes.len() {
         return Err(io::Error::new(
@@ -5497,6 +5583,7 @@ fn receive_lane_group(
                                 progress: lane_progress,
                                 cdc_enabled,
                                 session_basis_file_ids,
+                                profiler,
                             },
                             lane_end,
                         )
@@ -5521,6 +5608,7 @@ fn receive_fresh_generation_plan(
     tiny_materializer: &tiny_file_pool::TinyFileMaterializerHandle,
     progress: Option<ProgressCounter>,
     plan: &FreshGenerationPlan,
+    profiler: &TransferProfiler,
 ) -> io::Result<LaneReport> {
     let remaining_generation_count = plan
         .catalog
@@ -5563,6 +5651,7 @@ fn receive_fresh_generation_plan(
             false,
             Some(&generation.basis_file_ids),
             LaneEnd::Generation(generation.index),
+            profiler,
         )?;
 
         if let Some(progress) = &progress {
@@ -5595,6 +5684,7 @@ fn receive_fresh_generation_plan(
         false,
         None,
         LaneEnd::Stream,
+        profiler,
     )?);
 
     merge_lane_reports(reports)
@@ -5695,6 +5785,7 @@ fn send_lane(
     progress: Option<ProgressCounter>,
     session_basis_file_ids: Option<&[usize]>,
     lane_end: LaneEnd,
+    profiler: &TransferProfiler,
 ) -> io::Result<LaneReport> {
     let reader_stream = stream.try_clone()?;
 
@@ -5765,6 +5856,7 @@ fn send_lane(
                         &mut buffer,
                         &mut encoder,
                         progress.as_ref(),
+                        profiler,
                     )?;
 
                     add_lane_counts(&mut report, 1, entry.file_size, "sender")?;
@@ -5785,6 +5877,7 @@ fn send_lane(
                     *total_bytes,
                     &mut buffer,
                     progress.as_ref(),
+                    profiler,
                 )?;
 
                 add_lane_counts(
@@ -5827,6 +5920,7 @@ fn send_lane(
                     &mut buffer,
                     &mut encoder,
                     progress.as_ref(),
+                    profiler,
                 )?;
 
                 let completed_files = u64::from(offset == 0);
@@ -5976,6 +6070,7 @@ fn send_tiny_pack(
     expected_total_bytes: u64,
     buffer: &mut [u8],
     progress: Option<&ProgressCounter>,
+    profiler: &TransferProfiler,
 ) -> io::Result<TinyPackTransferSummary> {
     let summary = summarize_tiny_pack(manifest, file_ids)?;
 
@@ -6043,7 +6138,12 @@ fn send_tiny_pack(
 
         validate_source_metadata(&file, &path, entry)?;
 
+        let read_started = std::time::Instant::now();
         file.read_exact(destination)?;
+        profiler.record_sender_source_read(
+            read_started.elapsed(),
+            entry.file_size,
+        );
 
         validate_source_metadata(&file, &path, entry)?;
 
@@ -6181,6 +6281,7 @@ fn send_whole_file(
     buffer: &mut [u8],
     encoder: &mut PayloadEncoder,
     progress: Option<&ProgressCounter>,
+    profiler: &TransferProfiler,
 ) -> io::Result<bool> {
     write_u8(writer, MESSAGE_FILE)?;
 
@@ -6199,20 +6300,22 @@ fn send_whole_file(
 
     validate_source_metadata(&file, &path, entry)?;
 
-    let decision = compression_probe::decide_file_range(
+    let decision = compression_probe::decide_file_range_profiled(
         &file,
         0,
         entry.file_size,
         compression_probe::DEFAULT_LEVEL,
+        Some(profiler),
     )?;
 
-    let compressed = encoder.send_sequential_with_progress(
+    let compressed = encoder.send_sequential_with_progress_profiled(
         writer,
         &mut file,
         entry.file_size,
         buffer,
         decision,
         progress,
+        Some(profiler),
     )?;
 
     validate_source_metadata(&file, &path, entry)?;
@@ -6228,6 +6331,7 @@ fn send_file_stripe(
     buffer: &mut [u8],
     encoder: &mut PayloadEncoder,
     progress: Option<&ProgressCounter>,
+    profiler: &TransferProfiler,
 ) -> io::Result<bool> {
     let StripeDescriptor {
         file_id,
@@ -6258,24 +6362,26 @@ fn send_file_stripe(
 
     validate_source_metadata(&file, &path, entry)?;
 
-    let decision = compression_probe::decide_file_range(
+    let decision = compression_probe::decide_file_range_profiled(
         &file,
         offset,
         length,
         compression_probe::DEFAULT_LEVEL,
+        Some(profiler),
     )?;
 
     let stripe_end = offset
         .checked_add(length)
         .ok_or_else(|| io::Error::other("stripe description overflowed"))?;
 
-    let compressed = encoder.send_positional_with_progress(
+    let compressed = encoder.send_positional_with_progress_profiled(
         writer,
         &file,
         offset..stripe_end,
         buffer,
         decision,
         progress,
+        Some(profiler),
     )?;
 
     validate_source_metadata(&file, &path, entry)?;
@@ -6324,6 +6430,7 @@ struct ReceiveLaneContext<'a> {
     progress: Option<ProgressCounter>,
     cdc_enabled: bool,
     session_basis_file_ids: Option<&'a [usize]>,
+    profiler: &'a TransferProfiler,
 }
 
 fn receive_lane(
@@ -6341,6 +6448,7 @@ fn receive_lane(
         progress,
         cdc_enabled,
         session_basis_file_ids,
+        profiler,
     } = context;
     let reader_stream = stream.try_clone()?;
 
@@ -6472,6 +6580,7 @@ fn receive_lane(
                     &mut buffer,
                     &mut decoder,
                     progress.as_ref(),
+                    profiler,
                 )?;
 
                 add_lane_counts(&mut report, 1, entry.file_size, "receiver")?;
@@ -6491,6 +6600,7 @@ fn receive_lane(
                     &mut buffer,
                     tiny_materializer,
                     progress.as_ref(),
+                    profiler,
                 )?;
 
                 add_lane_counts(
@@ -6560,6 +6670,7 @@ fn receive_lane(
                     &mut buffer,
                     &mut decoder,
                     progress.as_ref(),
+                    profiler,
                 )?;
 
                 let completed_files = u64::from(offset == 0);
@@ -6626,6 +6737,7 @@ fn receive_tiny_pack(
     buffer: &mut [u8],
     tiny_materializer: &tiny_file_pool::TinyFileMaterializerHandle,
     progress: Option<&ProgressCounter>,
+    profiler: &TransferProfiler,
 ) -> io::Result<TinyPackTransferSummary> {
     let message = read_u8(reader)?;
 
@@ -6727,7 +6839,12 @@ fn receive_tiny_pack(
 
     let mut wire_payload = vec![0_u8; wire_bytes];
 
+    let socket_read_started = std::time::Instant::now();
     reader.read_exact(&mut wire_payload)?;
+    profiler.record_receiver_socket_read(
+        socket_read_started.elapsed(),
+        wire_bytes as u64,
+    );
 
     let total_bytes = usize::try_from(summary.bytes).map_err(|_| {
         io::Error::new(
@@ -6837,6 +6954,7 @@ fn receive_file_stripe(
     buffer: &mut [u8],
     decoder: &mut PayloadDecoder,
     progress: Option<&ProgressCounter>,
+    profiler: &TransferProfiler,
 ) -> io::Result<bool> {
     let StripeDescriptor {
         file_id,
@@ -6861,13 +6979,14 @@ fn receive_file_stripe(
         entry.relative_path.display()
     );
 
-    let compressed = decoder.receive_positional_with_progress(
+    let compressed = decoder.receive_positional_with_progress_profiled(
         reader,
         &file,
         offset..stripe_end,
         buffer,
         &context,
         progress,
+        Some(profiler),
     )?;
 
     file.sync_all()?;
@@ -6991,6 +7110,7 @@ fn receive_file(
     buffer: &mut [u8],
     decoder: &mut PayloadDecoder,
     progress: Option<&ProgressCounter>,
+    profiler: &TransferProfiler,
 ) -> io::Result<bool> {
     let final_path = destination_root.join(&entry.relative_path);
 
@@ -7006,13 +7126,14 @@ fn receive_file(
     let context = format!("file {file_id} ({})", entry.relative_path.display());
 
     let transfer_result = (|| -> io::Result<bool> {
-        let compressed = decoder.receive_sequential_with_progress(
+        let compressed = decoder.receive_sequential_with_progress_profiled(
             reader,
             &mut file,
             entry.file_size,
             buffer,
             &context,
             progress,
+            Some(profiler),
         )?;
 
         file.flush()?;
