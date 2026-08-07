@@ -5,6 +5,7 @@ use crate::console_progress::ProgressCounter;
 use crate::content_hash;
 use crate::control_plane::{self, ConnectionRole, Handshake, ManifestSummary};
 use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_second, format_bytes};
+use crate::desktop_layout::{self, DesktopLayoutSnapshot, MAX_DESKTOP_LAYOUT_BYTES};
 use crate::destination_inventory;
 use crate::destination_layout::{self, DestinationLayout, SourceDirectoryName};
 use crate::file_metadata;
@@ -34,6 +35,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
+const MESSAGE_DESKTOP_LAYOUT_METADATA: u8 = 0x2E;
 const MESSAGE_SOURCE_DIRECTORY_NAME: u8 = 0x2F;
 const MESSAGE_RECEIVER_READY: u8 = 0x30;
 const MESSAGE_FILE: u8 = 0x31;
@@ -316,6 +318,7 @@ impl MultistreamCopyReport {
 pub struct ReceiveReport {
     pub session_id: u64,
     pub data_stream_count: usize,
+    pub desktop_layout: Option<DesktopLayoutSnapshot>,
     pub tiny_materialization_workers: usize,
     pub files_received: u64,
     pub bytes_received: u64,
@@ -353,6 +356,15 @@ impl ReceiveReport {
         println!("  Session ID:           {:016X}", self.session_id);
 
         println!("  TCP data streams:     {}", self.data_stream_count);
+
+        if let Some(desktop_layout) = &self.desktop_layout {
+            println!(
+                "  Desktop layout:       {} items / {} monitors",
+                desktop_layout.items.len(),
+                desktop_layout.monitors.len(),
+            );
+        }
+
         println!(
             "  Tiny write workers:     {}",
             self.tiny_materialization_workers,
@@ -884,12 +896,15 @@ struct AcceptedSession {
     data_stream_count: usize,
 
     source_directory_name: Option<SourceDirectoryName>,
+
+    desktop_layout: Option<DesktopLayoutSnapshot>,
 }
 
 struct SendInternalOptions {
     server: Option<thread::JoinHandle<io::Result<ReceiveReport>>>,
     progress: Option<ProgressCounter>,
     catalog_limits: CatalogLimits,
+    desktop_layout: Option<DesktopLayoutSnapshot>,
 }
 
 pub fn run(
@@ -970,6 +985,7 @@ fn run_update_with_fault(
             server: Some(server),
             progress: None,
             catalog_limits,
+            desktop_layout: None,
         },
     )
 }
@@ -1043,6 +1059,8 @@ fn run_with_fault_and_layout(
             progress: None,
 
             catalog_limits,
+
+            desktop_layout: None,
         },
     )
 }
@@ -1058,6 +1076,7 @@ pub fn send(
         source_root,
         worker_count,
         data_stream_count,
+        None,
         None,
     )
 }
@@ -1075,6 +1094,25 @@ pub(crate) fn send_with_progress(
         worker_count,
         data_stream_count,
         Some(progress),
+        None,
+    )
+}
+
+pub(crate) fn send_with_progress_and_desktop_layout(
+    receiver_address: SocketAddr,
+    source_root: &Path,
+    worker_count: usize,
+    data_stream_count: usize,
+    progress: ProgressCounter,
+    desktop_layout: DesktopLayoutSnapshot,
+) -> io::Result<MultistreamCopyReport> {
+    send_configured(
+        receiver_address,
+        source_root,
+        worker_count,
+        data_stream_count,
+        Some(progress),
+        Some(desktop_layout),
     )
 }
 
@@ -1084,10 +1122,15 @@ fn send_configured(
     worker_count: usize,
     data_stream_count: usize,
     progress: Option<ProgressCounter>,
+    desktop_layout: Option<DesktopLayoutSnapshot>,
 ) -> io::Result<MultistreamCopyReport> {
     manifest_scan::validate_worker_count(worker_count)?;
 
     control_plane::validate_data_stream_count(data_stream_count)?;
+
+    if let Some(desktop_layout) = &desktop_layout {
+        desktop_layout.validate()?;
+    }
 
     let memory_plan = transfer_memory::plan_loopback(
         data_stream_count,
@@ -1106,6 +1149,7 @@ fn send_configured(
             server: None,
             progress,
             catalog_limits: CatalogLimits::default(),
+            desktop_layout,
         },
     )
 }
@@ -1170,6 +1214,7 @@ fn send_internal(
         server,
         progress,
         catalog_limits,
+        desktop_layout,
     } = options;
 
     let total_started = Instant::now();
@@ -1225,6 +1270,8 @@ fn send_internal(
     )?;
 
     write_source_directory_name(&mut control_stream, source_directory_name.as_ref())?;
+
+    write_desktop_layout_metadata(&mut control_stream, desktop_layout.as_ref())?;
 
     let mut data_streams = Vec::with_capacity(data_stream_count);
 
@@ -1479,7 +1526,8 @@ fn send_internal(
             .join()
             .map_err(|_| io::Error::other("multistream receiver thread panicked"))??;
 
-        if transfer_ack.files_copied != receiver_report.files_received
+        if desktop_layout.as_ref() != receiver_report.desktop_layout.as_ref()
+            || transfer_ack.files_copied != receiver_report.files_received
             || transfer_ack.bytes_copied != receiver_report.bytes_received
             || transfer_ack.data_wire_bytes != receiver_report.data_wire_bytes
             || transfer_ack.compressed_records != receiver_report.compressed_records
@@ -1987,6 +2035,8 @@ fn run_server_with_mode_and_layout(
 
         data_stream_count,
 
+        desktop_layout: accepted_session.desktop_layout,
+
         tiny_materialization_workers,
 
         files_received: ack.files_copied,
@@ -2171,6 +2221,88 @@ fn read_source_directory_name(reader: &mut impl Read) -> io::Result<Option<Sourc
         })
 }
 
+fn write_desktop_layout_metadata(
+    writer: &mut impl Write,
+    desktop_layout: Option<&DesktopLayoutSnapshot>,
+) -> io::Result<()> {
+    let encoded = desktop_layout
+        .map(desktop_layout::encode_desktop_layout)
+        .transpose()?;
+
+    let bytes = encoded.as_deref().unwrap_or_default();
+
+    if bytes.len() > MAX_DESKTOP_LAYOUT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "desktop layout metadata contains {} bytes, exceeding the {MAX_DESKTOP_LAYOUT_BYTES} byte wire limit",
+                bytes.len(),
+            ),
+        ));
+    }
+
+    let byte_count = u32::try_from(bytes.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "desktop layout metadata byte count cannot be represented",
+        )
+    })?;
+
+    write_u8(writer, MESSAGE_DESKTOP_LAYOUT_METADATA)?;
+
+    write_u32(writer, byte_count)?;
+
+    writer.write_all(bytes)?;
+
+    writer.flush()
+}
+
+fn read_desktop_layout_metadata(
+    reader: &mut impl Read,
+) -> io::Result<Option<DesktopLayoutSnapshot>> {
+    let message = read_u8(reader)?;
+
+    if message != MESSAGE_DESKTOP_LAYOUT_METADATA {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected desktop-layout metadata, received 0x{message:02X}",),
+        ));
+    }
+
+    let byte_count = usize::try_from(read_u32(reader)?).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "received desktop layout metadata byte count cannot be represented",
+        )
+    })?;
+
+    if byte_count > MAX_DESKTOP_LAYOUT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "received desktop layout metadata contains {byte_count} bytes, exceeding the {MAX_DESKTOP_LAYOUT_BYTES} byte wire limit",
+            ),
+        ));
+    }
+
+    if byte_count == 0 {
+        return Ok(None);
+    }
+
+    let mut bytes = vec![0_u8; byte_count];
+
+    reader.read_exact(&mut bytes)?;
+
+    desktop_layout::decode_desktop_layout(&bytes)
+        .map(Some)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("received invalid desktop layout metadata: {error}",),
+            )
+        })
+}
+
 fn accept_session(
     listener: &TcpListener,
     progress: Option<&ProgressCounter>,
@@ -2197,6 +2329,8 @@ fn accept_session(
 
     let source_directory_name = read_source_directory_name(&mut control_stream)?;
 
+    let desktop_layout = read_desktop_layout_metadata(&mut control_stream)?;
+
     let data_stream_count = usize::try_from(control_handshake.stream_count).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2212,6 +2346,8 @@ fn accept_session(
         data_stream_count,
 
         source_directory_name,
+
+        desktop_layout,
     };
 
     let mut data_streams: Vec<Option<TcpStream>> = std::iter::repeat_with(|| None)
@@ -7811,7 +7947,8 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DestinationMode, GenerationCommit, LaneEnd, MAX_SOURCE_DIRECTORY_NAME_UTF8_BYTES,
+        DestinationMode, GenerationCommit, LaneEnd, MAX_DESKTOP_LAYOUT_BYTES,
+        MAX_SOURCE_DIRECTORY_NAME_UTF8_BYTES, MESSAGE_DESKTOP_LAYOUT_METADATA,
         MESSAGE_FRESH_RESUME_VERIFY_REQUEST, MESSAGE_FRESH_RESUME_VERIFY_RESPONSE,
         MESSAGE_GENERATION_COMMIT, MESSAGE_SOURCE_DIRECTORY_NAME, ReceiverReady,
         TINY_PACK_TARGET_BYTES, TransferAck, TransferFault, TransferTask, accept_session,
@@ -7819,16 +7956,21 @@ mod tests {
         build_transfer_plan, catalog_task_file_id, connect_with_retry_config,
         expected_generation_commit, finalize_large_files, generation_commit_wire_bytes,
         materialize_manifest_directories, negotiate_verified_fresh_resume_files,
-        persist_generation_commit, prepare_destination, read_generation_commit, read_lane_end,
-        read_receiver_ready, read_source_directory_name, read_transfer_ack, read_u8,
-        read_verification_request, rebuild_fresh_generation_execution, receive_once, run,
-        run_update, run_update_with_fault, run_with_fault, run_with_fault_and_layout, send,
-        temporary_path, tiny_pack_record_wire_bytes, validate_generation_commit,
-        validate_resume_offer, validate_source_metadata, verify_content_digest,
+        persist_generation_commit, prepare_destination, read_desktop_layout_metadata,
+        read_generation_commit, read_lane_end, read_receiver_ready, read_source_directory_name,
+        read_transfer_ack, read_u8, read_verification_request, rebuild_fresh_generation_execution,
+        receive_once, run, run_update, run_update_with_fault, run_with_fault,
+        run_with_fault_and_layout, send, send_configured, temporary_path,
+        tiny_pack_record_wire_bytes, validate_generation_commit, validate_resume_offer,
+        validate_source_metadata, verify_content_digest, write_desktop_layout_metadata,
         write_generation_commit, write_lane_end, write_receiver_ready, write_source_directory_name,
         write_transfer_ack, write_verification_response,
     };
     use crate::control_plane::{self, ManifestSummary};
+    use crate::desktop_layout::{
+        DESKTOP_LAYOUT_FORMAT_VERSION, DesktopItemKind, DesktopLayoutItem, DesktopLayoutSnapshot,
+        DesktopMonitor, DesktopPoint, DesktopRect,
+    };
     use crate::destination_layout::DestinationLayout;
     use crate::destination_layout::SourceDirectoryName;
     use crate::file_metadata;
@@ -7847,6 +7989,46 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+
+    fn desktop_layout_snapshot() -> DesktopLayoutSnapshot {
+        DesktopLayoutSnapshot {
+            version: DESKTOP_LAYOUT_FORMAT_VERSION,
+
+            icon_size: 48,
+
+            auto_arrange: false,
+
+            monitors: vec![DesktopMonitor {
+                bounds: DesktopRect {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1080,
+                },
+
+                work_area: DesktopRect {
+                    left: 0,
+                    top: 0,
+                    right: 1920,
+                    bottom: 1040,
+                },
+
+                dpi_x: 96,
+
+                dpi_y: 96,
+
+                primary: true,
+            }],
+
+            items: vec![DesktopLayoutItem {
+                name: "example.txt".to_string(),
+
+                kind: DesktopItemKind::File,
+
+                position: DesktopPoint { x: 120, y: 160 },
+            }],
+        }
+    }
 
     #[test]
     fn tiny_pack_wire_size_includes_protocol_metadata() {
@@ -8454,6 +8636,58 @@ mod tests {
     }
 
     #[test]
+    fn desktop_layout_metadata_survives_transfer_session() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let parent = env::temp_dir().join(format!(
+            "networkcopy-desktop-layout-wire-{}-{unique}",
+            process::id(),
+        ));
+
+        let source = parent.join("Desktop");
+
+        let destination = parent.join("Received");
+
+        fs::create_dir_all(&source).unwrap();
+
+        fs::write(source.join("example.txt"), b"desktop layout transport").unwrap();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+
+        let address = listener.local_addr().unwrap();
+
+        let receiver_destination = destination.clone();
+
+        let receiver = thread::spawn(move || receive_once(listener, &receiver_destination));
+
+        let expected_layout = desktop_layout_snapshot();
+
+        let send_result =
+            send_configured(address, &source, 2, 2, None, Some(expected_layout.clone()));
+
+        let receive_result = receiver.join().unwrap();
+
+        let transferred = fs::read(destination.join("example.txt"));
+
+        let cleanup = fs::remove_dir_all(&parent);
+
+        let send_report = send_result.unwrap();
+
+        let receive_report = receive_result.unwrap();
+
+        assert_eq!(send_report.files_copied, 1,);
+
+        assert_eq!(transferred.unwrap(), b"desktop layout transport",);
+
+        assert_eq!(receive_report.desktop_layout, Some(expected_layout),);
+
+        cleanup.unwrap();
+    }
+
+    #[test]
     fn tiny_packs_respect_the_payload_target() {
         let tiny_file_size = TINY_PACK_TARGET_BYTES / 32;
 
@@ -8501,6 +8735,66 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
 
         assert!(error.to_string().contains("BLAKE3 verification failed"));
+    }
+
+    #[test]
+    fn desktop_layout_metadata_round_trips() {
+        let expected = desktop_layout_snapshot();
+
+        let mut bytes = Vec::new();
+
+        write_desktop_layout_metadata(&mut bytes, Some(&expected)).unwrap();
+
+        let actual = read_desktop_layout_metadata(&mut Cursor::new(bytes)).unwrap();
+
+        assert_eq!(actual, Some(expected));
+    }
+
+    #[test]
+    fn desktop_layout_metadata_allows_absent_layout() {
+        let mut bytes = Vec::new();
+
+        write_desktop_layout_metadata(&mut bytes, None).unwrap();
+
+        let actual = read_desktop_layout_metadata(&mut Cursor::new(bytes)).unwrap();
+
+        assert_eq!(actual, None);
+    }
+
+    #[test]
+    fn desktop_layout_metadata_rejects_oversized_wire_value() {
+        let oversized = MAX_DESKTOP_LAYOUT_BYTES + 1;
+
+        let mut bytes = vec![MESSAGE_DESKTOP_LAYOUT_METADATA];
+
+        bytes.extend_from_slice(&u32::try_from(oversized).unwrap().to_be_bytes());
+
+        let error = read_desktop_layout_metadata(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+
+        assert!(error.to_string().contains("wire limit"),);
+    }
+
+    #[test]
+    fn desktop_layout_metadata_rejects_invalid_payload() {
+        let invalid = b"not-an-ncdl-layout";
+
+        let mut bytes = vec![MESSAGE_DESKTOP_LAYOUT_METADATA];
+
+        bytes.extend_from_slice(&u32::try_from(invalid.len()).unwrap().to_be_bytes());
+
+        bytes.extend_from_slice(invalid);
+
+        let error = read_desktop_layout_metadata(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid desktop layout metadata",),
+        );
     }
 
     #[test]
@@ -8573,6 +8867,8 @@ mod tests {
 
         let source_directory_name = SourceDirectoryName::parse("Desktop").unwrap();
 
+        let desktop_layout = desktop_layout_snapshot();
+
         let mut control_stream = TcpStream::connect(address).unwrap();
 
         control_plane::configure_stream(&control_stream).unwrap();
@@ -8592,6 +8888,8 @@ mod tests {
         .unwrap();
 
         write_source_directory_name(&mut control_stream, Some(&source_directory_name)).unwrap();
+
+        write_desktop_layout_metadata(&mut control_stream, Some(&desktop_layout)).unwrap();
 
         let mut data_stream_one = TcpStream::connect(address).unwrap();
 
@@ -8639,6 +8937,8 @@ mod tests {
             accepted_session.source_directory_name,
             Some(source_directory_name),
         );
+
+        assert_eq!(accepted_session.desktop_layout, Some(desktop_layout),);
 
         assert_eq!(accepted_data.len(), 2);
 

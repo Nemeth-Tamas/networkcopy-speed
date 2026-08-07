@@ -212,13 +212,12 @@ fn capture_desktop_items(
 
         let pidl = OwnedPidl::new(pidl, index)?;
 
-        let position =
-            unsafe { folder_view.GetItemPosition(pidl.as_ptr()) }.map_err(|error| {
-                windows_error(
-                    &format!("failed to read position for Desktop item {name:?}",),
-                    error,
-                )
-            })?;
+        let position = unsafe { folder_view.GetItemPosition(pidl.as_ptr()) }.map_err(|error| {
+            windows_error(
+                &format!("failed to read position for Desktop item {name:?}",),
+                error,
+            )
+        })?;
 
         items.push(DesktopLayoutItem {
             name,
@@ -435,11 +434,8 @@ struct ThreadDpiAwareness {
 
 impl ThreadDpiAwareness {
     fn per_monitor_v2() -> io::Result<Self> {
-        let previous = unsafe {
-            SetThreadDpiAwarenessContext(
-                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-            )
-        };
+        let previous =
+            unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 
         if previous.is_invalid() {
             return Err(windows_error(
@@ -457,9 +453,7 @@ impl ThreadDpiAwareness {
 impl Drop for ThreadDpiAwareness {
     fn drop(&mut self) {
         unsafe {
-            SetThreadDpiAwarenessContext(
-                DPI_AWARENESS_CONTEXT(self.previous),
-            );
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT(self.previous));
         }
     }
 }

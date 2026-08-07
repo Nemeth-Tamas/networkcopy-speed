@@ -317,9 +317,12 @@ The Manager also includes a multi-source batch builder. Several source folders
 can be collected, previewed beneath one receiver destination root, checked for
 name collisions, and added atomically to the persistent transfer queue.
 
-The standalone transfer wire protocol is now version 12. Its control stream
-carries an optional validated source-folder name. Drive-root sources remain
-available for exact-destination transfers by sending no folder-name metadata.
+The standalone transfer wire protocol is now version 14. Its control stream
+carries an optional validated source-folder name, explicit file and directory
+manifest entries, and an optional bounded `NCDL` desktop-layout snapshot.
+Drive-root sources remain available for exact-destination transfers, and
+ordinary transfers send no desktop-layout metadata. Desktop-layout metadata is
+currently transported and validated but is not yet restored on the receiver.
 
 The updater now selects exact Manager, Agent, CLI, GUI-HU, and GUI-EN release
 assets, plans official or custom executable naming, and uses deterministic
