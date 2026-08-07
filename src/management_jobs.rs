@@ -9,6 +9,7 @@ use crate::manifest_scan;
 use crate::multistream_copy::DestinationMode;
 use crate::network_calibration;
 use crate::resume_state::ResumeJournal;
+use crate::windows_desktop_layout;
 use std::fs;
 use std::io;
 use std::net::{SocketAddr, TcpListener};
@@ -22,11 +23,17 @@ const PREPARE_REQUEST_HEADER_BYTES: usize = 8;
 
 const START_SEND_REQUEST_VERSION_V1: u16 = 1;
 
-const START_SEND_REQUEST_VERSION: u16 = 2;
+const START_SEND_REQUEST_VERSION_V2: u16 = 2;
+
+const START_SEND_REQUEST_VERSION: u16 = 3;
 
 const START_SEND_REQUEST_HEADER_BYTES_V1: usize = 24;
 
 const START_SEND_REQUEST_HEADER_BYTES: usize = 28;
+
+const PRESERVE_DESKTOP_LAYOUT_FLAG: u16 = 0x0001;
+
+const KNOWN_START_SEND_FLAGS: u16 = PRESERVE_DESKTOP_LAYOUT_FLAG;
 
 const START_SEND_RESPONSE_VERSION: u16 = 1;
 const START_SEND_RESPONSE_HEADER_BYTES: usize = 12;
@@ -138,6 +145,8 @@ pub(crate) struct StartSendRequest {
     pub(crate) calibration_mib: u64,
 
     pub(crate) forced_data_stream_count: Option<usize>,
+
+    pub(crate) preserve_desktop_layout: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -344,6 +353,25 @@ impl ManagementJobRegistry {
         calibration_mib: u64,
         forced_data_stream_count: Option<usize>,
     ) -> io::Result<StartedSendJob> {
+        self.start_send_with_desktop_layout(
+            receiver_address,
+            source_root,
+            worker_count,
+            calibration_mib,
+            forced_data_stream_count,
+            false,
+        )
+    }
+
+    pub(crate) fn start_send_with_desktop_layout(
+        self: &Arc<Self>,
+        receiver_address: SocketAddr,
+        source_root: &str,
+        worker_count: usize,
+        calibration_mib: u64,
+        forced_data_stream_count: Option<usize>,
+        preserve_desktop_layout: bool,
+    ) -> io::Result<StartedSendJob> {
         validate_send_parameters(receiver_address, source_root, worker_count, calibration_mib)?;
 
         validate_forced_data_stream_count(forced_data_stream_count)?;
@@ -420,6 +448,44 @@ impl ManagementJobRegistry {
         let spawn_result = thread::Builder::new()
             .name(format!("networkcopy-managed-sender-{job_id}"))
             .spawn(move || {
+                let desktop_layout = if preserve_desktop_layout {
+                    worker_progress.set_label("Capturing Desktop layout");
+
+                    match windows_desktop_layout::is_current_desktop_path(&worker_source) {
+                        Ok(true) => {
+                            match windows_desktop_layout::capture_current_desktop_layout() {
+                                Ok(snapshot) => Some(snapshot),
+
+                                Err(error) => {
+                                    eprintln!(
+                                        "managed Desktop layout capture failed; continuing without layout metadata: {error}",
+                                    );
+
+                                    None
+                                }
+                            }
+                        }
+
+                        Ok(false) => {
+                            eprintln!(
+                                "managed Desktop layout preservation was requested for a non-Desktop source; continuing without layout metadata",
+                            );
+
+                            None
+                        }
+
+                        Err(error) => {
+                            eprintln!(
+                                "failed to verify managed Desktop source; continuing without layout metadata: {error}",
+                            );
+
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 let result = calibrated_transfer::send_with_progress_and_stream_count(
                     receiver_address,
                     &worker_source,
@@ -427,7 +493,7 @@ impl ManagementJobRegistry {
                     calibration_bytes,
                     worker_progress,
                     forced_data_stream_count,
-                    None,
+                    desktop_layout,
                 );
 
                 let terminal_result = build_send_result(job_id, &result);
@@ -959,6 +1025,24 @@ pub(crate) fn encode_start_send_request_with_stream_count(
     calibration_mib: u64,
     forced_data_stream_count: Option<usize>,
 ) -> io::Result<Vec<u8>> {
+    encode_start_send_request_with_stream_count_and_desktop_layout(
+        receiver_address,
+        source_root,
+        worker_count,
+        calibration_mib,
+        forced_data_stream_count,
+        false,
+    )
+}
+
+pub(crate) fn encode_start_send_request_with_stream_count_and_desktop_layout(
+    receiver_address: SocketAddr,
+    source_root: &str,
+    worker_count: usize,
+    calibration_mib: u64,
+    forced_data_stream_count: Option<usize>,
+    preserve_desktop_layout: bool,
+) -> io::Result<Vec<u8>> {
     validate_send_parameters(receiver_address, source_root, worker_count, calibration_mib)?;
 
     validate_forced_data_stream_count(forced_data_stream_count)?;
@@ -1006,7 +1090,13 @@ pub(crate) fn encode_start_send_request_with_stream_count(
 
     payload.extend_from_slice(&START_SEND_REQUEST_VERSION.to_le_bytes());
 
-    payload.extend_from_slice(&0_u16.to_le_bytes());
+    let flags = if preserve_desktop_layout {
+        PRESERVE_DESKTOP_LAYOUT_FLAG
+    } else {
+        0
+    };
+
+    payload.extend_from_slice(&flags.to_le_bytes());
 
     payload.extend_from_slice(&worker_count.to_le_bytes());
 
@@ -1045,10 +1135,46 @@ pub(crate) fn decode_start_send_request(payload: &[u8]) -> io::Result<StartSendR
         )
     })?);
 
-    let (header_bytes, forced_data_stream_count) = match version {
-        START_SEND_REQUEST_VERSION_V1 => (START_SEND_REQUEST_HEADER_BYTES_V1, None),
+    let flags = u16::from_le_bytes(payload[2..4].try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "start-send flags field was malformed",
+        )
+    })?);
 
-        START_SEND_REQUEST_VERSION => {
+    let decode_forced_stream_count = |payload: &[u8]| -> io::Result<Option<usize>> {
+        let encoded = u32::from_le_bytes(payload[24..28].try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "forced data stream count was malformed",
+            )
+        })?);
+
+        if encoded == 0 {
+            Ok(None)
+        } else {
+            usize::try_from(encoded).map(Some).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "forced data stream count cannot be represented",
+                )
+            })
+        }
+    };
+
+    let (header_bytes, forced_data_stream_count, preserve_desktop_layout) = match version {
+        START_SEND_REQUEST_VERSION_V1 => {
+            if flags != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "start-send v1 reserved field was not zero",
+                ));
+            }
+
+            (START_SEND_REQUEST_HEADER_BYTES_V1, None, false)
+        }
+
+        START_SEND_REQUEST_VERSION_V2 => {
             if payload.len() < START_SEND_REQUEST_HEADER_BYTES {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -1059,48 +1185,54 @@ pub(crate) fn decode_start_send_request(payload: &[u8]) -> io::Result<StartSendR
                 ));
             }
 
-            let encoded = u32::from_le_bytes(payload[24..28].try_into().map_err(|_| {
-                io::Error::new(
+            if flags != 0 {
+                return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "forced data stream count was malformed",
-                )
-            })?);
+                    "start-send v2 reserved field was not zero",
+                ));
+            }
 
-            let decoded = if encoded == 0 {
-                None
-            } else {
-                Some(usize::try_from(encoded).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "forced data stream count cannot be represented",
-                    )
-                })?)
-            };
+            (
+                START_SEND_REQUEST_HEADER_BYTES,
+                decode_forced_stream_count(payload)?,
+                false,
+            )
+        }
 
-            (START_SEND_REQUEST_HEADER_BYTES, decoded)
+        START_SEND_REQUEST_VERSION => {
+            if payload.len() < START_SEND_REQUEST_HEADER_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "start-send v3 request has {} bytes, expected at least {START_SEND_REQUEST_HEADER_BYTES}",
+                        payload.len(),
+                    ),
+                ));
+            }
+
+            let unknown_flags = flags & !KNOWN_START_SEND_FLAGS;
+
+            if unknown_flags != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("start-send request contains unknown flags 0x{unknown_flags:04X}",),
+                ));
+            }
+
+            (
+                START_SEND_REQUEST_HEADER_BYTES,
+                decode_forced_stream_count(payload)?,
+                flags & PRESERVE_DESKTOP_LAYOUT_FLAG != 0,
+            )
         }
 
         unknown => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("unsupported start-send request version {unknown}"),
+                format!("unsupported start-send request version {unknown}",),
             ));
         }
     };
-
-    let reserved = u16::from_le_bytes(payload[2..4].try_into().map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "start-send reserved field was malformed",
-        )
-    })?);
-
-    if reserved != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "start-send reserved field was not zero",
-        ));
-    }
 
     let worker_count = usize::try_from(u32::from_le_bytes(payload[4..8].try_into().map_err(
         |_| {
@@ -1232,6 +1364,7 @@ pub(crate) fn decode_start_send_request(payload: &[u8]) -> io::Result<StartSendR
         worker_count,
         calibration_mib,
         forced_data_stream_count,
+        preserve_desktop_layout,
     })
 }
 
@@ -1890,7 +2023,9 @@ mod tests {
         decode_prepare_request, decode_prepared_response, decode_start_send_request,
         decode_started_send_response, decode_status, encode_prepare_request,
         encode_prepared_response, encode_start_send_request,
-        encode_start_send_request_with_stream_count, encode_started_send_response, encode_status,
+        encode_start_send_request_with_stream_count,
+        encode_start_send_request_with_stream_count_and_desktop_layout,
+        encode_started_send_response, encode_status,
     };
     use crate::management_snapshot::{ManagementJobOutcome, ManagementJobRole};
     use std::fs;
@@ -2106,6 +2241,60 @@ mod tests {
         assert_eq!(decoded.calibration_mib, 8,);
 
         assert_eq!(decoded.forced_data_stream_count, Some(4),);
+
+        assert!(!decoded.preserve_desktop_layout);
+    }
+
+    #[test]
+    fn desktop_layout_start_send_request_round_trips() {
+        let receiver = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7337));
+
+        let encoded = encode_start_send_request_with_stream_count_and_desktop_layout(
+            receiver,
+            r"C:\Users\User\Desktop",
+            4,
+            8,
+            Some(8),
+            true,
+        )
+        .unwrap();
+
+        let decoded = decode_start_send_request(&encoded).unwrap();
+
+        assert_eq!(decoded.receiver_address, receiver,);
+
+        assert_eq!(decoded.source_root, r"C:\Users\User\Desktop",);
+
+        assert_eq!(decoded.worker_count, 4,);
+
+        assert_eq!(decoded.calibration_mib, 8,);
+
+        assert_eq!(decoded.forced_data_stream_count, Some(8),);
+
+        assert!(decoded.preserve_desktop_layout,);
+    }
+
+    #[test]
+    fn start_send_request_rejects_unknown_desktop_flags() {
+        let receiver = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7337));
+
+        let mut encoded = encode_start_send_request_with_stream_count_and_desktop_layout(
+            receiver,
+            r"C:\Source",
+            4,
+            8,
+            None,
+            true,
+        )
+        .unwrap();
+
+        encoded[2..4].copy_from_slice(&0x8000_u16.to_le_bytes());
+
+        let error = decode_start_send_request(&encoded).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData,);
+
+        assert!(error.to_string().contains("unknown flags"),);
     }
 
     #[test]
