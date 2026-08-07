@@ -345,24 +345,6 @@ impl ManagementJobRegistry {
         Ok(job)
     }
 
-    pub(crate) fn start_send(
-        self: &Arc<Self>,
-        receiver_address: SocketAddr,
-        source_root: &str,
-        worker_count: usize,
-        calibration_mib: u64,
-        forced_data_stream_count: Option<usize>,
-    ) -> io::Result<StartedSendJob> {
-        self.start_send_with_desktop_layout(
-            receiver_address,
-            source_root,
-            worker_count,
-            calibration_mib,
-            forced_data_stream_count,
-            false,
-        )
-    }
-
     pub(crate) fn start_send_with_desktop_layout(
         self: &Arc<Self>,
         receiver_address: SocketAddr,
