@@ -61,6 +61,18 @@ pub fn current_desktop_path() -> io::Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
+pub fn is_current_desktop_path(path: &Path) -> io::Result<bool> {
+    if path.as_os_str().is_empty() {
+        return Ok(false);
+    }
+
+    let selected = fs::canonicalize(path)?;
+
+    let desktop = fs::canonicalize(current_desktop_path()?)?;
+
+    Ok(selected == desktop)
+}
+
 pub fn capture_current_desktop_layout() -> io::Result<DesktopLayoutSnapshot> {
     let capture_thread = thread::Builder::new()
         .name("networkcopy-desktop-capture".to_string())

@@ -10,12 +10,13 @@ use networkcopy_speed::gui_transfer::{
     GuiConnectionMode, GuiTransferControl, GuiTransferDiagnostic, GuiTransferProgress,
     GuiTransferRequest, GuiTransferSummary, run_gui_transfer_with_control,
 };
+use networkcopy_speed::windows_desktop_layout;
 use networkcopy_speed::windows_elevation;
 use rfd::FileDialog;
 use std::env;
 use std::ffi::OsStr;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -199,6 +200,11 @@ struct Text {
     choose_destination: &'static str,
     scanner_workers: &'static str,
     calibration_mib: &'static str,
+
+    preserve_desktop_layout: &'static str,
+
+    preserve_desktop_layout_hint: &'static str,
+
     start: &'static str,
     cancel: &'static str,
     running: &'static str,
@@ -325,6 +331,10 @@ impl Text {
         scanner_workers: "Fájlkereső szálak",
 
         calibration_mib: "Kalibráció mérete (MiB)",
+
+        preserve_desktop_layout: "Windows Asztal ikonelrendezésének megőrzése",
+
+        preserve_desktop_layout_hint: "Csak akkor érhető el, ha a kiválasztott forrás a jelenlegi Windows Asztal mappa. Az ikonpozíciók, az ikonméret és az Automatikus elrendezés beállítása az átvitelhez kerül.",
 
         start: "Indítás",
 
@@ -510,6 +520,10 @@ impl Text {
 
         calibration_mib: "Calibration size (MiB)",
 
+        preserve_desktop_layout: "Preserve Windows Desktop icon layout",
+
+        preserve_desktop_layout_hint: "Available only when the selected source is the current Windows Desktop folder. Icon positions, icon size, and the Auto Arrange setting are attached to the transfer.",
+
         start: "Start",
 
         cancel: "Cancel",
@@ -654,6 +668,11 @@ struct NetworkCopyGui {
     bind_address: String,
     scanner_workers: usize,
     calibration_mib: u64,
+
+    preserve_desktop_layout: bool,
+
+    desktop_layout_available: bool,
+
     transfer_receiver: Option<Receiver<TransferOutcome>>,
 
     transfer_control: Option<GuiTransferControl>,
@@ -725,6 +744,10 @@ impl NetworkCopyGui {
 
             scanner_workers: 4,
             calibration_mib: 64,
+
+            preserve_desktop_layout: false,
+
+            desktop_layout_available: false,
 
             transfer_receiver: None,
 
@@ -814,7 +837,7 @@ impl NetworkCopyGui {
 
         ui.add_space(8.0);
 
-        folder_picker(
+        let source_changed = folder_picker(
             ui,
             &mut self.source_folder,
             text.source_folder,
@@ -822,6 +845,26 @@ impl NetworkCopyGui {
             text.browse,
             text.choose_source,
         );
+
+        if source_changed {
+            self.refresh_desktop_layout_availability();
+        }
+
+        if self.desktop_layout_available {
+            ui.add_space(12.0);
+
+            ui.checkbox(
+                &mut self.preserve_desktop_layout,
+                text.preserve_desktop_layout,
+            )
+            .on_hover_text(text.preserve_desktop_layout_hint);
+
+            ui.label(
+                egui::RichText::new(text.preserve_desktop_layout_hint)
+                    .small()
+                    .color(muted_text()),
+            );
+        }
 
         ui.add_space(16.0);
 
@@ -841,6 +884,17 @@ impl NetworkCopyGui {
 
                 ui.end_row();
             });
+    }
+
+    fn refresh_desktop_layout_availability(&mut self) {
+        let source = self.source_folder.trim();
+
+        self.desktop_layout_available = !source.is_empty()
+            && windows_desktop_layout::is_current_desktop_path(Path::new(source)).unwrap_or(false);
+
+        if !self.desktop_layout_available {
+            self.preserve_desktop_layout = false;
+        }
     }
 
     fn receive_panel(&mut self, ui: &mut egui::Ui, text: Text) {
@@ -928,6 +982,9 @@ impl NetworkCopyGui {
                     worker_count: self.scanner_workers,
 
                     calibration_mib: self.calibration_mib,
+
+                    preserve_desktop_layout: self.preserve_desktop_layout
+                        && self.desktop_layout_available,
                 })
             }
 
@@ -958,6 +1015,7 @@ impl NetworkCopyGui {
                 source_root,
                 worker_count,
                 calibration_mib,
+                preserve_desktop_layout,
             } => {
                 self.mode = TransferMode::Send;
 
@@ -966,6 +1024,10 @@ impl NetworkCopyGui {
                 self.scanner_workers = *worker_count;
 
                 self.calibration_mib = *calibration_mib;
+
+                self.preserve_desktop_layout = *preserve_desktop_layout;
+
+                self.refresh_desktop_layout_availability();
 
                 self.apply_connection(TransferMode::Send, *connection);
             }
@@ -1974,36 +2036,46 @@ fn should_rearm_root_receiver(request: &GuiTransferRequest) -> bool {
 }
 
 fn resume_request_summary(ui: &mut egui::Ui, text: Text, request: &GuiTransferRequest) {
-    let (direction, folder, connection, send_options, update_existing, destination_layout) =
-        match request {
-            GuiTransferRequest::Send {
-                connection,
-                source_root,
-                worker_count,
-                calibration_mib,
-            } => (
-                text.send,
-                source_root,
-                *connection,
-                Some((*worker_count, *calibration_mib)),
-                None,
-                None,
-            ),
+    let (
+        direction,
+        folder,
+        connection,
+        send_options,
+        update_existing,
+        destination_layout,
+        preserve_desktop_layout,
+    ) = match request {
+        GuiTransferRequest::Send {
+            connection,
+            source_root,
+            worker_count,
+            calibration_mib,
+            preserve_desktop_layout,
+        } => (
+            text.send,
+            source_root,
+            *connection,
+            Some((*worker_count, *calibration_mib)),
+            None,
+            None,
+            Some(*preserve_desktop_layout),
+        ),
 
-            GuiTransferRequest::Receive {
-                connection,
-                destination_root,
-                destination_layout,
-                update_existing,
-            } => (
-                text.receive,
-                destination_root,
-                *connection,
-                None,
-                Some(*update_existing),
-                Some(*destination_layout),
-            ),
-        };
+        GuiTransferRequest::Receive {
+            connection,
+            destination_root,
+            destination_layout,
+            update_existing,
+        } => (
+            text.receive,
+            destination_root,
+            *connection,
+            None,
+            Some(*update_existing),
+            Some(*destination_layout),
+            None,
+        ),
+    };
 
     let connection = match connection {
         GuiConnectionMode::Direct => text.direct_connection.to_string(),
@@ -2051,6 +2123,18 @@ fn resume_request_summary(ui: &mut egui::Ui, text: Text, request: &GuiTransferRe
                 ui.label(text.resume_update_mode);
 
                 ui.label(if update_existing {
+                    text.enabled
+                } else {
+                    text.disabled
+                });
+
+                ui.end_row();
+            }
+
+            if let Some(preserve_desktop_layout) = preserve_desktop_layout {
+                ui.label(text.preserve_desktop_layout);
+
+                ui.label(if preserve_desktop_layout {
                     text.enabled
                 } else {
                     text.disabled
@@ -2138,8 +2222,10 @@ fn folder_picker(
     hint: &str,
     browse: &str,
     dialog_title: &str,
-) {
+) -> bool {
     ui.label(label);
+
+    let mut changed = false;
 
     ui.horizontal(|ui| {
         let button_width = 110.0;
@@ -2148,10 +2234,12 @@ fn folder_picker(
 
         let edit_width = (ui.available_width() - button_width - spacing).max(160.0);
 
-        ui.add_sized(
-            [edit_width, 28.0],
-            egui::TextEdit::singleline(value).hint_text(hint),
-        );
+        changed |= ui
+            .add_sized(
+                [edit_width, 28.0],
+                egui::TextEdit::singleline(value).hint_text(hint),
+            )
+            .changed();
 
         let clicked = ui
             .add_sized([button_width, 28.0], egui::Button::new(browse))
@@ -2159,8 +2247,12 @@ fn folder_picker(
 
         if clicked && let Some(path) = FileDialog::new().set_title(dialog_title).pick_folder() {
             *value = path.display().to_string();
+
+            changed = true;
         }
     });
+
+    changed
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -2256,6 +2348,8 @@ mod tests {
             worker_count: 4,
 
             calibration_mib: 64,
+
+            preserve_desktop_layout: false,
         };
 
         assert!(!should_rearm_root_receiver(&request,),);

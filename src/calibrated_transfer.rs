@@ -1,5 +1,6 @@
 use crate::console_progress::{ConsoleProgress, ProgressCounter};
 use crate::copy_bench::{decimal_megabytes_per_second, format_bytes};
+use crate::desktop_layout::DesktopLayoutSnapshot;
 use crate::destination_layout::DestinationLayout;
 use crate::multistream_copy::{self, DestinationMode, MultistreamCopyReport, ReceiveReport};
 use crate::network_calibration::{self, NetworkCalibrationMatrixReport, NetworkCalibrationReport};
@@ -160,6 +161,24 @@ pub(crate) fn send_with_progress(
     calibration_bytes: u64,
     progress: ProgressCounter,
 ) -> io::Result<CalibratedSendReport> {
+    send_with_progress_and_desktop_layout(
+        receiver_address,
+        source_root,
+        worker_count,
+        calibration_bytes,
+        progress,
+        None,
+    )
+}
+
+pub(crate) fn send_with_progress_and_desktop_layout(
+    receiver_address: SocketAddr,
+    source_root: &Path,
+    worker_count: usize,
+    calibration_bytes: u64,
+    progress: ProgressCounter,
+    desktop_layout: Option<DesktopLayoutSnapshot>,
+) -> io::Result<CalibratedSendReport> {
     send_with_progress_and_stream_count(
         receiver_address,
         source_root,
@@ -167,6 +186,7 @@ pub(crate) fn send_with_progress(
         calibration_bytes,
         progress,
         None,
+        desktop_layout,
     )
 }
 
@@ -177,6 +197,7 @@ pub(crate) fn send_with_progress_and_stream_count(
     calibration_bytes: u64,
     progress: ProgressCounter,
     forced_data_stream_count: Option<usize>,
+    desktop_layout: Option<DesktopLayoutSnapshot>,
 ) -> io::Result<CalibratedSendReport> {
     if let Some(data_stream_count) = forced_data_stream_count {
         network_calibration::validate_matrix_stream_count(data_stream_count)?;
@@ -230,12 +251,13 @@ pub(crate) fn send_with_progress_and_stream_count(
 
     progress.set_total(0);
 
-    let transfer = multistream_copy::send_with_progress(
+    let transfer = multistream_copy::send_with_progress_and_desktop_layout(
         receiver_address,
         source_root,
         worker_count,
         data_stream_count,
         progress.clone(),
+        desktop_layout,
     )?;
 
     progress.check_cancelled()?;

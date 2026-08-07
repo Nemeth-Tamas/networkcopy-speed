@@ -1,5 +1,6 @@
 use crate::calibrated_transfer::{self, CalibratedReceiveReport, CalibratedSendReport};
 use crate::console_progress::ProgressCounter;
+use crate::desktop_layout::DesktopLayoutSnapshot;
 use crate::destination_layout::DestinationLayout;
 use crate::direct_discovery;
 use crate::multistream_copy::DestinationMode;
@@ -113,7 +114,7 @@ pub(crate) fn send(
     worker_count: usize,
     calibration_bytes: u64,
 ) -> io::Result<CalibratedSendReport> {
-    send_configured(source_root, worker_count, calibration_bytes, None)
+    send_configured(source_root, worker_count, calibration_bytes, None, None)
 }
 
 pub(crate) fn send_with_progress(
@@ -122,7 +123,29 @@ pub(crate) fn send_with_progress(
     calibration_bytes: u64,
     progress: ProgressCounter,
 ) -> io::Result<CalibratedSendReport> {
-    send_configured(source_root, worker_count, calibration_bytes, Some(progress))
+    send_with_progress_and_desktop_layout(
+        source_root,
+        worker_count,
+        calibration_bytes,
+        progress,
+        None,
+    )
+}
+
+pub(crate) fn send_with_progress_and_desktop_layout(
+    source_root: &Path,
+    worker_count: usize,
+    calibration_bytes: u64,
+    progress: ProgressCounter,
+    desktop_layout: Option<DesktopLayoutSnapshot>,
+) -> io::Result<CalibratedSendReport> {
+    send_configured(
+        source_root,
+        worker_count,
+        calibration_bytes,
+        Some(progress),
+        desktop_layout,
+    )
 }
 
 fn send_configured(
@@ -130,6 +153,7 @@ fn send_configured(
     worker_count: usize,
     calibration_bytes: u64,
     progress: Option<ProgressCounter>,
+    desktop_layout: Option<DesktopLayoutSnapshot>,
 ) -> io::Result<CalibratedSendReport> {
     if let Some(progress) = &progress {
         progress.set_label("Discovering direct receiver");
@@ -174,20 +198,27 @@ fn send_configured(
 
     println!();
 
-    match progress {
-        Some(progress) => calibrated_transfer::send_with_progress(
+    match (progress, desktop_layout) {
+        (Some(progress), desktop_layout) => {
+            calibrated_transfer::send_with_progress_and_desktop_layout(
+                receiver_address,
+                source_root,
+                worker_count,
+                calibration_bytes,
+                progress,
+                desktop_layout,
+            )
+        }
+
+        (None, None) => calibrated_transfer::send(
             receiver_address,
             source_root,
             worker_count,
             calibration_bytes,
-            progress,
         ),
 
-        None => calibrated_transfer::send(
-            receiver_address,
-            source_root,
-            worker_count,
-            calibration_bytes,
-        ),
+        (None, Some(_)) => Err(io::Error::other(
+            "desktop layout metadata requires progress-aware direct sender execution",
+        )),
     }
 }

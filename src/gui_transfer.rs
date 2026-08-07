@@ -7,6 +7,7 @@ use crate::direct_transfer;
 use crate::manifest_scan;
 use crate::multistream_copy::DestinationMode;
 use crate::network_calibration;
+use crate::windows_desktop_layout;
 use crate::windows_setup;
 use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener};
@@ -29,6 +30,8 @@ pub enum GuiTransferRequest {
         worker_count: usize,
 
         calibration_mib: u64,
+
+        preserve_desktop_layout: bool,
     },
 
     Receive {
@@ -267,26 +270,73 @@ pub fn run_gui_transfer_with_control(
             source_root,
             worker_count,
             calibration_mib,
+            preserve_desktop_layout,
         } => {
             manifest_scan::validate_worker_count(worker_count)?;
 
             let calibration_bytes = network_calibration::bytes_from_mib(calibration_mib)?;
 
+            let desktop_layout = if preserve_desktop_layout {
+                control.progress.set_label("Capturing desktop layout");
+
+                control.progress.set_completed(0);
+
+                control.progress.set_total(0);
+
+                control.progress.check_cancelled()?;
+
+                match windows_desktop_layout::is_current_desktop_path(&source_root) {
+                    Ok(true) => match windows_desktop_layout::capture_current_desktop_layout() {
+                        Ok(snapshot) => Some(snapshot),
+
+                        Err(error) => {
+                            eprintln!(
+                                "desktop layout capture failed; continuing without layout metadata: {error}"
+                            );
+
+                            None
+                        }
+                    },
+
+                    Ok(false) => {
+                        eprintln!(
+                            "desktop layout preservation was requested for a non-Desktop source; continuing without layout metadata"
+                        );
+
+                        None
+                    }
+
+                    Err(error) => {
+                        eprintln!(
+                            "failed to verify Desktop source; continuing without layout metadata: {error}"
+                        );
+
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let report = match connection {
-                GuiConnectionMode::Direct => direct_transfer::send_with_progress(
-                    &source_root,
-                    worker_count,
-                    calibration_bytes,
-                    control.progress.clone(),
-                )?,
+                GuiConnectionMode::Direct => {
+                    direct_transfer::send_with_progress_and_desktop_layout(
+                        &source_root,
+                        worker_count,
+                        calibration_bytes,
+                        control.progress.clone(),
+                        desktop_layout,
+                    )?
+                }
 
                 GuiConnectionMode::Address(receiver_address) => {
-                    calibrated_transfer::send_with_progress(
+                    calibrated_transfer::send_with_progress_and_desktop_layout(
                         receiver_address,
                         &source_root,
                         worker_count,
                         calibration_bytes,
                         control.progress.clone(),
+                        desktop_layout,
                     )?
                 }
             };
@@ -824,6 +874,8 @@ mod tests {
             worker_count: 2,
 
             calibration_mib: 1,
+
+            preserve_desktop_layout: false,
         })
         .unwrap();
 
@@ -977,6 +1029,8 @@ mod tests {
             worker_count: 2,
 
             calibration_mib: 1,
+
+            preserve_desktop_layout: false,
         })
         .unwrap();
 
@@ -1014,6 +1068,8 @@ mod tests {
             worker_count: 2,
 
             calibration_mib: 1,
+
+            preserve_desktop_layout: false,
         })
         .unwrap();
 
@@ -1085,6 +1141,8 @@ mod tests {
 
             worker_count: 2,
             calibration_mib: 1,
+
+            preserve_desktop_layout: false,
         })
         .unwrap();
 
@@ -1127,6 +1185,8 @@ mod tests {
 
             worker_count: 2,
             calibration_mib: 1,
+
+            preserve_desktop_layout: false,
         })
         .unwrap();
 

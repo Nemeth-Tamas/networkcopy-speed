@@ -427,6 +427,7 @@ impl ManagementJobRegistry {
                     calibration_bytes,
                     worker_progress,
                     forced_data_stream_count,
+                    None,
                 );
 
                 let terminal_result = build_send_result(job_id, &result);

@@ -264,12 +264,14 @@ fn encode_request(request: &GuiTransferRequest) -> io::Result<String> {
         calibration_mib,
         update_existing,
         destination_layout,
+        preserve_desktop_layout,
     ) = match request {
         GuiTransferRequest::Send {
             connection,
             source_root,
             worker_count,
             calibration_mib,
+            preserve_desktop_layout,
         } => (
             "send",
             *connection,
@@ -278,6 +280,7 @@ fn encode_request(request: &GuiTransferRequest) -> io::Result<String> {
             *calibration_mib,
             false,
             DestinationLayout::Exact,
+            *preserve_desktop_layout,
         ),
 
         GuiTransferRequest::Receive {
@@ -293,6 +296,7 @@ fn encode_request(request: &GuiTransferRequest) -> io::Result<String> {
             0,
             *update_existing,
             *destination_layout,
+            false,
         ),
     };
 
@@ -311,7 +315,8 @@ fn encode_request(request: &GuiTransferRequest) -> io::Result<String> {
          worker_count={worker_count}\n\
          calibration_mib={calibration_mib}\n\
          update_existing={update_existing}\n\
-         destination_layout={}\n",
+         destination_layout={}\n\
+         preserve_desktop_layout={preserve_desktop_layout}\n",
         encode_path(path),
         destination_layout.code(),
     ))
@@ -386,6 +391,16 @@ fn decode_request(contents: &str) -> io::Result<GuiTransferRequest> {
         None => DestinationLayout::Exact,
     };
 
+    let preserve_desktop_layout = match fields.get("preserve_desktop_layout") {
+        Some(value) => value.parse::<bool>().map_err(|error| {
+            invalid_data(format!(
+                "invalid GUI session field 'preserve_desktop_layout': {error}",
+            ))
+        })?,
+
+        None => false,
+    };
+
     match direction {
         "send" => {
             let worker_count = parse_field::<usize>(&fields, "worker_count")?;
@@ -405,6 +420,7 @@ fn decode_request(contents: &str) -> io::Result<GuiTransferRequest> {
                 source_root: path,
                 worker_count,
                 calibration_mib,
+                preserve_desktop_layout,
             })
         }
 
@@ -493,6 +509,8 @@ mod tests {
 
             worker_count: 6,
             calibration_mib: 128,
+
+            preserve_desktop_layout: true,
         };
 
         let encoded = encode_request(&request).unwrap();
