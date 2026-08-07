@@ -321,8 +321,17 @@ The standalone transfer wire protocol is now version 14. Its control stream
 carries an optional validated source-folder name, explicit file and directory
 manifest entries, and an optional bounded `NCDL` desktop-layout snapshot.
 Drive-root sources remain available for exact-destination transfers, and
-ordinary transfers send no desktop-layout metadata. Desktop-layout metadata is
-currently transported and validated but is not yet restored on the receiver.
+ordinary transfers send no desktop-layout metadata.
+
+Windows Desktop layout migration is now implemented for both standalone and
+managed transfers. The sender captures ordinary Desktop file and folder
+positions, icon size, Auto Arrange state, DPI, work areas, and monitor geometry
+through the Windows Shell folder view. The receiver restores matching items
+through the supported Shell positioning APIs after file transfer completes.
+Different resolutions and DPI values are mapped proportionally between
+corresponding monitors and clamped to visible work areas. Missing, renamed,
+virtual, Public Desktop, or otherwise non-transferable Shell items do not fail
+the file transfer.
 
 The updater now selects exact Manager, Agent, CLI, GUI-HU, and GUI-EN release
 assets, plans official or custom executable naming, and uses deterministic
@@ -511,6 +520,19 @@ discovering the remote Agent at `192.168.2.103:7339`. Automatic LAN selection
 therefore presented exactly the two real endpoint computers using their common
 physical Ethernet subnet.
 
+A remaining multi-adapter endpoint-selection bug was reproduced again during
+v2.5 development. One Agent advertised through `169.254.21.253`,
+`172.20.96.1`, and its real LAN address `192.168.1.2`, but the Manager retained
+the APIPA address instead of the usable physical-LAN address. The v2.4.1
+process-identity deduplication therefore remains valid, but address ranking is
+not yet reliable on every adapter combination.
+
+Before v2.5 release, Automatic LAN must prefer a reachable ordinary LAN address
+over APIPA and virtual/tunnel adapter addresses when several replies identify
+the same running Agent process. This preference must apply only to Automatic
+LAN; Direct Link must continue to allow and prefer link-local addresses because
+they are intentional there.
+
 Physical two-machine Manager multi-source destination-root acceptance completed
 on 2026-08-06 over the Explicit IP route. Three sequential queue entries
 transferred 2,331 files and 1,244,706,622 bytes from `192.168.2.200` to
@@ -535,18 +557,43 @@ The same physical run exposed three post-release issues:
 - [ ] preserve empty source directories in the destination tree;
 - [ ] allow scrolling while extending a multi-entry Manager history selection.
 
-### Planned v2.5 desktop layout migration
+### v2.5 desktop layout migration
 
-- [ ] capture Windows desktop file and folder positions through the Shell folder
+- [x] capture Windows desktop file and folder positions through the Shell folder
       view;
-- [ ] record desktop icon size, Auto Arrange state, DPI, work area, and monitor
+- [x] record desktop icon size, Auto Arrange state, DPI, work area, and monitor
       geometry;
-- [ ] transfer the layout as optional migration metadata;
-- [ ] match destination desktop items by stable relative name;
-- [ ] scale and clamp positions safely for different destination resolutions;
-- [ ] restore ordinary desktop file and folder positions after transfer;
-- [ ] handle missing, renamed, redirected, and built-in Shell items without
-      failing the transfer.
+- [x] transfer the layout as optional bounded migration metadata;
+- [x] match destination desktop items by stable relative parsing name;
+- [x] scale and clamp positions safely for different destination resolutions,
+      DPI values, work areas, and monitor origins;
+- [x] restore ordinary desktop file and folder positions after transfer;
+- [x] handle missing, renamed, redirected, Public Desktop, and built-in Shell
+      items without failing the transfer;
+- [x] expose layout preservation in the standalone GUI only for the actual local
+      Windows Desktop;
+- [x] let the Manager ask the sender Agent whether a remote source is that
+      Agent's actual Windows Desktop;
+- [x] preserve the option through managed sender startup, mapped queue entries,
+      resume, Manager restart persistence, and `NCMS5` migration;
+- [x] complete live same-machine Shell restore acceptance with all 87 captured
+      Desktop items round-tripping unchanged;
+- [x] dry-run cross-display migration of all 87 captured Desktop items with
+      every planned position remaining inside a destination monitor work area;
+- [ ] complete an end-to-end physical managed Desktop transfer acceptance when
+      two endpoint machines are available.
+
+### Remaining v2.5 Automatic LAN work
+
+- [ ] rank multiple addresses belonging to the same Agent process so ordinary
+      physical-LAN addresses are preferred over APIPA and virtual/tunnel
+      interfaces in Automatic LAN mode;
+- [ ] retain Direct Link's existing link-local IPv6 and APIPA behavior;
+- [ ] add deterministic tests for physical-LAN, APIPA, virtual/tunnel, and
+      ambiguous multi-adapter combinations;
+- [ ] physically verify that the reproduced
+      `169.254.21.253` / `172.20.96.1` / `192.168.1.2` case selects
+      `192.168.1.2`.
 
 ### Planned v2.5 performance work
 
@@ -585,6 +632,32 @@ Planned investigation order:
 Direct Link is always a physical Ethernet candidate. Automatic LAN and Explicit
 IP may use Ethernet, Wi-Fi, VPN, or virtual interfaces, so the v2.5 policy must
 inspect the selected path rather than treating every LAN address as wired.
+
+## Planned v2.6 — Manager interface redesign
+
+v2.6 is planned as a substantial Manager information-architecture and UI/UX
+redesign rather than another incremental control-panel expansion. The current
+Manager remains functional but has become crowded as discovery, routing, remote
+browsing, batch construction, queue management, transfer monitoring, history,
+updates, and advanced transfer options have accumulated.
+
+Planned v2.6 goals include:
+
+- reorganize the Manager around clearer setup, endpoints/routes, queue, active
+  transfer, and history workflows;
+- reduce the amount of permanently visible configuration and advanced controls;
+- improve spacing, hierarchy, responsive use of window width, and visual
+  consistency;
+- make sender/receiver selection and route state easier to understand at a
+  glance;
+- integrate remote browsing and batch construction more cleanly with transfer
+  setup;
+- simplify queue cards while keeping recovery, resume, and Desktop-layout state
+  visible;
+- redesign capability presentation instead of allowing Agent cards to accumulate
+  increasingly long capability text;
+- preserve all existing queue persistence, recovery, Direct Link, Automatic LAN,
+  Explicit IP, updater, and Desktop-layout functionality during the redesign.
 
 ### Deliberately deferred
 
