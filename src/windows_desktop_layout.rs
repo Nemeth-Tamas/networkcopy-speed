@@ -194,13 +194,6 @@ fn restore_on_sta_thread(
         .cast()
         .map_err(|error| windows_error("Desktop folder view did not expose IShellView", error))?;
 
-    unsafe { shell_view.Refresh() }.map_err(|error| {
-        windows_error(
-            "failed to refresh the Desktop before restoring icon positions",
-            error,
-        )
-    })?;
-
     let targets =
         collect_restore_targets(&folder_view, &desktop_path, snapshot, &planned_positions)?;
 
