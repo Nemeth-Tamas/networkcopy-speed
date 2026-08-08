@@ -148,6 +148,8 @@ pub struct MultistreamCopyReport {
     pub total_elapsed: Duration,
 
     pub stage_profile: TransferStageProfile,
+
+    pub receiver_stage_profile: Option<TransferStageProfile>,
 }
 
 impl MultistreamCopyReport {
@@ -322,6 +324,24 @@ impl MultistreamCopyReport {
         print_stage_sample("Compression/probe:", self.stage_profile.sender_compression);
 
         print_stage_sample("Socket writes:", self.stage_profile.sender_socket_write);
+
+        if let Some(receiver_stage_profile) = self.receiver_stage_profile {
+            println!();
+
+            println!("Receiver stage profile (aggregate worker time)",);
+
+            print_stage_sample("Socket reads:", receiver_stage_profile.receiver_socket_read);
+
+            print_stage_sample(
+                "Decompression:",
+                receiver_stage_profile.receiver_decompression,
+            );
+
+            print_stage_sample(
+                "Destination writes:",
+                receiver_stage_profile.receiver_destination_write,
+            );
+        }
 
         println!(
             "  Payload throughput:   {:.2} MB/s ({:.2} MiB/s)",
@@ -1600,6 +1620,8 @@ fn send_internal(
 
     drop(control_stream);
 
+    let mut receiver_stage_profile = None;
+
     if let Some(server) = server {
         let receiver_report = server
             .join()
@@ -1634,6 +1656,8 @@ fn send_internal(
                 "client and server transfer reports differ",
             ));
         }
+
+        receiver_stage_profile = Some(receiver_report.stage_profile);
     }
 
     if transfer_ack.files_copied != summary.entries
@@ -1722,6 +1746,8 @@ fn send_internal(
         total_elapsed: total_started.elapsed(),
 
         stage_profile: profiler.snapshot(),
+
+        receiver_stage_profile,
     })
 }
 
@@ -8787,6 +8813,14 @@ mod tests {
         );
 
         assert_eq!(report.tiny_files_packed, 2);
+
+        let receiver_profile = report
+            .receiver_stage_profile
+            .expect("loopback transfer should retain its receiver stage profile");
+
+        assert!(receiver_profile.receiver_socket_read.operations > 0);
+
+        assert!(receiver_profile.receiver_destination_write.operations > 0);
     }
 
     #[test]
@@ -9502,6 +9536,8 @@ mod tests {
             sender_report.process_buffer_bytes,
             sender_report.buffer_bytes_per_peer
         );
+
+        assert!(sender_report.receiver_stage_profile.is_none());
 
         assert_eq!(
             fs::read(destination.join("small.txt",),).unwrap(),
