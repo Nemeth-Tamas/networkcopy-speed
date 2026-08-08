@@ -1,0 +1,16 @@
+NetworkCopy Speed Edition native IOCP source read-ahead benchmark
+  Source:      C:\Users\User\Desktop\randomprojectsillneverfinish\networkcopyspeededition\TestData\incompressible-2GiB.bin
+  Chunk:       8 MiB
+  Operations:  16
+
+Native IOCP source read-ahead complete
+  Bytes read:          2,147,483,648
+  Chunk size:          8 MiB
+  Operations:          16
+  Buffer pool:         128 MiB
+  Read submissions:    256
+  Immediate reads:     0
+  Setup time:          0.000 s
+  Read time:           0.288 s
+  Total time:          0.288 s
+  Read throughput:     7466.06 MB/s (7120.19 MiB/s)
