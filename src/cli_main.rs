@@ -3008,6 +3008,19 @@ fn run_network_bench_receive(
         "bind address",
     )?;
 
+    let socket_receive_buffer_kib = match arguments.next() {
+        Some(value) => Some(parse_u64_count(
+            &value,
+            "socket receive buffer KiB",
+        )?),
+
+        None => None,
+    };
+
+    let socket_receive_buffer_bytes = socket_receive_buffer_kib
+        .map(network_calibration::socket_buffer_bytes_from_kib)
+        .transpose()?;
+
     if let Some(extra) = arguments.next() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3024,13 +3037,34 @@ fn run_network_bench_receive(
 
     println!("  Listening:    {}", listener.local_addr()?);
 
+    match socket_receive_buffer_kib {
+        Some(buffer_kib) => {
+            println!(
+                "  Receive buffer: {buffer_kib} KiB requested",
+            );
+        }
+
+        None => {
+            println!("  Receive buffer: Windows default");
+        }
+    }
+
     println!("  Destination:  discarded memory buffers");
 
     println!("  Mode:         one calibration, then exit");
 
     println!();
 
-    let report = network_calibration::receive_once(listener)?;
+    let report = match socket_receive_buffer_bytes {
+        Some(buffer_bytes) => {
+            network_calibration::receive_once_with_socket_receive_buffer(
+                listener,
+                buffer_bytes,
+            )?
+        }
+
+        None => network_calibration::receive_once(listener)?,
+    };
 
     report.print("receive");
 
@@ -3581,7 +3615,10 @@ fn print_usage(program: &OsStr) {
     println!("  {program} send-auto <receiver-address> <source-root> [workers] [calibration-mib]");
     println!("  {program} bench-network-matrix-receive <bind-address>");
     println!("  {program} bench-network-matrix-send <receiver-address> [total-mib]");
-    println!("  {program} bench-network-receive <bind-address>");
+    println!(
+        "  {program} bench-network-receive <bind-address> \
+         [receive-buffer-kib]"
+    );
     println!(
         "  {program} bench-network-send <receiver-address> \
          [total-mib] [data-streams] [send-buffer-kib]"

@@ -380,7 +380,21 @@ fn send_matrix_internal(
 }
 
 pub fn receive_once(listener: TcpListener) -> io::Result<NetworkCalibrationReport> {
-    receive_one(&listener, None)
+    receive_one(&listener, None, None)
+}
+
+pub(crate) fn receive_once_with_socket_receive_buffer(
+    listener: TcpListener,
+    socket_receive_buffer_bytes: usize,
+) -> io::Result<NetworkCalibrationReport> {
+    if socket_receive_buffer_bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket receive buffer size must not be zero",
+        ));
+    }
+
+    receive_one(&listener, None, Some(socket_receive_buffer_bytes))
 }
 
 pub fn receive_matrix(listener: TcpListener) -> io::Result<NetworkCalibrationMatrixReport> {
@@ -412,7 +426,7 @@ fn receive_matrix_internal(
             ));
         }
 
-        let report = receive_one(listener, progress.clone())?;
+        let report = receive_one(listener, progress.clone(), None)?;
 
         if report.data_stream_count != expected_stream_count {
             return Err(io::Error::new(
@@ -478,6 +492,7 @@ fn accept_with_progress(
 fn receive_one(
     listener: &TcpListener,
     progress: Option<ProgressCounter>,
+    socket_receive_buffer_bytes: Option<usize>,
 ) -> io::Result<NetworkCalibrationReport> {
     let (mut control_stream, _control_peer) = accept_with_progress(listener, progress.as_ref())?;
 
@@ -501,6 +516,10 @@ fn receive_one(
         let (mut stream, _data_peer) = accept_with_progress(listener, progress.as_ref())?;
 
         control_plane::configure_stream(&stream)?;
+
+        if let Some(buffer_bytes) = socket_receive_buffer_bytes {
+            SockRef::from(&stream).set_recv_buffer_size(buffer_bytes)?;
+        }
 
         let (stream_id, declared_bytes) = read_data_header(&mut stream, config)?;
 
@@ -1082,7 +1101,8 @@ fn gigabits_per_second(bytes: u64, elapsed: Duration) -> f64 {
 mod tests {
     use super::{
         MATRIX_STREAM_COUNTS, NetworkCalibrationReport, build_matrix_report, lane_bytes,
-        receive_matrix, receive_once, send, send_matrix, socket_buffer_bytes_from_kib,
+        receive_matrix, receive_once, receive_once_with_socket_receive_buffer, send, send_matrix,
+        socket_buffer_bytes_from_kib,
     };
     use std::net::TcpListener;
     use std::thread;
@@ -1171,6 +1191,34 @@ mod tests {
         assert!(receiver_report.socket_send_buffer_bytes > 0);
 
         assert!(receiver_report.socket_receive_buffer_bytes > 0);
+    }
+
+    #[test]
+    fn loopback_explicit_receive_buffer_round_trips() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+
+        let address = listener.local_addr().unwrap();
+
+        let requested_buffer_bytes = 256 * 1024;
+
+        let receiver = thread::spawn(move || {
+            receive_once_with_socket_receive_buffer(listener, requested_buffer_bytes)
+        });
+
+        let total_bytes = 8 * 1024 * 1024 + 137;
+
+        let sender_report = send(address, total_bytes, 2).unwrap();
+
+        let receiver_report = receiver.join().unwrap().unwrap();
+
+        assert_eq!(sender_report.total_bytes, total_bytes);
+
+        assert_eq!(receiver_report.total_bytes, total_bytes);
+
+        assert_eq!(
+            receiver_report.socket_receive_buffer_bytes,
+            requested_buffer_bytes as u64,
+        );
     }
 
     #[test]
