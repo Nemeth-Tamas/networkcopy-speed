@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // explicit protocol-version check instead of failing as invalid data.
 const PROTOCOL_MAGIC: [u8; 4] = *b"NCS4";
 
-const PROTOCOL_VERSION: u16 = 14;
+const PROTOCOL_VERSION: u16 = 15;
 
 const ROLE_CONTROL: u8 = 1;
 const ROLE_DATA: u8 = 2;

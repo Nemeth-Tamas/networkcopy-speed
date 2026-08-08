@@ -15,6 +15,7 @@ use crate::session_cdc_catalog::{
     self, CatalogCandidate, CatalogGeneration, CatalogLimits, CatalogPlan,
 };
 use crate::session_cdc_lane;
+use crate::storage_media;
 use crate::striped_file;
 use crate::tcp_connect;
 use crate::tiny_file_pool;
@@ -694,8 +695,23 @@ struct TransferAck {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ReceiverReady {
     summary: ManifestSummary,
+
+    destination_seek_penalty: bool,
+
     completed_stripes: BTreeSet<ResumeStripe>,
+
     unchanged_file_ids: BTreeSet<usize>,
+}
+
+fn destination_seek_penalty(destination_root: &Path) -> bool {
+    let resolved = destination_root
+        .canonicalize()
+        .unwrap_or_else(|_| destination_root.to_path_buf());
+
+    storage_media::inspect_path(&resolved)
+        .ok()
+        .and_then(|report| report.incurs_seek_penalty())
+        .unwrap_or(false)
 }
 
 #[derive(Debug)]
@@ -2094,7 +2110,11 @@ fn run_server_with_mode_and_layout(
 
     let receiver_ready = ReceiverReady {
         summary,
+
+        destination_seek_penalty: destination_seek_penalty(destination_root.as_ref()),
+
         completed_stripes,
+
         unchanged_file_ids,
     };
 
@@ -7566,6 +7586,8 @@ fn write_receiver_ready(writer: &mut impl Write, ready: &ReceiverReady) -> io::R
 
     write_u64(writer, ready.summary.fingerprint)?;
 
+    write_u8(writer, u8::from(ready.destination_seek_penalty))?;
+
     write_u32(writer, stripe_count)?;
 
     for stripe in &ready.completed_stripes {
@@ -7639,6 +7661,19 @@ fn read_receiver_ready_after_message(
         fingerprint: read_u64(reader)?,
     };
 
+    let destination_seek_penalty = match read_u8(reader)? {
+        0 => false,
+
+        1 => true,
+
+        value => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("receiver-ready seek-penalty flag has invalid value {value}",),
+            ));
+        }
+    };
+
     let stripe_count = read_u32(reader)?;
 
     if stripe_count > MAX_RESUME_OFFER_STRIPES {
@@ -7705,7 +7740,11 @@ fn read_receiver_ready_after_message(
 
     Ok(ReceiverReady {
         summary,
+
+        destination_seek_penalty,
+
         completed_stripes,
+
         unchanged_file_ids,
     })
 }
@@ -8270,21 +8309,21 @@ mod tests {
         DestinationMode, GenerationCommit, LaneEnd, MAX_DESKTOP_LAYOUT_BYTES,
         MAX_SOURCE_DIRECTORY_NAME_UTF8_BYTES, MESSAGE_DESKTOP_LAYOUT_METADATA,
         MESSAGE_FRESH_RESUME_VERIFY_REQUEST, MESSAGE_FRESH_RESUME_VERIFY_RESPONSE,
-        MESSAGE_GENERATION_COMMIT, MESSAGE_SOURCE_DIRECTORY_NAME, ReceiverReady,
-        TINY_PACK_TARGET_BYTES, TransferAck, TransferFault, TransferTask, accept_session,
-        apply_fresh_resume_prefix, apply_resume_offer, build_fresh_generation_plan_with_limits,
-        build_transfer_plan, catalog_task_file_id, connect_with_retry_config,
-        expected_generation_commit, finalize_large_files, generation_commit_wire_bytes,
-        materialize_manifest_directories, negotiate_verified_fresh_resume_files,
-        persist_generation_commit, prepare_destination, read_desktop_layout_metadata,
-        read_generation_commit, read_lane_end, read_receiver_ready, read_source_directory_name,
-        read_transfer_ack, read_u8, read_verification_request, rebuild_fresh_generation_execution,
-        receive_once, run, run_update, run_update_with_fault, run_with_fault,
-        run_with_fault_and_layout, send, send_configured, temporary_path,
+        MESSAGE_GENERATION_COMMIT, MESSAGE_RECEIVER_READY, MESSAGE_SOURCE_DIRECTORY_NAME,
+        ReceiverReady, TINY_PACK_TARGET_BYTES, TransferAck, TransferFault, TransferTask,
+        accept_session, apply_fresh_resume_prefix, apply_resume_offer,
+        build_fresh_generation_plan_with_limits, build_transfer_plan, catalog_task_file_id,
+        connect_with_retry_config, expected_generation_commit, finalize_large_files,
+        generation_commit_wire_bytes, materialize_manifest_directories,
+        negotiate_verified_fresh_resume_files, persist_generation_commit, prepare_destination,
+        read_desktop_layout_metadata, read_generation_commit, read_lane_end, read_receiver_ready,
+        read_source_directory_name, read_transfer_ack, read_u8, read_verification_request,
+        rebuild_fresh_generation_execution, receive_once, run, run_update, run_update_with_fault,
+        run_with_fault, run_with_fault_and_layout, send, send_configured, temporary_path,
         tiny_pack_record_wire_bytes, validate_generation_commit, validate_resume_offer,
         validate_source_metadata, verify_content_digest, write_desktop_layout_metadata,
         write_generation_commit, write_lane_end, write_receiver_ready, write_source_directory_name,
-        write_transfer_ack, write_verification_response,
+        write_transfer_ack, write_u8, write_u64, write_verification_response,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::desktop_layout::{
@@ -9553,6 +9592,8 @@ mod tests {
                 fingerprint: 0x1234_5678_9ABC_DEF0,
             },
 
+            destination_seek_penalty: true,
+
             completed_stripes: BTreeSet::from([
                 ResumeStripe::new(2, 0, 4096).unwrap(),
                 ResumeStripe::new(2, 4096, 2048).unwrap(),
@@ -9570,6 +9611,27 @@ mod tests {
         let actual = read_receiver_ready(&mut reader).unwrap();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn receiver_ready_rejects_invalid_seek_penalty_flag() {
+        let mut bytes = Vec::new();
+
+        write_u8(&mut bytes, MESSAGE_RECEIVER_READY).unwrap();
+
+        write_u64(&mut bytes, 0).unwrap();
+        write_u64(&mut bytes, 0).unwrap();
+        write_u64(&mut bytes, 0).unwrap();
+        write_u64(&mut bytes, 0).unwrap();
+
+        // Only 0 and 1 are valid.
+        write_u8(&mut bytes, 2).unwrap();
+
+        let error = read_receiver_ready(&mut Cursor::new(bytes)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData,);
+
+        assert!(error.to_string().contains("seek-penalty flag",),);
     }
 
     #[test]
