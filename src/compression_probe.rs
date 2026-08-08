@@ -38,6 +38,9 @@ pub struct CompressionProbeReport {
     pub level: i32,
     pub ratio_percent: f64,
     pub savings_percent: f64,
+
+    pub break_even_path_megabytes_per_second: f64,
+
     pub decision: CompressionDecision,
     pub compression_elapsed: Duration,
     pub total_elapsed: Duration,
@@ -74,7 +77,13 @@ impl CompressionProbeReport {
             "  Sample throughput:     {:.2} MB/s",
             decimal_megabytes_per_second(self.sampled_bytes, self.compression_elapsed,)
         );
-        println!("  Decision:              {}", self.decision.description());
+
+        println!(
+            "  Break-even path speed: {:.2} MB/s",
+            self.break_even_path_megabytes_per_second,
+        );
+
+        println!("  Decision:              {}", self.decision.description(),);
         println!(
             "  Total probe time:      {:.6} s",
             self.total_elapsed.as_secs_f64()
@@ -119,6 +128,9 @@ pub fn run(source: &Path, level: i32) -> io::Result<CompressionProbeReport> {
 
     let savings_percent = 100.0 - ratio_percent;
 
+    let break_even_path_megabytes_per_second =
+        break_even_path_megabytes_per_second(sampled_bytes, compressed_bytes, compression_elapsed);
+
     let decision = choose_decision(sampled_bytes, compressed_bytes);
 
     let estimated_wire_bytes =
@@ -133,6 +145,7 @@ pub fn run(source: &Path, level: i32) -> io::Result<CompressionProbeReport> {
         level,
         ratio_percent,
         savings_percent,
+        break_even_path_megabytes_per_second,
         decision,
         compression_elapsed,
         total_elapsed: total_started.elapsed(),
@@ -275,6 +288,30 @@ pub(crate) fn should_compress_sizes(raw_bytes: u64, compressed_bytes: u64) -> bo
     compressed_percent <= required_percent
 }
 
+fn break_even_path_megabytes_per_second(
+    sampled_bytes: u64,
+    compressed_bytes: u64,
+    compression_elapsed: Duration,
+) -> f64 {
+    if sampled_bytes == 0 || compressed_bytes >= sampled_bytes {
+        return 0.0;
+    }
+
+    let seconds = compression_elapsed.as_secs_f64();
+
+    if seconds == 0.0 {
+        return f64::INFINITY;
+    }
+
+    let compression_bytes_per_second = sampled_bytes as f64 / seconds;
+
+    let saved_bytes = sampled_bytes - compressed_bytes;
+
+    let savings_fraction = saved_bytes as f64 / sampled_bytes as f64;
+
+    compression_bytes_per_second * savings_fraction / 1_000_000.0
+}
+
 fn compression_ratio_percent(sampled_bytes: u64, compressed_bytes: u64) -> f64 {
     if sampled_bytes == 0 {
         return 100.0;
@@ -333,8 +370,10 @@ fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Res
 #[cfg(test)]
 mod tests {
     use super::{
-        CompressionDecision, MAX_SAMPLE_COUNT, SAMPLE_BYTES, choose_decision, sample_ranges,
+        CompressionDecision, MAX_SAMPLE_COUNT, SAMPLE_BYTES, break_even_path_megabytes_per_second,
+        choose_decision, sample_ranges,
     };
+    use std::time::Duration;
 
     #[test]
     fn large_files_sample_start_middle_and_end() {
@@ -382,5 +421,29 @@ mod tests {
 
         assert_eq!(decompressed, source);
         assert!(compressed.len() < source.len());
+    }
+
+    #[test]
+    fn compression_break_even_uses_saved_wire_time() {
+        let break_even =
+            break_even_path_megabytes_per_second(1_000_000, 500_000, Duration::from_millis(100));
+
+        // Compression throughput is 10 MB/s and
+        // saves 50% of the payload, so compression
+        // breaks even against a 5 MB/s path.
+        assert!((break_even - 5.0).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn compression_break_even_is_zero_without_savings() {
+        assert_eq!(
+            break_even_path_megabytes_per_second(1_000_000, 1_000_000, Duration::from_millis(100),),
+            0.0,
+        );
+
+        assert_eq!(
+            break_even_path_megabytes_per_second(0, 0, Duration::from_millis(100),),
+            0.0,
+        );
     }
 }
