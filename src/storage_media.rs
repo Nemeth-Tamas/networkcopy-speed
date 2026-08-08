@@ -5,9 +5,10 @@ use std::fmt;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::fs::{FileExt, OpenOptionsExt};
 use std::path::{Component, Path, Prefix};
 use std::ptr::{self, NonNull};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,9 +27,9 @@ const PROPERTY_STANDARD_QUERY: u32 = 0;
 
 const UNCACHED_ALIGNMENT_BYTES: usize = 4096;
 
-const UNCACHED_READ_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const UNCACHED_IO_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
-const STORAGE_READ_LANE_COUNTS: [usize; 4] = [1, 2, 4, 8];
+const STORAGE_LANE_COUNTS: [usize; 4] = [1, 2, 4, 8];
 
 #[repr(C)]
 struct StoragePropertyQuery {
@@ -116,13 +117,46 @@ impl StorageReadLaneReport {
     }
 }
 
-struct AlignedReadBuffer {
+#[derive(Clone, Copy, Debug)]
+pub struct StorageWriteLaneReport {
+    pub bytes_written: u64,
+    pub lane_count: usize,
+    pub write_elapsed: Duration,
+    pub flush_elapsed: Duration,
+    pub total_elapsed: Duration,
+}
+
+impl StorageWriteLaneReport {
+    pub fn print(&self) {
+        println!("Uncached storage destination-write benchmark complete",);
+
+        println!("  Bytes written: {}", format_bytes(self.bytes_written),);
+
+        println!("  Write lanes:   {}", self.lane_count,);
+
+        println!("  Chunk size:    4 MiB",);
+
+        println!("  Write time:    {:.6} s", self.write_elapsed.as_secs_f64(),);
+
+        println!("  Flush time:    {:.6} s", self.flush_elapsed.as_secs_f64(),);
+
+        println!("  Total I/O:     {:.6} s", self.total_elapsed.as_secs_f64(),);
+
+        println!(
+            "  Throughput:    {:.2} MB/s ({:.2} MiB/s)",
+            decimal_megabytes_per_second(self.bytes_written, self.total_elapsed,),
+            binary_mebibytes_per_second(self.bytes_written, self.total_elapsed,),
+        );
+    }
+}
+
+struct AlignedIoBuffer {
     pointer: NonNull<u8>,
     length: usize,
     layout: Layout,
 }
 
-impl AlignedReadBuffer {
+impl AlignedIoBuffer {
     fn new(length: usize) -> io::Result<Self> {
         let layout = Layout::from_size_align(length, UNCACHED_ALIGNMENT_BYTES).map_err(|_| {
             io::Error::new(
@@ -153,9 +187,16 @@ impl AlignedReadBuffer {
         // the lifetime of self.
         unsafe { std::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.length) }
     }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY:
+        // pointer owns length initialized bytes for
+        // the lifetime of self.
+        unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.length) }
+    }
 }
 
-impl Drop for AlignedReadBuffer {
+impl Drop for AlignedIoBuffer {
     fn drop(&mut self) {
         // SAFETY:
         // pointer was allocated with exactly this
@@ -204,7 +245,7 @@ pub fn benchmark_uncached_read_lanes(
     source: &Path,
     lane_count: usize,
 ) -> io::Result<StorageReadLaneReport> {
-    validate_storage_read_lane_count(lane_count)?;
+    validate_storage_lane_count(lane_count)?;
 
     let metadata = std::fs::metadata(source)?;
 
@@ -247,7 +288,7 @@ pub fn benchmark_uncached_read_lanes(
         let mut handles = Vec::with_capacity(lane_count);
 
         for lane_index in 0..lane_count {
-            let (offset, length) = storage_read_lane_range(file_bytes, lane_index, lane_count)?;
+            let (offset, length) = storage_lane_range(file_bytes, lane_index, lane_count)?;
 
             handles.push(
                 thread::Builder::new()
@@ -291,23 +332,140 @@ pub fn benchmark_uncached_read_lanes(
     })
 }
 
-fn validate_storage_read_lane_count(lane_count: usize) -> io::Result<()> {
-    if !STORAGE_READ_LANE_COUNTS.contains(&lane_count) {
+pub fn benchmark_uncached_write_lanes(
+    destination: &Path,
+    file_bytes: u64,
+    lane_count: usize,
+) -> io::Result<StorageWriteLaneReport> {
+    validate_storage_lane_count(lane_count)?;
+
+    if file_bytes == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "storage read lanes must be 1, 2, 4, or 8",
+            "storage benchmark destination size must not be zero",
+        ));
+    }
+
+    let required_alignment = u64::try_from(UNCACHED_ALIGNMENT_BYTES)
+        .expect("uncached alignment fits in u64")
+        .checked_mul(u64::try_from(lane_count).expect("lane count fits in u64"))
+        .ok_or_else(|| io::Error::other("uncached lane alignment overflowed"))?;
+
+    if !file_bytes.is_multiple_of(required_alignment) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "uncached benchmark size must be divisible by {required_alignment} bytes for {lane_count} lane(s)",
+            ),
+        ));
+    }
+
+    if let Some(parent) = destination.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(destination)?;
+
+        file.set_len(file_bytes)?;
+    }
+
+    let destination_file = Arc::new(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_NO_BUFFERING)
+            .open(destination)?,
+    );
+
+    let total_started = Instant::now();
+
+    let write_started = Instant::now();
+
+    let lane_results = thread::scope(|scope| -> io::Result<Vec<u64>> {
+        let mut handles = Vec::with_capacity(lane_count);
+
+        for lane_index in 0..lane_count {
+            let (offset, length) = storage_lane_range(file_bytes, lane_index, lane_count)?;
+
+            let lane_file = Arc::clone(&destination_file);
+
+            handles.push(
+                thread::Builder::new()
+                    .name(format!("networkcopy-storage-write-{lane_index}",))
+                    .spawn_scoped(scope, move || {
+                        write_uncached_range(lane_file, offset, length, lane_index)
+                    })?,
+            );
+        }
+
+        let mut results = Vec::with_capacity(lane_count);
+
+        for handle in handles {
+            results.push(
+                handle
+                    .join()
+                    .map_err(|_| io::Error::other("storage write lane panicked"))??,
+            );
+        }
+
+        Ok(results)
+    })?;
+
+    let write_elapsed = write_started.elapsed();
+
+    let flush_started = Instant::now();
+
+    destination_file.sync_all()?;
+
+    let flush_elapsed = flush_started.elapsed();
+
+    let total_elapsed = total_started.elapsed();
+
+    let bytes_written = lane_results.into_iter().try_fold(0_u64, |total, bytes| {
+        total
+            .checked_add(bytes)
+            .ok_or_else(|| io::Error::other("storage write byte count overflowed"))
+    })?;
+
+    if bytes_written != file_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!("uncached benchmark wrote {bytes_written} bytes, expected {file_bytes}",),
+        ));
+    }
+
+    Ok(StorageWriteLaneReport {
+        bytes_written,
+        lane_count,
+        write_elapsed,
+        flush_elapsed,
+        total_elapsed,
+    })
+}
+
+fn validate_storage_lane_count(lane_count: usize) -> io::Result<()> {
+    if !STORAGE_LANE_COUNTS.contains(&lane_count) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "storage lanes must be 1, 2, 4, or 8",
         ));
     }
 
     Ok(())
 }
 
-fn storage_read_lane_range(
+fn storage_lane_range(
     file_bytes: u64,
     lane_index: usize,
     lane_count: usize,
 ) -> io::Result<(u64, u64)> {
-    validate_storage_read_lane_count(lane_count)?;
+    validate_storage_lane_count(lane_count)?;
 
     if lane_index >= lane_count {
         return Err(io::Error::new(
@@ -346,17 +504,17 @@ fn read_uncached_range(source: &Path, offset: u64, length: u64) -> io::Result<u6
 
     file.seek(SeekFrom::Start(offset))?;
 
-    let mut buffer = AlignedReadBuffer::new(UNCACHED_READ_CHUNK_BYTES)?;
+    let mut buffer = AlignedIoBuffer::new(UNCACHED_IO_CHUNK_BYTES)?;
 
     let mut transferred = 0_u64;
 
     while transferred < length {
         let remaining = length - transferred;
 
-        let requested = usize::try_from(remaining.min(UNCACHED_READ_CHUNK_BYTES as u64))
+        let requested = usize::try_from(remaining.min(UNCACHED_IO_CHUNK_BYTES as u64))
             .map_err(|_| io::Error::other("storage read request cannot be represented"))?;
 
-        if requested % UNCACHED_ALIGNMENT_BYTES != 0 {
+        if !requested.is_multiple_of(UNCACHED_ALIGNMENT_BYTES) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "uncached storage read request is not 4 KiB aligned",
@@ -386,6 +544,63 @@ fn read_uncached_range(source: &Path, offset: u64, length: u64) -> io::Result<u6
                     .map_err(|_| io::Error::other("storage read length cannot be represented"))?,
             )
             .ok_or_else(|| io::Error::other("storage read count overflowed"))?;
+    }
+
+    Ok(transferred)
+}
+
+fn write_uncached_range(
+    destination: Arc<std::fs::File>,
+    offset: u64,
+    length: u64,
+    lane_index: usize,
+) -> io::Result<u64> {
+    let mut buffer = AlignedIoBuffer::new(UNCACHED_IO_CHUNK_BYTES)?;
+
+    let pattern = u8::try_from((lane_index + 1) * 37).unwrap_or(0xA5);
+
+    buffer.as_mut_slice().fill(pattern);
+
+    let mut transferred = 0_u64;
+
+    while transferred < length {
+        let remaining = length - transferred;
+
+        let requested = usize::try_from(remaining.min(UNCACHED_IO_CHUNK_BYTES as u64))
+            .map_err(|_| io::Error::other("storage write request cannot be represented"))?;
+
+        if !requested.is_multiple_of(UNCACHED_ALIGNMENT_BYTES) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "uncached storage write request is not 4 KiB aligned",
+            ));
+        }
+
+        let source = &buffer.as_slice()[..requested];
+
+        let written = loop {
+            match destination.seek_write(source, offset + transferred) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    continue;
+                }
+
+                result => break result?,
+            }
+        };
+
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "uncached storage benchmark wrote zero bytes",
+            ));
+        }
+
+        transferred = transferred
+            .checked_add(
+                u64::try_from(written)
+                    .map_err(|_| io::Error::other("storage write length cannot be represented"))?,
+            )
+            .ok_or_else(|| io::Error::other("storage write count overflowed"))?;
     }
 
     Ok(transferred)
@@ -502,7 +717,7 @@ fn query_drive_seek_penalty(drive_letter: u8) -> io::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{drive_letter_from_path, storage_read_lane_range};
+    use super::{drive_letter_from_path, storage_lane_range};
     use std::path::Path;
 
     #[test]
@@ -535,25 +750,25 @@ mod tests {
         let file_bytes = 2 * 1024 * 1024 * 1024_u64;
 
         assert_eq!(
-            storage_read_lane_range(file_bytes, 0, 4,).unwrap(),
+            storage_lane_range(file_bytes, 0, 4,).unwrap(),
             (0, 512 * 1024 * 1024,),
         );
 
         assert_eq!(
-            storage_read_lane_range(file_bytes, 1, 4,).unwrap(),
+            storage_lane_range(file_bytes, 1, 4,).unwrap(),
             (512 * 1024 * 1024, 512 * 1024 * 1024,),
         );
 
         assert_eq!(
-            storage_read_lane_range(file_bytes, 3, 4,).unwrap(),
+            storage_lane_range(file_bytes, 3, 4,).unwrap(),
             (1536 * 1024 * 1024, 512 * 1024 * 1024,),
         );
     }
 
     #[test]
     fn storage_read_lanes_reject_bad_counts() {
-        assert!(storage_read_lane_range(1024 * 1024, 0, 3,).is_err(),);
+        assert!(storage_lane_range(1024 * 1024, 0, 3,).is_err(),);
 
-        assert!(storage_read_lane_range(1024 * 1024, 8, 8,).is_err(),);
+        assert!(storage_lane_range(1024 * 1024, 8, 8,).is_err(),);
     }
 }

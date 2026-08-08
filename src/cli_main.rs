@@ -51,6 +51,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &mut arguments,
             )
         }
+        "bench-storage-write-lanes" => {
+            run_storage_write_lanes_bench(
+                &mut arguments,
+            )
+        }
         "bench-zstd-dictionary" => run_zstd_dictionary_bench(&mut arguments),
         "bench-tiny-file-writes" => {
             run_tiny_file_write_bench(&mut arguments)
@@ -2159,6 +2164,109 @@ fn run_storage_read_lanes_bench(
     Ok(())
 }
 
+fn run_storage_write_lanes_bench(
+    arguments:
+        &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let destination =
+        PathBuf::from(
+            required_argument(
+                arguments,
+                "storage benchmark destination file",
+            )?,
+        );
+
+    let size_mib =
+        parse_u64_count(
+            &required_argument(
+                arguments,
+                "storage benchmark size in MiB",
+            )?,
+            "storage benchmark size in MiB",
+        )?;
+
+    let lane_count =
+        parse_usize_count(
+            &required_argument(
+                arguments,
+                "storage write lane count",
+            )?,
+            "storage write lane count",
+        )?;
+
+    if let Some(extra) =
+        arguments.next()
+    {
+        return Err(
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unexpected extra argument: {}",
+                    extra.to_string_lossy(),
+                ),
+            )
+            .into(),
+        );
+    }
+
+    let file_bytes =
+        size_mib
+            .checked_mul(
+                1024 * 1024,
+            )
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "storage benchmark size overflowed",
+                )
+            })?;
+
+    let media =
+        storage_media::inspect_path(
+            &destination,
+        )?;
+
+    println!(
+        "NetworkCopy Speed Edition uncached storage write benchmark",
+    );
+
+    println!(
+        "  Destination:   {}",
+        destination.display(),
+    );
+
+    println!(
+        "  Storage class: {}",
+        media.kind,
+    );
+
+    println!(
+        "  Data size:     {size_mib} MiB",
+    );
+
+    println!(
+        "  Write lanes:   {lane_count}",
+    );
+
+    println!(
+        "  Cache mode:    unbuffered",
+    );
+
+    println!();
+
+    let report =
+        storage_media::
+            benchmark_uncached_write_lanes(
+                &destination,
+                file_bytes,
+                lane_count,
+            )?;
+
+    report.print();
+
+    Ok(())
+}
+
 fn run_compression_probe(
     arguments: &mut impl Iterator<Item = OsString>,
 ) -> Result<(), Box<dyn Error>> {
@@ -3944,6 +4052,9 @@ fn print_usage(program: &OsStr) {
     );
     println!(
         "  {program} bench-storage-read-lanes <source-file> <1|2|4|8>"
+    );
+    println!(
+        "  {program} bench-storage-write-lanes <destination-file> <size-mib> <1|2|4|8>"
     );
     println!(
         "  {program} bench-zstd-dictionary <root-directory> \
