@@ -15,6 +15,7 @@ const ACK_MAGIC: [u8; 4] = *b"NCA1";
 const PROTOCOL_VERSION: u32 = 1;
 const RECEIVER_READY: u8 = 0xA1;
 
+const KIB: u64 = 1024;
 const MIB: u64 = 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 
@@ -169,6 +170,26 @@ pub(crate) fn validate_matrix_stream_count(data_stream_count: usize) -> io::Resu
     ))
 }
 
+pub(crate) fn socket_buffer_bytes_from_kib(buffer_kib: u64) -> io::Result<usize> {
+    if buffer_kib == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket buffer size must not be zero",
+        ));
+    }
+
+    let bytes = buffer_kib.checked_mul(KIB).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "socket buffer size overflowed")
+    })?;
+
+    usize::try_from(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket buffer size cannot be represented",
+        )
+    })
+}
+
 pub fn bytes_from_mib(total_mib: u64) -> io::Result<u64> {
     let total_bytes = total_mib.checked_mul(MIB).ok_or_else(|| {
         io::Error::new(
@@ -199,7 +220,29 @@ pub fn send(
     total_bytes: u64,
     data_stream_count: usize,
 ) -> io::Result<NetworkCalibrationReport> {
-    send_one(receiver_address, total_bytes, data_stream_count, None)
+    send_one(receiver_address, total_bytes, data_stream_count, None, None)
+}
+
+pub(crate) fn send_with_socket_send_buffer(
+    receiver_address: SocketAddr,
+    total_bytes: u64,
+    data_stream_count: usize,
+    socket_send_buffer_bytes: usize,
+) -> io::Result<NetworkCalibrationReport> {
+    if socket_send_buffer_bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket send buffer size must not be zero",
+        ));
+    }
+
+    send_one(
+        receiver_address,
+        total_bytes,
+        data_stream_count,
+        None,
+        Some(socket_send_buffer_bytes),
+    )
 }
 
 fn send_one(
@@ -207,6 +250,7 @@ fn send_one(
     total_bytes: u64,
     data_stream_count: usize,
     progress: Option<ProgressCounter>,
+    socket_send_buffer_bytes: Option<usize>,
 ) -> io::Result<NetworkCalibrationReport> {
     validate_config(total_bytes, data_stream_count)?;
 
@@ -230,6 +274,10 @@ fn send_one(
         let mut stream = multistream_copy::connect_with_retry(receiver_address)?;
 
         control_plane::configure_stream(&stream)?;
+
+        if let Some(buffer_bytes) = socket_send_buffer_bytes {
+            SockRef::from(&stream).set_send_buffer_size(buffer_bytes)?;
+        }
 
         let bytes = lane_bytes(total_bytes, data_stream_count, stream_id)?;
 
@@ -324,6 +372,7 @@ fn send_matrix_internal(
             total_bytes,
             data_stream_count,
             progress.clone(),
+            None,
         )?);
     }
 
@@ -1033,11 +1082,24 @@ fn gigabits_per_second(bytes: u64, elapsed: Duration) -> f64 {
 mod tests {
     use super::{
         MATRIX_STREAM_COUNTS, NetworkCalibrationReport, build_matrix_report, lane_bytes,
-        receive_matrix, receive_once, send, send_matrix,
+        receive_matrix, receive_once, send, send_matrix, socket_buffer_bytes_from_kib,
     };
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn socket_buffer_kib_converts_to_bytes() {
+        assert_eq!(socket_buffer_bytes_from_kib(256).unwrap(), 256 * 1024,);
+
+        assert_eq!(socket_buffer_bytes_from_kib(1024).unwrap(), 1024 * 1024,);
+
+        assert_eq!(socket_buffer_bytes_from_kib(4096).unwrap(), 4 * 1024 * 1024,);
+
+        assert!(socket_buffer_bytes_from_kib(0).is_err());
+
+        assert!(socket_buffer_bytes_from_kib(u64::MAX).is_err(),);
+    }
 
     #[test]
     fn lane_ranges_cover_total_bytes() {

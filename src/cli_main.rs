@@ -2929,6 +2929,19 @@ fn run_network_bench_send(
         None => network_calibration::DEFAULT_DATA_STREAMS,
     };
 
+    let socket_send_buffer_kib = match arguments.next() {
+        Some(value) => Some(parse_u64_count(
+            &value,
+            "socket send buffer KiB",
+        )?),
+
+        None => None,
+    };
+
+    let socket_send_buffer_bytes = socket_send_buffer_kib
+        .map(network_calibration::socket_buffer_bytes_from_kib)
+        .transpose()?;
+
     if let Some(extra) = arguments.next() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2949,11 +2962,38 @@ fn run_network_bench_send(
 
     println!("  Data streams: {data_stream_count}");
 
+    match socket_send_buffer_kib {
+        Some(buffer_kib) => {
+            println!(
+                "  Send buffer:  {buffer_kib} KiB requested",
+            );
+        }
+
+        None => {
+            println!("  Send buffer:  Windows default");
+        }
+    }
+
     println!("  Source:       generated memory buffers");
 
     println!();
 
-    let report = network_calibration::send(receiver_address, total_bytes, data_stream_count)?;
+    let report = match socket_send_buffer_bytes {
+        Some(buffer_bytes) => {
+            network_calibration::send_with_socket_send_buffer(
+                receiver_address,
+                total_bytes,
+                data_stream_count,
+                buffer_bytes,
+            )?
+        }
+
+        None => network_calibration::send(
+            receiver_address,
+            total_bytes,
+            data_stream_count,
+        )?,
+    };
 
     report.print("send");
 
@@ -3542,7 +3582,10 @@ fn print_usage(program: &OsStr) {
     println!("  {program} bench-network-matrix-receive <bind-address>");
     println!("  {program} bench-network-matrix-send <receiver-address> [total-mib]");
     println!("  {program} bench-network-receive <bind-address>");
-    println!("  {program} bench-network-send <receiver-address> [total-mib] [data-streams]");
+    println!(
+        "  {program} bench-network-send <receiver-address> \
+         [total-mib] [data-streams] [send-buffer-kib]"
+    );
     println!("  {program} receive <bind-address> <destination-root>");
     println!("  {program} send <receiver-address> <source-root> [workers] [data-streams]");
     println!("  {program} bench-copy <source> <destination> [buffer-mib]");
