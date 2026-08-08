@@ -5,7 +5,7 @@ use crate::iocp_probe::CompletionPort;
 use crate::pipeline_bench::validate_config;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::mem;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
@@ -24,6 +24,49 @@ const MIB: usize = 1024 * 1024;
 
 pub const DEFAULT_CHUNK_MIB: usize = 8;
 pub const DEFAULT_OPERATION_COUNT: usize = 8;
+
+#[derive(Debug)]
+pub struct BlockingReadReport {
+    pub bytes_read: u64,
+    pub chunk_bytes: usize,
+    pub read_operations: u64,
+    pub setup_elapsed: Duration,
+    pub io_elapsed: Duration,
+    pub total_elapsed: Duration,
+}
+
+impl BlockingReadReport {
+    pub fn print(&self) {
+        println!("Blocking sequential source read complete");
+
+        println!("  Bytes read:          {}", format_bytes(self.bytes_read),);
+
+        println!("  Chunk size:          {} MiB", self.chunk_bytes / MIB,);
+
+        println!("  Read operations:     {}", self.read_operations,);
+
+        println!(
+            "  Setup time:          {:.3} s",
+            self.setup_elapsed.as_secs_f64(),
+        );
+
+        println!(
+            "  Read time:           {:.3} s",
+            self.io_elapsed.as_secs_f64(),
+        );
+
+        println!(
+            "  Total time:          {:.3} s",
+            self.total_elapsed.as_secs_f64(),
+        );
+
+        println!(
+            "  Read throughput:     {:.2} MB/s ({:.2} MiB/s)",
+            decimal_megabytes_per_second(self.bytes_read, self.io_elapsed,),
+            binary_mebibytes_per_second(self.bytes_read, self.io_elapsed,),
+        );
+    }
+}
 
 #[derive(Debug)]
 pub struct IocpReadAheadReport {
@@ -198,6 +241,85 @@ impl IoOperation {
 enum Submission {
     Immediate,
     Pending,
+}
+
+pub fn run_blocking_read(source: &Path, chunk_mib: usize) -> io::Result<BlockingReadReport> {
+    let total_started = Instant::now();
+
+    let (chunk_bytes, _) = validate_config(chunk_mib, 1)?;
+
+    let mut source_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+        .open(source)?;
+
+    let source_metadata = source_file.metadata()?;
+
+    if !source_metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("source is not a regular file: {}", source.display(),),
+        ));
+    }
+
+    let source_len = source_metadata.len();
+
+    if source_len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source file is empty",
+        ));
+    }
+
+    let mut buffer = vec![0_u8; chunk_bytes];
+
+    let setup_elapsed = total_started.elapsed();
+
+    let io_started = Instant::now();
+
+    let mut bytes_read = 0_u64;
+    let mut read_operations = 0_u64;
+
+    loop {
+        match source_file.read(&mut buffer) {
+            Ok(0) => break,
+
+            Ok(count) => {
+                bytes_read = bytes_read
+                    .checked_add(count as u64)
+                    .ok_or_else(|| io::Error::other("read byte count overflowed"))?;
+
+                read_operations = read_operations
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("read operation count overflowed"))?;
+            }
+
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+
+            Err(error) => return Err(error),
+        }
+    }
+
+    let io_elapsed = io_started.elapsed();
+    let total_elapsed = total_started.elapsed();
+
+    if bytes_read != source_len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "source length changed during blocking read: expected {source_len} bytes, read {bytes_read} bytes",
+            ),
+        ));
+    }
+
+    Ok(BlockingReadReport {
+        bytes_read,
+        chunk_bytes,
+        read_operations,
+        setup_elapsed,
+        io_elapsed,
+        total_elapsed,
+    })
 }
 
 pub fn run_read_ahead(
@@ -964,8 +1086,8 @@ fn validate_overlapped_layout() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CHUNK_MIB, DEFAULT_OPERATION_COUNT, OffsetOverlapped, run, run_read_ahead,
-        validate_overlapped_layout,
+        DEFAULT_CHUNK_MIB, DEFAULT_OPERATION_COUNT, OffsetOverlapped, run, run_blocking_read,
+        run_read_ahead, validate_overlapped_layout,
     };
     use std::env;
     use std::fs;
@@ -1028,6 +1150,41 @@ mod tests {
         assert_eq!(report.read_submissions, 4,);
 
         assert!(report.immediate_read_submissions <= report.read_submissions,);
+    }
+
+    #[test]
+    fn reads_file_through_blocking_sequential_path() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let source = env::temp_dir().join(format!(
+            "networkcopy-blocking-read-{}-{unique}.bin",
+            process::id()
+        ));
+
+        let mut contents = vec![0_u8; 3 * 1024 * 1024 + 137];
+
+        for (index, byte) in contents.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+
+        fs::write(&source, &contents).unwrap();
+
+        let result = run_blocking_read(&source, 1);
+
+        let cleanup = fs::remove_file(&source);
+
+        let report = result.unwrap();
+
+        cleanup.unwrap();
+
+        assert_eq!(report.bytes_read, contents.len() as u64,);
+
+        assert_eq!(report.chunk_bytes, 1024 * 1024,);
+
+        assert!(report.read_operations >= 4,);
     }
 
     #[test]

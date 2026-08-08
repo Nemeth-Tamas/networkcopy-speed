@@ -78,6 +78,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "bench-pipeline" => run_bench_pipeline(&mut arguments),
         "probe-iocp" => run_iocp_probe(&mut arguments),
         "probe-overlapped-read" => run_overlapped_read_probe(&mut arguments),
+        "bench-blocking-read" => run_blocking_read_bench(&mut arguments),
         "bench-iocp-read-ahead" => run_iocp_read_ahead_bench(&mut arguments),
         "bench-iocp-copy" => run_iocp_copy_bench(&mut arguments),
         "bench-scan" => run_manifest_scan_bench(&mut arguments),
@@ -2717,6 +2718,71 @@ fn run_overlapped_read_probe(
     Ok(())
 }
 
+fn run_blocking_read_bench(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let source = PathBuf::from(
+        required_argument(
+            arguments,
+            "source path",
+        )?,
+    );
+
+    let chunk_mib =
+        match arguments.next() {
+            Some(value) => {
+                parse_buffer_mib(&value)?
+            }
+
+            None => {
+                iocp_copy::DEFAULT_CHUNK_MIB
+            }
+        };
+
+    if let Some(extra) = arguments.next() {
+        return Err(
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unexpected extra argument: {}",
+                    extra.to_string_lossy(),
+                ),
+            )
+            .into(),
+        );
+    }
+
+    pipeline_bench::validate_config(
+        chunk_mib,
+        1,
+    )?;
+
+    println!(
+        "NetworkCopy Speed Edition blocking sequential source-read benchmark",
+    );
+
+    println!(
+        "  Source:      {}",
+        source.display(),
+    );
+
+    println!(
+        "  Chunk:       {chunk_mib} MiB",
+    );
+
+    println!();
+
+    let report =
+        iocp_copy::run_blocking_read(
+            &source,
+            chunk_mib,
+        )?;
+
+    report.print();
+
+    Ok(())
+}
+
 fn run_iocp_read_ahead_bench(
     arguments: &mut impl Iterator<Item = OsString>,
 ) -> Result<(), Box<dyn Error>> {
@@ -3747,6 +3813,10 @@ fn print_usage(program: &OsStr) {
     println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
     println!("  {program} probe-iocp");
     println!("  {program} probe-overlapped-read <source> [read-mib]");
+    println!(
+        "  {program} bench-blocking-read <source> \
+         [chunk-mib]"
+    );
     println!(
         "  {program} bench-iocp-read-ahead <source> \
          [chunk-mib] [operations]"
