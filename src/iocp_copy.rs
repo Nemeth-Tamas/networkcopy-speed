@@ -26,6 +26,58 @@ pub const DEFAULT_CHUNK_MIB: usize = 8;
 pub const DEFAULT_OPERATION_COUNT: usize = 8;
 
 #[derive(Debug)]
+pub struct IocpReadAheadReport {
+    pub bytes_read: u64,
+    pub chunk_bytes: usize,
+    pub operation_count: usize,
+    pub pool_bytes: usize,
+    pub read_submissions: u64,
+    pub immediate_read_submissions: u64,
+    pub setup_elapsed: Duration,
+    pub io_elapsed: Duration,
+    pub total_elapsed: Duration,
+}
+
+impl IocpReadAheadReport {
+    pub fn print(&self) {
+        println!("Native IOCP source read-ahead complete");
+
+        println!("  Bytes read:          {}", format_bytes(self.bytes_read),);
+
+        println!("  Chunk size:          {} MiB", self.chunk_bytes / MIB,);
+
+        println!("  Operations:          {}", self.operation_count,);
+
+        println!("  Buffer pool:         {} MiB", self.pool_bytes / MIB,);
+
+        println!("  Read submissions:    {}", self.read_submissions,);
+
+        println!("  Immediate reads:     {}", self.immediate_read_submissions,);
+
+        println!(
+            "  Setup time:          {:.3} s",
+            self.setup_elapsed.as_secs_f64(),
+        );
+
+        println!(
+            "  Read time:           {:.3} s",
+            self.io_elapsed.as_secs_f64(),
+        );
+
+        println!(
+            "  Total time:          {:.3} s",
+            self.total_elapsed.as_secs_f64(),
+        );
+
+        println!(
+            "  Read throughput:     {:.2} MB/s ({:.2} MiB/s)",
+            decimal_megabytes_per_second(self.bytes_read, self.io_elapsed,),
+            binary_mebibytes_per_second(self.bytes_read, self.io_elapsed,),
+        );
+    }
+}
+
+#[derive(Debug)]
 pub struct IocpCopyReport {
     pub bytes_copied: u64,
     pub chunk_bytes: usize,
@@ -146,6 +198,254 @@ impl IoOperation {
 enum Submission {
     Immediate,
     Pending,
+}
+
+pub fn run_read_ahead(
+    source: &Path,
+    chunk_mib: usize,
+    operation_count: usize,
+) -> io::Result<IocpReadAheadReport> {
+    let total_started = Instant::now();
+
+    let (chunk_bytes, pool_bytes) = validate_config(chunk_mib, operation_count)?;
+
+    validate_overlapped_layout()?;
+
+    let source_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OVERLAPPED | FILE_FLAG_SEQUENTIAL_SCAN)
+        .open(source)?;
+
+    let source_metadata = source_file.metadata()?;
+
+    if !source_metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("source is not a regular file: {}", source.display(),),
+        ));
+    }
+
+    let source_len = source_metadata.len();
+
+    if source_len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source file is empty",
+        ));
+    }
+
+    let source_handle = source_file.as_raw_handle() as HANDLE;
+
+    let completion_port = CompletionPort::new()?;
+
+    completion_port.associate(source_handle, SOURCE_COMPLETION_KEY)?;
+
+    let mut operations: Vec<Box<IoOperation>> = (0..operation_count)
+        .map(|_| Box::new(IoOperation::new(chunk_bytes)))
+        .collect();
+
+    let operation_addresses: HashSet<usize> = operations
+        .iter_mut()
+        .map(|operation| operation.overlapped_pointer() as usize)
+        .collect();
+
+    let setup_elapsed = total_started.elapsed();
+
+    let io_started = Instant::now();
+
+    let mut next_offset = 0_u64;
+    let mut outstanding = 0_usize;
+    let mut bytes_read = 0_u64;
+
+    let mut read_submissions = 0_u64;
+    let mut immediate_read_submissions = 0_u64;
+
+    let mut first_error: Option<io::Error> = None;
+    let mut cancellation_requested = false;
+
+    for operation in &mut operations {
+        if next_offset >= source_len {
+            break;
+        }
+
+        let requested_bytes = request_size(source_len, next_offset, chunk_bytes)?;
+
+        match submit_read(source_handle, operation, next_offset, requested_bytes) {
+            Ok(submission) => {
+                outstanding += 1;
+
+                read_submissions += 1;
+
+                if submission == Submission::Immediate {
+                    immediate_read_submissions += 1;
+                }
+
+                next_offset += u64::from(requested_bytes);
+            }
+
+            Err(error) => {
+                record_read_ahead_failure(
+                    &mut first_error,
+                    &mut cancellation_requested,
+                    source_handle,
+                    error,
+                );
+
+                break;
+            }
+        }
+    }
+
+    while outstanding > 0 {
+        let packet = match completion_port.wait_io() {
+            Ok(packet) => packet,
+
+            Err(error) => {
+                cancel_source(source_handle);
+
+                mem::forget(operations);
+
+                return Err(error);
+            }
+        };
+
+        outstanding -= 1;
+
+        if first_error.is_some() {
+            continue;
+        }
+
+        if let Some(error_code) = packet.error_code {
+            record_read_ahead_failure(
+                &mut first_error,
+                &mut cancellation_requested,
+                source_handle,
+                io::Error::from_raw_os_error(error_code),
+            );
+
+            continue;
+        }
+
+        let operation_address = packet.overlapped as usize;
+
+        if !operation_addresses.contains(&operation_address) {
+            record_read_ahead_failure(
+                &mut first_error,
+                &mut cancellation_requested,
+                source_handle,
+                io::Error::other("IOCP returned an unknown OVERLAPPED pointer"),
+            );
+
+            continue;
+        }
+
+        // SAFETY:
+        // Every accepted pointer belongs to one of the
+        // still-live boxed IoOperation allocations.
+        // Windows has completed this operation, so it
+        // may now be inspected and reused.
+        let operation = unsafe { &mut *(packet.overlapped.cast::<IoOperation>()) };
+
+        if packet.completion_key != SOURCE_COMPLETION_KEY {
+            record_read_ahead_failure(
+                &mut first_error,
+                &mut cancellation_requested,
+                source_handle,
+                io::Error::other("read operation completed with the wrong key"),
+            );
+
+            continue;
+        }
+
+        if operation.stage != OperationStage::Reading {
+            record_read_ahead_failure(
+                &mut first_error,
+                &mut cancellation_requested,
+                source_handle,
+                io::Error::other("non-read operation produced a source read-ahead completion"),
+            );
+
+            continue;
+        }
+
+        if packet.bytes_transferred != operation.requested_bytes {
+            record_read_ahead_failure(
+                &mut first_error,
+                &mut cancellation_requested,
+                source_handle,
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "read at offset {} requested {} bytes but completed with {}",
+                        operation.file_offset, operation.requested_bytes, packet.bytes_transferred,
+                    ),
+                ),
+            );
+
+            continue;
+        }
+
+        bytes_read = bytes_read
+            .checked_add(u64::from(packet.bytes_transferred))
+            .ok_or_else(|| io::Error::other("read byte count overflowed"))?;
+
+        operation.stage = OperationStage::Idle;
+
+        if next_offset < source_len {
+            let requested_bytes = request_size(source_len, next_offset, chunk_bytes)?;
+
+            match submit_read(source_handle, operation, next_offset, requested_bytes) {
+                Ok(submission) => {
+                    outstanding += 1;
+
+                    read_submissions += 1;
+
+                    if submission == Submission::Immediate {
+                        immediate_read_submissions += 1;
+                    }
+
+                    next_offset += u64::from(requested_bytes);
+                }
+
+                Err(error) => {
+                    record_read_ahead_failure(
+                        &mut first_error,
+                        &mut cancellation_requested,
+                        source_handle,
+                        error,
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
+    let io_elapsed = io_started.elapsed();
+    let total_elapsed = total_started.elapsed();
+
+    if bytes_read != source_len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "source length changed during read-ahead: expected {source_len} bytes, read {bytes_read} bytes",
+            ),
+        ));
+    }
+
+    Ok(IocpReadAheadReport {
+        bytes_read,
+        chunk_bytes,
+        operation_count,
+        pool_bytes,
+        read_submissions,
+        immediate_read_submissions,
+        setup_elapsed,
+        io_elapsed,
+        total_elapsed,
+    })
 }
 
 pub fn run(
@@ -584,6 +884,33 @@ fn request_size(file_len: u64, offset: u64, chunk_bytes: usize) -> io::Result<u3
     })
 }
 
+fn record_read_ahead_failure(
+    first_error: &mut Option<io::Error>,
+    cancellation_requested: &mut bool,
+    source_handle: HANDLE,
+    error: io::Error,
+) {
+    if first_error.is_none() {
+        *first_error = Some(error);
+    }
+
+    if !*cancellation_requested {
+        cancel_source(source_handle);
+
+        *cancellation_requested = true;
+    }
+}
+
+fn cancel_source(source_handle: HANDLE) {
+    // SAFETY:
+    // The handle remains valid while the source
+    // file is alive. A null OVERLAPPED cancels
+    // every outstanding operation for the file.
+    unsafe {
+        let _ = CancelIoEx(source_handle, ptr::null());
+    }
+}
+
 fn record_failure(
     first_error: &mut Option<io::Error>,
     cancellation_requested: &mut bool,
@@ -602,11 +929,13 @@ fn record_failure(
 }
 
 fn cancel_all(source_handle: HANDLE, destination_handle: HANDLE) {
+    cancel_source(source_handle);
+
     // SAFETY:
-    // Both handles remain valid here. A null OVERLAPPED pointer requests
-    // cancellation of every operation issued against the handle.
+    // The destination handle remains valid here.
+    // A null OVERLAPPED cancels every outstanding
+    // operation issued against the handle.
     unsafe {
-        let _ = CancelIoEx(source_handle, ptr::null());
         let _ = CancelIoEx(destination_handle, ptr::null());
     }
 }
@@ -635,7 +964,7 @@ fn validate_overlapped_layout() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_CHUNK_MIB, DEFAULT_OPERATION_COUNT, OffsetOverlapped, run,
+        DEFAULT_CHUNK_MIB, DEFAULT_OPERATION_COUNT, OffsetOverlapped, run, run_read_ahead,
         validate_overlapped_layout,
     };
     use std::env;
@@ -658,6 +987,47 @@ mod tests {
             mem::align_of::<OffsetOverlapped>(),
             mem::align_of::<OVERLAPPED>()
         );
+    }
+
+    #[test]
+    fn reads_file_through_bounded_iocp_ahead() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        let source = env::temp_dir().join(format!(
+            "networkcopy-iocp-read-ahead-{}-{unique}.bin",
+            process::id()
+        ));
+
+        let mut contents = vec![0_u8; 3 * 1024 * 1024 + 137];
+
+        for (index, byte) in contents.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+
+        fs::write(&source, &contents).unwrap();
+
+        let result = run_read_ahead(&source, 1, 4);
+
+        let cleanup = fs::remove_file(&source);
+
+        let report = result.unwrap();
+
+        cleanup.unwrap();
+
+        assert_eq!(report.bytes_read, contents.len() as u64,);
+
+        assert_eq!(report.chunk_bytes, 1024 * 1024,);
+
+        assert_eq!(report.operation_count, 4,);
+
+        assert_eq!(report.pool_bytes, 4 * 1024 * 1024,);
+
+        assert_eq!(report.read_submissions, 4,);
+
+        assert!(report.immediate_read_submissions <= report.read_submissions,);
     }
 
     #[test]

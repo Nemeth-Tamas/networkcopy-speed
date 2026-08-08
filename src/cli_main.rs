@@ -78,6 +78,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "bench-pipeline" => run_bench_pipeline(&mut arguments),
         "probe-iocp" => run_iocp_probe(&mut arguments),
         "probe-overlapped-read" => run_overlapped_read_probe(&mut arguments),
+        "bench-iocp-read-ahead" => run_iocp_read_ahead_bench(&mut arguments),
         "bench-iocp-copy" => run_iocp_copy_bench(&mut arguments),
         "bench-scan" => run_manifest_scan_bench(&mut arguments),
         "probe-control" => run_control_plane_probe(&mut arguments),
@@ -2716,6 +2717,88 @@ fn run_overlapped_read_probe(
     Ok(())
 }
 
+fn run_iocp_read_ahead_bench(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let source =
+        PathBuf::from(
+            required_argument(
+                arguments,
+                "source path",
+            )?,
+        );
+
+    let chunk_mib =
+        match arguments.next() {
+            Some(value) => {
+                parse_buffer_mib(&value)?
+            }
+
+            None => {
+                iocp_copy::DEFAULT_CHUNK_MIB
+            }
+        };
+
+    let operation_count =
+        match arguments.next() {
+            Some(value) => {
+                parse_buffer_count(&value)?
+            }
+
+            None => {
+                iocp_copy::DEFAULT_OPERATION_COUNT
+            }
+        };
+
+    if let Some(extra) = arguments.next() {
+        return Err(
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unexpected extra argument: {}",
+                    extra.to_string_lossy(),
+                ),
+            )
+            .into(),
+        );
+    }
+
+    pipeline_bench::validate_config(
+        chunk_mib,
+        operation_count,
+    )?;
+
+    println!(
+        "NetworkCopy Speed Edition native IOCP source read-ahead benchmark",
+    );
+
+    println!(
+        "  Source:      {}",
+        source.display(),
+    );
+
+    println!(
+        "  Chunk:       {chunk_mib} MiB",
+    );
+
+    println!(
+        "  Operations:  {operation_count}",
+    );
+
+    println!();
+
+    let report =
+        iocp_copy::run_read_ahead(
+            &source,
+            chunk_mib,
+            operation_count,
+        )?;
+
+    report.print();
+
+    Ok(())
+}
+
 fn run_iocp_copy_bench(
     arguments: &mut impl Iterator<Item = OsString>,
 ) -> Result<(), Box<dyn Error>> {
@@ -3664,6 +3747,10 @@ fn print_usage(program: &OsStr) {
     println!("  {program} bench-pipeline <source> <destination> [chunk-mib] [buffers]");
     println!("  {program} probe-iocp");
     println!("  {program} probe-overlapped-read <source> [read-mib]");
+    println!(
+        "  {program} bench-iocp-read-ahead <source> \
+         [chunk-mib] [operations]"
+    );
     println!("  {program} bench-iocp-copy <source> <destination> [chunk-mib] [operations]");
     println!("  {program} bench-scan <root-directory> [workers]");
     println!("  {program} probe-control <root-directory> [workers] [data-streams]");
