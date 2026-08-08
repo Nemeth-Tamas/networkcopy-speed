@@ -1,0 +1,22 @@
+Windows Firewall rule ready
+  Rule:          NetworkCopy Speed Edition TCP 7337
+  Program:       C:\Users\User\Desktop\randomprojectsillneverfinish\networkcopyspeededition\target\release\networkcopy-speed.exe
+  Inbound TCP:   7337
+  Remote scope:  local subnet
+
+NetworkCopy Speed Edition raw TCP receiver
+  Listening:    127.0.0.1:7337
+  Receive buffer: 1024 KiB requested
+  Destination:  discarded memory buffers
+  Mode:         one calibration, then exit
+
+Raw TCP calibration receive complete
+  TCP data streams:     2
+  Payload transferred:  17,179,869,184 bytes
+  Buffer per lane:      1,048,576 bytes
+  Process buffers:      2,097,152 bytes
+  Socket send buffer:   65,536 bytes
+  Socket receive buffer:1,048,576 bytes
+  Elapsed:              1.018806 s
+  Raw throughput:       16862.75 MB/s (16081.57 MiB/s)
+  Link throughput:      134.902 Gbit/s
