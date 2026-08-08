@@ -1011,6 +1011,16 @@ struct TransferPlan {
     lanes: Vec<Vec<TransferTask>>,
 }
 
+fn serialize_transfer_plan(transfer_plan: &mut TransferPlan) {
+    let Some((first_lane, remaining_lanes)) = transfer_plan.lanes.split_first_mut() else {
+        return;
+    };
+
+    for lane in remaining_lanes {
+        first_lane.append(lane);
+    }
+}
+
 #[derive(Debug)]
 struct FreshGenerationPlan {
     catalog: CatalogPlan,
@@ -1618,6 +1628,10 @@ fn send_internal(
         &receiver_ready.unchanged_file_ids,
     )?;
 
+    if receiver_ready.destination_seek_penalty {
+        serialize_transfer_plan(&mut transfer_plan);
+    }
+
     if let Some(generation_plan) = fresh_generation_plan.as_mut() {
         rebuild_fresh_generation_execution(generation_plan, &transfer_plan)?;
     }
@@ -2152,6 +2166,10 @@ fn run_server_with_mode_and_layout(
         &receiver_ready.unchanged_file_ids,
     )?;
 
+    if receiver_ready.destination_seek_penalty {
+        serialize_transfer_plan(&mut transfer_plan);
+    }
+
     if let Some(generation_plan) = fresh_generation_plan.as_mut() {
         rebuild_fresh_generation_execution(generation_plan, &transfer_plan)?;
     }
@@ -2172,11 +2190,20 @@ fn run_server_with_mode_and_layout(
 
     let destination_root = Arc::new(destination_root);
 
-    let tiny_materializer = tiny_file_pool::TinyFileMaterializer::start_profiled(
-        Arc::clone(&destination_root),
-        progress.clone(),
-        Arc::clone(&profiler),
-    )?;
+    let tiny_materializer = if receiver_ready.destination_seek_penalty {
+        tiny_file_pool::TinyFileMaterializer::start_profiled_with_worker_count(
+            Arc::clone(&destination_root),
+            progress.clone(),
+            Arc::clone(&profiler),
+            1,
+        )?
+    } else {
+        tiny_file_pool::TinyFileMaterializer::start_profiled(
+            Arc::clone(&destination_root),
+            progress.clone(),
+            Arc::clone(&profiler),
+        )?
+    };
 
     let tiny_materialization_workers = tiny_materializer.worker_count();
 
@@ -8319,11 +8346,12 @@ mod tests {
         read_desktop_layout_metadata, read_generation_commit, read_lane_end, read_receiver_ready,
         read_source_directory_name, read_transfer_ack, read_u8, read_verification_request,
         rebuild_fresh_generation_execution, receive_once, run, run_update, run_update_with_fault,
-        run_with_fault, run_with_fault_and_layout, send, send_configured, temporary_path,
-        tiny_pack_record_wire_bytes, validate_generation_commit, validate_resume_offer,
-        validate_source_metadata, verify_content_digest, write_desktop_layout_metadata,
-        write_generation_commit, write_lane_end, write_receiver_ready, write_source_directory_name,
-        write_transfer_ack, write_u8, write_u64, write_verification_response,
+        run_with_fault, run_with_fault_and_layout, send, send_configured, serialize_transfer_plan,
+        temporary_path, tiny_pack_record_wire_bytes, validate_generation_commit,
+        validate_resume_offer, validate_source_metadata, verify_content_digest,
+        write_desktop_layout_metadata, write_generation_commit, write_lane_end,
+        write_receiver_ready, write_source_directory_name, write_transfer_ack, write_u8, write_u64,
+        write_verification_response,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::desktop_layout::{
@@ -9611,6 +9639,33 @@ mod tests {
         let actual = read_receiver_ready(&mut reader).unwrap();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn seek_penalty_plan_uses_only_first_lane() {
+        let manifest = vec![
+            entry("large.bin", 4_000, FileClass::Large),
+            entry("medium.bin", 500, FileClass::Medium),
+        ];
+
+        let mut plan = build_transfer_plan(&manifest, 4).unwrap();
+
+        let task_count_before = plan.lanes.iter().map(Vec::len).sum::<usize>();
+
+        let tasks_before = plan.lanes.iter().flatten().cloned().collect::<Vec<_>>();
+
+        serialize_transfer_plan(&mut plan);
+
+        assert_eq!(plan.lanes.len(), 4,);
+
+        assert_eq!(
+            plan.lanes.iter().map(Vec::len).sum::<usize>(),
+            task_count_before,
+        );
+
+        assert_eq!(plan.lanes[0], tasks_before,);
+
+        assert!(plan.lanes[1..].iter().all(Vec::is_empty),);
     }
 
     #[test]

@@ -131,6 +131,20 @@ impl TinyFileMaterializer {
         )
     }
 
+    pub(crate) fn start_profiled_with_worker_count(
+        destination_root: Arc<PathBuf>,
+        progress: Option<ProgressCounter>,
+        profiler: Arc<TransferProfiler>,
+        worker_count: usize,
+    ) -> io::Result<Self> {
+        Self::start_with_worker_count_and_profiler(
+            destination_root,
+            progress,
+            worker_count,
+            Some(profiler),
+        )
+    }
+
     #[cfg(test)]
     fn start_with_worker_count(
         destination_root: Arc<PathBuf>,
@@ -581,6 +595,31 @@ mod tests {
         materializer.finish().unwrap();
 
         assert!(!root.join("invalid.bin").exists());
+
+        fs::remove_dir_all(root.as_path()).unwrap();
+    }
+
+    #[test]
+    fn explicit_profiled_worker_count_is_honored() {
+        let root = temporary_root();
+
+        fs::create_dir_all(&root).unwrap();
+
+        let root = Arc::new(root);
+
+        let profiler = Arc::new(crate::transfer_profile::TransferProfiler::default());
+
+        let materializer = TinyFileMaterializer::start_profiled_with_worker_count(
+            Arc::clone(&root),
+            None,
+            profiler,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(materializer.worker_count(), 1,);
+
+        materializer.finish().unwrap();
 
         fs::remove_dir_all(root.as_path()).unwrap();
     }
