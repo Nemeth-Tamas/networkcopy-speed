@@ -4,6 +4,7 @@ use crate::desktop_layout::DesktopLayoutSnapshot;
 use crate::destination_layout::DestinationLayout;
 use crate::multistream_copy::{self, DestinationMode, MultistreamCopyReport, ReceiveReport};
 use crate::network_calibration::{self, NetworkCalibrationMatrixReport, NetworkCalibrationReport};
+use crate::storage_media::{self, StorageMediaKind};
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
@@ -115,12 +116,24 @@ pub fn send(
 
     println!();
 
-    let data_stream_count = calibration.recommended.data_stream_count;
+    let source_storage = source_storage_kind(source_root);
+
+    let data_stream_count = select_transfer_stream_count(
+        calibration.recommended.data_stream_count,
+        None,
+        source_storage,
+    );
 
     let compression_lane_megabytes_per_second =
         compression_lane_megabytes_per_second(&calibration, data_stream_count)?;
 
     let calibrated_report = calibration.best;
+
+    if source_storage == StorageMediaKind::SeekPenalty {
+        println!("Storage policy: source has seek penalty; using one sequential transfer stream",);
+
+        println!();
+    }
 
     let transfer_progress = ConsoleProgress::start("Scanning source", 0)?;
 
@@ -205,8 +218,13 @@ pub(crate) fn send_with_progress_and_stream_count(
 
     progress.check_cancelled()?;
 
-    let data_stream_count =
-        forced_data_stream_count.unwrap_or(calibration.recommended.data_stream_count);
+    let source_storage = source_storage_kind(source_root);
+
+    let data_stream_count = select_transfer_stream_count(
+        calibration.recommended.data_stream_count,
+        forced_data_stream_count,
+        source_storage,
+    );
 
     let compression_lane_megabytes_per_second =
         compression_lane_megabytes_per_second(&calibration, data_stream_count)?;
@@ -218,6 +236,10 @@ pub(crate) fn send_with_progress_and_stream_count(
             progress.set_label(format!(
                 "Scanning source - resuming with {data_stream_count} streams"
             ));
+        }
+
+        None if source_storage == StorageMediaKind::SeekPenalty => {
+            progress.set_label("Scanning source - HDD sequential mode");
         }
 
         None => {
@@ -396,6 +418,32 @@ pub(crate) fn receive_once_with_progress_mode_and_layout(
     })
 }
 
+fn source_storage_kind(source_root: &Path) -> StorageMediaKind {
+    let resolved = source_root
+        .canonicalize()
+        .unwrap_or_else(|_| source_root.to_path_buf());
+
+    storage_media::inspect_path(&resolved)
+        .map(|report| report.kind)
+        .unwrap_or(StorageMediaKind::Unknown)
+}
+
+fn select_transfer_stream_count(
+    network_recommended: usize,
+    forced_data_stream_count: Option<usize>,
+    source_storage: StorageMediaKind,
+) -> usize {
+    if let Some(forced) = forced_data_stream_count {
+        return forced;
+    }
+
+    if source_storage == StorageMediaKind::SeekPenalty {
+        return 1;
+    }
+
+    network_recommended
+}
+
 fn compression_lane_megabytes_per_second(
     calibration: &NetworkCalibrationMatrixReport,
     data_stream_count: usize,
@@ -441,7 +489,10 @@ fn percentage_of(value: f64, ceiling: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{compression_lane_megabytes_per_second, receive_once, send};
+    use super::{
+        compression_lane_megabytes_per_second, receive_once, select_transfer_stream_count, send,
+    };
+    use crate::storage_media::StorageMediaKind;
     use std::env;
     use std::fs;
     use std::net::TcpListener;
@@ -525,5 +576,34 @@ mod tests {
         );
 
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn seek_penalty_source_uses_one_stream() {
+        assert_eq!(
+            select_transfer_stream_count(8, None, StorageMediaKind::SeekPenalty,),
+            1,
+        );
+    }
+
+    #[test]
+    fn fast_storage_keeps_network_recommendation() {
+        assert_eq!(
+            select_transfer_stream_count(4, None, StorageMediaKind::NoSeekPenalty,),
+            4,
+        );
+
+        assert_eq!(
+            select_transfer_stream_count(8, None, StorageMediaKind::Unknown,),
+            8,
+        );
+    }
+
+    #[test]
+    fn forced_stream_count_wins_over_storage_policy() {
+        assert_eq!(
+            select_transfer_stream_count(8, Some(4), StorageMediaKind::SeekPenalty,),
+            4,
+        );
     }
 }
