@@ -2,6 +2,7 @@ use crate::console_progress::ProgressCounter;
 use crate::control_plane;
 use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_second, format_bytes};
 use crate::multistream_copy;
+use crate::transfer_path::{TransferPathKind, classify_tcp_stream};
 use socket2::SockRef;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -23,11 +24,14 @@ pub const DEFAULT_TOTAL_MIB: u64 = 1024;
 pub const DEFAULT_DATA_STREAMS: usize = 1;
 pub const BUFFER_BYTES: usize = 1024 * 1024;
 const MATRIX_STREAM_COUNTS: [usize; 4] = [1, 2, 4, 8];
-const MATRIX_RECOMMENDATION_FRACTION: f64 = 0.90;
+
+const CONSERVATIVE_RECOMMENDATION_FRACTION: f64 = 0.90;
+const PHYSICAL_ETHERNET_RECOMMENDATION_FRACTION: f64 = 0.95;
 
 #[derive(Clone, Copy, Debug)]
 pub struct NetworkCalibrationReport {
     pub data_stream_count: usize,
+    pub transfer_path_kind: TransferPathKind,
     pub total_bytes: u64,
     pub buffer_bytes_per_lane: u64,
     pub process_buffer_bytes: u64,
@@ -41,6 +45,8 @@ impl NetworkCalibrationReport {
         println!("Raw TCP calibration {direction} complete");
 
         println!("  TCP data streams:     {}", self.data_stream_count);
+
+        println!("  Transfer path:        {}", self.transfer_path_kind,);
 
         println!(
             "  Payload transferred:  {} bytes",
@@ -89,6 +95,10 @@ impl NetworkCalibrationReport {
 pub struct NetworkCalibrationMatrixReport {
     pub reports: Vec<NetworkCalibrationReport>,
 
+    pub transfer_path_kind: TransferPathKind,
+
+    pub recommendation_fraction: f64,
+
     pub best: NetworkCalibrationReport,
 
     pub recommended: NetworkCalibrationReport,
@@ -100,9 +110,11 @@ impl NetworkCalibrationMatrixReport {
     pub fn print(&self, direction: &str) {
         println!("Raw TCP path matrix {direction} complete");
 
+        println!("  Transfer path:        {}", self.transfer_path_kind,);
+
         println!(
-            "  Selection policy: smallest lane count reaching {:.0}% of the best result",
-            MATRIX_RECOMMENDATION_FRACTION * 100.0
+            "  Selection policy:     smallest lane count reaching {:.0}% of the best result",
+            self.recommendation_fraction * 100.0,
         );
 
         println!();
@@ -286,11 +298,13 @@ fn send_one(
         data_streams.push(stream);
     }
 
-    let socket_buffers = socket_buffer_sizes(
-        data_streams
-            .first()
-            .ok_or_else(|| io::Error::other("network calibration established no data streams"))?,
-    )?;
+    let first_data_stream = data_streams
+        .first()
+        .ok_or_else(|| io::Error::other("network calibration established no data streams"))?;
+
+    let socket_buffers = socket_buffer_sizes(first_data_stream)?;
+
+    let transfer_path_kind = classify_tcp_stream(first_data_stream).kind;
 
     read_receiver_ready(&mut control_stream)?;
 
@@ -333,7 +347,13 @@ fn send_one(
         ));
     }
 
-    build_report(data_stream_count, total_bytes, socket_buffers, elapsed)
+    build_report(
+        data_stream_count,
+        transfer_path_kind,
+        total_bytes,
+        socket_buffers,
+        elapsed,
+    )
 }
 
 pub fn send_matrix(
@@ -560,11 +580,13 @@ fn receive_one(
         })?);
     }
 
-    let socket_buffers = socket_buffer_sizes(
-        ordered_streams
-            .first()
-            .ok_or_else(|| io::Error::other("network calibration accepted no data streams"))?,
-    )?;
+    let first_data_stream = ordered_streams
+        .first()
+        .ok_or_else(|| io::Error::other("network calibration accepted no data streams"))?;
+
+    let socket_buffers = socket_buffer_sizes(first_data_stream)?;
+
+    let transfer_path_kind = classify_tcp_stream(first_data_stream).kind;
 
     let started = Instant::now();
 
@@ -600,10 +622,40 @@ fn receive_one(
 
     build_report(
         config.data_stream_count,
+        transfer_path_kind,
         received_bytes,
         socket_buffers,
         elapsed,
     )
+}
+
+fn matrix_transfer_path_kind(reports: &[NetworkCalibrationReport]) -> TransferPathKind {
+    let Some(first) = reports.first() else {
+        return TransferPathKind::Unknown;
+    };
+
+    let kind = first.transfer_path_kind;
+
+    if reports
+        .iter()
+        .all(|report| report.transfer_path_kind == kind)
+    {
+        kind
+    } else {
+        TransferPathKind::Unknown
+    }
+}
+
+fn recommendation_fraction_for_path(path_kind: TransferPathKind) -> f64 {
+    match path_kind {
+        TransferPathKind::PhysicalEthernet => PHYSICAL_ETHERNET_RECOMMENDATION_FRACTION,
+
+        TransferPathKind::Wifi
+        | TransferPathKind::Tunnel
+        | TransferPathKind::Virtual
+        | TransferPathKind::Loopback
+        | TransferPathKind::Unknown => CONSERVATIVE_RECOMMENDATION_FRACTION,
+    }
 }
 
 fn build_matrix_report(
@@ -622,9 +674,13 @@ fn build_matrix_report(
             )
         })?;
 
+    let transfer_path_kind = matrix_transfer_path_kind(&reports);
+
+    let recommendation_fraction = recommendation_fraction_for_path(transfer_path_kind);
+
     let best_megabytes_per_second = report_megabytes_per_second(&best);
 
-    let recommendation_threshold = best_megabytes_per_second * MATRIX_RECOMMENDATION_FRACTION;
+    let recommendation_threshold = best_megabytes_per_second * recommendation_fraction;
 
     let recommended = reports
         .iter()
@@ -643,6 +699,8 @@ fn build_matrix_report(
 
     Ok(NetworkCalibrationMatrixReport {
         reports,
+        transfer_path_kind,
+        recommendation_fraction,
         best,
         recommended,
         recommended_percent_of_best,
@@ -1047,6 +1105,7 @@ fn socket_buffer_sizes(stream: &TcpStream) -> io::Result<SocketBufferSizes> {
 
 fn build_report(
     data_stream_count: usize,
+    transfer_path_kind: TransferPathKind,
     total_bytes: u64,
     socket_buffers: SocketBufferSizes,
     elapsed: Duration,
@@ -1078,6 +1137,7 @@ fn build_report(
 
     Ok(NetworkCalibrationReport {
         data_stream_count,
+        transfer_path_kind,
         total_bytes,
         buffer_bytes_per_lane,
         process_buffer_bytes,
@@ -1100,10 +1160,12 @@ fn gigabits_per_second(bytes: u64, elapsed: Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MATRIX_STREAM_COUNTS, NetworkCalibrationReport, build_matrix_report, lane_bytes,
-        receive_matrix, receive_once, receive_once_with_socket_receive_buffer, send, send_matrix,
+        CONSERVATIVE_RECOMMENDATION_FRACTION, MATRIX_STREAM_COUNTS, NetworkCalibrationReport,
+        PHYSICAL_ETHERNET_RECOMMENDATION_FRACTION, build_matrix_report, lane_bytes, receive_matrix,
+        receive_once, receive_once_with_socket_receive_buffer, send, send_matrix,
         socket_buffer_bytes_from_kib,
     };
+    use crate::transfer_path::TransferPathKind;
     use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
@@ -1134,6 +1196,7 @@ mod tests {
     fn matrix_recommends_smallest_near_best_count() {
         let report = |data_stream_count, milliseconds| NetworkCalibrationReport {
             data_stream_count,
+            transfer_path_kind: TransferPathKind::Unknown,
             total_bytes: 100 * 1024 * 1024,
 
             buffer_bytes_per_lane: 1024 * 1024,
@@ -1159,7 +1222,59 @@ mod tests {
 
         assert_eq!(matrix.recommended.data_stream_count, 4);
 
+        assert_eq!(matrix.transfer_path_kind, TransferPathKind::Unknown,);
+
+        assert_eq!(
+            matrix.recommendation_fraction,
+            CONSERVATIVE_RECOMMENDATION_FRACTION,
+        );
+
         assert!(matrix.recommended_percent_of_best >= 90.0);
+    }
+
+    #[test]
+    fn physical_ethernet_requires_95_percent_of_peak() {
+        let report = |data_stream_count, milliseconds| NetworkCalibrationReport {
+            data_stream_count,
+            transfer_path_kind: TransferPathKind::PhysicalEthernet,
+
+            total_bytes: 100 * 1024 * 1024,
+
+            buffer_bytes_per_lane: 1024 * 1024,
+
+            process_buffer_bytes: data_stream_count as u64 * 1024 * 1024,
+
+            socket_send_buffer_bytes: 64 * 1024,
+
+            socket_receive_buffer_bytes: 64 * 1024,
+
+            elapsed: Duration::from_millis(milliseconds),
+        };
+
+        let matrix = build_matrix_report(vec![
+            report(1, 200),
+            report(2, 140),
+            report(4, 106),
+            report(8, 100),
+        ])
+        .unwrap();
+
+        assert_eq!(matrix.best.data_stream_count, 8);
+
+        // Four streams reach about 94.3% of peak:
+        // enough for the conservative 90% policy,
+        // but not enough for physical Ethernet's 95%.
+        assert_eq!(matrix.recommended.data_stream_count, 8,);
+
+        assert_eq!(
+            matrix.transfer_path_kind,
+            TransferPathKind::PhysicalEthernet,
+        );
+
+        assert_eq!(
+            matrix.recommendation_fraction,
+            PHYSICAL_ETHERNET_RECOMMENDATION_FRACTION,
+        );
     }
 
     #[test]
@@ -1183,6 +1298,13 @@ mod tests {
         assert_eq!(sender_report.data_stream_count, 2);
 
         assert_eq!(receiver_report.data_stream_count, 2);
+
+        assert_eq!(sender_report.transfer_path_kind, TransferPathKind::Loopback,);
+
+        assert_eq!(
+            receiver_report.transfer_path_kind,
+            TransferPathKind::Loopback,
+        );
 
         assert!(sender_report.socket_send_buffer_bytes > 0);
 
