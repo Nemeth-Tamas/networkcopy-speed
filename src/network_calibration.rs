@@ -2,6 +2,7 @@ use crate::console_progress::ProgressCounter;
 use crate::control_plane;
 use crate::copy_bench::{binary_mebibytes_per_second, decimal_megabytes_per_second, format_bytes};
 use crate::multistream_copy;
+use socket2::SockRef;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -29,6 +30,8 @@ pub struct NetworkCalibrationReport {
     pub total_bytes: u64,
     pub buffer_bytes_per_lane: u64,
     pub process_buffer_bytes: u64,
+    pub socket_send_buffer_bytes: u64,
+    pub socket_receive_buffer_bytes: u64,
     pub elapsed: Duration,
 }
 
@@ -51,6 +54,16 @@ impl NetworkCalibrationReport {
         println!(
             "  Process buffers:      {} bytes",
             format_bytes(self.process_buffer_bytes,)
+        );
+
+        println!(
+            "  Socket send buffer:   {} bytes",
+            format_bytes(self.socket_send_buffer_bytes,)
+        );
+
+        println!(
+            "  Socket receive buffer:{} bytes",
+            format_bytes(self.socket_receive_buffer_bytes,)
         );
 
         println!(
@@ -137,6 +150,12 @@ struct CalibrationConfig {
     total_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SocketBufferSizes {
+    send_bytes: usize,
+    receive_bytes: usize,
+}
+
 pub(crate) fn validate_matrix_stream_count(data_stream_count: usize) -> io::Result<()> {
     if MATRIX_STREAM_COUNTS.contains(&data_stream_count) {
         return Ok(());
@@ -219,6 +238,12 @@ fn send_one(
         data_streams.push(stream);
     }
 
+    let socket_buffers = socket_buffer_sizes(
+        data_streams
+            .first()
+            .ok_or_else(|| io::Error::other("network calibration established no data streams"))?,
+    )?;
+
     read_receiver_ready(&mut control_stream)?;
 
     let payload = Arc::new(build_payload_buffer());
@@ -260,7 +285,7 @@ fn send_one(
         ));
     }
 
-    build_report(data_stream_count, total_bytes, elapsed)
+    build_report(data_stream_count, total_bytes, socket_buffers, elapsed)
 }
 
 pub fn send_matrix(
@@ -467,6 +492,12 @@ fn receive_one(
         })?);
     }
 
+    let socket_buffers = socket_buffer_sizes(
+        ordered_streams
+            .first()
+            .ok_or_else(|| io::Error::other("network calibration accepted no data streams"))?,
+    )?;
+
     let started = Instant::now();
 
     write_receiver_ready(&mut control_stream)?;
@@ -499,7 +530,12 @@ fn receive_one(
 
     write_ack(&mut control_stream, received_bytes)?;
 
-    build_report(config.data_stream_count, received_bytes, elapsed)
+    build_report(
+        config.data_stream_count,
+        received_bytes,
+        socket_buffers,
+        elapsed,
+    )
 }
 
 fn build_matrix_report(
@@ -932,9 +968,19 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
     Ok(u64::from_be_bytes(value))
 }
 
+fn socket_buffer_sizes(stream: &TcpStream) -> io::Result<SocketBufferSizes> {
+    let socket = SockRef::from(stream);
+
+    Ok(SocketBufferSizes {
+        send_bytes: socket.send_buffer_size()?,
+        receive_bytes: socket.recv_buffer_size()?,
+    })
+}
+
 fn build_report(
     data_stream_count: usize,
     total_bytes: u64,
+    socket_buffers: SocketBufferSizes,
     elapsed: Duration,
 ) -> io::Result<NetworkCalibrationReport> {
     let stream_count = u64::try_from(data_stream_count).map_err(|_| {
@@ -956,11 +1002,19 @@ fn build_report(
                 )
             })?;
 
+    let socket_send_buffer_bytes = u64::try_from(socket_buffers.send_bytes)
+        .map_err(|_| io::Error::other("socket send buffer size cannot be represented"))?;
+
+    let socket_receive_buffer_bytes = u64::try_from(socket_buffers.receive_bytes)
+        .map_err(|_| io::Error::other("socket receive buffer size cannot be represented"))?;
+
     Ok(NetworkCalibrationReport {
         data_stream_count,
         total_bytes,
         buffer_bytes_per_lane,
         process_buffer_bytes,
+        socket_send_buffer_bytes,
+        socket_receive_buffer_bytes,
         elapsed,
     })
 }
@@ -1004,6 +1058,10 @@ mod tests {
 
             process_buffer_bytes: data_stream_count as u64 * 1024 * 1024,
 
+            socket_send_buffer_bytes: 64 * 1024,
+
+            socket_receive_buffer_bytes: 64 * 1024,
+
             elapsed: Duration::from_millis(milliseconds),
         };
 
@@ -1043,6 +1101,14 @@ mod tests {
         assert_eq!(sender_report.data_stream_count, 2);
 
         assert_eq!(receiver_report.data_stream_count, 2);
+
+        assert!(sender_report.socket_send_buffer_bytes > 0);
+
+        assert!(sender_report.socket_receive_buffer_bytes > 0);
+
+        assert!(receiver_report.socket_send_buffer_bytes > 0);
+
+        assert!(receiver_report.socket_receive_buffer_bytes > 0);
     }
 
     #[test]
