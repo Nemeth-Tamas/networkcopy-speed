@@ -7,8 +7,11 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 const MIB: usize = 1024 * 1024;
-const SAMPLE_BYTES: usize = MIB;
-const MAX_SAMPLE_COUNT: usize = 3;
+
+const SAMPLE_BYTES: usize = MIB / 2;
+
+const MAX_SAMPLE_COUNT: usize = 7;
+
 const MIN_SAVINGS_PERCENT: u64 = 10;
 
 pub const DEFAULT_LEVEL: i32 = 1;
@@ -259,13 +262,25 @@ fn sample_ranges(file_bytes: u64) -> Vec<(u64, usize)> {
     }
 
     let sample_bytes = SAMPLE_BYTES as u64;
+
     let last_offset = file_bytes - sample_bytes;
 
-    vec![
-        (0, SAMPLE_BYTES),
-        (last_offset / 2, SAMPLE_BYTES),
-        (last_offset, SAMPLE_BYTES),
-    ]
+    let interval_count =
+        u64::try_from(MAX_SAMPLE_COUNT - 1).expect("compression sample count fits in u64");
+
+    let whole_interval = last_offset / interval_count;
+
+    let interval_remainder = last_offset % interval_count;
+
+    (0..MAX_SAMPLE_COUNT)
+        .map(|index| {
+            let index = u64::try_from(index).expect("compression sample index fits in u64");
+
+            let offset = whole_interval * index + interval_remainder * index / interval_count;
+
+            (offset, SAMPLE_BYTES)
+        })
+        .collect()
 }
 
 fn choose_decision(sampled_bytes: u64, compressed_bytes: u64) -> CompressionDecision {
@@ -376,19 +391,56 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn large_files_sample_start_middle_and_end() {
+    fn large_files_sample_across_the_full_range() {
         let file_bytes = 100 * 1024 * 1024_u64;
 
         let ranges = sample_ranges(file_bytes);
 
-        assert_eq!(ranges.len(), MAX_SAMPLE_COUNT);
-        assert_eq!(ranges[0], (0, SAMPLE_BYTES));
+        assert_eq!(ranges.len(), MAX_SAMPLE_COUNT,);
 
-        assert_eq!(ranges[2], (file_bytes - SAMPLE_BYTES as u64, SAMPLE_BYTES,));
+        assert_eq!(ranges[0], (0, SAMPLE_BYTES),);
 
-        assert!(ranges[0].0 < ranges[1].0);
+        assert_eq!(
+            ranges[MAX_SAMPLE_COUNT - 1],
+            (file_bytes - SAMPLE_BYTES as u64, SAMPLE_BYTES,),
+        );
 
-        assert!(ranges[1].0 < ranges[2].0);
+        for pair in ranges.windows(2) {
+            assert!(pair[0].0 < pair[1].0,);
+        }
+    }
+
+    #[test]
+    fn spread_samples_avoid_periodic_phase_aliasing() {
+        let mib = 1024 * 1024_u64;
+
+        let file_bytes = 4 * 1024 * 1024 * 1024_u64;
+
+        let ranges = sample_ranges(file_bytes);
+
+        let period = 32 * mib;
+
+        let mut random_regions = 0;
+        let mut zero_regions = 0;
+        let mut pattern_regions = 0;
+
+        for (offset, _) in ranges {
+            let phase = offset % period;
+
+            if phase < 8 * mib || phase >= 24 * mib {
+                random_regions += 1;
+            } else if phase < 16 * mib {
+                zero_regions += 1;
+            } else {
+                pattern_regions += 1;
+            }
+        }
+
+        assert!(random_regions > 0);
+
+        assert!(zero_regions > 0);
+
+        assert!(pattern_regions > 0);
     }
 
     #[test]
