@@ -160,6 +160,7 @@ pub(crate) fn decide_file_range_profiled(
     offset: u64,
     length: u64,
     level: i32,
+    path_megabytes_per_second: Option<f64>,
     profiler: Option<&TransferProfiler>,
 ) -> io::Result<CompressionDecision> {
     validate_level(level)?;
@@ -203,7 +204,12 @@ pub(crate) fn decide_file_range_profiled(
         profiler.record_sender_compression(measurement_elapsed, sampled_bytes);
     }
 
-    Ok(choose_decision(sampled_bytes, compressed_bytes))
+    Ok(choose_decision_for_path(
+        sampled_bytes,
+        compressed_bytes,
+        measurement_elapsed,
+        path_megabytes_per_second,
+    ))
 }
 
 fn measure_ranges(
@@ -285,6 +291,36 @@ fn sample_ranges(file_bytes: u64) -> Vec<(u64, usize)> {
 
 fn choose_decision(sampled_bytes: u64, compressed_bytes: u64) -> CompressionDecision {
     if should_compress_sizes(sampled_bytes, compressed_bytes) {
+        CompressionDecision::Compress
+    } else {
+        CompressionDecision::SendRaw
+    }
+}
+
+fn choose_decision_for_path(
+    sampled_bytes: u64,
+    compressed_bytes: u64,
+    compression_elapsed: Duration,
+    path_megabytes_per_second: Option<f64>,
+) -> CompressionDecision {
+    let size_decision = choose_decision(sampled_bytes, compressed_bytes);
+
+    if size_decision == CompressionDecision::SendRaw {
+        return CompressionDecision::SendRaw;
+    }
+
+    let Some(path_megabytes_per_second) = path_megabytes_per_second else {
+        return CompressionDecision::Compress;
+    };
+
+    if !path_megabytes_per_second.is_finite() || path_megabytes_per_second <= 0.0 {
+        return CompressionDecision::Compress;
+    }
+
+    let break_even =
+        break_even_path_megabytes_per_second(sampled_bytes, compressed_bytes, compression_elapsed);
+
+    if path_megabytes_per_second <= break_even {
         CompressionDecision::Compress
     } else {
         CompressionDecision::SendRaw
@@ -386,7 +422,7 @@ fn read_exact_at(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Res
 mod tests {
     use super::{
         CompressionDecision, MAX_SAMPLE_COUNT, SAMPLE_BYTES, break_even_path_megabytes_per_second,
-        choose_decision, sample_ranges,
+        choose_decision, choose_decision_for_path, sample_ranges,
     };
     use std::time::Duration;
 
@@ -496,6 +532,40 @@ mod tests {
         assert_eq!(
             break_even_path_megabytes_per_second(0, 0, Duration::from_millis(100),),
             0.0,
+        );
+    }
+
+    #[test]
+    fn slow_path_keeps_worthwhile_compression() {
+        let decision =
+            choose_decision_for_path(1_000_000, 500_000, Duration::from_millis(100), Some(4.0));
+
+        // 10 MB/s compression throughput with
+        // 50% savings gives a 5 MB/s break-even.
+        assert_eq!(decision, CompressionDecision::Compress,);
+    }
+
+    #[test]
+    fn fast_path_skips_completion_time_loss() {
+        let decision =
+            choose_decision_for_path(1_000_000, 500_000, Duration::from_millis(100), Some(6.0));
+
+        assert_eq!(decision, CompressionDecision::SendRaw,);
+    }
+
+    #[test]
+    fn path_speed_never_overrides_bad_savings() {
+        let decision =
+            choose_decision_for_path(1_000_000, 950_000, Duration::from_millis(1), Some(0.1));
+
+        assert_eq!(decision, CompressionDecision::SendRaw,);
+    }
+
+    #[test]
+    fn missing_path_speed_preserves_legacy_policy() {
+        assert_eq!(
+            choose_decision_for_path(1_000_000, 500_000, Duration::from_millis(100), None,),
+            CompressionDecision::Compress,
         );
     }
 }

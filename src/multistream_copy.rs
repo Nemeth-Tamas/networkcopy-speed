@@ -6372,6 +6372,7 @@ fn send_whole_file(
         0,
         entry.file_size,
         compression_probe::DEFAULT_LEVEL,
+        None,
         Some(profiler),
     )?;
 
@@ -6434,6 +6435,7 @@ fn send_file_stripe(
         offset,
         length,
         compression_probe::DEFAULT_LEVEL,
+        None,
         Some(profiler),
     )?;
 
