@@ -319,7 +319,7 @@ fn storage_read_lane_range(
     let lane_count = u64::try_from(lane_count)
         .map_err(|_| io::Error::other("storage lane count cannot be represented"))?;
 
-    if file_bytes % lane_count != 0 {
+    if !file_bytes.is_multiple_of(lane_count) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "storage benchmark file does not divide evenly across lanes",
