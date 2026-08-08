@@ -117,16 +117,21 @@ pub fn send(
 
     let data_stream_count = calibration.recommended.data_stream_count;
 
+    let compression_lane_megabytes_per_second =
+        compression_lane_megabytes_per_second(&calibration, data_stream_count)?;
+
     let calibrated_report = calibration.best;
 
     let transfer_progress = ConsoleProgress::start("Scanning source", 0)?;
 
-    let transfer = multistream_copy::send_with_progress(
+    let transfer = multistream_copy::send_with_progress_calibrated(
         receiver_address,
         source_root,
         worker_count,
         data_stream_count,
         transfer_progress.counter(),
+        None,
+        compression_lane_megabytes_per_second,
     )?;
 
     transfer_progress.finish()?;
@@ -203,18 +208,8 @@ pub(crate) fn send_with_progress_and_stream_count(
     let data_stream_count =
         forced_data_stream_count.unwrap_or(calibration.recommended.data_stream_count);
 
-    if !calibration
-        .reports
-        .iter()
-        .any(|report| report.data_stream_count == data_stream_count)
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "requested transfer stream count {data_stream_count} was not included in the completed calibration matrix"
-            ),
-        ));
-    }
+    let compression_lane_megabytes_per_second =
+        compression_lane_megabytes_per_second(&calibration, data_stream_count)?;
 
     let calibrated_report = calibration.best;
 
@@ -234,13 +229,14 @@ pub(crate) fn send_with_progress_and_stream_count(
 
     progress.set_total(0);
 
-    let transfer = multistream_copy::send_with_progress_and_desktop_layout(
+    let transfer = multistream_copy::send_with_progress_calibrated(
         receiver_address,
         source_root,
         worker_count,
         data_stream_count,
         progress.clone(),
         desktop_layout,
+        compression_lane_megabytes_per_second,
     )?;
 
     progress.check_cancelled()?;
@@ -400,6 +396,37 @@ pub(crate) fn receive_once_with_progress_mode_and_layout(
     })
 }
 
+fn compression_lane_megabytes_per_second(
+    calibration: &NetworkCalibrationMatrixReport,
+    data_stream_count: usize,
+) -> io::Result<f64> {
+    let report = calibration
+        .reports
+        .iter()
+        .find(|report| report.data_stream_count == data_stream_count)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "requested transfer stream count {data_stream_count} was not included in the completed calibration matrix",
+                ),
+            )
+        })?;
+
+    let aggregate = report_megabytes_per_second(report);
+
+    let lane = aggregate / data_stream_count as f64;
+
+    if !lane.is_finite() || lane <= 0.0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "selected calibration produced an invalid per-lane throughput",
+        ));
+    }
+
+    Ok(lane)
+}
+
 fn report_megabytes_per_second(report: &NetworkCalibrationReport) -> f64 {
     decimal_megabytes_per_second(report.total_bytes, report.elapsed)
 }
@@ -414,7 +441,7 @@ fn percentage_of(value: f64, ceiling: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{receive_once, send};
+    use super::{compression_lane_megabytes_per_second, receive_once, send};
     use std::env;
     use std::fs;
     use std::net::TcpListener;
@@ -469,6 +496,19 @@ mod tests {
             sender_report.transfer.data_stream_count,
             receiver_report.transfer.data_stream_count
         );
+
+        let expected_compression_lane = compression_lane_megabytes_per_second(
+            &sender_report.calibration,
+            sender_report.transfer.data_stream_count,
+        )
+        .unwrap();
+
+        let actual_compression_lane = sender_report
+            .transfer
+            .compression_lane_megabytes_per_second
+            .unwrap();
+
+        assert!((actual_compression_lane - expected_compression_lane).abs() < 0.000_001,);
 
         assert!(sender_report.calibrated_megabytes_per_second > 0.0);
 

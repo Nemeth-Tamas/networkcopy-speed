@@ -111,6 +111,9 @@ pub struct MultistreamCopyReport {
     pub worker_count: usize,
     pub data_stream_count: usize,
     pub transfer_path: TransferPath,
+
+    pub compression_lane_megabytes_per_second: Option<f64>,
+
     pub tiny_materialization_workers: usize,
     pub files_copied: u64,
     pub bytes_copied: u64,
@@ -161,6 +164,13 @@ impl MultistreamCopyReport {
         println!("  TCP data streams:     {}", self.data_stream_count);
 
         print_transfer_path(&self.transfer_path);
+
+        if let Some(megabytes_per_second) = self.compression_lane_megabytes_per_second {
+            println!(
+                "  Compression budget:   {:.2} MB/s per lane",
+                megabytes_per_second,
+            );
+        }
 
         println!(
             "  Tiny write workers:   {}",
@@ -1049,9 +1059,14 @@ struct AcceptedSession {
 
 struct SendInternalOptions {
     server: Option<thread::JoinHandle<io::Result<ReceiveReport>>>,
+
     progress: Option<ProgressCounter>,
+
     catalog_limits: CatalogLimits,
+
     desktop_layout: Option<DesktopLayoutSnapshot>,
+
+    compression_lane_megabytes_per_second: Option<f64>,
 }
 
 pub fn run(
@@ -1133,6 +1148,7 @@ fn run_update_with_fault(
             progress: None,
             catalog_limits,
             desktop_layout: None,
+            compression_lane_megabytes_per_second: None,
         },
     )
 }
@@ -1208,6 +1224,8 @@ fn run_with_fault_and_layout(
             catalog_limits,
 
             desktop_layout: None,
+
+            compression_lane_megabytes_per_second: None,
         },
     )
 }
@@ -1225,34 +1243,28 @@ pub fn send(
         data_stream_count,
         None,
         None,
-    )
-}
-
-pub(crate) fn send_with_progress(
-    receiver_address: SocketAddr,
-    source_root: &Path,
-    worker_count: usize,
-    data_stream_count: usize,
-    progress: ProgressCounter,
-) -> io::Result<MultistreamCopyReport> {
-    send_with_progress_and_desktop_layout(
-        receiver_address,
-        source_root,
-        worker_count,
-        data_stream_count,
-        progress,
         None,
     )
 }
 
-pub(crate) fn send_with_progress_and_desktop_layout(
+pub(crate) fn send_with_progress_calibrated(
     receiver_address: SocketAddr,
     source_root: &Path,
     worker_count: usize,
     data_stream_count: usize,
     progress: ProgressCounter,
     desktop_layout: Option<DesktopLayoutSnapshot>,
+    compression_lane_megabytes_per_second: f64,
 ) -> io::Result<MultistreamCopyReport> {
+    if !compression_lane_megabytes_per_second.is_finite()
+        || compression_lane_megabytes_per_second <= 0.0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "compression lane throughput must be finite and greater than zero",
+        ));
+    }
+
     send_configured(
         receiver_address,
         source_root,
@@ -1260,6 +1272,7 @@ pub(crate) fn send_with_progress_and_desktop_layout(
         data_stream_count,
         Some(progress),
         desktop_layout,
+        Some(compression_lane_megabytes_per_second),
     )
 }
 
@@ -1270,6 +1283,7 @@ fn send_configured(
     data_stream_count: usize,
     progress: Option<ProgressCounter>,
     desktop_layout: Option<DesktopLayoutSnapshot>,
+    compression_lane_megabytes_per_second: Option<f64>,
 ) -> io::Result<MultistreamCopyReport> {
     manifest_scan::validate_worker_count(worker_count)?;
 
@@ -1297,6 +1311,7 @@ fn send_configured(
             progress,
             catalog_limits: CatalogLimits::default(),
             desktop_layout,
+            compression_lane_megabytes_per_second,
         },
     )
 }
@@ -1362,6 +1377,7 @@ fn send_internal(
         progress,
         catalog_limits,
         desktop_layout,
+        compression_lane_megabytes_per_second,
     } = options;
 
     let total_started = Instant::now();
@@ -1619,6 +1635,7 @@ fn send_internal(
             manifest.as_slice(),
             generation_plan,
             progress.clone(),
+            compression_lane_megabytes_per_second,
             profiler.as_ref(),
         )?
     } else {
@@ -1630,6 +1647,7 @@ fn send_internal(
             progress.clone(),
             None,
             LaneEnd::Stream,
+            compression_lane_megabytes_per_second,
             profiler.as_ref(),
         )?
     };
@@ -1746,6 +1764,7 @@ fn send_internal(
         worker_count,
         data_stream_count,
         transfer_path,
+        compression_lane_megabytes_per_second,
         tiny_materialization_workers,
         files_copied: transfer_ack.files_copied,
         bytes_copied: transfer_ack.bytes_copied,
@@ -5484,6 +5503,7 @@ fn send_lane_group(
     progress: Option<ProgressCounter>,
     session_basis_file_ids: Option<&[usize]>,
     lane_end: LaneEnd,
+    compression_lane_megabytes_per_second: Option<f64>,
     profiler: &TransferProfiler,
 ) -> io::Result<LaneReport> {
     if data_streams.len() != lanes.len() {
@@ -5511,6 +5531,7 @@ fn send_lane_group(
                             lane_progress,
                             session_basis_file_ids,
                             lane_end,
+                            compression_lane_megabytes_per_second,
                             profiler,
                         )
                     })?,
@@ -5530,6 +5551,7 @@ fn send_fresh_generation_plan(
     manifest: &[ManifestEntry],
     plan: &FreshGenerationPlan,
     progress: Option<ProgressCounter>,
+    compression_lane_megabytes_per_second: Option<f64>,
     profiler: &TransferProfiler,
 ) -> io::Result<LaneReport> {
     let remaining_generation_count = plan
@@ -5569,6 +5591,7 @@ fn send_fresh_generation_plan(
             progress.clone(),
             Some(&generation.basis_file_ids),
             LaneEnd::Generation(generation.index),
+            compression_lane_megabytes_per_second,
             profiler,
         )?;
 
@@ -5595,6 +5618,7 @@ fn send_fresh_generation_plan(
         progress,
         None,
         LaneEnd::Stream,
+        compression_lane_megabytes_per_second,
         profiler,
     )?);
 
@@ -5849,6 +5873,7 @@ fn send_lane(
     progress: Option<ProgressCounter>,
     session_basis_file_ids: Option<&[usize]>,
     lane_end: LaneEnd,
+    compression_lane_megabytes_per_second: Option<f64>,
     profiler: &TransferProfiler,
 ) -> io::Result<LaneReport> {
     let reader_stream = stream.try_clone()?;
@@ -5922,6 +5947,7 @@ fn send_lane(
                         &mut buffer,
                         &mut encoder,
                         progress.as_ref(),
+                        compression_lane_megabytes_per_second,
                         profiler,
                     )?;
 
@@ -5986,6 +6012,7 @@ fn send_lane(
                     &mut buffer,
                     &mut encoder,
                     progress.as_ref(),
+                    compression_lane_megabytes_per_second,
                     profiler,
                 )?;
 
@@ -6348,6 +6375,7 @@ fn send_whole_file(
     buffer: &mut [u8],
     encoder: &mut PayloadEncoder,
     progress: Option<&ProgressCounter>,
+    compression_lane_megabytes_per_second: Option<f64>,
     profiler: &TransferProfiler,
 ) -> io::Result<bool> {
     write_u8(writer, MESSAGE_FILE)?;
@@ -6372,7 +6400,7 @@ fn send_whole_file(
         0,
         entry.file_size,
         compression_probe::DEFAULT_LEVEL,
-        None,
+        compression_lane_megabytes_per_second,
         Some(profiler),
     )?;
 
@@ -6399,6 +6427,7 @@ fn send_file_stripe(
     buffer: &mut [u8],
     encoder: &mut PayloadEncoder,
     progress: Option<&ProgressCounter>,
+    compression_lane_megabytes_per_second: Option<f64>,
     profiler: &TransferProfiler,
 ) -> io::Result<bool> {
     let StripeDescriptor {
@@ -6435,7 +6464,7 @@ fn send_file_stripe(
         offset,
         length,
         compression_probe::DEFAULT_LEVEL,
-        None,
+        compression_lane_megabytes_per_second,
         Some(profiler),
     )?;
 
@@ -8967,8 +8996,15 @@ mod tests {
 
         let expected_layout = desktop_layout_snapshot();
 
-        let send_result =
-            send_configured(address, &source, 2, 2, None, Some(expected_layout.clone()));
+        let send_result = send_configured(
+            address,
+            &source,
+            2,
+            2,
+            None,
+            Some(expected_layout.clone()),
+            None,
+        );
 
         let receive_result = receiver.join().unwrap();
 
