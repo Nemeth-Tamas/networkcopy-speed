@@ -5,8 +5,8 @@ use std::ptr;
 use std::slice;
 
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    FreeMibTable, GetIfTable2, GetUnicastIpAddressTable, MIB_IF_ROW2, MIB_IF_TABLE2,
-    MIB_UNICASTIPADDRESS_ROW, MIB_UNICASTIPADDRESS_TABLE,
+    FreeMibTable, GetIfTable2, GetUnicastIpAddressTable, MIB_IF_TABLE2, MIB_UNICASTIPADDRESS_ROW,
+    MIB_UNICASTIPADDRESS_TABLE,
 };
 use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
@@ -53,6 +53,28 @@ impl fmt::Display for TransferPathKind {
             Self::Unknown => "unknown",
         })
     }
+}
+
+pub fn format_link_speed(bits_per_second: u64) -> String {
+    const KILOBIT: f64 = 1_000.0;
+    const MEGABIT: f64 = 1_000_000.0;
+    const GIGABIT: f64 = 1_000_000_000.0;
+
+    let speed = bits_per_second as f64;
+
+    if speed >= GIGABIT {
+        return format!("{:.2} Gbit/s", speed / GIGABIT);
+    }
+
+    if speed >= MEGABIT {
+        return format!("{:.2} Mbit/s", speed / MEGABIT);
+    }
+
+    if speed >= KILOBIT {
+        return format!("{:.2} kbit/s", speed / KILOBIT);
+    }
+
+    format!("{bits_per_second} bit/s")
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

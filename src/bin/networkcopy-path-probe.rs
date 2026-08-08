@@ -4,7 +4,7 @@ use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use networkcopy_speed::transfer_path::{TransferPath, inspect_tcp_stream};
+use networkcopy_speed::transfer_path::{TransferPath, format_link_speed, inspect_tcp_stream};
 
 fn main() {
     if let Err(error) = run() {
@@ -72,28 +72,6 @@ fn print_optional_details(path: &TransferPath) {
     if let Some(speed) = path.receive_link_speed_bps {
         println!("  Receive link speed:   {}", format_link_speed(speed),);
     }
-}
-
-fn format_link_speed(bits_per_second: u64) -> String {
-    const KILOBIT: f64 = 1_000.0;
-    const MEGABIT: f64 = 1_000_000.0;
-    const GIGABIT: f64 = 1_000_000_000.0;
-
-    let speed = bits_per_second as f64;
-
-    if speed >= GIGABIT {
-        return format!("{:.2} Gbit/s", speed / GIGABIT);
-    }
-
-    if speed >= MEGABIT {
-        return format!("{:.2} Mbit/s", speed / MEGABIT);
-    }
-
-    if speed >= KILOBIT {
-        return format!("{:.2} kbit/s", speed / KILOBIT);
-    }
-
-    format!("{bits_per_second} bit/s")
 }
 
 #[cfg(test)]

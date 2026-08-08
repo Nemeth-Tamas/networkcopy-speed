@@ -686,8 +686,9 @@ Planned investigation order:
       socket reads, decompression, and destination writes;
 - [ ] extend source/destination disk-stage attribution through CDC and exact-reuse
       paths before using profiler results to tune those specialized paths;
-- [ ] classify the actual transfer interface instead of inferring transport from
-      Automatic LAN or Explicit IP mode;
+- [x] classify the actual connected TCP data path as physical Ethernet, Wi-Fi,
+      VPN/tunnel, virtual, loopback, or unknown instead of inferring transport
+      from Automatic LAN or Explicit IP mode;
 - [ ] benchmark Windows automatic TCP buffering against explicit 256 KiB,
       1 MiB, and 4 MiB send/receive buffers before changing production defaults;
 - [ ] retain the smallest stream count reaching 90% of peak on Wi-Fi and unknown
@@ -713,6 +714,16 @@ and operation counts. Because transfer lanes operate concurrently, summed stage
 time can legitimately exceed wall-clock transfer duration. The profiler is
 intended to identify where concurrent workers spend time rather than to present
 a serial percentage breakdown.
+
+Transfer-path classification now inspects the local interface actually selected
+by the connected TCP data stream. Reports retain the path class, local address,
+Windows interface index and alias, MTU, and advertised transmit/receive link
+speeds when available.
+
+Live Windows acceptance on 2026-08-08 connected the standalone path probe from
+`192.168.1.2` to `1.1.1.1:443`. Windows selected interface 7 (`Ethernet`) with a
+1500-byte MTU and 2.50 Gbit/s transmit and receive link speeds, and NetworkCopy
+correctly classified the route as physical Ethernet.
 
 Direct Link is always a physical Ethernet candidate. Automatic LAN and Explicit
 IP may use Ethernet, Wi-Fi, VPN, or virtual interfaces, so the v2.6 policy must

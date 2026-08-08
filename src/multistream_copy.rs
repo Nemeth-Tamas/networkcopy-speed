@@ -20,6 +20,7 @@ use crate::tcp_connect;
 use crate::tiny_file_pool;
 use crate::tiny_pack_codec::{self, TinyPackEncoding};
 use crate::transfer_memory;
+use crate::transfer_path::{TransferPath, classify_tcp_stream, format_link_speed};
 use crate::transfer_profile::{StageSample, TransferProfiler, TransferStageProfile};
 use crate::update_verification::{self, FILE_DIGEST_BYTES, FileDigest};
 use crate::windows_desktop_layout::{
@@ -109,6 +110,7 @@ pub(crate) enum DestinationMode {
 pub struct MultistreamCopyReport {
     pub worker_count: usize,
     pub data_stream_count: usize,
+    pub transfer_path: TransferPath,
     pub tiny_materialization_workers: usize,
     pub files_copied: u64,
     pub bytes_copied: u64,
@@ -157,6 +159,9 @@ impl MultistreamCopyReport {
         println!("Multistream TCP folder copy complete");
         println!("  Scanner workers:      {}", self.worker_count);
         println!("  TCP data streams:     {}", self.data_stream_count);
+
+        print_transfer_path(&self.transfer_path);
+
         println!(
             "  Tiny write workers:   {}",
             self.tiny_materialization_workers,
@@ -355,6 +360,7 @@ impl MultistreamCopyReport {
 pub struct ReceiveReport {
     pub session_id: u64,
     pub data_stream_count: usize,
+    pub transfer_path: TransferPath,
     pub desktop_layout: Option<DesktopLayoutSnapshot>,
     pub desktop_layout_restore: Option<DesktopLayoutRestoreReport>,
     pub tiny_materialization_workers: usize,
@@ -396,6 +402,8 @@ impl ReceiveReport {
         println!("  Session ID:           {:016X}", self.session_id);
 
         println!("  TCP data streams:     {}", self.data_stream_count);
+
+        print_transfer_path(&self.transfer_path);
 
         if let Some(desktop_layout) = &self.desktop_layout {
             println!(
@@ -591,6 +599,50 @@ impl ReceiveReport {
             decimal_megabytes_per_second(self.bytes_received, self.elapsed,),
             binary_mebibytes_per_second(self.bytes_received, self.elapsed,)
         );
+    }
+}
+
+fn print_transfer_path(path: &TransferPath) {
+    println!("  Transfer path:        {}", path.kind);
+
+    if let Some(alias) = &path.interface_alias {
+        println!("  Local interface:      {alias}");
+    }
+
+    if let Some(address) = path.local_address {
+        println!("  Local address:        {address}");
+    }
+
+    if let Some(interface_index) = path.interface_index {
+        println!("  Interface index:      {interface_index}");
+    }
+
+    if let Some(mtu) = path.mtu {
+        println!("  Interface MTU:        {mtu} bytes");
+    }
+
+    match (path.transmit_link_speed_bps, path.receive_link_speed_bps) {
+        (Some(transmit), Some(receive)) if transmit == receive => {
+            println!("  Link speed:           {}", format_link_speed(transmit),);
+        }
+
+        (Some(transmit), Some(receive)) => {
+            println!(
+                "  Link speed TX/RX:     {} / {}",
+                format_link_speed(transmit),
+                format_link_speed(receive),
+            );
+        }
+
+        (Some(transmit), None) => {
+            println!("  Transmit link speed:  {}", format_link_speed(transmit),);
+        }
+
+        (None, Some(receive)) => {
+            println!("  Receive link speed:   {}", format_link_speed(receive),);
+        }
+
+        (None, None) => {}
     }
 }
 
@@ -1389,6 +1441,11 @@ fn send_internal(
         data_streams.push(stream);
     }
 
+    let transfer_path = data_streams
+        .first()
+        .map(classify_tcp_stream)
+        .unwrap_or_default();
+
     let connection_elapsed = connection_started.elapsed();
     let manifest_started = Instant::now();
 
@@ -1688,6 +1745,7 @@ fn send_internal(
     Ok(MultistreamCopyReport {
         worker_count,
         data_stream_count,
+        transfer_path,
         tiny_materialization_workers,
         files_copied: transfer_ack.files_copied,
         bytes_copied: transfer_ack.bytes_copied,
@@ -1889,6 +1947,11 @@ fn run_server_with_mode_and_layout(
 ) -> io::Result<ReceiveReport> {
     let (mut control_stream, data_streams, accepted_session) =
         accept_session(listener, progress.as_ref())?;
+
+    let transfer_path = data_streams
+        .first()
+        .map(classify_tcp_stream)
+        .unwrap_or_default();
 
     let session_started = Instant::now();
 
@@ -2198,6 +2261,8 @@ fn run_server_with_mode_and_layout(
         session_id: accepted_session.session_id,
 
         data_stream_count,
+
+        transfer_path,
 
         desktop_layout: accepted_session.desktop_layout,
 
@@ -8201,6 +8266,7 @@ mod tests {
     use crate::manifest_scan::{self, DirectoryEntry, FileClass, ManifestEntry};
     use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
     use crate::session_cdc_catalog::CatalogLimits;
+    use crate::transfer_path::TransferPathKind;
     use std::collections::BTreeSet;
     use std::env;
     use std::fs::{self, File, OpenOptions};
@@ -8813,6 +8879,8 @@ mod tests {
         );
 
         assert_eq!(report.tiny_files_packed, 2);
+
+        assert_eq!(report.transfer_path.kind, TransferPathKind::Loopback,);
 
         let receiver_profile = report
             .receiver_stage_profile
@@ -9524,6 +9592,13 @@ mod tests {
         assert_eq!(sender_report.files_copied, 2);
 
         assert_eq!(receiver_report.files_received, 2);
+
+        assert_eq!(sender_report.transfer_path.kind, TransferPathKind::Loopback,);
+
+        assert_eq!(
+            receiver_report.transfer_path.kind,
+            TransferPathKind::Loopback,
+        );
 
         assert_eq!(sender_report.bytes_copied, receiver_report.bytes_received);
 
