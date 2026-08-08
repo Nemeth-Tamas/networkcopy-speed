@@ -46,6 +46,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         "probe-storage-media" => {
             run_storage_media_probe(&mut arguments)
         }
+        "bench-storage-read-lanes" => {
+            run_storage_read_lanes_bench(
+                &mut arguments,
+            )
+        }
         "bench-zstd-dictionary" => run_zstd_dictionary_bench(&mut arguments),
         "bench-tiny-file-writes" => {
             run_tiny_file_write_bench(&mut arguments)
@@ -2077,6 +2082,83 @@ fn run_storage_media_probe(
     Ok(())
 }
 
+fn run_storage_read_lanes_bench(
+    arguments:
+        &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let source =
+        PathBuf::from(
+            required_argument(
+                arguments,
+                "storage benchmark source file",
+            )?,
+        );
+
+    let lane_count =
+        parse_usize_count(
+            &required_argument(
+                arguments,
+                "storage read lane count",
+            )?,
+            "storage read lane count",
+        )?;
+
+    if let Some(extra) =
+        arguments.next()
+    {
+        return Err(
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unexpected extra argument: {}",
+                    extra.to_string_lossy(),
+                ),
+            )
+            .into(),
+        );
+    }
+
+    let media =
+        storage_media::inspect_path(
+            &source,
+        )?;
+
+    println!(
+        "NetworkCopy Speed Edition uncached storage read benchmark",
+    );
+
+    println!(
+        "  Source:        {}",
+        source.display(),
+    );
+
+    println!(
+        "  Storage class: {}",
+        media.kind,
+    );
+
+    println!(
+        "  Read lanes:    {lane_count}",
+    );
+
+    println!(
+        "  Cache mode:    unbuffered",
+    );
+
+    println!();
+
+    let report =
+        storage_media::
+            benchmark_uncached_read_lanes(
+                &source,
+                lane_count,
+            )?;
+
+    report.print();
+
+    Ok(())
+}
+
 fn run_compression_probe(
     arguments: &mut impl Iterator<Item = OsString>,
 ) -> Result<(), Box<dyn Error>> {
@@ -3859,6 +3941,9 @@ fn print_usage(program: &OsStr) {
     println!("  {program} probe-compression <source> [zstd-level]");
     println!(
         "  {program} probe-storage-media <path>"
+    );
+    println!(
+        "  {program} bench-storage-read-lanes <source-file> <1|2|4|8>"
     );
     println!(
         "  {program} bench-zstd-dictionary <root-directory> \
