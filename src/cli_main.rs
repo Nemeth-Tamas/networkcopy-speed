@@ -43,6 +43,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         "bench-copy" => run_bench_copy(&mut arguments),
         "bench-hash" => run_hash_bench(&mut arguments),
         "probe-compression" => run_compression_probe(&mut arguments),
+        "probe-storage-media" => {
+            run_storage_media_probe(&mut arguments)
+        }
         "bench-zstd-dictionary" => run_zstd_dictionary_bench(&mut arguments),
         "bench-tiny-file-writes" => {
             run_tiny_file_write_bench(&mut arguments)
@@ -1997,6 +2000,83 @@ fn run_direct_interfaces(
     Ok(())
 }
 
+fn run_storage_media_probe(
+    arguments: &mut impl Iterator<Item = OsString>,
+) -> Result<(), Box<dyn Error>> {
+    let path = PathBuf::from(
+        required_argument(
+            arguments,
+            "storage path",
+        )?,
+    );
+
+    if let Some(extra) = arguments.next() {
+        return Err(
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unexpected extra argument: {}",
+                    extra.to_string_lossy(),
+                ),
+            )
+            .into(),
+        );
+    }
+
+    let report =
+        storage_media::inspect_path(&path)?;
+
+    println!(
+        "NetworkCopy Speed Edition storage media probe",
+    );
+
+    println!(
+        "  Path:          {}",
+        path.display(),
+    );
+
+    match report.drive_letter {
+        Some(letter) => {
+            println!(
+                "  Drive:         {letter}:",
+            );
+        }
+
+        None => {
+            println!(
+                "  Drive:         unavailable",
+            );
+        }
+    }
+
+    match report.incurs_seek_penalty() {
+        Some(true) => {
+            println!(
+                "  Seek penalty:  yes",
+            );
+        }
+
+        Some(false) => {
+            println!(
+                "  Seek penalty:  no",
+            );
+        }
+
+        None => {
+            println!(
+                "  Seek penalty:  unknown",
+            );
+        }
+    }
+
+    println!(
+        "  Storage class: {}",
+        report.kind,
+    );
+
+    Ok(())
+}
+
 fn run_compression_probe(
     arguments: &mut impl Iterator<Item = OsString>,
 ) -> Result<(), Box<dyn Error>> {
@@ -3777,6 +3857,9 @@ fn print_usage(program: &OsStr) {
     println!("  {program} bench-copy <source> <destination> [buffer-mib]");
     println!("  {program} bench-hash <source> [buffer-mib]");
     println!("  {program} probe-compression <source> [zstd-level]");
+    println!(
+        "  {program} probe-storage-media <path>"
+    );
     println!(
         "  {program} bench-zstd-dictionary <root-directory> \
          [dictionary-kib] [zstd-level] [workers]"

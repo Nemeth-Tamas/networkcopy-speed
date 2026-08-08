@@ -54,6 +54,7 @@ pub mod release_update;
 mod resume_state;
 pub mod session_cdc_catalog;
 mod session_cdc_lane;
+mod storage_media;
 mod striped_file;
 mod tcp_connect;
 mod tiny_file_materialize;
