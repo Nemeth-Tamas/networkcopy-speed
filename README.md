@@ -8,1543 +8,531 @@
 
 # NetworkCopy Speed Edition
 
-A high-performance Windows folder-transfer tool written in Rust.
+**Fast, restartable Windows folder transfers written in Rust.**
 
-NetworkCopy can transfer folders across a normal local network or directly
-between two computers connected by an Ethernet cable. Direct Link Mode does
-not require a router, switch, DHCP server, or manually assigned IP addresses.
+NetworkCopy Speed Edition transfers folders between Windows machines over a normal LAN, an explicit IP connection, or a direct Ethernet cable.
 
-The repository contains:
+It is designed around a simple goal:
 
-- high-performance command-line and desktop transfer front ends;
-- automatic LAN, Direct Link, and manual IP transfer modes;
-- a dedicated self-elevating endpoint agent;
-- a WGPU management application for remote browsing and orchestration;
-- one shared networking and transfer engine used by every front end.
+> Move data as fast as the machines and network reasonably allow, without giving up integrity, restartability, or ease of use.
 
-## Current status
+The same Rust transfer engine powers the standalone GUI, command-line interface, endpoint Agent, and Manager-controlled transfers.
 
-Current stable release:
+[Download releases](https://github.com/Nemeth-Tamas/networkcopy-speed/releases)
+
+## What NetworkCopy can do
+
+NetworkCopy supports:
+
+* ordinary LAN transfers;
+* direct computer-to-computer Ethernet transfers without a router, switch, DHCP server, or Internet connection;
+* explicit IPv4 and IPv6 endpoints;
+* automatic path calibration and multistream transfers;
+* adaptive raw or Zstandard payload encoding;
+* tiny-file packing;
+* striped large-file transfers;
+* interruption recovery and stripe resume;
+* verified update transfers that skip unchanged files;
+* exact receiver-side content reuse;
+* content-defined deduplication for related files;
+* fresh-transfer cross-file CDC using files committed earlier in the same session;
+* Windows Desktop icon-layout migration;
+* persistent Manager-side transfer queues;
+* remote dual-pane browsing through endpoint Agents;
+* automatic update preparation with size and SHA-256 verification;
+* optional Authenticode signing for release builds.
+
+NetworkCopy is currently **Windows-only**.
+
+## Which executable should I use?
+
+Release builds contain five executable variants.
+
+| Executable                                         | Purpose                                                       |
+| -------------------------------------------------- | ------------------------------------------------------------- |
+| `NetworkCopy-Speed-vX.Y.Z-Manager-Windows-x64.exe` | Queue, browse and orchestrate transfers between remote Agents |
+| `NetworkCopy-Speed-vX.Y.Z-Agent-Windows-x64.exe`   | Endpoint Agent for Manager-controlled transfers               |
+| `NetworkCopy-Speed-vX.Y.Z-GUI-HU-Windows-x64.exe`  | Standalone GUI, Hungarian selected initially                  |
+| `NetworkCopy-Speed-vX.Y.Z-GUI-EN-Windows-x64.exe`  | Standalone GUI, English selected initially                    |
+| `NetworkCopy-Speed-vX.Y.Z-CLI-Windows-x64.exe`     | CLI, diagnostics and benchmark tools                          |
+
+Both GUI builds contain both Hungarian and English. The executable variant only controls the initial language.
+
+For two machines and an occasional transfer, use the standalone GUI.
+
+For unattended transfers, multiple queued folders, or remote browsing, run the Agent on each endpoint and use the Manager.
+
+## Transfer modes
+
+### Automatic LAN
+
+NetworkCopy discovers available endpoint Agents and selects addresses using Windows interface information, local-subnet affinity, and cross-Agent shared-LAN affinity.
+
+This is intended to avoid choosing an APIPA address, virtual adapter, VPN interface, or other technically reachable but undesirable route when a normal LAN address is available.
+
+### Direct Link
+
+Two Windows computers can be connected directly with an Ethernet cable.
+
+No router, switch, DHCP server, Internet connection, or manually assigned static address is required.
+
+Direct Link prefers scoped IPv6 link-local communication and can fall back to IPv4 APIPA when necessary. Interfaces carrying a normal default route are rejected from the dedicated Direct Link path.
+
+Discovery, calibration and transfer traffic are bound to the selected interface.
+
+### Explicit IP
+
+A receiver may also be selected directly by IPv4 or IPv6 address when automatic discovery is not appropriate.
+
+This is useful for unusual network layouts, controlled testing, or manually selected routes.
+
+## Manager and Agent
+
+The Manager is an orchestration layer. It does **not** relay file payloads.
 
 ```text
-2.5.0
+          commands / status
+        ┌───────────────────┐
+        │                   │
+     Manager           Sender Agent
+                           │
+                           │ file payload
+                           ▼
+                      Receiver Agent
 ```
 
-Current development version:
+Once a transfer is accepted, the sender communicates directly with the receiver.
+
+Closing the Manager does not terminate an already-running transfer.
+
+The Manager supports a persistent sequential queue, remote source and destination browsing, Automatic LAN, Direct Link and Explicit IP routes, retry and resume, cancellation, persistent history, restart reattachment, and automatic start-next behavior.
+
+Endpoint Agents remain deliberately simple one-job-at-a-time executors. The Manager owns queue ordering and orchestration.
+
+## v2.6 — measured performance work
+
+v2.6 is primarily a transfer-engine optimization release.
+
+The work was measurement-driven rather than based on simply adding more threads.
+
+Major changes include path-aware transfer behavior, storage-media awareness, completion-time-aware compression decisions, reduced fresh-transfer CDC planning overhead, bounded CDC catalog state, elimination of duplicate execution-plan storage, session CDC basis-index caching, single-flight basis-index construction, and SSD/NVMe-only background CDC prebuilding.
+
+Seek-penalty source storage is treated conservatively. Automatic calibrated transfers can serialize source access rather than multiplying random reads, and background CDC basis-index prebuilding is disabled when Windows reports a seek penalty or when the storage class cannot be determined.
+
+The transfer wire protocol is currently:
 
 ```text
-2.6.0-dev
+15
 ```
 
-v2.5 adds Windows Desktop layout migration, empty-directory preservation,
-improved Manager history selection, stronger multi-adapter Automatic LAN
-address ranking, and optional release signing support.
+Older peers reach an explicit protocol-version check rather than silently interpreting incompatible data.
 
-Desktop migration can preserve ordinary Desktop file and folder positions,
-icon size, Auto Arrange state, monitor geometry, work areas, and DPI. The
-feature is available in both the standalone GUI and managed transfers, with
-remote Desktop recognition performed by the sender Agent. Layout metadata is
-optional and bounded, and restore failures do not turn an otherwise successful
-file transfer into a failed transfer.
+## v2.6 performance receipts
 
-Automatic LAN discovery now combines exact Agent process identity,
-Windows-interface metadata, local-subnet affinity, and cross-Agent shared-LAN
-affinity. The reproduced one-machine multi-adapter case correctly retained
-`192.168.1.2:7339` instead of APIPA `169.254.21.253:7339` or the virtual
-`172.20.96.1:7339` route.
+These measurements are included to document the optimization work, not to promise identical performance on every machine.
 
-Release packaging supports optional certificate-store Authenticode signing,
-RFC 3161 SHA-256 timestamping, signature verification before checksums, and
-unsigned local development builds. See
-[Release Trust and Antivirus Guidance](RELEASE-TRUST.md).
+### Fresh CDC planning — 100,000-file synthetic workload
 
-v2 supports verified content reuse during both updates
-and fresh folder transfers. Update mode reuses content from older receiver-side
-medium and large files. Fresh transfers use deterministic bounded catalog
-generations, explicit receiver commit acknowledgements, exact-file reuse, and
-session-scoped cross-file CDC using files committed by earlier generations.
-
-The v2 transfer engine has passed physical two-machine acceptance over a normal
-LAN. The acceptance run achieved 98.48 MB/s, reconstructed a 60 MiB related
-file using 59.88 MiB of receiver-side data, transmitted no CDC basis index,
-reported 99.80% CDC savings, and passed independent SHA-256 verification for
-every transferred file.
-
-The GUI includes:
-
-- Hungarian default language;
-- English built into the same executable;
-- runtime language switching;
-- Direct Link and manual IP-address modes;
-- Send and Receive operation selection;
-- native Windows folder pickers;
-- live phase, byte, percentage, and throughput progress;
-- immediate cooperative cancellation;
-- persistent interrupted-transfer records;
-- one-click transfer restart and stripe resume;
-- automatic administrator elevation when Receive requires firewall setup;
-
-## v2.1 roadmap
-
-- [x] persist committed fresh-transfer file IDs in the resume journal;
-- [x] preserve and verify committed files during fresh-session restart;
-- [x] rebuild deterministic catalog state from a committed generation prefix;
-- [x] retain cross-file CDC reuse after interruption and restart;
-- [x] extend exact reuse to tiny-file packs;
-- [x] extend exact reuse to striped large files;
-- [x] add repeated crash, corruption, and restart acceptance tests;
-- [x] complete two-Windows-instance direct-link interruption acceptance.
-
-### v2.1 interruption acceptance
-
-The release candidate was tested between two independent Windows virtual
-machines using automatic Direct Link discovery over IPv6 link-local addresses.
-
-The receiver was forcibly terminated after the first 480 MiB generation had
-been committed and atomically journaled. After restart, NetworkCopy verified and
-skipped all eight committed files, then reconstructed eight related files using
-the preserved receiver-side catalog.
-
-The resumed session reported:
-
-- 8 skipped committed files / 503,316,480 bytes;
-- 8 completed CDC files and 0 fallbacks;
-- 501,686,315 reused bytes;
-- 1,630,165 literal bytes;
-- 0 CDC index wire bytes;
-- 99.84% total wire savings;
-- matching independent SHA-256 manifests;
-- successful resume-journal removal after completion.
-
-Physical network throughput and Direct Link discovery had already passed the
-v2.0 two-machine acceptance. The v2.1 run specifically validates the new
-interruption, verification, catalog reconstruction, and restart behavior.
-
-### Automated v2.1 recovery torture
-
-The long-running recovery matrices are ignored during ordinary `cargo test`
-runs. They repeatedly exercise fresh-generation crashes, multiple restarts,
-cross-file CDC catalog recovery, same-size corruption rejection, and large-file
-stripe checkpoint recovery.
-
-Run ten rounds of every matrix in release mode:
-
-```powershell
-.\scripts\run-v21-torture.ps1 -Rounds 10
-```
-
-Use a smaller round count for a quick local smoke run:
-
-```powershell
-.\scripts\run-v21-torture.ps1 -Rounds 2
-```
-
-### Automated v2.1 release-candidate gate
-
-The release builder can run the complete local gate, execute the ignored
-recovery matrices, build the CLI and both GUI language variants, smoke-test the
-CLI version output, and generate SHA-256 checksums.
-
-While the package version remains `2.1.0-dev`, create a local release candidate
-with two torture rounds per matrix:
-
-```powershell
-.\scripts\Build-Release.ps1 `
-    -AllowDevelopmentVersion `
-    -TortureRounds 2
-```
-
-For the final pre-release local gate, use ten rounds:
-
-```powershell
-.\scripts\Build-Release.ps1 `
-    -AllowDevelopmentVersion `
-    -TortureRounds 10
-```
-
-The `-AllowDevelopmentVersion` switch must be removed after `Cargo.toml` is
-changed to the stable `2.1.0` version.
-
-## v2.2 release — LAN management
-
-v2.2 ships a separate management interface that discovers NetworkCopy sender
-and receiver agents on the local network and remotely orchestrates transfers
-between them.
-
-The management computer carries only commands, status, and progress data.
-File payloads travel directly from the selected sender to the selected receiver.
-
-Released v2.2 scope and follow-ups:
-
-- [x] add a persistent LAN-visible agent process;
-- [x] connect the agent to sender and receiver job control;
-- [x] automatically cancel a still-active endpoint when its paired job fails or is cancelled;
-- [x] advertise and discover available agents on the LAN;
-- [x] report machine name, reachable management address, capabilities, and current state;
-- [x] remotely enumerate Windows drive roots on each endpoint;
-- [x] remotely enumerate folders and files on each endpoint;
-- [x] select the source machine and source folder;
-- [x] select the receiver machine and destination folder;
-- [ ] support Direct Link and explicit IP transfer modes;
-- [x] start sender and receiver transfer jobs remotely;
-- [x] expose live managed-job progress for GUI polling;
-- [x] retain the most recent completed, cancelled, or failed job result;
-- [x] resume interrupted transfer jobs remotely from retained manager history;
-- [x] keep active transfers running if the management UI disconnects;
-- [x] reconnect the manager to a paired transfer already running on the endpoints;
-- [x] add an initial separate WGPU management application;
-- [x] add remote dual-pane folder browsing to the management application;
-- [x] add paired session history and richer diagnostics to the management application;
-- [x] persist management configuration and transfer history across manager restarts;
-- [x] polish the management workflow with compact status, collapsible setup, and collapsible history;
-- [x] provide a double-clickable, self-elevating endpoint agent executable;
-- [ ] test three-machine orchestration on a physical LAN.
-
-The first v2.2 management release will intentionally use a trusted-LAN model
-without authentication or encryption. It must only be used on a known,
-controlled network. Pairing, authenticated commands, encrypted management
-traffic, allowed-root policies, and stronger remote-filesystem protections are
-planned after the working management workflow has been field-tested.
-
-### v2.2 release highlights
-
-- dedicated double-clickable endpoint agent with automatic UAC elevation;
-- safe idle-agent restart without interrupting active transfers;
-- LAN discovery with manual management-address fallback;
-- remote Windows drive and directory browsing;
-- independent sender and receiver selection;
-- direct sender-to-receiver payload transfer;
-- remote start, status polling, cancellation, and paired failure cleanup;
-- manager disconnect and active-transfer reconnection;
-- persistent transfer configuration and result history;
-- journal-backed retry of cancelled and failed transfers;
-- polished collapsible WGPU management interface;
-- packaged manager, agent, CLI, and Hungarian/English GUI executables.
-
-The v2.2 manager schedules one paired transfer at a time. Persistent queued
-orchestration is planned for v2.3.
-
-Management traffic remains unauthenticated and unencrypted in v2.2. Use the
-management agent only on a known and controlled local network.
-
-## v2.3 release — effortless queued transfers
-
-v2.3 introduces a persistent manager-side transfer queue. Endpoint agents remain
-simple one-job-at-a-time executors, while the manager owns ordering, persistence,
-conflict detection, failure handling, resume, and automatic start-next behavior.
-
-The primary workflow is:
-
-1. select the sender and receiver;
-2. add several source and destination pairs;
-3. start the queue;
-4. leave the machines alone while the transfers run in sequence.
-
-### v2.3 release highlights
-
-- persistent sequential transfer queue with stable request IDs;
-- queue order, state, pause preference, route intent, and recovery persistence;
-- automatic start-next behavior with safe unavailable and busy endpoint checks;
-- explicit retry, run-again, skip, cancellation, and pause-after-current controls;
-- journal-backed queued resume with the original stream count;
-- safe Manager restart reattachment without silently duplicating active work;
-- Automatic LAN, Direct Link, and Explicit IP management routes;
-- dual-stack IPv4 and IPv6 management control;
-- strict gateway-free physical-Ethernet Direct Link discovery;
-- scoped IPv6 link-local preference with IPv4 APIPA fallback;
-- completion, failure, pause, and action-required Windows notifications;
-- endpoint-agent notification-area control with idle/busy status and safe exit;
-- background GitHub Releases update checks with an explicit browser-opening flow;
-- packaged Manager, Agent, CLI, and Hungarian/English GUI executables.
-
-Management traffic remains unauthenticated and unencrypted. Use management mode
-only on a known and controlled network.
-
-### Released v2.3 scope and pending field acceptance
-
-- [x] add stable-ID queued transfer requests;
-- [x] persist queue order and state across manager restarts;
-- [x] add, reorder, remove, and clear queue entries;
-- [x] show the current, next, and remaining transfers;
-- [x] start the next eligible transfer automatically;
-- [x] detect unavailable, busy, and conflicting endpoints;
-- [x] support pausing after the current transfer;
-- [x] retain failed work and require an explicit retry, skip, or continuation;
-- [x] queue journal-backed resume operations with their original stream count;
-- [x] reconnect a restarted manager to the correct active queue item;
-- [x] expose Automatic LAN, Direct Link, and Explicit IP manager route modes;
-- [x] add useful Windows completion, failure, pause, and action-required notifications;
-- [x] add a small endpoint-agent tray control surface;
-- [x] check GitHub Releases for newer stable versions and open the download flow;
-- [ ] complete physical three-machine and queued-transfer acceptance testing.
-
-### Managed Direct Link progress
-
-- [x] persist route intent in Manager configuration and queued requests;
-- [x] support functional Explicit IP management endpoints;
-- [x] add the Automatic LAN, Direct Link, and Explicit IP route selector;
-- [x] preserve route intent during queue execution and Manager restart recovery;
-- [x] add dual-stack IPv4 and IPv6 management-control listeners;
-- [x] preserve IPv6 link-local scope IDs through payload orchestration;
-- [x] enumerate strict connected physical Ethernet interfaces;
-- [x] reject Ethernet interfaces carrying a default route;
-- [x] prefer scoped IPv6 link-local management addresses with APIPA fallback;
-- [x] probe management agents through each strict Direct Link interface;
-- [x] expose responding Direct Link agents in the Manager;
-- [x] start, resume, and reattach queued transfers through the selected direct route;
-- [ ] complete physical Direct Link Manager acceptance.
-
-Sequential reliability comes before concurrent execution. v2.4 deliberately
-continues to operate one sender/receiver pair at a time.
-
-## v2.4 release — safer and faster unattended setup
-
-v2.4 strengthens queue recovery, adds destination-root batch mapping to the
-Manager and existing bilingual standalone GUI, and turns update checking into
-an explicit, user-approved executable update flow.
-
-### v2.4 release highlights
-
-The queue-hardening foundation is now implemented:
-
-- each running endpoint agent receives a random process identity;
-- an exact queue binding records the queue item, both agent identities, and both
-  endpoint job IDs;
-- unresolved bindings prevent unsafe retry, skip, removal, and queue reordering;
-- bindings survive Running-to-Blocked transitions and clear on terminal states;
-- the `NCMS4` state format persists optional exact bindings atomically;
-- `NCMS1`, `NCMS2`, and `NCMS3` states remain loadable and migrate without an
-  active binding.
-
-The Manager now creates exact bindings from verified endpoint snapshots, saves
-them immediately, and requires exact agent-instance and job-ID matches during
-restart recovery. Retry on bound work performs reattachment without starting
-duplicate endpoint jobs.
-
-The Manager also includes a multi-source batch builder. Several source folders
-can be collected, previewed beneath one receiver destination root, checked for
-name collisions, and added atomically to the persistent transfer queue.
-
-The standalone transfer wire protocol is now version 14. Its control stream
-carries an optional validated source-folder name, explicit file and directory
-manifest entries, and an optional bounded `NCDL` desktop-layout snapshot.
-Drive-root sources remain available for exact-destination transfers, and
-ordinary transfers send no desktop-layout metadata.
-
-Windows Desktop layout migration is now implemented for both standalone and
-managed transfers. The sender captures ordinary Desktop file and folder
-positions, icon size, Auto Arrange state, DPI, work areas, and monitor geometry
-through the Windows Shell folder view. The receiver restores matching items
-through the supported Shell positioning APIs after file transfer completes.
-Different resolutions and DPI values are mapped proportionally between
-corresponding monitors and clamped to visible work areas. Missing, renamed,
-virtual, Public Desktop, or otherwise non-transferable Shell items do not fail
-the file transfer.
-
-The updater now selects exact Manager, Agent, CLI, GUI-HU, and GUI-EN release
-assets, plans official or custom executable naming, and uses deterministic
-per-application LocalAppData staging. The Manager can explicitly download its
-own selected artifact on a worker thread, enforce the GitHub-reported byte
-count, verify the GitHub SHA-256 digest, and retain the verified executable
-without replacing the running application.
-
-Successful Manager preparation now also writes an `NCH1` binary handoff plan.
-The bounded format records the parent process ID, exact application kind,
-official-or-custom naming policy, expected executable size and SHA-256 digest,
-and every update path using lossless Windows UTF-16 encoding. The plan is
-written through a synchronized partial file, atomically renamed, read back, and
-validated before preparation is reported as successful.
-
-The staged Manager recognizes a hidden `--update-handoff-wait` helper mode.
-Before waiting, it proves that it is running from the exact staged path named by
-the `NCH1` plan, independently checks its file size and SHA-256 digest, and opens
-a synchronization handle to the recorded original Manager process. It waits for
-that process object for at most 120 seconds. Only after the original Manager has
-exited does the helper prepare the synchronized `previous.exe` backup and the
-separately verified installation candidate. Officially named releases are
-published beside the old executable without overwriting a conflicting file.
-Custom-named releases atomically replace the exited Manager while preserving its
-exact filename. After either publication policy succeeds, the helper launches the
-exact installed path with a hidden startup-confirmation argument. The installed
-Manager independently validates its path, size, and SHA-256, constructs its
-application state, and atomically writes a process-bound startup marker. The
-helper accepts completion only while that relaunched process remains alive.
-A launch error, early exit, invalid marker, timeout, or post-startup executable
-verification failure stops the failed child before rollback. A newly created
-official path is removed, while a custom-named executable is restored from the
-verified `previous.exe` backup. Pre-existing official destinations are preserved.
-
-The installed Manager opens the staged helper's exact process object before
-publishing its startup marker and arms a detached cleanup worker. After the
-helper exits, that worker revalidates the installed executable and process-bound
-marker, removes the known candidate, rollback, backup, marker, handoff, and
-staged-helper files, and removes the staging directory only when it is empty.
-Unknown staging entries stop cleanup without deleting any transaction files.
-
-On a later ordinary Manager start, recovery runs only after Manager application
-construction succeeds. It inspects only the deterministic staging directory for
-the running version, requires the handoff install path and SHA-256 to match the
-running executable, and accepts either a validated marker from an exited startup
-process or the healthy ordinary restart itself. The staged helper is deleted
-first, so a still-running helper prevents any partial cleanup. Unknown entries,
-path mismatches, digest mismatches, and active marker processes preserve the
-transaction unchanged.
-
-After a Manager update is prepared, the running Manager exposes a two-step
-**Install update** confirmation. Final confirmation saves persistence again,
-launches the verified staged Manager in handoff-helper mode, and requests a
-clean close of the original Manager window. The helper waits for that process to
-exit, prepares and publishes the verified installation, relaunches the exact
-installed executable, and waits up to 20 seconds for its validated startup
-marker.
-
-After the original Manager exits, the installation layer writes and synchronizes
-a partial copy of the installed executable, atomically publishes that exact copy
-as `previous.exe`, and writes a separately verified new-executable candidate
-beside the final install destination. Both copies are read back and SHA-256
-checked. Officially named updates move into a new versioned path without
-replacing an existing destination. Custom-name updates first prove that the
-installed executable still exactly matches the backup and then atomically replace
-it in place. A failed post-replacement verification restores a separately copied
-and verified rollback candidate from `previous.exe`.
-
-### Queue recovery hardening
-
-- [x] assign each running endpoint agent a random process identity;
-- [x] define an exact binding containing the queue item, agent identities, and
-      endpoint job IDs;
-- [x] retain unresolved bindings inside the persistent transfer queue;
-- [x] prevent retry, skip, removal, and reordering while a binding is unresolved;
-- [x] clear bindings on terminal states while retaining them when work is blocked;
-- [x] encode and validate exact bindings through the `NCMS4` state format;
-- [x] preserve loading of `NCMS1`, `NCMS2`, and `NCMS3` states without bindings;
-- [x] create the binding from verified endpoint snapshots after transfer startup;
-- [x] save a newly created binding immediately instead of waiting for debounce;
-- [x] require exact agent-instance and job-ID matching during restart reattachment;
-- [x] make Retry reattach bound work without starting new endpoint jobs;
-- [ ] prove both endpoints are clear before deliberately restarting bound work;
-- [ ] complete exact-binding Manager restart and unreachable-endpoint acceptance.
-
-### Batch destination-root setup
-
-- [x] define one shared exact-destination and source-name-under-root mapping model;
-- [x] select several source folders in the Manager;
-- [x] select one receiver destination root;
-- [x] preview the generated source-to-destination mappings;
-- [x] reject duplicate source folder names that would collide beneath the root;
-- [x] add the generated mappings to the persistent queue in one operation.
-
-### Standalone GUI root receiver
-
-- [x] transmit the selected source folder name as validated protocol metadata;
-- [x] resolve validated source-folder metadata beneath the selected receiver root;
-- [x] expose Exact destination and Destination root selection in the HU/EN GUI;
-- [x] keep a root-mode receiver listening after each completed transfer;
-- [x] allow cancellation while waiting or while a transfer is active;
-- [x] retain the existing one-folder standalone sender workflow;
-- [x] migrate interrupted standalone GUI session persistence.
-
-Destination-root mode now behaves as a persistent receiver. After a successful
-folder transfer, the standalone GUI retains the completed summary and
-automatically starts listening again with the same connection, destination
-root, layout, and update settings. Exact-destination mode remains a one-transfer
-operation. Cancelling while idle discovery, listener acceptance, calibration,
-or payload transfer stops the loop without starting another receiver.
-
-### User-approved executable updates
-
-- [x] define exact app-kind and GUI-language-aware selection for Manager, Agent,
-      CLI, GUI-HU, and GUI-EN release assets;
-- [x] wire the Manager to `ReleaseArtifactKind::Manager`;
-- [ ] wire Agent, CLI, GUI-HU, and GUI-EN to their own release artifact kinds;
-- [x] plan official-versus-custom executable naming and deterministic
-      LocalAppData staging, backup, handoff, and startup-marker paths;
-- [x] download the selected Manager release only after an explicit user action;
-- [x] stream the download through a temporary partial file;
-- [x] enforce the GitHub release-asset byte count and SHA-256 digest;
-- [x] flush, synchronize, and atomically publish the verified staged executable;
-- [x] remove incomplete partial files without touching the installed application;
-- [x] run Manager download and verification work outside the egui thread;
-- [x] save Manager persistence before beginning update preparation;
-- [x] serialize and validate the executable handoff plan using a bounded,
-      versioned binary format with lossless Windows UTF-16 paths;
-- [x] make the staged Manager validate its own path, size, and SHA-256 before
-      accepting helper responsibilities;
-- [x] open and wait on the original Manager's Windows process object with a
-      bounded timeout without modifying installation files;
-- [x] launch the staged Manager in wait-only helper mode after explicit
-      two-step approval and save persistence immediately before handoff;
-- [x] request a clean close of the original Manager only after the helper process
-      has been created successfully;
-- [x] prepare an exact synchronized backup through a partial file and atomically
-      publish it as `previous.exe`;
-- [x] copy the staged executable to a separately verified candidate beside the
-      final destination without moving or modifying the running helper;
-- [x] leave the installed executable and final install path unchanged while
-      preparing the transaction;
-- [x] invoke transaction preparation only after the recorded parent process exits;
-- [x] publish an officially named new executable beside an officially named old
-      one without overwriting a conflicting destination;
-- [x] replace a renamed executable in place while preserving its exact custom
-      filename;
-- [x] restore `previous.exe` through a separate verified rollback candidate when
-      custom-name post-replacement verification fails;
-- [x] relaunch the exact installed executable and require a process-bound startup
-      marker after installed-path, size, SHA-256, and Manager-construction checks;
-- [x] arm installed-process cleanup before startup confirmation, wait for the
-      exact staged helper process to exit, and then remove only known transaction
-      files and the empty staging directory;
-- [x] terminate a failed relaunched Manager and restore the pre-update custom-name
-      executable or remove only the official path created by that transaction;
-- [x] recover interrupted cleanup on a later healthy ordinary startup while
-      preserving active, mismatched, malformed, or unknown transaction state.
-
-### Acceptance
-
-- [ ] complete v2.3 physical three-machine queue acceptance;
-- [ ] complete managed Direct Link physical acceptance;
-- [x] complete Manager multi-source destination-root acceptance;
-- [ ] complete repeated standalone root-receiver acceptance;
-- [x] complete renamed and officially named executable update acceptance.
-
-The Manager executable updater completed live GitHub release acceptance on
-2026-08-06. An officially named v2.3.99 Manager installed v2.4.0 beside itself
-without modifying the old executable. A custom-renamed v2.3.99 Manager replaced
-itself in place while preserving its exact filename. Both installed executables
-matched the published v2.4.0 SHA-256 digest, relaunched successfully, confirmed
-healthy startup, and removed all staging and transaction files.
-
-### v2.4.1 release
-
-v2.4.1 fixes Automatic LAN discovery on Windows systems with several physical,
-virtual, VPN, container, or WSL network adapters. The Manager now sends
-discovery probes through each usable IPv4 subnet, skips individually unreachable
-adapter routes, identifies duplicate replies by the exact running Agent process,
-and retains the address with the strongest shared-LAN affinity.
-
-Physical acceptance on 2026-08-06 reduced five replies from the local
-multi-adapter Agent to one card at `192.168.2.200:7339`, while independently
-discovering the remote Agent at `192.168.2.103:7339`. Automatic LAN selection
-therefore presented exactly the two real endpoint computers using their common
-physical Ethernet subnet.
-
-A remaining multi-adapter endpoint-selection bug was reproduced again during
-v2.5 development. One Agent advertised through `169.254.21.253`,
-`172.20.96.1`, and its real LAN address `192.168.1.2`, but the Manager retained
-the APIPA address instead of the usable physical-LAN address. The v2.4.1
-process-identity deduplication therefore remains valid, but address ranking is
-not yet reliable on every adapter combination.
-
-Before v2.5 release, Automatic LAN must prefer a reachable ordinary LAN address
-over APIPA and virtual/tunnel adapter addresses when several replies identify
-the same running Agent process. This preference must apply only to Automatic
-LAN; Direct Link must continue to allow and prefer link-local addresses because
-they are intentional there.
-
-Physical two-machine Manager multi-source destination-root acceptance completed
-on 2026-08-06 over the Explicit IP route. Three sequential queue entries
-transferred 2,331 files and 1,244,706,622 bytes from `192.168.2.200` to
-`192.168.2.103`.
-
-Independent canonical file-only SHA-256 verification produced the same digest on
-both machines:
+The synthetic scale probe contains:
 
 ```text
-BD0E1435F5B32A4EE96985839569C6D89128C84407E836CF9DC3792CF954B52D
+Source files:                100000
+TCP lanes:                   4
+Catalog generations:         196
+Original transfer tasks:     100000
+Moved execution tasks:       100000
+Catalog candidate slots:     100000
+Peak rolling basis IDs:      62500
+Derived published file IDs:  100000
+Retained published-ID slots: 0
+Uncataloged file-ID slots:   0
+Evicted file-ID slots:       37500
+Duplicate source payload:    0 bytes
 ```
 
-The run confirmed correct batch mapping, sequential queue execution, Unicode
-filenames, thousands of small files, large incompressible files, compressible
-files, and exact payload integrity.
+The final release-mode probe measured:
 
-The same physical run exposed three post-release issues:
-
-- [x] send Automatic LAN discovery through every usable IPv4 subnet on
-      multi-adapter Windows systems without failing on unreachable virtual
-      adapters;
-- [x] preserve empty source directories in the destination tree;
-- [x] allow scrolling while extending a multi-entry Manager history selection.
-
-## v2.5 release — Desktop migration and reliability
-
-v2.5 completes the planned reliability and Desktop-migration work available
-under the current one-machine acceptance environment. Performance profiling,
-IOCP read-ahead, stream-policy benchmarking, compression timing, and streaming
-CDC work have moved to v2.6 so that v2.7 can focus exclusively on the Manager
-interface redesign.
-
-### v2.5 release highlights
-
-- Windows Desktop icon-layout migration for standalone and managed transfers;
-- proportional cross-resolution and cross-DPI position mapping with visible-area
-  clamping;
-- sender-Agent recognition of redirected/current Windows Desktop folders;
-- persistent managed Desktop-layout intent through `NCMS5` queue state;
-- explicit preservation of empty source directories;
-- Manager history drag-selection scrolling and edge auto-scroll;
-- stronger Automatic LAN address ranking for multi-adapter Windows systems;
-- optional Authenticode release signing and RFC 3161 SHA-256 timestamp support;
-- protocol v14 with bounded optional `NCDL` Desktop-layout metadata.
-
-### v2.5 desktop layout migration
-
-- [x] capture Windows desktop file and folder positions through the Shell folder
-      view;
-- [x] record desktop icon size, Auto Arrange state, DPI, work area, and monitor
-      geometry;
-- [x] transfer the layout as optional bounded migration metadata;
-- [x] match destination desktop items by stable relative parsing name;
-- [x] scale and clamp positions safely for different destination resolutions,
-      DPI values, work areas, and monitor origins;
-- [x] restore ordinary desktop file and folder positions after transfer;
-- [x] handle missing, renamed, redirected, Public Desktop, and built-in Shell
-      items without failing the transfer;
-- [x] expose layout preservation in the standalone GUI only for the actual local
-      Windows Desktop;
-- [x] let the Manager ask the sender Agent whether a remote source is that
-      Agent's actual Windows Desktop;
-- [x] preserve the option through managed sender startup, mapped queue entries,
-      resume, Manager restart persistence, and `NCMS5` migration;
-- [x] complete live same-machine Shell restore acceptance with all 87 captured
-      Desktop items round-tripping unchanged;
-- [x] dry-run cross-display migration of all 87 captured Desktop items with
-      every planned position remaining inside a destination monitor work area;
-- [x] complete the available one-machine v2.5 acceptance: live Shell
-      capture/restore, same-machine 87-item round-trip verification,
-      cross-display migration dry-run, remote Desktop classification,
-      managed sender propagation, queue persistence, and resume plumbing.
-
-A true two-endpoint physical Desktop migration remains a later field-acceptance
-check when a second machine is available. It is not release-blocking for v2.5;
-the sender capture, wire metadata, receiver restore, cross-display planner, and
-managed control paths are independently covered by the current acceptance and
-automated tests.
-
-### v2.5 Automatic LAN address ranking
-
-- [x] rank multiple addresses belonging to the same Agent process so ordinary
-      physical-LAN addresses are preferred over APIPA and virtual/tunnel
-      interfaces in Automatic LAN mode;
-- [x] retain Direct Link's separate link-local IPv6 and APIPA behavior;
-- [x] add deterministic tests covering APIPA, virtual adapters, physical LAN,
-      one-Agent discovery, and remote multi-address discovery;
-- [x] physically verify that the reproduced
-      `169.254.21.253` / `172.20.96.1` / `192.168.1.2` case selects
-      `192.168.1.2`.
-
-Automatic LAN ranking now combines address scope with Windows interface
-metadata, local-subnet affinity, and the existing cross-Agent shared-LAN
-affinity. This avoids relying on private-address spelling such as assuming that
-`192.168.x.x` is physical or that `172.x.x.x` is virtual. Direct Link uses its
-independent strict-interface discovery path and is unaffected.
-
-One-machine physical acceptance on 2026-08-07 reproduced the three-address
-Agent case and confirmed that Automatic LAN retained `192.168.1.2:7339` instead
-of the APIPA `169.254.21.253:7339` or virtual `172.20.96.1:7339` endpoint.
-
-
-
-## Planned v2.7 — Manager interface redesign
-
-v2.7 is planned as a substantial Manager information-architecture and UI/UX
-redesign rather than another incremental control-panel expansion. The current
-Manager remains functional but has become crowded as discovery, routing, remote
-browsing, batch construction, queue management, transfer monitoring, history,
-updates, and advanced transfer options have accumulated.
-
-Planned v2.7 goals include:
-
-- reorganize the Manager around clearer setup, endpoints/routes, queue, active
-  transfer, and history workflows;
-- reduce the amount of permanently visible configuration and advanced controls;
-- improve spacing, hierarchy, responsive use of window width, and visual
-  consistency;
-- make sender/receiver selection and route state easier to understand at a
-  glance;
-- integrate remote browsing and batch construction more cleanly with transfer
-  setup;
-- simplify queue cards while keeping recovery, resume, and Desktop-layout state
-  visible;
-- redesign capability presentation instead of allowing Agent cards to accumulate
-  increasingly long capability text;
-- preserve all existing queue persistence, recovery, Direct Link, Automatic LAN,
-  Explicit IP, updater, and Desktop-layout functionality during the redesign.
-
-## Planned v2.6 — measured speed work
-
-v2.6 will return the project focus to raw transfer performance after the v2.5
-Desktop-layout release. The goal is measured throughput improvement rather than
-generic socket tuning. The current engine already applies `TCP_NODELAY`, uses
-adaptive Zstandard level 1 compression, prints the complete 1/2/4/8-stream
-calibration matrix, runs concurrent transfer lanes, and enforces a process-wide
-transfer buffer budget.
-
-Planned investigation order:
-
-- [x] add aggregate stage profiling for ordinary, striped, and tiny-pack payload
-      source reads, compression/probing, underlying socket writes, underlying
-      socket reads, decompression, and destination writes;
-- [ ] extend source/destination disk-stage attribution through CDC and exact-reuse
-      paths before using profiler results to tune those specialized paths;
-- [x] classify the actual connected TCP data path as physical Ethernet, Wi-Fi,
-      VPN/tunnel, virtual, loopback, or unknown instead of inferring transport
-      from Automatic LAN or Explicit IP mode;
-- [ ] benchmark Windows automatic TCP buffering against explicit 256 KiB,
-      1 MiB, and 4 MiB send/receive buffers before changing production defaults;
-- [ ] retain the smallest stream count reaching 90% of peak on Wi-Fi and unknown
-      interfaces;
-- [ ] test the smallest stream count reaching 95% of peak on physical Ethernet
-      and Direct Link interfaces;
-- [ ] retain the conservative 90% policy whenever interface classification is
-      unavailable or ambiguous;
-- [ ] add bounded IOCP-backed source read-ahead using a small reusable operation
-      pool inside the existing transfer-memory budget;
-- [ ] predict raw-versus-compressed completion time from measured compression
-      speed and calibrated path throughput instead of considering wire savings
-      alone;
-- [ ] stream CDC reconstruction operations and literal records instead of
-      duplicating complete plans in memory;
-- [ ] increase CDC literal allowances only after streaming plans are implemented,
-      with the limit derived from the global transfer-memory budget;
-- [ ] keep Windows IO Ring research for a later v3 investigation unless profiling
-      identifies syscall submission as a meaningful production bottleneck.
-
-Stage timing is reported as aggregate worker time together with processed bytes
-and operation counts. Because transfer lanes operate concurrently, summed stage
-time can legitimately exceed wall-clock transfer duration. The profiler is
-intended to identify where concurrent workers spend time rather than to present
-a serial percentage breakdown.
-
-Transfer-path classification now inspects the local interface actually selected
-by the connected TCP data stream. Reports retain the path class, local address,
-Windows interface index and alias, MTU, and advertised transmit/receive link
-speeds when available.
-
-Live Windows acceptance on 2026-08-08 connected the standalone path probe from
-`192.168.1.2` to `1.1.1.1:443`. Windows selected interface 7 (`Ethernet`) with a
-1500-byte MTU and 2.50 Gbit/s transmit and receive link speeds, and NetworkCopy
-correctly classified the route as physical Ethernet.
-
-Direct Link is always a physical Ethernet candidate. Automatic LAN and Explicit
-IP may use Ethernet, Wi-Fi, VPN, or virtual interfaces, so the v2.6 policy must
-inspect the selected path rather than treating every LAN address as wired.
-
-The previous v2.5 F/G/H/I/J performance milestones were deliberately moved here
-so v2.5 can ship after Desktop migration and the remaining discovery correctness
-work, while v2.7 can focus entirely on the Manager redesign.
-
-### Deliberately deferred
-
-- pairing, authentication, encryption, and other security hardening;
-- automatic agent startup with Windows;
-- major diagnostics expansion;
-- transfer-history export;
-- ZIP-based release deployment.
-
-The in-place updater is no longer deferred. It remains user-triggered: pressing Update downloads the new release, migrates shared persistence, exits the old process, installs or replaces the executable as appropriate, and relaunches the new version.
-
-Management traffic remains intended for known and controlled local networks.
-
-### Management agent and command-line tools
-
-Start an agent from an elevated terminal:
-
-```powershell
-cargo run --bin networkcopy-agent
+```text
+Planner elapsed:             0.003412 s
+Execution build elapsed:     0.003591 s
+Combined:                    0.007003 s
 ```
 
-For normal endpoint use, build or download the dedicated
-`networkcopy-agent.exe` application and double-click it. The executable requests
-administrator permission automatically and keeps a visible terminal open while
-the agent is running.
+During the v2.6 optimization work, the same planner workload in the original development configuration took approximately **25.28 seconds**.
 
-Double-clicking the executable again restarts an idle dedicated agent. If the
-existing agent has an active transfer, restart is refused and the running
-transfer is left untouched. An agent started through the older
-`networkcopy-speed.exe management-agent` command must be closed manually before
-switching to the dedicated executable.
+After the structural planner changes, the comparable development-mode catalog plus execution-plan work had fallen to roughly **0.054 seconds**, an improvement of approximately **470×** before release-mode optimization is considered.
 
-Discover agents from another computer on the same LAN:
+The final design also removed the old retained basis snapshots and duplicate execution-task storage.
 
-```powershell
-cargo run --bin networkcopy-speed -- management-discover
+For this 100,000-file workload, retained CDC-planner structures include:
+
+```text
+Rolling basis payload:       500000 bytes
+Retained catalog ID payload: 300000 bytes
+Catalog candidate payload:   1600000 bytes
+Execution task payload:      3200000 bytes
+Duplicate source payload:    0 bytes
 ```
 
-Inspect strict gateway-free Direct Link management candidates:
+This is a planner microbenchmark. It does **not** represent complete folder-transfer time.
 
-```powershell
-cargo run `
-    --bin networkcopy-speed `
-    -- `
-    management-direct-candidates
+### Session CDC basis-index optimization
+
+A controlled 640 MiB workload used 80 related 8 MiB files. Sixteen files in the later generation could reuse one previously committed basis file.
+
+Before basis-index caching:
+
+```text
+Basis index builds:          16
+Distinct basis files:        1
+Repeated index builds:       15
+Indexed data:                128 MiB
+Aggregate indexing time:     0.139649 s
 ```
 
-Query the available Windows drive roots:
+After the bounded cache:
 
-```powershell
-cargo run --bin networkcopy-speed -- management-roots 127.0.0.1:7339
+```text
+Basis index builds:          4
+Repeated index builds:       3
+Cache hits:                  12
+Indexed data:                32 MiB
 ```
 
-Browse a remote directory:
+After single-flight construction:
 
-```powershell
-cargo run --bin networkcopy-speed -- management-list 127.0.0.1:7339 "C:\Users"
+```text
+Basis index builds:          1
+Repeated index builds:       0
+Cache hits:                  15
+Indexed data:                8 MiB
 ```
 
-The WGPU management application uses this protocol to provide discovered-machine
-cards and dual-pane remote folder browsers for selecting the source and
-destination without typing paths manually.
+The final SSD/NVMe background-prebuild path produced:
 
-Prepare a receiver destination on another computer:
-
-```powershell
-cargo run --bin networkcopy-speed -- management-prepare-receive 127.0.0.1:7339 "C:\Transfers\Corpus" --update
+```text
+Basis index builds:          1
+Distinct basis files:        1
+Repeated index builds:       0
+Basis-index cache hits:      16
+Background prebuilds:        1
+Post-generation wait:        0.000012 s
 ```
 
-Inspect active management job state:
+The unavoidable index was therefore built once while useful transfer work was already happening, leaving approximately **12 microseconds** of measured generation-transition wait in this run.
 
-```powershell
-cargo run --bin networkcopy-speed -- management-job-status 127.0.0.1:7339
+Background prebuilding is deliberately disabled for seek-penalty and unknown storage.
+
+### Raw 512 MiB loopback transfer
+
+A separate local benchmark used 32 deterministic incompressible 16 MiB files.
+
+It intentionally produced no CDC reuse and no compressed records.
+
+```text
+Files copied:                32
+Logical data:                536870912 bytes
+Application wire:            536872557 bytes
+CDC offers:                  0
+Compressed records:          0
+BLAKE3 integrity:            verified
+
+Data transfer time:          0.309433 s
+Total time:                  0.310753 s
+Payload throughput:          1735.02 MB/s
+                              1654.64 MiB/s
 ```
 
-Cancel a prepared management job:
+Aggregate worker-stage measurements were:
 
-```powershell
-cargo run --bin networkcopy-speed -- management-cancel 127.0.0.1:7339 1
+```text
+Source reads:                0.095467 s
+Compression/probe:           0.092823 s
+Socket writes:               0.317246 s
+Receiver socket reads:       0.292531 s
+Destination writes:          0.156158 s
 ```
 
-A prepared receiver now binds the production transfer listener on TCP port 7337
-and immediately begins waiting for the calibration matrix and folder transfer.
+This is a **local Windows loopback benchmark**, not a physical-network throughput claim. Real transfer speed depends on storage, CPU, network adapters, drivers, Wi-Fi conditions, Ethernet link speed, cabling and workload.
 
-Remote sender startup is implemented through the management protocol. A sender
-job may be started directly, or both endpoints may be prepared and started
-together through the paired orchestration command below.
+### Physical two-machine acceptance
 
-After a successful transfer, the receiver job automatically leaves the active
-registry and the agent returns to the idle state.
+The transfer engine has also passed physical two-machine LAN acceptance.
 
-Start a sender job through its management agent:
+One representative run achieved:
 
-```powershell
-networkcopy-speed.exe management-start-send `
-    192.168.1.10:7339 `
-    192.168.1.20:7337 `
-    "D:\TransferSource" `
-    4 `
-    8
+```text
+Payload throughput:          98.48 MB/s
+Related logical file:        60 MiB
+Receiver-side reused data:   59.88 MiB
+CDC index transmitted:       0 bytes
+CDC savings:                 99.80%
 ```
 
-The command returns immediately after the sender job has been accepted. The
-sender agent performs calibration and transfer in a background worker, reports
-itself as busy through discovery and management hello, and returns to idle when
-the job completes, fails, or is cancelled.
+Independent SHA-256 verification matched every transferred file.
 
-Orchestrate both endpoints from one manager command:
+Synthetic loopback results and physical-network results are intentionally reported separately.
 
-```powershell
-networkcopy-speed.exe management-transfer `
-    192.168.1.10:7339 `
-    192.168.1.20:7339 `
-    "D:\TransferSource" `
-    "E:\TransferDestination" `
-    4 `
-    8 `
-    --update
+## How the transfer engine works
+
+A transfer starts by scanning the source tree and building a deterministic manifest.
+
+The sender and receiver establish one control connection plus one or more data lanes. Network calibration and path policy determine how much concurrency is useful rather than assuming that more TCP streams are always faster.
+
+Different file classes then take different paths:
+
+```text
+tiny files
+    → bounded packs
+    → adaptive raw / Zstandard encoding
+
+medium files
+    → whole-file transfer
+    → verified exact reuse
+    → CDC reconstruction when useful
+
+large files
+    → multi-lane stripes
+    → resumable stripe checkpoints
+    → reuse paths where appropriate
 ```
 
-The manager first prepares the receiver, derives its payload endpoint from the
-receiver management address, and then starts the sender. IPv6 flow and scope
-information are preserved when deriving link-local payload endpoints.
+All paths converge on integrity verification and final destination publication.
 
-The command returns a paired record containing both endpoint job IDs. The
-manager process is not involved in the payload path and may exit after both jobs
-have been accepted.
+The GUI, CLI, Agent and Manager all use this same transfer library.
 
-If sender startup fails, the manager automatically cancels the prepared receiver
-job so the receiver is not left busy or listening indefinitely.
+## Adaptive compression
 
-Poll an endpoint for GUI-ready progress and its latest retained result:
+Compression is not forced on every payload.
 
-```powershell
-networkcopy-speed.exe management-snapshot 192.168.1.10:7339
-```
+NetworkCopy probes transferable records and compares compression work against the expected transfer benefit.
 
-The snapshot contains the active job role, progress phase, completed and total
-bytes, cancellation state, and the latest terminal result. Completed sender
-results include logical and wire byte counts; receiver results include received
-file and logical-byte counts. Failed and cancelled jobs retain their diagnostic
-message after the endpoint returns to idle.
+Compressible data can use Zstandard.
 
-## Management GUI
+Incompressible data falls back to raw transfer instead of wasting CPU to produce a payload that is effectively the same size.
 
-Build the WGPU manager:
+This decision is made per transferable record, so one folder may contain both compressed and raw data.
 
-```powershell
-cargo build `
-    --release `
-    --bin networkcopy-manager
-```
+## Content-defined reuse
 
-Start the dedicated agent on the sender and receiver machines. It requests
-administrator elevation automatically:
+NetworkCopy uses content-defined chunking for related-file reuse.
 
-```powershell
-networkcopy-agent.exe
-```
+Chunk boundaries use a Gear-style rolling hash, while chunk identity and final integrity use BLAKE3.
 
-The dedicated agent also exposes a Windows notification-area icon:
-
-- hover to see whether the endpoint is idle or busy;
-- double-click to show the current status;
-- right-click to show status or exit an idle agent;
-- exit remains disabled while a transfer is active.
-
-The Manager checks GitHub Releases in the background when it opens. It compares
-only stable numeric versions and can open the selected stable release page. It
-never downloads an executable silently. When a newer stable version is
-available, **Prepare update** explicitly downloads the Manager artifact,
-validates its size and GitHub SHA-256 digest, and stages it beneath LocalAppData.
-The running executable is not replaced or relaunched yet.
-
-The older `networkcopy-speed.exe management-agent` command remains available
-for command-line and development use.
-
-Then open the manager on any machine on the trusted LAN:
-
-```powershell
-networkcopy-manager.exe
-```
-
-The manager discovers LAN agents, assigns sender and receiver roles, accepts
-remote source and destination paths, starts a paired transfer, polls both
-endpoint snapshots, displays live progress and retained terminal results, and
-cancels both endpoint jobs from one window.
-
-The manager structures its workflow into collapsible group cards for LAN agents,
-transfer setup, remote folder browsers, and transfer history. Starting,
-attaching, or resuming a transfer automatically collapses the setup section,
-while archiving a completed or failed transfer automatically opens history.
-
-The manager includes independent sender and receiver folder browsers. Each pane
-loads the selected endpoint's Windows drive roots, navigates directories,
-refreshes the current folder, moves to the parent folder, and copies the current
-remote path into the paired transfer configuration.
-
-The manager retains the 20 most recent paired terminal transfers across
-application restarts. History cards combine sender and receiver results, show
-the paired outcome, logical and wire data, wire savings, stream count, endpoint
-errors, and can restore the previous transfer setup for another run.
-
-Cancelled and failed managed transfers expose a resume action when the receiver
-retained a valid `.networkcopy-resume.bin` journal. The manager restarts the
-same source and destination, reruns the calibration matrix, and forces the
-journal's original TCP stream count for the actual payload. The receiver then
-validates the stored manifest fingerprint, stream count, committed files, and
-completed stripes before reusing any previous work.
-
-Completed transfers and failures that occurred before journal creation do not
-show a resume action.
-
-After the manager is closed and reopened, select the original sender and receiver
-agents and click **Attach to active jobs**. The manager reads both active
-snapshots, verifies that the sender targets the selected receiver payload
-endpoint, reconstructs the paired job record, and resumes live monitoring and
-cancellation without restarting the transfer.
-
-The manager saves its last-used endpoint addresses, remote paths, transfer
-settings, and the 20 retained history cards beneath the current user's
-`%LOCALAPPDATA%\NetworkCopy Speed Edition` directory. State replacement uses
-temporary and backup files, and a missing state file is treated as a normal
-first launch.
-
-The manager is not part of the payload path. Closing it does not terminate a
-transfer that has already been accepted by both endpoint agents.
-
-When one paired endpoint reaches a failed or cancelled terminal state while the
-other endpoint is still active, the manager performs one best-effort
-cancellation of the surviving job. Normal completion on one endpoint does not
-trigger cleanup because the peer may still be finalizing its result.
-
-Management traffic remains unauthenticated during the current trusted-LAN
-development phase.
-
-## v2 roadmap
-
-Implementation order:
-
-- [x] single-file fixed-block deduplication control benchmark;
-- [x] repeatable overwrite, insertion, deletion, and append corpus;
-- [x] content-defined chunk boundary prototype;
-- [x] fixed-block versus content-defined chunk-size matrix;
-- [x] receiver basis-file chunk index;
-- [x] deduplicated reconstruction prototype with final BLAKE3 verification;
-- [x] bounded-memory folder-level deduplication planning;
-- [x] protocol-v9 medium-file CDC transfer and ordinary whole-file fallback;
-- [x] large-file CDC with retained multi-lane striped fallback;
-- [x] CDC-aware interruption and file-level retry behavior;
-- [x] fresh-transfer exact reuse for repeated medium files;
-- [x] extend exact reuse to tiny packs and striped large files;
-- [x] deterministic bounded session catalog and generation planner;
-- [x] protocol-v10 generation barriers and receiver commit acknowledgements;
-- [x] session-scoped cross-file CDC using completed files as chunk bases;
-- [x] interrupted-session catalog rebuild and retry behavior;
-- [x] GUI CDC telemetry and mixed-workload loopback acceptance;
-- [x] physical two-machine acceptance.
-
-The first benchmark intentionally uses fixed boundaries from byte zero. It
-measures both same-position reuse and blocks found elsewhere in the basis file.
-This provides the control result that content-defined chunking must beat,
-particularly after insertions or deletions shift subsequent content.
-
-The deterministic mutation harness creates exact-copy, overwrite, aligned
-insertion, unaligned insertion, unaligned deletion, and append candidates. It
-runs the fixed-block benchmark at 4, 16, 64, and 256 KiB so future
-content-defined chunking implementations can be evaluated against identical
-inputs.
-
-The content-defined prototype uses a 64-bit Gear hash for boundary selection.
-Each byte requires one table lookup, one shift, and one wrapping addition, and
-earlier bytes stop affecting the boundary state after 64 subsequent bytes.
-Chunk identities still use full BLAKE3 digests; the Gear hash selects boundaries
-only. The default target is 64 KiB, with 32 KiB minimum and 128 KiB maximum
-chunks.
-
-The comparison matrix evaluates fixed and content-defined boundaries at 4,
-16, 64, and 256 KiB. It reports reusable and literal bytes, estimated index
-payload, and total basis-indexing plus candidate-scanning throughput.
-
-On the 64 KiB mutation corpus, an unaligned 4097-byte insertion improved from
-14.98% fixed-block reuse to 99.41% Gear CDC reuse. The corresponding deletion
-improved from 14.99% to 99.52%. Estimated literal payload fell from roughly
-5.95 MB to 41,575 and 33,381 bytes respectively. Gear CDC analyzed the basis
-and candidate at approximately 1.17 to 1.20 GB/s on the acceptance machine.
-
-### How v2 deduplication works
-
-The receiver already has an older copy of a file. It scans that file once and
-builds a compact index containing each chunk's offset, length, and BLAKE3
-identity.
-
-```mermaid
-flowchart LR
-    R["Receiver: old destination file"]
-    RC["Gear chunking"]
-    I["Basis index<br/>offset + length + BLAKE3"]
-    W["Compact index sent once"]
-    S["Sender: new source file"]
-    SC["Same Gear chunking"]
-    M["Match chunk identities"]
-    P["Reconstruction plan<br/>references + literal bytes"]
-    B["Receiver rebuilds temporary file"]
-    V["Final whole-file BLAKE3"]
-    A["Atomic destination replacement"]
-
-    R --> RC
-    RC --> I
-    I --> W
-    S --> SC
-    W --> M
-    SC --> M
-    M --> P
-    P --> B
-    B --> V
-    V --> A
-```
-
-A small insertion does not require resending everything after it:
+A simple insertion therefore does not invalidate every block after the insertion point.
 
 ```text
 Receiver already has:
+
 [ A ][ B ][ C ][ D ][ E ]
 
-Sender now has:
+Sender wants:
+
 [ A ][ B ][ NEW ][ C ][ D ][ E ]
 
-Sender transmits:
-[ref A][ref B][literal NEW][ref C][ref D][ref E]
+A reconstruction plan can describe:
+
+COPY A + B
+WRITE NEW
+COPY C + D + E
 ```
 
-The index behaves like a map from chunk identity to an existing receiver-file
-location:
+Neighboring references are merged into larger ranges rather than sending one network command per chunk.
+
+If CDC would not save enough wire data, exceeds its bounded planning limits, or cannot find a useful basis, NetworkCopy automatically falls back to the ordinary transfer path.
+
+## Fresh-transfer CDC
+
+Fresh destinations normally have no older file to use as a basis.
+
+NetworkCopy solves this with deterministic transfer generations.
+
+Files from a completed generation are verified and committed before they become eligible as bases for later generations.
 
 ```text
-BLAKE3(A), length(A)  -> offset 0
-BLAKE3(B), length(B)  -> offset after A
-BLAKE3(C), length(C)  -> offset after B
+Generation 0
+    ↓ transfer
+    ↓ verify
+    ↓ commit
+    ↓ publish as trusted basis
+
+Generation 1
+    ↓ may reuse Generation 0 content
+```
+
+A later lane can therefore never reference a file that another lane has not finished and committed.
+
+The rolling catalog is bounded, deterministic and reconstructable after interruption.
+
+v2.6 additionally keeps basis indexes in a bounded session cache, suppresses concurrent duplicate construction of the same index, and can prebuild the most likely next basis in the background on no-seek-penalty storage.
+
+## Exact reuse
+
+Content-defined reconstruction is not used when an exact existing copy is already available.
+
+Exact matches are reused directly after verification.
+
+This applies to fresh-transfer reuse as well as update workflows and avoids transmitting data that the receiver already has.
+
+## Integrity and destination safety
+
+BLAKE3 verification is part of the transfer engine rather than an optional post-transfer mode.
+
+NetworkCopy verifies reconstructed and transferred content before treating it as complete.
+
+Update and CDC paths preserve the old destination until replacement data has been successfully reconstructed and verified.
+
+Interrupted CDC plan transmission does not partially overwrite the existing destination.
+
+Metadata restoration occurs after successful file completion.
+
+## Cancellation, interruption and resume
+
+Transfers are designed to survive interruption without assuming that partially written data is valid.
+
+Large-file stripes can be recorded in the destination-side resume journal.
+
+Fresh-transfer generation commits are persisted so a restarted session can rebuild the same deterministic rolling CDC state.
+
+Committed files are revalidated before they are trusted.
+
+If a file that should be reusable has changed or become corrupted, NetworkCopy rejects the stale state rather than silently skipping it.
+
+A successful completed transfer removes the corresponding resume state.
+
+The release gate includes ignored recovery-torture matrices covering repeated interruption and restart scenarios.
+
+## Windows Desktop layout migration
+
+When the transferred source is a Windows Desktop, NetworkCopy can preserve ordinary Desktop item layout metadata.
+
+The captured snapshot can include item positions, icon size, Auto Arrange state, monitor geometry, work areas and DPI information.
+
+The receiver maps transferable items onto the destination Desktop and clamps restored positions to visible work areas.
+
+Missing, renamed, virtual, Public Desktop or otherwise non-transferable Shell items do not turn an otherwise successful file transfer into a failed transfer.
+
+Desktop layout transfer is optional and bounded.
+
+## Persistent transfer queue
+
+The Manager owns a persistent sequential queue.
+
+Multiple source/destination pairs can be prepared and left running unattended.
+
+Queue state includes ordering, route intent, recovery information and active endpoint binding information.
+
+The Manager supports retry, skip, cancellation, run-again behavior, pause-after-current, restart reattachment and journal-backed resume.
+
+Sequential reliability is intentional: one sender/receiver pair runs at a time.
+
+## Batch transfer setup
+
+Several source folders can be collected and mapped beneath one receiver destination root before being added to the queue.
+
+The Manager previews the resulting destination paths and checks collisions before adding the batch atomically.
+
+This is useful for common migration jobs such as:
+
+```text
+Desktop
+Documents
+Downloads
+Pictures
 ...
 ```
 
-### What reconstruction actually does
+without manually waiting for each folder to finish before starting the next one.
 
-The sender does not transmit a separate command for every chunk. Neighboring
-references are merged into large ranges so reconstruction normally needs only a
-few operations.
+## Updates
 
-```text
-Old receiver file:
-[ A ][ B ][ C ][ D ][ E ]
+The Manager can check GitHub Releases for newer stable versions.
 
-New sender file:
-[ A ][ B ][ NEW ][ C ][ D ][ E ]
+It does not silently replace itself.
 
-Merged reconstruction plan:
-1. COPY basis range containing A + B
-2. WRITE literal bytes containing NEW
-3. COPY basis range containing C + D + E
-```
+When the user explicitly prepares an update, NetworkCopy selects the correct application asset, verifies the reported size and SHA-256 digest, stages the candidate beneath LocalAppData, and uses a process-bound handoff for publication and startup verification.
 
-```mermaid
-sequenceDiagram
-    participant R as Receiver
-    participant S as Sender
+The update path includes rollback behavior when the replacement cannot be verified or started successfully.
 
-    R->>R: Scan old file and build NCI1 index
-    R->>S: Send compact NCI1 chunk index
+## Release trust and antivirus
 
-    S->>S: Scan new file and build NCP1 plan
-    S->>S: Merge neighboring basis references
-    S->>R: Send NCP1 ranges plus literal bytes
+Release packaging supports optional Windows Authenticode signing from the certificate store with RFC 3161 SHA-256 timestamping.
 
-    R->>R: Read referenced ranges from old file
-    R->>R: Write references and literals to temporary file
-    R->>R: Calculate BLAKE3 while writing
+Unsigned local development builds are also supported.
 
-    alt BLAKE3 matches sender digest
-        R->>R: Atomically replace destination
-    else BLAKE3 mismatch
-        R->>R: Delete temporary file and keep old destination
-    end
-```
+For details about signing, executable trust and antivirus behavior, see:
 
-The sender calculates the expected whole-file BLAKE3 while scanning the new
-file. The receiver calculates the reconstructed whole-file BLAKE3 while writing
-the temporary file. This avoids an additional verification read of either file.
+[Release Trust and Antivirus Guidance](RELEASE-TRUST.md)
 
-### How folder transfers stay memory-bounded
+## Security model
 
-Files are planned independently. A completed file's chunk index, reconstruction
-plan, and literal staging are discarded before the next file begins.
+NetworkCopy is optimized for **trusted local networks**.
 
-```mermaid
-flowchart TD
-    M["Existing folder manifest"]
-    F1["Select next same-path changed file"]
-    G["Cheap first/last sample gate"]
-    I["Build one receiver NCI1 index"]
-    P["Build one bounded sender NCP1 plan"]
-    D{"Plan smaller than full file?"}
-    C["Queue CDC transfer"]
-    X["Queue ordinary full-file transfer"]
-    R["Drop per-file index and plan"]
-    N{"More files?"}
+The current management protocol is not intended as an Internet-facing remote-administration service.
 
-    M --> F1
-    F1 --> G
-    G -->|Probably related| I
-    G -->|Probably unrelated| X
-    I --> P
-    P -->|Literal limit exceeded| X
-    P --> D
-    D -->|Yes| C
-    D -->|No| X
-    C --> R
-    X --> R
-    R --> N
-    N -->|Yes| F1
-    N -->|No| Z["Folder plan complete"]
-```
+Manager/Agent control traffic is currently unauthenticated and unencrypted.
 
-The production implementation currently uses a 16 MiB ceiling for literal bytes
-belonging to one active reconstruction plan. If the limit is reached, or the
-complete CDC wire payload would not beat an ordinary full-file transfer, that
-file immediately falls back to the existing transfer engine. Folder size and
-file count therefore do not cause unbounded chunk-index or literal memory
-growth. A larger dynamic ceiling is deferred until reconstruction plans and
-literal records can be streamed without duplicating the complete payload in
-memory.
+Do not expose the management Agent directly to an untrusted network or the public Internet.
 
-### Protocol v7 medium-file update path
+Payload integrity verification protects against accidental corruption; it is not a substitute for authenticated encrypted transport against a hostile peer.
 
-Protocol v7 performs CDC negotiation independently on each TCP data lane.
-A changed medium file can use the existing destination file as its basis.
-Missing, unsuitable, or unprofitable candidates fall back to the ordinary
-whole-file transfer record.
+Authentication, encrypted management traffic and stronger remote-filesystem authorization remain separate future security work.
 
-```mermaid
-sequenceDiagram
-    participant R as Receiver data lane
-    participant S as Sender data lane
+## Quick start — standalone GUI
 
-    R->>R: Scan old destination file
-    R->>R: Build NCI1 chunk index
-    R->>S: Send one compact NCI1 index
-
-    S->>S: Scan new source file
-    S->>S: Match chunks against NCI1
-    S->>S: Build bounded NCP1 reconstruction plan
-
-    alt CDC is smaller than full-file transfer
-        S->>R: Send NCP1 references and literal bytes
-        R->>R: Copy referenced ranges from old file
-        R->>R: Insert received literal bytes
-        R->>R: Calculate final BLAKE3 while writing
-        R->>R: Atomically replace destination
-    else CDC unavailable or unprofitable
-        S->>R: Send fallback marker
-        S->>R: Send ordinary whole-file record
-    end
-```
-
-```text
-Old receiver file:
-[ unchanged prefix ][ old section ][ unchanged suffix ]
-
-New sender file:
-[ unchanged prefix ][ NEW section ][ unchanged suffix ]
-
-Protocol v7 sends:
-[ reference prefix ][ literal NEW section ][ reference suffix ]
-```
-
-The first protocol-v7 loopback acceptance updated three medium files containing
-20,990,976 logical bytes. It reused 20,864,841 receiver-side bytes and sent
-126,135 literal bytes. Including three receiver indexes, three reconstruction
-plans, CDC framing, and stream termination, the data lanes carried 140,722
-bytes for 99.33% savings. All reconstructed files passed receiver-side BLAKE3
-verification and independent SHA-256 comparison.
-
-### How the GUI activates CDC
-
-CDC does not require a separate sender option. The receiver controls the update
-policy by enabling **Update existing destination**.
-
-```mermaid
-flowchart TD
-    G["Receiver enables Update existing destination"]
-    U["Verified update mode"]
-    I["Compare source manifest with destination"]
-    S["Unchanged same-path files"]
-    C["Changed same-path files"]
-    K["Verify and skip"]
-    M{"Medium or large file of at least 1 MiB?"}
-    D["Protocol-v9 CDC negotiation"]
-    P{"Index plus plan beats full file?"}
-    R["Reconstruct, verify BLAKE3, replace"]
-    F["Ordinary whole-file or multi-lane striped fallback"]
-
-    G --> U
-    U --> I
-    I --> S
-    I --> C
-    S --> K
-    C --> M
-    M -->|Yes| D
-    M -->|No| F
-    D --> P
-    P -->|Yes| R
-    P -->|No| F
-```
-
-The sender does not need to predict whether the receiver has a useful basis
-file. Each data lane receives either a compact basis index or an unavailable
-marker. CDC therefore remains automatic and safely falls back to the existing
-transfer engine.
-
-### CDC interruption and retry behavior
-
-Partial CDC plans are not persisted. The receiver reads and validates the complete
-`NCP1` plan before reconstruction begins, so a disconnect during plan transfer
-leaves the old destination file untouched. The next session rebuilds the basis
-index and retries that file from the beginning.
-
-```mermaid
-stateDiagram-v2
-    [*] --> OldDestination
-
-    OldDestination --> ReceivingPlan: Send NCI1 index
-    ReceivingPlan --> OldDestination: Disconnect or truncated NCP1
-    ReceivingPlan --> Reconstructing: Complete validated NCP1
-
-    Reconstructing --> OldDestination: Write or BLAKE3 failure
-    Reconstructing --> NewDestination: BLAKE3 match and atomic replacement
-
-    NewDestination --> VerifiedSkip: Session lost before final ACK
-    VerifiedSkip --> [*]: Next update verifies and skips file
-```
-
-After a successful reconstruction, the receiver restores that file's source
-metadata immediately. If the session then fails before the final transfer
-acknowledgement, the next verified update recognizes the completed file and
-skips it. Resume therefore occurs at file granularity for CDC updates; incomplete
-plans are safely discarded rather than checkpointed.
-
-### Planned fresh-transfer reuse
-
-Fresh transfers begin without receiver-side basis files. The planned rolling
-catalog will make each completed and verified file available as a basis for
-files transferred later in the same session.
-
-```mermaid
-flowchart LR
-    A["Transfer first generation normally"]
-    B["Verify and atomically commit files"]
-    C["Publish whole-file and chunk catalog entries"]
-    D["Plan later generation against committed content"]
-    E{"Reuse profitable?"}
-    F["Send references plus new literals"]
-    G["Use ordinary transfer fallback"]
-
-    A --> B
-    B --> C
-    C --> D
-    D --> E
-    E -->|Yes| F
-    E -->|No| G
-    F --> B
-    G --> B
-```
-
-Only fully committed files will be valid bases. Files within one generation may
-still transfer across multiple TCP lanes, while generation barriers prevent a
-lane from referencing data that another lane has not completed. The first slice
-will reuse exact duplicate files; later slices will add a bounded rolling chunk
-catalog for cross-file CDC.
-
-The `NCI1` prototype wire format uses a 24-byte header followed by one 44-byte
-record per chunk. The receiver builds and encodes the index once; the sender
-decodes it once and performs local hash lookups while scanning the new file.
-There is no network round trip for each individual chunk.
-
-## v1.4 highlights
-
-Implementation order:
-
-- [x] held-out shared Zstandard dictionary benchmark;
-- [x] dictionary-size matrix on synthetic and realistic tiny-file datasets;
-- [x] adaptive receiver filesystem worker calibration;
-- [x] bounded parallel tiny-file materialization;
-- [x] final end-to-end tiny-file benchmark and telemetry.
-
-Shared Zstandard dictionaries were rejected after held-out testing. They did
-not improve complete-pack compression on synthetic or realistic tiny-file
-datasets once dictionary transmission was counted. The existing adaptive raw
-or complete-pack Zstandard strategy remains unchanged.
-
-Receiver filesystem calibration selected a shared two-worker tiny-file
-materialization pool. The pool is bounded globally across all TCP lanes,
-preserves per-file BLAKE3 verification and atomic replacement, and falls back
-to one worker on single-core systems.
-
-Protocol v6 returns the receiver's selected tiny-file materialization worker
-count in the final transfer acknowledgement, so CLI and GUI summaries on both
-peers report the actual bounded pool width.
-
-The final 10,000-file loopback acceptance run transferred 1.85 MiB of logical
-tiny-file data in 10.17 seconds using two TCP streams and two shared tiny-file
-write workers. The three tiny-file packs used 1.38 MiB on the application wire,
-for 25.51% savings. Compared with the earlier 19.56-second baseline, receiver
-materialization changes reduced total transfer time by approximately 48%.
-
-## v1.3 highlights
-
-v1.3 includes:
-
-- [x] adaptive compression of complete tiny-file packs;
-- [x] exact compressed/raw pack and pack-wire telemetry;
-- [x] repeatable compressible and incompressible tiny-pack benchmarks;
-- [x] read-only fast destination inventory by path, size, and timestamp;
-- [x] sender/receiver unchanged-file offer protocol;
-- [x] scheduler removal of unchanged whole files and large-file stripes;
-- [x] partial tiny-pack filtering and repacking;
-- [x] safe update-mode destination preparation;
-- [x] old-file preservation until replacement data is verified;
-- [x] atomic Windows replacement of completed files;
-- [x] GUI and session controls for update-existing destination mode;
-- [x] unchanged-file and skipped-byte telemetry;
-- [x] reusable BLAKE3 candidate hashing and exact digest matching;
-- [x] BLAKE3-verified unchanged-file negotiation;
-- [x] verified update mode enabled by default;
-- [x] wire protocol v5 with explicit cross-version rejection;
-- [x] safe reset of stale resumed stripes after verification mismatch;
-- [x] automatic per-record Zstandard/raw strategy selection;
-- [x] compression-strategy reporting and conservative workload diagnostics;
-
-NetworkCopy probes each transferable record before encoding it. Compressible
-files, stripes, and tiny-file packs use Zstandard; incompressible payloads
-automatically fall back to raw transfer. The GUI reports whether a completed
-session was dominated by skipped files, tiny-file overhead, useful
-compression, raw fallback, or showed no clear single limiter.
-
-Block-level and content-defined deduplication are reserved for v2.0.
-
-## Quick start — graphical interface
-
-Run:
+Start the GUI on both machines:
 
 ```powershell
 networkcopy-gui.exe
 ```
 
-### Direct Ethernet cable
+For a normal LAN transfer, select the appropriate receive/send mode and use the receiver's address.
 
-Connect the two Windows computers with an Ethernet cable.
+For Direct Link:
 
-On the receiving computer:
+1. connect the two machines with an Ethernet cable;
+2. start **Receive** on the destination machine;
+3. choose **Direct cable**;
+4. select the destination folder;
+5. approve elevation if Windows Firewall configuration requires it;
+6. start **Send** on the source machine;
+7. choose **Direct cable** and the source folder.
 
-1. Open **Fogadás / Receive**.
-2. Select **Közvetlen kábel / Direct cable**.
-3. Choose the destination folder.
-4. Press **Indítás / Start**.
-5. Approve administrator elevation when Windows requests it.
+Direct Link discovery and path calibration are automatic.
 
-On the sending computer:
+## Quick start — Manager
 
-1. Open **Küldés / Send**.
-2. Select **Közvetlen kábel / Direct cable**.
-3. Choose the source folder.
-4. Press **Indítás / Start**.
+Run the Agent on both transfer endpoints:
 
-NetworkCopy automatically:
-
-- identifies dedicated Ethernet interfaces;
-- rejects interfaces carrying a default route;
-- discovers the receiver over scoped IPv6 link-local multicast;
-- falls back to IPv4 APIPA when IPv6 is unavailable;
-- binds discovery, calibration, control, and transfer sockets to the selected
-  interface;
-- measures the path with 1, 2, 4, and 8 TCP streams;
-- chooses the smallest stream count reaching at least 90% of the best measured
-  result;
-- starts the folder transfer.
-
-### Existing LAN or manual address
-
-Select **IP-cím / IP address**.
-
-The receiver enters a local listening address, for example:
-
-```text
-0.0.0.0:7337
+```powershell
+networkcopy-agent.exe
 ```
 
-The sender enters the receiver address, for example:
+The Agent requests elevation when required and exposes a notification-area icon showing whether the endpoint is idle or busy.
 
-```text
-192.168.1.50:7337
+Then run the Manager:
+
+```powershell
+networkcopy-manager.exe
 ```
 
-Loopback development and local testing can use:
+The Manager can discover both Agents, browse their filesystems, assign sender and receiver roles, create queued transfers and monitor progress.
 
-```text
-127.0.0.1:7337
+The Manager itself does not need to stay open after both endpoints have accepted a transfer.
+
+## Command-line examples
+
+Show all available commands:
+
+```powershell
+networkcopy-speed.exe --help
 ```
 
-## Cancellation and resume
+Show the version:
 
-The GUI's Cancel button interrupts:
-
-- Direct Link discovery;
-- receiver waits;
-- calibration;
-- scanning checkpoints;
-- file payload transfer;
-- large-file stripe processing.
-
-NetworkCopy stores a tiny transfer-request record beside the executable when
-possible. When that directory is not writable, it falls back to:
-
-```text
-%LOCALAPPDATA%\NetworkCopy Speed Edition
+```powershell
+networkcopy-speed.exe version
 ```
-
-After an interrupted operation, the next launch offers to restore the previous
-settings and restart the operation.
-
-The destination-side resume journal remains authoritative for completed
-large-file stripes. Restarting the same operation allows those completed
-stripes to be skipped.
-
-A successful transfer removes the corresponding GUI session record.
-
-## Transfer engine
-
-The GUI and CLI call the same Rust library. There is no second networking
-implementation and the GUI does not launch or scrape the CLI.
-
-The transfer engine includes:
-
-- parallel directory scanning;
-- UTF-16 Windows path support;
-- one control connection plus calibrated TCP data lanes;
-- tiny-file packing;
-- large-file striping;
-- resumable stripe journals;
-- adaptive Zstandard compression;
-- BLAKE3 integrity verification;
-- sparse-file and metadata handling;
-- bounded reusable transfer buffers;
-- process-wide memory budgeting;
-- explicit source-interface binding for Direct Link Mode.
-
-## Calibration policy
-
-Before a folder transfer, NetworkCopy measures:
-
-```text
-1, 2, 4, and 8 TCP streams
-```
-
-The selected count is the smallest number of streams that reaches at least
-90% of the best measured throughput.
-
-This avoids using eight connections when fewer lanes already saturate the
-available path.
-
-## Validated transfer
-
-The v1.1 Direct Link acceptance dataset contained:
-
-```text
-2,181 files
-6,807,145,167 logical bytes
-```
-
-Validation covered:
-
-- scoped IPv6 link-local discovery;
-- IPv4 APIPA fallback with IPv6 disabled;
-- explicit local source binding;
-- multistream calibration;
-- compression;
-- tiny-file packing;
-- BLAKE3 verification;
-- cable interruption;
-- restart and completed-stripe resume.
-
-One IPv4 APIPA validation run completed at:
-
-```text
-282.55 MB/s logical payload throughput
-30.35% application-wire savings
-```
-
-These numbers describe that specific VMware test environment and dataset.
-Actual speed depends on storage, CPU, adapters, drivers, cabling, and the
-compressibility of the transferred data.
-
-## Network ports
-
-NetworkCopy uses:
-
-| Protocol | Port | Purpose |
-|---|---:|---|
-| UDP | 7336 | Direct Link discovery |
-| TCP | 7337 | Calibration, control, and file transfer |
-
-The GUI receiver configures the required inbound Windows Firewall rules and
-automatically relaunches with administrator privileges when necessary.
-
-## Command-line interface
 
 Direct Link receiver:
 
@@ -1558,54 +546,36 @@ Direct Link sender:
 networkcopy-speed.exe direct-send "C:\Source" 4 64
 ```
 
-Sender arguments:
-
-```text
-direct-send <source> [scanner-workers] [calibration-mib]
-```
-
-Use the built-in help for benchmark, diagnostic, explicit-address, and
-lower-level commands:
+Inspect storage classification:
 
 ```powershell
-networkcopy-speed.exe --help
+networkcopy-speed.exe probe-storage-media "C:\Source"
 ```
 
-## Building
+Run a local multistream transfer benchmark:
+
+```powershell
+networkcopy-speed.exe bench-multistream-copy `
+    "C:\Source" `
+    "C:\Destination" `
+    4 `
+    4
+```
+
+The CLI also exposes internal network, storage, compression, CDC, reconstruction, IOCP and diagnostic benchmarks used during development.
+
+## Building from source
 
 Requirements:
 
-- Windows 11 or a supported Windows 10 installation;
-- stable Rust toolchain;
-- MSVC Rust target and Visual Studio C++ build tools.
-
-Debug GUI:
-
-```powershell
-cargo run --bin networkcopy-gui
+```text
+Windows 10 or Windows 11
+stable Rust toolchain
+MSVC Rust target
+Visual Studio C++ build tools
 ```
 
-Release GUI with Hungarian as the initial language:
-
-```powershell
-cargo build `
-    --release `
-    --bin networkcopy-gui
-```
-
-Release GUI with English as the initial language:
-
-```powershell
-cargo build `
-    --release `
-    --bin networkcopy-gui `
-    --features default-language-en
-```
-
-Both variants contain both languages. The feature only changes which language
-is selected at startup.
-
-Release CLI:
+Build the CLI:
 
 ```powershell
 cargo build `
@@ -1613,23 +583,47 @@ cargo build `
     --bin networkcopy-speed
 ```
 
-## Release naming
-
-The v1.4 release assets are executable-only:
-
-```text
-networkcopy-speed-hu.exe
-networkcopy-speed-en.exe
-```
-
-No installer, ZIP package, or checksum sidecar file is required.
-
-## Quality gate
-
-Before a release:
+Build the Agent:
 
 ```powershell
-cargo fmt --check
+cargo build `
+    --release `
+    --bin networkcopy-agent
+```
+
+Build the Manager:
+
+```powershell
+cargo build `
+    --release `
+    --bin networkcopy-manager
+```
+
+Build the GUI with Hungarian selected initially:
+
+```powershell
+cargo build `
+    --release `
+    --bin networkcopy-gui `
+    --no-default-features
+```
+
+Build the GUI with English selected initially:
+
+```powershell
+cargo build `
+    --release `
+    --bin networkcopy-gui `
+    --no-default-features `
+    --features default-language-en
+```
+
+## Development quality gate
+
+Normal development changes are expected to pass:
+
+```powershell
+cargo fmt
 
 cargo test
 
@@ -1638,51 +632,91 @@ cargo clippy `
     --all-features `
     -- `
     -D warnings
-
-cargo build --release
 ```
 
-## Project structure
+The long-running recovery torture tests are intentionally ignored by ordinary `cargo test`.
+
+They can be run separately with:
+
+```powershell
+.\scripts\run-v21-torture.ps1 -Rounds 10
+```
+
+## Release build
+
+The release builder performs formatting checks, locked tests, strict Clippy, optional recovery torture, optimized executable builds, CLI version smoke testing, optional Authenticode signing and release checksum generation.
+
+For a development-version release candidate:
+
+```powershell
+.\scripts\Build-Release.ps1 `
+    -AllowDevelopmentVersion `
+    -TortureRounds 10
+```
+
+For a final stable release after `Cargo.toml` has been changed to the stable version:
+
+```powershell
+.\scripts\Build-Release.ps1 `
+    -TortureRounds 10
+```
+
+Do not use `-SkipChecks` for a release.
+
+## Architecture
+
+The repository intentionally keeps every front end on one shared transfer implementation.
+
+```mermaid
+flowchart LR
+    GUI["Standalone GUI"]
+    CLI["CLI"]
+    AGENT["Endpoint Agent"]
+    MANAGER["Manager"]
+
+    CORE["Shared Rust transfer engine"]
+
+    GUI --> CORE
+    CLI --> CORE
+    AGENT --> CORE
+    MANAGER --> AGENT
+```
+
+Core responsibilities include manifest scanning, transfer planning, network calibration, path handling, adaptive compression, tiny-file packing, large-file striping, resume state, exact reuse, CDC reconstruction, BLAKE3 verification, metadata restoration and transfer telemetry.
+
+The Manager is orchestration; the Agent invokes the same transfer engine used by the standalone programs.
+
+## Design priorities
+
+NetworkCopy deliberately prioritizes:
 
 ```text
-src/
-├── bin/
-│   └── networkcopy-gui.rs
-├── lib.rs
-├── cli_main.rs
-├── gui_transfer.rs
-├── gui_session.rs
-├── windows_elevation.rs
-├── direct_discovery.rs
-├── direct_discovery_v4.rs
-├── direct_transfer.rs
-├── calibrated_transfer.rs
-├── multistream_copy.rs
-├── manifest_scan.rs
-├── adaptive_compression.rs
-├── resume_state.rs
-└── ...
+1. transfer speed
+2. ease of use
+3. reliability and integrity
+4. low operational friction
 ```
 
-Important architectural boundary:
+Performance changes are expected to be measured.
 
-```text
-GUI ─┐
-     ├── shared transfer library ── networking and storage engine
-CLI ─┘
-```
+More concurrency is not automatically treated as an optimization.
 
-## Scope
+A change that looks clever but loses a benchmark is allowed to die. :)
 
-NetworkCopy is currently Windows-only and optimized for trusted local
-machine-to-machine transfers.
+## Project scope
 
-The project intentionally focuses on:
+NetworkCopy is built for local Windows machine-to-machine transfers.
 
-- local Ethernet and LAN paths;
-- maximum practical throughput;
-- restartable transfers;
-- correctness and integrity;
-- a portable standalone executable.
+The project is not trying to become a cloud storage service, Internet file-sharing platform or general remote-administration suite.
 
-See `LICENSE` for licensing terms.
+The focus remains fast local transfer, straightforward setup, deterministic integrity, interruption recovery and practical migration workflows.
+
+## Next
+
+After v2.6, development moves to the v2.7 UI/UX redesign.
+
+The transfer engine is intentionally being left alone long enough for the interface to catch up with what it can now do. :)
+
+## License
+
+See [LICENSE](LICENSE) for licensing terms.
