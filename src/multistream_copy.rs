@@ -8607,6 +8607,127 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "development-only CDC planner scale probe"]
+    fn fresh_generation_plan_scale_probe() {
+        const FILE_COUNT: usize = 100_000;
+        const FILE_BYTES: u64 = 1024 * 1024;
+        const DATA_STREAMS: usize = 4;
+
+        let manifest = (0..FILE_COUNT)
+            .map(|file_id| {
+                entry(
+                    &format!("medium-{file_id:06}.bin"),
+                    FILE_BYTES,
+                    FileClass::Medium,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let transfer_plan = build_transfer_plan(&manifest, DATA_STREAMS).unwrap();
+
+        let transfer_task_count = transfer_plan.lanes.iter().map(Vec::len).sum::<usize>();
+
+        let planning_started = Instant::now();
+
+        let generation_plan = build_fresh_generation_plan_with_limits(
+            &manifest,
+            &transfer_plan,
+            CatalogLimits::default(),
+        )
+        .unwrap();
+
+        let planning_elapsed = planning_started.elapsed();
+
+        let generation_count = generation_plan.catalog.generations.len();
+
+        let catalog_candidate_slots = generation_plan
+            .catalog
+            .generations
+            .iter()
+            .map(|generation| generation.transfer_files.len())
+            .sum::<usize>();
+
+        let basis_file_id_slots = generation_plan
+            .catalog
+            .generations
+            .iter()
+            .map(|generation| generation.basis_file_ids.len())
+            .sum::<usize>();
+
+        let published_file_id_slots = generation_plan
+            .catalog
+            .generations
+            .iter()
+            .map(|generation| generation.published_file_ids.len())
+            .sum::<usize>();
+
+        let uncataloged_file_id_slots = generation_plan
+            .catalog
+            .generations
+            .iter()
+            .map(|generation| generation.uncataloged_file_ids.len())
+            .sum::<usize>();
+
+        let evicted_file_id_slots = generation_plan
+            .catalog
+            .generations
+            .iter()
+            .map(|generation| generation.evicted_file_ids.len())
+            .sum::<usize>();
+
+        let generation_task_count = generation_plan
+            .generation_lanes
+            .iter()
+            .flatten()
+            .map(Vec::len)
+            .sum::<usize>();
+
+        let trailing_task_count = generation_plan
+            .trailing_lanes
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>();
+
+        let cloned_execution_task_count = generation_task_count + trailing_task_count;
+
+        let basis_payload_bytes = basis_file_id_slots * std::mem::size_of::<usize>();
+
+        let catalog_candidate_payload_bytes = catalog_candidate_slots
+            * std::mem::size_of::<crate::session_cdc_catalog::CatalogCandidate>();
+
+        let cloned_execution_task_payload_bytes =
+            cloned_execution_task_count * std::mem::size_of::<TransferTask>();
+
+        println!("Fresh CDC planner scale probe");
+        println!("  Source files:                {FILE_COUNT}");
+        println!("  TCP lanes:                   {DATA_STREAMS}");
+        println!("  Catalog generations:         {generation_count}");
+        println!("  Original transfer tasks:     {transfer_task_count}");
+        println!("  Cloned execution tasks:      {cloned_execution_task_count}");
+        println!("  Catalog candidate slots:     {catalog_candidate_slots}");
+        println!("  Basis file-ID slots:         {basis_file_id_slots}");
+        println!("  Published file-ID slots:     {published_file_id_slots}");
+        println!("  Uncataloged file-ID slots:   {uncataloged_file_id_slots}");
+        println!("  Evicted file-ID slots:       {evicted_file_id_slots}");
+        println!("  Basis ID payload:            {basis_payload_bytes} bytes");
+        println!("  Catalog candidate payload:   {catalog_candidate_payload_bytes} bytes");
+        println!("  Cloned task payload:         {cloned_execution_task_payload_bytes} bytes");
+        println!(
+            "  Planner elapsed:             {:.6} s",
+            planning_elapsed.as_secs_f64()
+        );
+
+        assert_eq!(catalog_candidate_slots, FILE_COUNT);
+
+        assert_eq!(cloned_execution_task_count, transfer_task_count);
+
+        assert!(
+            basis_file_id_slots > FILE_COUNT,
+            "basis snapshots should expose cross-generation amplification"
+        );
+    }
+
+    #[test]
     fn fresh_resume_accepts_complete_generation_prefix() {
         let manifest = vec![
             entry("medium-a.bin", 100, FileClass::Medium),
