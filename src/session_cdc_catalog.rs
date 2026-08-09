@@ -80,8 +80,6 @@ pub struct CatalogGeneration {
 
     pub transfer_files: Vec<CatalogCandidate>,
 
-    pub published_file_ids: Vec<usize>,
-
     pub uncataloged_file_ids: Vec<usize>,
 
     pub evicted_file_ids: Vec<usize>,
@@ -91,6 +89,17 @@ pub struct CatalogGeneration {
     pub catalog_entries_before: u64,
 
     pub catalog_entries_after: u64,
+}
+
+impl CatalogGeneration {
+    pub fn published_file_ids(&self) -> impl Iterator<Item = usize> + '_ {
+        self.transfer_files.iter().filter_map(|candidate| {
+            self.uncataloged_file_ids
+                .binary_search(&candidate.file_id)
+                .is_err()
+                .then_some(candidate.file_id)
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -132,8 +141,7 @@ impl CatalogBasis {
     }
 
     pub fn apply_generation(&mut self, generation: &CatalogGeneration) -> io::Result<()> {
-        self.file_ids
-            .extend_from_slice(&generation.published_file_ids);
+        self.file_ids.extend(generation.published_file_ids());
 
         let evicted_count = generation.evicted_file_ids.len();
 
@@ -254,8 +262,6 @@ fn finish_catalog_generation(
 
     let logical_bytes = sum_candidate_bytes(&transfer_files)?;
 
-    let mut published_file_ids = Vec::new();
-
     let mut uncataloged_file_ids = Vec::new();
 
     let mut evicted_file_ids = Vec::new();
@@ -291,8 +297,6 @@ fn finish_catalog_generation(
         *catalog_entries = (*catalog_entries)
             .checked_add(estimated_entries)
             .ok_or_else(|| io::Error::other("session CDC catalog entry count overflowed"))?;
-
-        published_file_ids.push(candidate.file_id);
     }
 
     *peak_catalog_entries = (*peak_catalog_entries).max(*catalog_entries);
@@ -301,8 +305,6 @@ fn finish_catalog_generation(
         index: generation_index,
 
         transfer_files,
-
-        published_file_ids,
 
         uncataloged_file_ids,
 
@@ -374,8 +376,6 @@ pub fn validate_plan(plan: &CatalogPlan, limits: CatalogLimits) -> io::Result<()
             .checked_add(logical_bytes)
             .ok_or_else(|| io::Error::other("session CDC validation byte count overflowed"))?;
 
-        let mut expected_published = Vec::new();
-
         let mut expected_uncataloged = Vec::new();
 
         let mut expected_evicted = Vec::new();
@@ -433,15 +433,6 @@ pub fn validate_plan(plan: &CatalogPlan, limits: CatalogLimits) -> io::Result<()
             catalog_entries = catalog_entries
                 .checked_add(estimated_entries)
                 .ok_or_else(|| io::Error::other("session CDC validation catalog overflowed"))?;
-
-            expected_published.push(candidate.file_id);
-        }
-
-        if generation.published_file_ids != expected_published {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "session CDC generation published-file set is incorrect",
-            ));
         }
 
         if generation.uncataloged_file_ids != expected_uncataloged {
@@ -625,7 +616,10 @@ mod tests {
 
         assert_eq!(plan.generations[2].evicted_file_ids, vec![0],);
 
-        assert_eq!(plan.generations[2].published_file_ids, vec![2],);
+        assert_eq!(
+            plan.generations[2].published_file_ids().collect::<Vec<_>>(),
+            vec![2],
+        );
 
         let final_basis = CatalogBasis::before_generation(&plan, 3).unwrap();
 
@@ -655,7 +649,10 @@ mod tests {
 
         assert_eq!(plan.generations.len(), 1);
 
-        assert_eq!(plan.generations[0].published_file_ids, vec![0, 1, 2],);
+        assert_eq!(
+            plan.generations[0].published_file_ids().collect::<Vec<_>>(),
+            vec![0, 1, 2],
+        );
 
         assert_eq!(plan.generations[0].evicted_file_ids, vec![0]);
 
@@ -676,7 +673,10 @@ mod tests {
 
         assert_eq!(plan.generations.len(), 1,);
 
-        assert_eq!(plan.generations[0].published_file_ids, Vec::<usize>::new(),);
+        assert_eq!(
+            plan.generations[0].published_file_ids().collect::<Vec<_>>(),
+            Vec::<usize>::new(),
+        );
 
         assert_eq!(plan.generations[0].uncataloged_file_ids, vec![7],);
 

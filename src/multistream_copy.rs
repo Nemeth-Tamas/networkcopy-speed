@@ -7848,7 +7848,7 @@ fn expected_generation_commit(generation: &CatalogGeneration) -> GenerationCommi
             .map(|candidate| candidate.file_id)
             .collect(),
 
-        published_file_ids: generation.published_file_ids.clone(),
+        published_file_ids: generation.published_file_ids().collect(),
 
         evicted_file_ids: generation.evicted_file_ids.clone(),
     }
@@ -8411,7 +8411,9 @@ mod tests {
         assert!(first_basis.file_ids().is_empty());
 
         assert_eq!(
-            generation_plan.catalog.generations[0].published_file_ids,
+            generation_plan.catalog.generations[0]
+                .published_file_ids()
+                .collect::<Vec<_>>(),
             vec![0],
         );
 
@@ -8420,7 +8422,9 @@ mod tests {
         assert_eq!(second_basis.file_ids(), &[0]);
 
         assert_eq!(
-            generation_plan.catalog.generations[1].published_file_ids,
+            generation_plan.catalog.generations[1]
+                .published_file_ids()
+                .collect::<Vec<_>>(),
             vec![1],
         );
 
@@ -8560,12 +8564,14 @@ mod tests {
                 peak_rolling_basis_file_ids.max(rolling_basis.file_ids().len());
         }
 
-        let published_file_id_slots = generation_plan
+        let derived_published_file_ids = generation_plan
             .catalog
             .generations
             .iter()
-            .map(|generation| generation.published_file_ids.len())
+            .map(|generation| generation.published_file_ids().count())
             .sum::<usize>();
+
+        let retained_published_file_id_slots = 0_usize;
 
         let uncataloged_file_id_slots = generation_plan
             .catalog
@@ -8607,6 +8613,12 @@ mod tests {
         let rolling_basis_payload_bytes =
             peak_rolling_basis_file_ids * std::mem::size_of::<usize>();
 
+        let retained_catalog_id_payload_bytes = retained_published_file_id_slots
+            .checked_add(uncataloged_file_id_slots)
+            .and_then(|slots| slots.checked_add(evicted_file_id_slots))
+            .and_then(|slots| slots.checked_mul(std::mem::size_of::<usize>()))
+            .expect("retained catalog ID payload overflowed");
+
         let catalog_candidate_payload_bytes = catalog_candidate_slots
             * std::mem::size_of::<crate::session_cdc_catalog::CatalogCandidate>();
 
@@ -8626,10 +8638,12 @@ mod tests {
         println!("  Source capacity after move:  {source_task_capacity_after_move}");
         println!("  Catalog candidate slots:     {catalog_candidate_slots}");
         println!("  Peak rolling basis IDs:      {peak_rolling_basis_file_ids}");
-        println!("  Published file-ID slots:     {published_file_id_slots}");
+        println!("  Derived published file IDs:  {derived_published_file_ids}");
+        println!("  Retained published-ID slots: {retained_published_file_id_slots}");
         println!("  Uncataloged file-ID slots:   {uncataloged_file_id_slots}");
         println!("  Evicted file-ID slots:       {evicted_file_id_slots}");
         println!("  Rolling basis payload:       {rolling_basis_payload_bytes} bytes");
+        println!("  Retained catalog ID payload: {retained_catalog_id_payload_bytes} bytes");
         println!("  Catalog candidate payload:   {catalog_candidate_payload_bytes} bytes");
         println!("  Execution task payload:      {execution_task_payload_bytes} bytes");
         println!("  Duplicate source payload:    {duplicate_source_payload_bytes} bytes");
@@ -8643,6 +8657,10 @@ mod tests {
         );
 
         assert_eq!(catalog_candidate_slots, FILE_COUNT);
+
+        assert_eq!(derived_published_file_ids, FILE_COUNT);
+
+        assert_eq!(retained_published_file_id_slots, 0);
 
         assert_eq!(moved_execution_task_count, transfer_task_count);
 
