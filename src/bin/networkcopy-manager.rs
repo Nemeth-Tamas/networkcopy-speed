@@ -146,6 +146,55 @@ struct CancelResponse {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagerPage {
+    Dashboard,
+
+    Transfers,
+
+    Queue,
+
+    Agents,
+
+    History,
+
+    Settings,
+}
+
+impl ManagerPage {
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Dashboard => "Dashboard",
+
+            Self::Transfers => "Transfers",
+
+            Self::Queue => "Transfer queue",
+
+            Self::Agents => "Agents",
+
+            Self::History => "Transfer history",
+
+            Self::Settings => "Settings",
+        }
+    }
+
+    const fn subtitle(self) -> &'static str {
+        match self {
+            Self::Dashboard => "Live transfer status and the things that need your attention.",
+
+            Self::Transfers => "Configure endpoints, paths, transfer options, and remote folders.",
+
+            Self::Queue => "Manage persistent sequential transfers and recovery.",
+
+            Self::Agents => "Discover and select NetworkCopy endpoints.",
+
+            Self::History => "Review retained completed, failed, and cancelled transfers.",
+
+            Self::Settings => "Manager version, persistence, update, and trust information.",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ManagedEndpointRole {
     Sender,
 
@@ -449,6 +498,8 @@ struct NetworkCopyManager {
 
     route_mode: ManagementRouteMode,
 
+    page: ManagerPage,
+
     show_agents: bool,
 
     show_setup: bool,
@@ -568,6 +619,8 @@ impl NetworkCopyManager {
             desktop_path_check_receiver: None,
 
             route_mode: ManagementRouteMode::AutomaticLan,
+
+            page: ManagerPage::Dashboard,
 
             show_agents: true,
 
@@ -3272,7 +3325,7 @@ impl NetworkCopyManager {
         }
     }
 
-    fn render_dashboard_sidebar(&self, ui: &mut egui::Ui) {
+    fn render_dashboard_sidebar(&mut self, ui: &mut egui::Ui) {
         ui.set_min_width(DASHBOARD_SIDEBAR_WIDTH);
         ui.set_max_width(DASHBOARD_SIDEBAR_WIDTH);
 
@@ -3300,27 +3353,60 @@ impl NetworkCopyManager {
 
         ui.add_space(26.0);
 
-        render_dashboard_sidebar_item(ui, "Dashboard", true, None);
+        let mut next_page = self.page;
+
+        if render_dashboard_sidebar_item(ui, "Dashboard", self.page == ManagerPage::Dashboard, None)
+        {
+            next_page = ManagerPage::Dashboard;
+        }
 
         ui.add_space(4.0);
 
-        render_dashboard_sidebar_item(ui, "Transfers", false, None);
+        if render_dashboard_sidebar_item(ui, "Transfers", self.page == ManagerPage::Transfers, None)
+        {
+            next_page = ManagerPage::Transfers;
+        }
 
         ui.add_space(4.0);
 
-        render_dashboard_sidebar_item(ui, "Queue", false, Some(self.queue.len()));
+        if render_dashboard_sidebar_item(
+            ui,
+            "Queue",
+            self.page == ManagerPage::Queue,
+            Some(self.queue.len()),
+        ) {
+            next_page = ManagerPage::Queue;
+        }
 
         ui.add_space(4.0);
 
-        render_dashboard_sidebar_item(ui, "Agents", false, Some(self.agents.len()));
+        if render_dashboard_sidebar_item(
+            ui,
+            "Agents",
+            self.page == ManagerPage::Agents,
+            Some(self.agents.len()),
+        ) {
+            next_page = ManagerPage::Agents;
+        }
 
         ui.add_space(4.0);
 
-        render_dashboard_sidebar_item(ui, "History", false, Some(self.history.len()));
+        if render_dashboard_sidebar_item(
+            ui,
+            "History",
+            self.page == ManagerPage::History,
+            Some(self.history.len()),
+        ) {
+            next_page = ManagerPage::History;
+        }
 
         ui.add_space(4.0);
 
-        render_dashboard_sidebar_item(ui, "Settings", false, None);
+        if render_dashboard_sidebar_item(ui, "Settings", self.page == ManagerPage::Settings, None) {
+            next_page = ManagerPage::Settings;
+        }
+
+        self.page = next_page;
 
         ui.add_space(42.0);
 
@@ -3402,6 +3488,346 @@ impl NetworkCopyManager {
                 egui::Color32::from_rgb(0, 219, 199),
             );
         });
+    }
+
+    fn render_dashboard_overview(&mut self, ui: &mut egui::Ui) {
+        let sender = if self.sender_agent.trim().is_empty() {
+            "No sender selected".to_string()
+        } else {
+            self.sender_agent.clone()
+        };
+
+        let receiver = if self.receiver_agent.trim().is_empty() {
+            "No receiver selected".to_string()
+        } else {
+            self.receiver_agent.clone()
+        };
+
+        let source = if self.source_root.trim().is_empty() {
+            "No source selected".to_string()
+        } else {
+            self.source_root.clone()
+        };
+
+        let destination = if self.destination_root.trim().is_empty() {
+            "No destination selected".to_string()
+        } else {
+            self.destination_root.clone()
+        };
+
+        let pending = self
+            .queue
+            .items()
+            .iter()
+            .filter(|item| item.state == QueuedTransferState::Pending)
+            .count();
+
+        ui.columns(2, |columns| {
+            let transfer_frame = dashboard_section_frame(&columns[0]);
+
+            transfer_frame.show(&mut columns[0], |ui| {
+                ui.set_min_height(170.0);
+
+                ui.label(
+                    egui::RichText::new("Next transfer")
+                        .size(18.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(225, 238, 250)),
+                );
+
+                ui.add_space(8.0);
+
+                status_label(
+                    ui,
+                    self.route_mode.label(),
+                    egui::Color32::from_rgb(0, 219, 199),
+                );
+
+                ui.add_space(8.0);
+
+                ui.label(egui::RichText::new(format!("{sender}  →  {receiver}")).monospace());
+
+                ui.add_space(4.0);
+
+                ui.label(format!("{source}  →  {destination}"));
+
+                ui.add_space(12.0);
+
+                if ui.button("Configure transfer").clicked() {
+                    self.page = ManagerPage::Transfers;
+                }
+            });
+
+            let queue_frame = dashboard_section_frame(&columns[1]);
+
+            queue_frame.show(&mut columns[1], |ui| {
+                ui.set_min_height(170.0);
+
+                ui.label(
+                    egui::RichText::new("Transfer queue")
+                        .size(18.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(225, 238, 250)),
+                );
+
+                ui.add_space(8.0);
+
+                ui.label(
+                    egui::RichText::new(self.queue.len().to_string())
+                        .size(30.0)
+                        .strong(),
+                );
+
+                ui.label(
+                    egui::RichText::new(format!("{pending} waiting"))
+                        .color(egui::Color32::from_rgb(181, 124, 255)),
+                );
+
+                ui.add_space(8.0);
+
+                ui.label(if self.queue_running {
+                    "Queue is running."
+                } else if self.queue.paused_after_current() {
+                    "Queue is paused after the current transfer."
+                } else if self.queue.is_empty() {
+                    "Nothing is queued yet."
+                } else {
+                    "Queue is ready."
+                });
+
+                ui.add_space(12.0);
+
+                if ui.button("Open queue").clicked() {
+                    self.page = ManagerPage::Queue;
+                }
+            });
+        });
+
+        ui.add_space(DASHBOARD_CONTENT_GAP);
+
+        let agents_frame = dashboard_section_frame(ui);
+
+        agents_frame.show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Agents").size(18.0).strong());
+
+                ui.separator();
+
+                ui.label(format!("{} LAN agent(s)", self.agents.len(),));
+
+                ui.separator();
+
+                ui.label(format!("{} Direct Link route(s)", self.direct_routes.len(),));
+
+                if ui.button("Manage agents").clicked() {
+                    self.page = ManagerPage::Agents;
+                }
+            });
+        });
+    }
+
+    fn render_selected_page(&mut self, ui: &mut egui::Ui) -> Option<egui::Rect> {
+        render_manager_page_heading(ui, self.page);
+
+        ui.add_space(DASHBOARD_CONTENT_GAP);
+
+        match self.page {
+            ManagerPage::Dashboard => {
+                self.render_dashboard_summary(ui);
+
+                ui.add_space(DASHBOARD_CONTENT_GAP);
+
+                let show_transfer_panel = self.transfer.is_some()
+                    || self.start_receiver.is_some()
+                    || self.attach_receiver.is_some()
+                    || self.cancel_receiver.is_some()
+                    || self.peer_cleanup_receiver.is_some();
+
+                if show_transfer_panel {
+                    dashboard_section_frame(ui).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+
+                        self.render_transfer(ui);
+                    });
+
+                    ui.add_space(DASHBOARD_CONTENT_GAP);
+                }
+
+                self.render_dashboard_overview(ui);
+
+                None
+            }
+
+            ManagerPage::Transfers => {
+                let show_transfer_panel = self.transfer.is_some()
+                    || self.start_receiver.is_some()
+                    || self.attach_receiver.is_some()
+                    || self.cancel_receiver.is_some()
+                    || self.peer_cleanup_receiver.is_some();
+
+                if show_transfer_panel {
+                    dashboard_section_frame(ui).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+
+                        self.render_transfer(ui);
+                    });
+
+                    ui.add_space(DASHBOARD_CONTENT_GAP);
+                }
+
+                dashboard_section_frame(ui).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+
+                    self.render_configuration(ui);
+                });
+
+                None
+            }
+
+            ManagerPage::Queue => {
+                dashboard_section_frame(ui).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+
+                    self.render_queue(ui);
+                });
+
+                None
+            }
+
+            ManagerPage::Agents => {
+                dashboard_section_frame(ui).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+
+                    self.render_discovery(ui);
+                });
+
+                None
+            }
+
+            ManagerPage::History => {
+                let response = dashboard_section_frame(ui).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+
+                    self.render_history(ui);
+                });
+
+                Some(response.response.rect)
+            }
+
+            ManagerPage::Settings => {
+                dashboard_section_frame(ui)
+                    .show(ui, |ui| {
+                        ui.set_min_width(
+                            ui.available_width(),
+                        );
+
+                        ui.label(
+                            egui::RichText::new(
+                                "Application",
+                            )
+                            .size(18.0)
+                            .strong(),
+                        );
+
+                        ui.add_space(8.0);
+
+                        ui.label(format!(
+                            "NetworkCopy Manager v{}",
+                            env!(
+                                "CARGO_PKG_VERSION"
+                            ),
+                        ));
+
+                        match &self.state_path {
+                            Some(path) => {
+                                ui.label(
+                                    egui::RichText::new(
+                                        format!(
+                                            "State: {}",
+                                            path.display(),
+                                        ),
+                                    )
+                                    .monospace(),
+                                );
+                            }
+
+                            None => {
+                                ui.label(
+                                    "Manager persistence path is unavailable.",
+                                );
+                            }
+                        }
+
+                        ui.add_space(14.0);
+
+                        ui.label(
+                            egui::RichText::new(
+                                "Security model",
+                            )
+                            .size(18.0)
+                            .strong(),
+                        );
+
+                        ui.add_space(6.0);
+
+                        status_label(
+                            ui,
+                            "Trusted LAN",
+                            egui::Color32::from_rgb(
+                                0, 219, 199,
+                            ),
+                        );
+
+                        ui.label(
+                            "Management traffic is currently unauthenticated and unencrypted.",
+                        );
+
+                        ui.label(
+                            "Do not expose the NetworkCopy management Agent directly to an untrusted network or the public Internet.",
+                        );
+
+                        ui.add_space(14.0);
+
+                        ui.label(
+                            egui::RichText::new(
+                                "Updates",
+                            )
+                            .size(18.0)
+                            .strong(),
+                        );
+
+                        ui.add_space(6.0);
+
+                        if let Some(check) =
+                            &self.update_check
+                        {
+                            ui.label(format!(
+                                "Latest stable release: {}",
+                                check.latest.tag_name,
+                            ));
+                        } else if self
+                            .update_receiver
+                            .is_some()
+                        {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+
+                                ui.label(
+                                    "Checking stable releases...",
+                                );
+                            });
+                        } else {
+                            ui.label(
+                                "No completed update check is available.",
+                            );
+                        }
+                    });
+
+                None
+            }
+        }
     }
 
     fn render_app_header(&mut self, ui: &mut egui::Ui) {
@@ -5177,179 +5603,22 @@ impl eframe::App for NetworkCopyManager {
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
 
-                            let mut history_rect = None;
+                            ui.set_width(ui.available_width());
 
                             self.render_app_header(ui);
 
                             ui.add_space(DASHBOARD_CONTENT_GAP);
 
-                            self.render_dashboard_summary(ui);
-
-                            ui.add_space(DASHBOARD_CONTENT_GAP);
-
                             self.render_messages(ui);
 
-                            let show_transfer_panel = self.transfer.is_some()
-                                || self.start_receiver.is_some()
-                                || self.attach_receiver.is_some()
-                                || self.cancel_receiver.is_some()
-                                || self.peer_cleanup_receiver.is_some();
-
-                            if show_transfer_panel {
-                                ui.add_space(8.0);
-
-                                dashboard_section_frame(ui).show(ui, |ui| {
-                                    ui.set_min_width(ui.available_width());
-
-                                    self.render_transfer(ui);
-                                });
-
+                            if !self.notice.is_empty()
+                                || !self.error.is_empty()
+                                || !self.persistence_error.is_empty()
+                            {
                                 ui.add_space(DASHBOARD_CONTENT_GAP);
                             }
 
-                            let agent_summary = format!("{} discovered", self.agents.len(),);
-
-                            dashboard_section_frame(ui).show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-
-                                render_section_toggle(
-                                    ui,
-                                    "LAN agents",
-                                    &agent_summary,
-                                    &mut self.show_agents,
-                                );
-
-                                if self.show_agents {
-                                    ui.add_space(8.0);
-
-                                    self.render_discovery(ui);
-                                }
-                            });
-
-                            ui.add_space(DASHBOARD_CONTENT_GAP);
-
-                            let setup_summary = if self.sender_agent.trim().is_empty()
-                                || self.receiver_agent.trim().is_empty()
-                            {
-                                "Choose sender and receiver".to_string()
-                            } else if self.source_root.trim().is_empty()
-                                || self.destination_root.trim().is_empty()
-                            {
-                                "Choose source and destination".to_string()
-                            } else {
-                                format!(
-                                    "{} · endpoints and paths selected",
-                                    self.route_mode.label(),
-                                )
-                            };
-
-                            dashboard_section_frame(ui).show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-
-                                render_section_toggle(
-                                    ui,
-                                    "Transfer setup",
-                                    &setup_summary,
-                                    &mut self.show_setup,
-                                );
-
-                                if self.show_setup {
-                                    ui.add_space(8.0);
-
-                                    self.render_configuration(ui);
-                                }
-                            });
-
-                            ui.add_space(DASHBOARD_CONTENT_GAP);
-
-                            let pending_queue_items = self
-                                .queue
-                                .items()
-                                .iter()
-                                .filter(|item| item.state == QueuedTransferState::Pending)
-                                .count();
-
-                            let queue_summary = if self.queue.is_empty() {
-                                "Empty".to_string()
-                            } else if self.queue_running {
-                                format!(
-                                    "{} item(s) · {} pending · running",
-                                    self.queue.len(),
-                                    pending_queue_items,
-                                )
-                            } else if self.queue.paused_after_current() {
-                                format!(
-                                    "{} item(s) · {} pending · paused",
-                                    self.queue.len(),
-                                    pending_queue_items,
-                                )
-                            } else {
-                                format!(
-                                    "{} item(s) · {} pending",
-                                    self.queue.len(),
-                                    pending_queue_items,
-                                )
-                            };
-
-                            dashboard_section_frame(ui).show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-
-                                render_section_toggle(
-                                    ui,
-                                    "Transfer queue",
-                                    &queue_summary,
-                                    &mut self.show_queue,
-                                );
-
-                                if self.show_queue {
-                                    ui.add_space(8.0);
-
-                                    self.render_queue(ui);
-                                }
-                            });
-
-                            ui.add_space(DASHBOARD_CONTENT_GAP);
-
-                            let history_summary = format!(
-                                "{} / {} retained",
-                                self.history.len(),
-                                MAX_TRANSFER_HISTORY,
-                            );
-
-                            dashboard_section_frame(ui).show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-
-                                render_section_toggle(
-                                    ui,
-                                    "Transfer history",
-                                    &history_summary,
-                                    &mut self.show_history,
-                                );
-
-                                if self.show_history {
-                                    ui.add_space(8.0);
-
-                                    let history_response = ui.scope(|ui| {
-                                        self.render_history(ui);
-                                    });
-
-                                    history_rect = Some(history_response.response.rect);
-                                }
-                            });
-
-                            ui.add_space(DASHBOARD_CONTENT_GAP);
-
-                            if let Some(path) = &self.state_path {
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Manager state: {}",
-                                        path.display(),
-                                    ))
-                                    .small()
-                                    .monospace()
-                                    .color(egui::Color32::from_rgb(105, 124, 142)),
-                                );
-                            }
+                            let history_rect = self.render_selected_page(ui);
 
                             ui.add_space(16.0);
 
@@ -6349,6 +6618,19 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn render_manager_page_heading(ui: &mut egui::Ui, page: ManagerPage) {
+    ui.label(
+        egui::RichText::new(page.title())
+            .size(26.0)
+            .strong()
+            .color(egui::Color32::from_rgb(238, 246, 255)),
+    );
+
+    ui.add_space(2.0);
+
+    ui.label(egui::RichText::new(page.subtitle()).color(egui::Color32::from_rgb(135, 154, 173)));
+}
+
 fn dashboard_card_frame(ui: &egui::Ui) -> egui::Frame {
     egui::Frame::group(ui.style())
         .fill(egui::Color32::from_rgb(11, 24, 38))
@@ -6398,40 +6680,40 @@ fn render_dashboard_sidebar_item(
     label: &str,
     selected: bool,
     badge: Option<usize>,
-) {
+) -> bool {
     let fill = if selected {
-        egui::Color32::from_rgb(8, 62, 100)
+        egui::Color32::from_rgb(8, 72, 116)
     } else {
         egui::Color32::TRANSPARENT
     };
 
-    egui::Frame::group(ui.style())
-        .fill(fill)
-        .stroke(egui::Stroke::NONE)
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
+    let stroke = if selected {
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(15, 102, 156))
+    } else {
+        egui::Stroke::NONE
+    };
 
-            ui.horizontal(|ui| {
-                let color = if selected {
-                    egui::Color32::from_rgb(72, 185, 255)
-                } else {
-                    egui::Color32::from_rgb(180, 195, 209)
-                };
+    let color = if selected {
+        egui::Color32::from_rgb(90, 198, 255)
+    } else {
+        egui::Color32::from_rgb(180, 195, 209)
+    };
 
-                ui.label(egui::RichText::new(label).size(15.0).strong().color(color));
+    let text = match badge {
+        Some(badge) => {
+            format!("{label}  {badge}")
+        }
 
-                if let Some(badge) = badge {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(badge.to_string())
-                                .small()
-                                .strong()
-                                .color(egui::Color32::from_rgb(112, 205, 255)),
-                        );
-                    });
-                }
-            });
-        });
+        None => label.to_string(),
+    };
+
+    ui.add_sized(
+        [ui.available_width(), 36.0],
+        egui::Button::new(egui::RichText::new(text).size(15.0).strong().color(color))
+            .fill(fill)
+            .stroke(stroke),
+    )
+    .clicked()
 }
 
 fn configure_style(context: &egui::Context) {
