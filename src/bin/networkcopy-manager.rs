@@ -51,6 +51,12 @@ const HISTORY_DRAG_EDGE_SPEED: f32 = 720.0;
 
 const STATE_SAVE_INTERVAL: Duration = Duration::from_millis(750);
 
+const DASHBOARD_SIDEBAR_WIDTH: f32 = 205.0;
+
+const DASHBOARD_CONTENT_GAP: f32 = 14.0;
+
+const DASHBOARD_CARD_HEIGHT: f32 = 94.0;
+
 type DiscoveryResult = Result<Vec<DiscoveredAgent>, String>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3266,6 +3272,138 @@ impl NetworkCopyManager {
         }
     }
 
+    fn render_dashboard_sidebar(&self, ui: &mut egui::Ui) {
+        ui.set_min_width(DASHBOARD_SIDEBAR_WIDTH);
+        ui.set_max_width(DASHBOARD_SIDEBAR_WIDTH);
+
+        ui.add_space(10.0);
+
+        ui.label(
+            egui::RichText::new("NetworkCopy")
+                .size(22.0)
+                .strong()
+                .color(egui::Color32::from_rgb(240, 247, 255)),
+        );
+
+        ui.label(
+            egui::RichText::new("Speed Edition")
+                .size(16.0)
+                .strong()
+                .color(egui::Color32::from_rgb(0, 174, 255)),
+        );
+
+        ui.label(
+            egui::RichText::new("Manager")
+                .size(13.0)
+                .color(egui::Color32::from_rgb(126, 145, 163)),
+        );
+
+        ui.add_space(26.0);
+
+        render_dashboard_sidebar_item(ui, "Dashboard", true, None);
+
+        ui.add_space(4.0);
+
+        render_dashboard_sidebar_item(ui, "Transfers", false, None);
+
+        ui.add_space(4.0);
+
+        render_dashboard_sidebar_item(ui, "Queue", false, Some(self.queue.len()));
+
+        ui.add_space(4.0);
+
+        render_dashboard_sidebar_item(ui, "Agents", false, Some(self.agents.len()));
+
+        ui.add_space(4.0);
+
+        render_dashboard_sidebar_item(ui, "History", false, Some(self.history.len()));
+
+        ui.add_space(4.0);
+
+        render_dashboard_sidebar_item(ui, "Settings", false, None);
+
+        ui.add_space(42.0);
+
+        dashboard_card_frame(ui).show(ui, |ui| {
+            let (status, status_color) = self.manager_status();
+
+            ui.label(
+                egui::RichText::new("System status")
+                    .small()
+                    .color(egui::Color32::from_rgb(126, 145, 163)),
+            );
+
+            ui.add_space(4.0);
+
+            ui.label(egui::RichText::new(status).strong().color(status_color));
+
+            ui.add_space(2.0);
+
+            ui.label(
+                egui::RichText::new("Trusted LAN transfer")
+                    .small()
+                    .color(egui::Color32::from_rgb(126, 145, 163)),
+            );
+        });
+    }
+
+    fn render_dashboard_summary(&self, ui: &mut egui::Ui) {
+        let active_transfers = usize::from(self.transfer.is_some() && !self.monitoring_complete);
+
+        let pending_queue_items = self
+            .queue
+            .items()
+            .iter()
+            .filter(|item| item.state == QueuedTransferState::Pending)
+            .count();
+
+        let route_detail = match self.route_mode {
+            ManagementRouteMode::AutomaticLan => "Automatic discovery",
+
+            ManagementRouteMode::DirectLink => "Dedicated Ethernet",
+
+            ManagementRouteMode::ExplicitIp => "Manual endpoint",
+        };
+
+        ui.columns(4, |columns| {
+            render_dashboard_metric(
+                &mut columns[0],
+                "Active transfers",
+                active_transfers.to_string(),
+                if active_transfers == 0 {
+                    "Ready"
+                } else {
+                    "Transfer running"
+                },
+                egui::Color32::from_rgb(0, 174, 255),
+            );
+
+            render_dashboard_metric(
+                &mut columns[1],
+                "Queued jobs",
+                self.queue.len().to_string(),
+                format!("{pending_queue_items} waiting"),
+                egui::Color32::from_rgb(181, 124, 255),
+            );
+
+            render_dashboard_metric(
+                &mut columns[2],
+                "Connected agents",
+                self.agents.len().to_string(),
+                format!("{} Direct Link route(s)", self.direct_routes.len(),),
+                egui::Color32::from_rgb(105, 225, 111),
+            );
+
+            render_dashboard_metric(
+                &mut columns[3],
+                "Transfer route",
+                self.route_mode.label(),
+                route_detail,
+                egui::Color32::from_rgb(0, 219, 199),
+            );
+        });
+    }
+
     fn render_app_header(&mut self, ui: &mut egui::Ui) {
         let (status, status_color) = self.manager_status();
 
@@ -5014,187 +5152,215 @@ impl eframe::App for NetworkCopyManager {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            let scroll_output = egui::ScrollArea::vertical()
-                .id_salt("manager-main-scroll")
-                .vertical_scroll_offset(self.main_scroll_offset)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(4, 13, 23))
+                    .show(ui, |ui| {
+                        ui.set_min_height(ui.available_height());
+
+                        self.render_dashboard_sidebar(ui);
+                    });
+
+                ui.add_space(DASHBOARD_CONTENT_GAP);
+
+                ui.vertical(|ui| {
                     ui.set_width(ui.available_width());
 
-                    let mut history_rect = None;
+                    let scroll_output = egui::ScrollArea::vertical()
+                        .id_salt("manager-main-scroll")
+                        .vertical_scroll_offset(self.main_scroll_offset)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
 
-                    self.render_app_header(ui);
+                            let mut history_rect = None;
 
-                    ui.add_space(10.0);
+                            self.render_app_header(ui);
 
-                    self.render_messages(ui);
+                            ui.add_space(DASHBOARD_CONTENT_GAP);
 
-                    let show_transfer_panel = self.transfer.is_some()
-                        || self.start_receiver.is_some()
-                        || self.attach_receiver.is_some()
-                        || self.cancel_receiver.is_some()
-                        || self.peer_cleanup_receiver.is_some();
+                            self.render_dashboard_summary(ui);
 
-                    if show_transfer_panel {
-                        ui.add_space(12.0);
+                            ui.add_space(DASHBOARD_CONTENT_GAP);
 
-                        ui.group(|ui| {
-                            ui.set_min_width(ui.available_width());
+                            self.render_messages(ui);
 
-                            self.render_transfer(ui);
-                        });
+                            let show_transfer_panel = self.transfer.is_some()
+                                || self.start_receiver.is_some()
+                                || self.attach_receiver.is_some()
+                                || self.cancel_receiver.is_some()
+                                || self.peer_cleanup_receiver.is_some();
 
-                        ui.add_space(10.0);
-                    } else {
-                        ui.add_space(8.0);
-                    }
+                            if show_transfer_panel {
+                                ui.add_space(8.0);
 
-                    let agent_summary = format!("{} discovered", self.agents.len());
+                                dashboard_section_frame(ui).show(ui, |ui| {
+                                    ui.set_min_width(ui.available_width());
 
-                    ui.group(|ui| {
-                        ui.set_min_width(ui.available_width());
+                                    self.render_transfer(ui);
+                                });
 
-                        render_section_toggle(
-                            ui,
-                            "LAN agents",
-                            &agent_summary,
-                            &mut self.show_agents,
-                        );
+                                ui.add_space(DASHBOARD_CONTENT_GAP);
+                            }
 
-                        if self.show_agents {
-                            ui.add_space(8.0);
+                            let agent_summary = format!("{} discovered", self.agents.len(),);
 
-                            self.render_discovery(ui);
-                        }
-                    });
+                            dashboard_section_frame(ui).show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
 
-                    ui.add_space(10.0);
+                                render_section_toggle(
+                                    ui,
+                                    "LAN agents",
+                                    &agent_summary,
+                                    &mut self.show_agents,
+                                );
 
-                    let setup_summary = if self.sender_agent.trim().is_empty()
-                        || self.receiver_agent.trim().is_empty()
-                    {
-                        "Choose sender and receiver".to_string()
-                    } else if self.source_root.trim().is_empty()
-                        || self.destination_root.trim().is_empty()
-                    {
-                        "Choose source and destination".to_string()
-                    } else {
-                        format!("{} · endpoints and paths selected", self.route_mode.label(),)
-                    };
+                                if self.show_agents {
+                                    ui.add_space(8.0);
 
-                    ui.group(|ui| {
-                        ui.set_min_width(ui.available_width());
-
-                        render_section_toggle(
-                            ui,
-                            "Transfer setup",
-                            &setup_summary,
-                            &mut self.show_setup,
-                        );
-
-                        if self.show_setup {
-                            ui.add_space(8.0);
-
-                            self.render_configuration(ui);
-                        }
-                    });
-
-                    ui.add_space(10.0);
-
-                    let pending_queue_items = self
-                        .queue
-                        .items()
-                        .iter()
-                        .filter(|item| item.state == QueuedTransferState::Pending)
-                        .count();
-
-                    let queue_summary = if self.queue.is_empty() {
-                        "Empty".to_string()
-                    } else if self.queue_running {
-                        format!(
-                            "{} item(s) · {} pending · running",
-                            self.queue.len(),
-                            pending_queue_items,
-                        )
-                    } else if self.queue.paused_after_current() {
-                        format!(
-                            "{} item(s) · {} pending · paused",
-                            self.queue.len(),
-                            pending_queue_items,
-                        )
-                    } else {
-                        format!(
-                            "{} item(s) · {} pending",
-                            self.queue.len(),
-                            pending_queue_items,
-                        )
-                    };
-
-                    ui.group(|ui| {
-                        ui.set_min_width(ui.available_width());
-
-                        render_section_toggle(
-                            ui,
-                            "Transfer queue",
-                            &queue_summary,
-                            &mut self.show_queue,
-                        );
-
-                        if self.show_queue {
-                            ui.add_space(8.0);
-
-                            self.render_queue(ui);
-                        }
-                    });
-
-                    ui.add_space(10.0);
-
-                    let history_summary =
-                        format!("{} / {} retained", self.history.len(), MAX_TRANSFER_HISTORY,);
-
-                    ui.group(|ui| {
-                        ui.set_min_width(ui.available_width());
-
-                        render_section_toggle(
-                            ui,
-                            "Transfer history",
-                            &history_summary,
-                            &mut self.show_history,
-                        );
-
-                        if self.show_history {
-                            ui.add_space(8.0);
-
-                            let history_response = ui.scope(|ui| {
-                                self.render_history(ui);
+                                    self.render_discovery(ui);
+                                }
                             });
 
-                            history_rect = Some(history_response.response.rect);
-                        }
-                    });
+                            ui.add_space(DASHBOARD_CONTENT_GAP);
 
-                    ui.add_space(10.0);
+                            let setup_summary = if self.sender_agent.trim().is_empty()
+                                || self.receiver_agent.trim().is_empty()
+                            {
+                                "Choose sender and receiver".to_string()
+                            } else if self.source_root.trim().is_empty()
+                                || self.destination_root.trim().is_empty()
+                            {
+                                "Choose source and destination".to_string()
+                            } else {
+                                format!(
+                                    "{} · endpoints and paths selected",
+                                    self.route_mode.label(),
+                                )
+                            };
 
-                    if let Some(path) = &self.state_path {
-                        ui.label(
-                            egui::RichText::new(format!("Manager state: {}", path.display(),))
-                                .small()
-                                .monospace(),
-                        );
-                    }
+                            dashboard_section_frame(ui).show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
 
-                    ui.add_space(16.0);
+                                render_section_toggle(
+                                    ui,
+                                    "Transfer setup",
+                                    &setup_summary,
+                                    &mut self.show_setup,
+                                );
 
-                    history_rect
+                                if self.show_setup {
+                                    ui.add_space(8.0);
+
+                                    self.render_configuration(ui);
+                                }
+                            });
+
+                            ui.add_space(DASHBOARD_CONTENT_GAP);
+
+                            let pending_queue_items = self
+                                .queue
+                                .items()
+                                .iter()
+                                .filter(|item| item.state == QueuedTransferState::Pending)
+                                .count();
+
+                            let queue_summary = if self.queue.is_empty() {
+                                "Empty".to_string()
+                            } else if self.queue_running {
+                                format!(
+                                    "{} item(s) · {} pending · running",
+                                    self.queue.len(),
+                                    pending_queue_items,
+                                )
+                            } else if self.queue.paused_after_current() {
+                                format!(
+                                    "{} item(s) · {} pending · paused",
+                                    self.queue.len(),
+                                    pending_queue_items,
+                                )
+                            } else {
+                                format!(
+                                    "{} item(s) · {} pending",
+                                    self.queue.len(),
+                                    pending_queue_items,
+                                )
+                            };
+
+                            dashboard_section_frame(ui).show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+
+                                render_section_toggle(
+                                    ui,
+                                    "Transfer queue",
+                                    &queue_summary,
+                                    &mut self.show_queue,
+                                );
+
+                                if self.show_queue {
+                                    ui.add_space(8.0);
+
+                                    self.render_queue(ui);
+                                }
+                            });
+
+                            ui.add_space(DASHBOARD_CONTENT_GAP);
+
+                            let history_summary = format!(
+                                "{} / {} retained",
+                                self.history.len(),
+                                MAX_TRANSFER_HISTORY,
+                            );
+
+                            dashboard_section_frame(ui).show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+
+                                render_section_toggle(
+                                    ui,
+                                    "Transfer history",
+                                    &history_summary,
+                                    &mut self.show_history,
+                                );
+
+                                if self.show_history {
+                                    ui.add_space(8.0);
+
+                                    let history_response = ui.scope(|ui| {
+                                        self.render_history(ui);
+                                    });
+
+                                    history_rect = Some(history_response.response.rect);
+                                }
+                            });
+
+                            ui.add_space(DASHBOARD_CONTENT_GAP);
+
+                            if let Some(path) = &self.state_path {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Manager state: {}",
+                                        path.display(),
+                                    ))
+                                    .small()
+                                    .monospace()
+                                    .color(egui::Color32::from_rgb(105, 124, 142)),
+                                );
+                            }
+
+                            ui.add_space(16.0);
+
+                            history_rect
+                        });
+
+                    self.update_history_drag_scroll(
+                        ui,
+                        scroll_output.inner,
+                        scroll_output.state.offset.y,
+                        scroll_output.content_size.y,
+                        scroll_output.inner_rect,
+                    );
                 });
-
-            self.update_history_drag_scroll(
-                ui,
-                scroll_output.inner,
-                scroll_output.state.offset.y,
-                scroll_output.content_size.y,
-                scroll_output.inner_rect,
-            );
+            });
         });
 
         self.persist_state_if_needed(ui.ctx());
@@ -6179,36 +6345,129 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn dashboard_card_frame(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::group(ui.style())
+        .fill(egui::Color32::from_rgb(11, 24, 38))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(25, 52, 76)))
+}
+
+fn dashboard_section_frame(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::group(ui.style())
+        .fill(egui::Color32::from_rgb(9, 20, 32))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(22, 45, 66)))
+}
+
+fn render_dashboard_metric(
+    ui: &mut egui::Ui,
+    title: &str,
+    value: impl Into<String>,
+    detail: impl Into<String>,
+    accent: egui::Color32,
+) {
+    dashboard_card_frame(ui).show(ui, |ui| {
+        ui.set_min_height(DASHBOARD_CARD_HEIGHT);
+        ui.set_min_width(ui.available_width());
+
+        ui.label(
+            egui::RichText::new(title)
+                .color(egui::Color32::from_rgb(169, 187, 204))
+                .strong(),
+        );
+
+        ui.add_space(5.0);
+
+        ui.label(
+            egui::RichText::new(value.into())
+                .size(28.0)
+                .strong()
+                .color(egui::Color32::from_rgb(238, 246, 255)),
+        );
+
+        ui.add_space(2.0);
+
+        ui.label(egui::RichText::new(detail.into()).small().color(accent));
+    });
+}
+
+fn render_dashboard_sidebar_item(
+    ui: &mut egui::Ui,
+    label: &str,
+    selected: bool,
+    badge: Option<usize>,
+) {
+    let fill = if selected {
+        egui::Color32::from_rgb(8, 62, 100)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+
+    egui::Frame::group(ui.style())
+        .fill(fill)
+        .stroke(egui::Stroke::NONE)
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            ui.horizontal(|ui| {
+                let color = if selected {
+                    egui::Color32::from_rgb(72, 185, 255)
+                } else {
+                    egui::Color32::from_rgb(180, 195, 209)
+                };
+
+                ui.label(egui::RichText::new(label).size(15.0).strong().color(color));
+
+                if let Some(badge) = badge {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(badge.to_string())
+                                .small()
+                                .strong()
+                                .color(egui::Color32::from_rgb(112, 205, 255)),
+                        );
+                    });
+                }
+            });
+        });
+}
+
 fn configure_style(context: &egui::Context) {
     context.set_theme(egui::Theme::Dark);
 
     context.style_mut_of(egui::Theme::Dark, |style| {
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
 
-        style.spacing.button_padding = egui::vec2(12.0, 7.0);
+        style.spacing.button_padding = egui::vec2(13.0, 8.0);
 
         style
             .text_styles
-            .insert(egui::TextStyle::Heading, egui::FontId::proportional(22.0));
+            .insert(egui::TextStyle::Heading, egui::FontId::proportional(23.0));
 
         style
             .text_styles
-            .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(14.5));
 
         style
             .text_styles
-            .insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
+            .insert(egui::TextStyle::Button, egui::FontId::proportional(14.5));
+
+        style
+            .text_styles
+            .insert(egui::TextStyle::Small, egui::FontId::proportional(12.5));
     });
 
     let mut visuals = egui::Visuals::dark();
 
-    visuals.panel_fill = egui::Color32::from_rgb(10, 17, 27);
+    visuals.panel_fill = egui::Color32::from_rgb(5, 13, 22);
 
-    visuals.window_fill = egui::Color32::from_rgb(16, 27, 42);
+    visuals.window_fill = egui::Color32::from_rgb(9, 20, 32);
 
-    visuals.extreme_bg_color = egui::Color32::from_rgb(5, 10, 17);
+    visuals.extreme_bg_color = egui::Color32::from_rgb(3, 9, 16);
 
-    visuals.selection.bg_fill = egui::Color32::from_rgb(0, 128, 194);
+    visuals.faint_bg_color = egui::Color32::from_rgb(11, 24, 38);
+
+    visuals.selection.bg_fill = egui::Color32::from_rgb(0, 126, 196);
+
+    visuals.selection.stroke.color = egui::Color32::from_rgb(116, 214, 255);
 
     context.set_visuals_of(egui::Theme::Dark, visuals);
 }
@@ -6394,8 +6653,8 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 900.0])
-            .with_min_inner_size([860.0, 640.0]),
+            .with_inner_size([1440.0, 900.0])
+            .with_min_inner_size([1080.0, 680.0]),
 
         centered: true,
 
