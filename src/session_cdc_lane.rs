@@ -6,12 +6,12 @@ use crate::cdc_reconstruction_bench::{
 use crate::content_defined_dedup_bench;
 use crate::manifest_scan::{FileClass, ManifestEntry};
 use crate::transfer_profile::TransferProfiler;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::windows::fs::MetadataExt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
@@ -29,58 +29,95 @@ const SESSION_CDC_PLAN_FIXED_WIRE_BYTES: u64 = 1 + 8 + 8 + 8 + 8;
 
 #[derive(Debug, Default)]
 pub(crate) struct SenderBasisIndexCache {
-    entries: Mutex<VecDeque<(usize, Arc<BasisFileIndex>)>>,
+    state: Mutex<SenderBasisIndexCacheState>,
+    ready: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct SenderBasisIndexCacheState {
+    entries: VecDeque<(usize, Arc<BasisFileIndex>)>,
+    building_file_ids: BTreeSet<usize>,
 }
 
 impl SenderBasisIndexCache {
-    fn get(&self, basis_file_id: usize) -> Option<Arc<BasisFileIndex>> {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn get_or_build<F>(
+        &self,
+        basis_file_id: usize,
+        build: F,
+    ) -> io::Result<(Arc<BasisFileIndex>, bool)>
+    where
+        F: FnOnce() -> io::Result<Arc<BasisFileIndex>>,
+    {
+        let mut build = Some(build);
 
-        let position = entries
-            .iter()
-            .position(|(cached_file_id, _)| *cached_file_id == basis_file_id)?;
+        loop {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let entry = entries.remove(position)?;
+            if let Some(position) = state
+                .entries
+                .iter()
+                .position(|(cached_file_id, _)| *cached_file_id == basis_file_id)
+            {
+                let entry = state
+                    .entries
+                    .remove(position)
+                    .expect("located CDC basis cache entry disappeared");
 
-        let index = Arc::clone(&entry.1);
+                let index = Arc::clone(&entry.1);
 
-        entries.push_back(entry);
+                state.entries.push_back(entry);
 
-        Some(index)
-    }
-
-    fn insert(&self, basis_file_id: usize, index: Arc<BasisFileIndex>) {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        if let Some(position) = entries
-            .iter()
-            .position(|(cached_file_id, _)| *cached_file_id == basis_file_id)
-        {
-            if let Some(entry) = entries.remove(position) {
-                entries.push_back(entry);
+                return Ok((index, true));
             }
 
-            return;
-        }
+            if state.building_file_ids.insert(basis_file_id) {
+                drop(state);
 
-        if entries.len() >= MAXIMUM_CACHED_BASIS_INDEXES {
-            let _ = entries.pop_front();
-        }
+                let result = build
+                    .take()
+                    .expect("CDC basis builder closure was already consumed")(
+                );
 
-        entries.push_back((basis_file_id, index));
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+                let removed = state.building_file_ids.remove(&basis_file_id);
+
+                debug_assert!(removed);
+
+                if let Ok(index) = &result {
+                    if state.entries.len() >= MAXIMUM_CACHED_BASIS_INDEXES {
+                        let _ = state.entries.pop_front();
+                    }
+
+                    state.entries.push_back((basis_file_id, Arc::clone(index)));
+                }
+
+                self.ready.notify_all();
+
+                return result.map(|index| (index, false));
+            }
+
+            let state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            drop(state);
+        }
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.entries
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
             .len()
     }
 }
@@ -153,11 +190,7 @@ pub(crate) fn sender_try_plan(
             continue;
         }
 
-        let (index, cache_miss) = if let Some(index) = basis_index_cache.get(basis_file_id) {
-            profiler.record_sender_session_cdc_basis_cache_hit();
-
-            (index, false)
-        } else {
+        let (index, cache_hit) = basis_index_cache.get_or_build(basis_file_id, || {
             let index_started = Instant::now();
 
             let index = Arc::new(BasisFileIndex::build(
@@ -171,8 +204,25 @@ pub(crate) fn sender_try_plan(
                 index.file_bytes(),
             );
 
-            (index, true)
-        };
+            validate_source_file(&basis_path, basis_entry, "session CDC basis")?;
+
+            if index.file_bytes() != basis_entry.file_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "session CDC basis index contains {} bytes, expected {}",
+                        index.file_bytes(),
+                        basis_entry.file_size,
+                    ),
+                ));
+            }
+
+            Ok(index)
+        })?;
+
+        if cache_hit {
+            profiler.record_sender_session_cdc_basis_cache_hit();
+        }
 
         validate_source_file(&basis_path, basis_entry, "session CDC basis")?;
 
@@ -185,10 +235,6 @@ pub(crate) fn sender_try_plan(
                     basis_entry.file_size,
                 ),
             ));
-        }
-
-        if cache_miss {
-            basis_index_cache.insert(basis_file_id, Arc::clone(&index));
         }
 
         let plan = match ReconstructionPlan::build_bounded(
@@ -621,6 +667,8 @@ mod tests {
     use super::{
         MESSAGE_SESSION_CDC_PLAN, SenderBasisIndexCache, receiver_apply_plan, sender_try_plan,
     };
+    use crate::cdc_basis_index::BasisFileIndex;
+    use crate::content_defined_dedup_bench;
     use crate::manifest_scan::{FileClass, ManifestEntry};
     use crate::transfer_profile::TransferProfiler;
     use std::env;
@@ -629,7 +677,10 @@ mod tests {
     use std::os::windows::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::process;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn session_lane_reconstructs_related_medium_file_from_committed_basis() {
@@ -807,6 +858,75 @@ mod tests {
         assert_eq!(profile.sender_session_cdc_basis_cache_hits, 1,);
 
         assert_eq!(basis_index_cache.len(), 1,);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn basis_index_cache_single_flights_concurrent_builds() {
+        let root = temporary_root("single-flight");
+
+        fs::create_dir_all(&root).unwrap();
+
+        let basis_path = root.join("basis.bin");
+
+        fs::write(
+            &basis_path,
+            deterministic_bytes(1024 * 1024, 0x1357_2468_ABCD_EF01),
+        )
+        .unwrap();
+
+        let shared_index = Arc::new(
+            BasisFileIndex::build(
+                &basis_path,
+                content_defined_dedup_bench::DEFAULT_AVERAGE_KIB,
+            )
+            .unwrap(),
+        );
+
+        let cache = SenderBasisIndexCache::default();
+
+        let start = Barrier::new(4);
+
+        let build_count = AtomicU64::new(0);
+
+        let cache_hits = thread::scope(|scope| {
+            let mut handles = Vec::new();
+
+            for _ in 0..4 {
+                let cache = &cache;
+                let start = &start;
+                let build_count = &build_count;
+                let shared_index = Arc::clone(&shared_index);
+
+                handles.push(scope.spawn(move || {
+                    start.wait();
+
+                    let (_, cache_hit) = cache
+                        .get_or_build(7, || {
+                            let _ = build_count.fetch_add(1, Ordering::SeqCst);
+
+                            thread::sleep(Duration::from_millis(25));
+
+                            Ok(shared_index)
+                        })
+                        .unwrap();
+
+                    cache_hit
+                }));
+            }
+
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(build_count.load(Ordering::SeqCst), 1,);
+
+        assert_eq!(cache_hits.iter().filter(|&&cache_hit| cache_hit).count(), 3,);
+
+        assert_eq!(cache.len(), 1);
 
         fs::remove_dir_all(root).unwrap();
     }

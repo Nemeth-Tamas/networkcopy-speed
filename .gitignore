@@ -7,3 +7,5 @@
 /DedupMutationCorpus
 /DedupFolderSource
 /DedupFolderDestination
+/cdc-cache-probe-src
+/cdc-cache-probe-dst
