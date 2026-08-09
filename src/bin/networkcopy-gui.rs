@@ -25,14 +25,18 @@ const APP_NAME: &str = "NetworkCopy Speed Edition";
 
 const AUTO_RESUME_RECEIVE_ARGUMENT: &str = "--resume-receive";
 
+const STANDALONE_CONTENT_GAP: f32 = 14.0;
+
+const MODE_CARD_HEIGHT: f32 = 112.0;
+
 fn main() -> eframe::Result {
     let auto_resume_receive =
         env::args_os().any(|argument| argument == OsStr::new(AUTO_RESUME_RECEIVE_ARGUMENT));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([920.0, 720.0])
-            .with_min_inner_size([680.0, 520.0]),
+            .with_inner_size([1180.0, 820.0])
+            .with_min_inner_size([860.0, 620.0]),
 
         centered: true,
         renderer: eframe::Renderer::Wgpu,
@@ -773,24 +777,72 @@ impl NetworkCopyGui {
         }
     }
 
-    fn mode_selector(&mut self, ui: &mut egui::Ui, text: Text) {
-        ui.scope(|ui| {
-            ui.spacing_mut().button_padding = egui::vec2(20.0, 10.0);
+    fn render_header(&mut self, ui: &mut egui::Ui, text: Text) {
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(8, 19, 31))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(21, 48, 70)))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
 
-            ui.horizontal(|ui| {
-                ui.selectable_value(
-                    &mut self.mode,
-                    TransferMode::Send,
-                    egui::RichText::new(text.send).strong(),
-                );
+                ui.horizontal(|ui| {
+                    brand_mark(ui, 50.0);
 
-                ui.selectable_value(
-                    &mut self.mode,
-                    TransferMode::Receive,
-                    egui::RichText::new(text.receive).strong(),
-                );
+                    ui.add_space(8.0);
+
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(APP_NAME)
+                                .size(22.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(235, 244, 252)),
+                        );
+
+                        ui.label(egui::RichText::new(text.subtitle).color(muted_text()));
+                    });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.selectable_value(&mut self.language, Language::English, "English");
+
+                        ui.selectable_value(&mut self.language, Language::Hungarian, "Magyar");
+
+                        standalone_status_pill(
+                            ui,
+                            &format!("v{}", env!("CARGO_PKG_VERSION"),),
+                            egui::Color32::from_rgb(0, 219, 199),
+                        );
+                    });
+                });
             });
+    }
+
+    fn mode_selector(&mut self, ui: &mut egui::Ui, text: Text) {
+        let mut next_mode = self.mode;
+
+        ui.columns(2, |columns| {
+            if standalone_mode_card(
+                &mut columns[0],
+                text.send,
+                text.send_description,
+                self.mode == TransferMode::Send,
+                brand_blue_light(),
+            ) {
+                next_mode = TransferMode::Send;
+            }
+
+            if standalone_mode_card(
+                &mut columns[1],
+                text.receive,
+                text.receive_description,
+                self.mode == TransferMode::Receive,
+                egui::Color32::from_rgb(181, 124, 255),
+            ) {
+                next_mode = TransferMode::Receive;
+            }
         });
+
+        self.mode = next_mode;
     }
 
     fn connection_selector(&mut self, ui: &mut egui::Ui, text: Text) {
@@ -1816,48 +1868,49 @@ impl eframe::App for NetworkCopyGui {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
 
-                    ui.horizontal(|ui| {
-                        brand_mark(ui, 58.0);
+                    self.render_header(ui, text);
 
-                        ui.add_space(8.0);
-
-                        ui.vertical(|ui| {
-                            ui.label(egui::RichText::new(APP_NAME).strong().size(27.0));
-
-                            ui.label(egui::RichText::new(text.subtitle).color(muted_text()));
-                        });
-
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.selectable_value(&mut self.language, Language::English, "English");
-
-                            ui.selectable_value(&mut self.language, Language::Hungarian, "Magyar");
-
-                            ui.label(text.language);
-                        });
-                    });
-
-                    ui.add_space(16.0);
-
-                    ui.separator();
-
-                    ui.add_space(14.0);
+                    ui.add_space(STANDALONE_CONTENT_GAP);
 
                     self.mode_selector(ui, text);
 
-                    ui.add_space(14.0);
+                    ui.add_space(STANDALONE_CONTENT_GAP);
 
-                    card(ui, brand_blue(), |ui| {
-                        ui.heading(text.direct_mode);
+                    let setup_accent = match self.mode {
+                        TransferMode::Send => brand_blue_light(),
 
-                        ui.add_space(8.0);
+                        TransferMode::Receive => egui::Color32::from_rgb(181, 124, 255),
+                    };
+
+                    card(ui, setup_accent, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            standalone_status_pill(
+                                ui,
+                                match self.mode {
+                                    TransferMode::Send => text.send,
+
+                                    TransferMode::Receive => text.receive,
+                                },
+                                setup_accent,
+                            );
+
+                            ui.label(
+                                egui::RichText::new(text.direct_mode)
+                                    .size(19.0)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(229, 239, 249)),
+                            );
+                        });
+
+                        ui.add_space(10.0);
 
                         self.connection_selector(ui, text);
 
-                        ui.add_space(12.0);
+                        ui.add_space(14.0);
 
                         ui.separator();
 
-                        ui.add_space(12.0);
+                        ui.add_space(14.0);
 
                         match self.mode {
                             TransferMode::Send => {
@@ -1870,15 +1923,15 @@ impl eframe::App for NetworkCopyGui {
                         }
                     });
 
-                    ui.add_space(18.0);
+                    ui.add_space(STANDALONE_CONTENT_GAP);
 
                     self.action_buttons(ui, text);
 
-                    ui.add_space(18.0);
+                    ui.add_space(STANDALONE_CONTENT_GAP);
 
                     self.status_panel(ui, text);
 
-                    ui.add_space(16.0);
+                    ui.add_space(18.0);
                 });
         });
 
@@ -1892,38 +1945,149 @@ impl eframe::App for NetworkCopyGui {
     }
 }
 
+fn standalone_status_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    let fill = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 24);
+
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 110),
+        ))
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(text.to_ascii_uppercase())
+                    .small()
+                    .strong()
+                    .color(color),
+            );
+        });
+}
+
+fn standalone_mode_card(
+    ui: &mut egui::Ui,
+    title: &str,
+    description: &str,
+    selected: bool,
+    accent: egui::Color32,
+) -> bool {
+    let fill = if selected {
+        egui::Color32::from_rgb(10, 38, 57)
+    } else {
+        card_fill()
+    };
+
+    let stroke_color = if selected {
+        accent
+    } else {
+        egui::Color32::from_rgb(24, 52, 75)
+    };
+
+    let mut clicked = false;
+
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(egui::Stroke::new(
+            if selected { 1.5 } else { 1.0 },
+            stroke_color,
+        ))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(14))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            ui.set_min_height(MODE_CARD_HEIGHT);
+
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("●").size(11.0).color(accent));
+
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(21.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(235, 244, 252)),
+                );
+            });
+
+            ui.add_space(7.0);
+
+            ui.label(egui::RichText::new(description).color(muted_text()));
+
+            ui.add_space(10.0);
+
+            let button_text = if selected {
+                format!("✓  {title}")
+            } else {
+                title.to_string()
+            };
+
+            let button =
+                ui.add_sized(
+                    [ui.available_width(), 34.0],
+                    egui::Button::new(egui::RichText::new(button_text).strong().color(
+                        if selected {
+                            accent
+                        } else {
+                            egui::Color32::from_rgb(190, 205, 219)
+                        },
+                    ))
+                    .fill(if selected {
+                        egui::Color32::from_rgb(9, 56, 81)
+                    } else {
+                        egui::Color32::from_rgb(12, 29, 44)
+                    })
+                    .stroke(egui::Stroke::new(1.0, stroke_color))
+                    .corner_radius(egui::CornerRadius::same(7)),
+                );
+
+            clicked = button.clicked();
+        });
+
+    clicked
+}
+
 fn configure_style(context: &egui::Context) {
     context.set_theme(egui::Theme::Dark);
 
     context.style_mut_of(egui::Theme::Dark, |style| {
-        style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
 
-        style.spacing.button_padding = egui::vec2(14.0, 8.0);
+        style.spacing.button_padding = egui::vec2(13.0, 8.0);
 
-        style.spacing.slider_width = 180.0;
-
-        style
-            .text_styles
-            .insert(egui::TextStyle::Heading, egui::FontId::proportional(23.0));
+        style.spacing.slider_width = 190.0;
 
         style
             .text_styles
-            .insert(egui::TextStyle::Body, egui::FontId::proportional(16.0));
+            .insert(egui::TextStyle::Heading, egui::FontId::proportional(22.0));
 
         style
             .text_styles
-            .insert(egui::TextStyle::Button, egui::FontId::proportional(16.0));
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(14.5));
+
+        style
+            .text_styles
+            .insert(egui::TextStyle::Button, egui::FontId::proportional(14.5));
+
+        style
+            .text_styles
+            .insert(egui::TextStyle::Small, egui::FontId::proportional(12.5));
     });
 
     let mut visuals = egui::Visuals::dark();
 
-    visuals.panel_fill = egui::Color32::from_rgb(10, 17, 27);
+    visuals.panel_fill = egui::Color32::from_rgb(5, 13, 22);
 
     visuals.window_fill = card_fill();
 
-    visuals.extreme_bg_color = egui::Color32::from_rgb(5, 10, 17);
+    visuals.extreme_bg_color = egui::Color32::from_rgb(3, 9, 16);
 
-    visuals.selection.bg_fill = brand_blue();
+    visuals.faint_bg_color = egui::Color32::from_rgb(11, 24, 38);
+
+    visuals.selection.bg_fill = egui::Color32::from_rgb(0, 112, 170);
+
+    visuals.selection.stroke.color = brand_blue_light();
 
     visuals.hyperlink_color = brand_blue_light();
 
@@ -1933,11 +2097,24 @@ fn configure_style(context: &egui::Context) {
 fn card(ui: &mut egui::Ui, accent: egui::Color32, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(card_fill())
-        .stroke(egui::Stroke::new(1.0, accent))
-        .corner_radius(egui::CornerRadius::same(12))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(23, 53, 76)))
+        .corner_radius(egui::CornerRadius::same(10))
         .inner_margin(egui::Margin::same(16))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
+
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("●").size(9.0).color(accent));
+
+                ui.label(
+                    egui::RichText::new("NETWORKCOPY")
+                        .small()
+                        .strong()
+                        .color(accent),
+                );
+            });
+
+            ui.add_space(7.0);
 
             add_contents(ui);
         });
@@ -1986,19 +2163,19 @@ fn resume_button(text: &str) -> egui::Button<'_> {
 }
 
 fn card_fill() -> egui::Color32 {
-    egui::Color32::from_rgb(16, 27, 42)
+    egui::Color32::from_rgb(9, 20, 32)
 }
 
 fn brand_blue() -> egui::Color32 {
-    egui::Color32::from_rgb(0, 128, 194)
+    egui::Color32::from_rgb(0, 112, 170)
 }
 
 fn brand_blue_light() -> egui::Color32 {
-    egui::Color32::from_rgb(0, 198, 255)
+    egui::Color32::from_rgb(64, 190, 255)
 }
 
 fn brand_green() -> egui::Color32 {
-    egui::Color32::from_rgb(126, 230, 64)
+    egui::Color32::from_rgb(105, 225, 111)
 }
 
 fn brand_green_dark() -> egui::Color32 {
