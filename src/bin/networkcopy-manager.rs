@@ -5158,7 +5158,11 @@ impl eframe::App for NetworkCopyManager {
                     .show(ui, |ui| {
                         ui.set_min_height(ui.available_height());
 
-                        self.render_dashboard_sidebar(ui);
+                        ui.vertical(|ui| {
+                            ui.set_width(DASHBOARD_SIDEBAR_WIDTH);
+
+                            self.render_dashboard_sidebar(ui);
+                        });
                     });
 
                 ui.add_space(DASHBOARD_CONTENT_GAP);
