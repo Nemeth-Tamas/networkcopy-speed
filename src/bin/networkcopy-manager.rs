@@ -500,8 +500,6 @@ struct NetworkCopyManager {
 
     page: ManagerPage,
 
-    show_agents: bool,
-
     show_setup: bool,
 
     show_browsers: bool,
@@ -621,8 +619,6 @@ impl NetworkCopyManager {
             route_mode: ManagementRouteMode::AutomaticLan,
 
             page: ManagerPage::Dashboard,
-
-            show_agents: true,
 
             show_setup: true,
 
@@ -3861,170 +3857,183 @@ impl NetworkCopyManager {
 
         let mut release_to_open = None::<String>;
 
-        ui.horizontal_wrapped(|ui| {
-            ui.heading(APP_NAME);
+        dashboard_section_frame(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
 
-            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(APP_NAME)
+                        .size(20.0)
+                        .strong()
+                        .color(
+                            egui::Color32::from_rgb(
+                                230, 240, 250,
+                            ),
+                        ),
+                );
 
-            status_label(ui, status, status_color);
+                ui.separator();
 
-            ui.separator();
+                status_label(ui, status, status_color);
 
-            ui.label(format!("v{}", env!("CARGO_PKG_VERSION"),));
+                ui.separator();
 
-            ui.separator();
+                ui.label(format!("v{}", env!("CARGO_PKG_VERSION"),));
 
-            if checking_updates {
-                ui.spinner();
+                ui.separator();
 
-                ui.label("Checking GitHub Releases...");
-            } else if let Some(check) = &update_check {
-                if check.update_available {
-                    status_label(
-                        ui,
-                        &format!("{} available", check.latest.tag_name,),
-                        egui::Color32::from_rgb(126, 230, 64),
-                    );
+                if checking_updates {
+                    ui.spinner();
 
-                    if ui.button("Open release").clicked() {
-                        release_to_open = Some(check.latest.html_url.clone());
-                    }
-
-                    if preparing_update {
-                        ui.spinner();
-
-                        ui.label("Downloading and SHA-256 verifying Manager update...");
-                    } else if let Some(prepared) = &prepared_update {
+                    ui.label("Checking GitHub Releases...");
+                } else if let Some(check) = &update_check {
+                    if check.update_available {
                         status_label(
                             ui,
-                            "Verified update staged",
+                            &format!("{} available", check.latest.tag_name,),
                             egui::Color32::from_rgb(126, 230, 64),
                         );
 
-                        ui.label(format!("{} ready", format_bytes(prepared.verified.size),))
-                            .on_hover_text(format!(
-                                "Staged executable: {}\nPlanned install path: {}\nHandoff plan: {}",
-                                prepared.verified.executable.display(),
-                                prepared.plan.install_path.display(),
-                                prepared.plan.handoff_plan.display(),
-                            ));
+                        if ui.button("Open release").clicked() {
+                            release_to_open = Some(check.latest.html_url.clone());
+                        }
 
-                        if update_handoff_confirmation {
-                            ui.label(
-                                egui::RichText::new(
-                                    "This checkpoint starts the verified updater helper and closes \
-                                     Manager. It does not replace or relaunch an executable yet.",
-                                )
-                                .color(egui::Color32::from_rgb(255, 196, 92)),
+                        if preparing_update {
+                            ui.spinner();
+
+                            ui.label("Downloading and SHA-256 verifying Manager update...");
+                        } else if let Some(prepared) = &prepared_update {
+                            status_label(
+                                ui,
+                                "Verified update staged",
+                                egui::Color32::from_rgb(126, 230, 64),
                             );
 
-                            let confirm = ui.add_enabled(
-                                update_blocked_reason.is_none(),
-                                egui::Button::new(
-                                    egui::RichText::new("Confirm close and start updater").strong(),
-                                )
-                                .fill(egui::Color32::from_rgb(112, 64, 28)),
-                            );
+                            ui.label(format!("{} ready", format_bytes(prepared.verified.size),))
+                                .on_hover_text(format!(
+                                    "Staged executable: {}\nPlanned install path: {}\nHandoff plan: {}",
+                                    prepared.verified.executable.display(),
+                                    prepared.plan.install_path.display(),
+                                    prepared.plan.handoff_plan.display(),
+                                ));
 
-                            let confirm = if let Some(reason) = &update_blocked_reason {
-                                confirm.on_hover_text(reason)
+                            if update_handoff_confirmation {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "This checkpoint starts the verified updater helper and closes \
+                                         Manager. It does not replace or relaunch an executable yet.",
+                                    )
+                                    .color(egui::Color32::from_rgb(255, 196, 92)),
+                                );
+
+                                let confirm = ui.add_enabled(
+                                    update_blocked_reason.is_none(),
+                                    egui::Button::new(
+                                        egui::RichText::new("Confirm close and start updater").strong(),
+                                    )
+                                    .fill(egui::Color32::from_rgb(112, 64, 28)),
+                                );
+
+                                let confirm = if let Some(reason) = &update_blocked_reason {
+                                    confirm.on_hover_text(reason)
+                                } else {
+                                    confirm
+                                };
+
+                                if confirm.clicked() {
+                                    launch_handoff = true;
+                                }
+
+                                if ui.small_button("Cancel").clicked() {
+                                    cancel_handoff = true;
+                                }
                             } else {
-                                confirm
-                            };
+                                let install = ui.add_enabled(
+                                    update_blocked_reason.is_none(),
+                                    egui::Button::new(egui::RichText::new("Install update").strong())
+                                        .fill(egui::Color32::from_rgb(42, 78, 72)),
+                                );
 
-                            if confirm.clicked() {
-                                launch_handoff = true;
-                            }
+                                let install = if let Some(reason) = &update_blocked_reason {
+                                    install.on_hover_text(reason)
+                                } else {
+                                    install
+                                };
 
-                            if ui.small_button("Cancel").clicked() {
-                                cancel_handoff = true;
+                                if install.clicked() {
+                                    arm_handoff = true;
+                                }
                             }
                         } else {
-                            let install = ui.add_enabled(
+                            let response = ui.add_enabled(
                                 update_blocked_reason.is_none(),
-                                egui::Button::new(egui::RichText::new("Install update").strong())
+                                egui::Button::new(egui::RichText::new("Prepare update").strong())
                                     .fill(egui::Color32::from_rgb(42, 78, 72)),
                             );
 
-                            let install = if let Some(reason) = &update_blocked_reason {
-                                install.on_hover_text(reason)
+                            let response = if let Some(reason) = &update_blocked_reason {
+                                response.on_hover_text(reason)
                             } else {
-                                install
+                                response
                             };
 
-                            if install.clicked() {
-                                arm_handoff = true;
+                            if response.clicked() {
+                                preparation_requested = true;
                             }
                         }
-                    } else {
-                        let response = ui.add_enabled(
-                            update_blocked_reason.is_none(),
-                            egui::Button::new(egui::RichText::new("Prepare update").strong())
-                                .fill(egui::Color32::from_rgb(42, 78, 72)),
-                        );
 
-                        let response = if let Some(reason) = &update_blocked_reason {
-                            response.on_hover_text(reason)
-                        } else {
-                            response
-                        };
-
-                        if response.clicked() {
-                            preparation_requested = true;
+                        if !update_preparation_error.is_empty() {
+                            ui.label(
+                                egui::RichText::new("Update preparation or handoff failed")
+                                    .color(egui::Color32::from_rgb(255, 112, 120)),
+                            )
+                            .on_hover_text(&update_preparation_error);
                         }
+                    } else {
+                        ui.label(format!("Latest stable: {}", check.latest.tag_name,));
                     }
 
-                    if !update_preparation_error.is_empty() {
-                        ui.label(
-                            egui::RichText::new("Update preparation or handoff failed")
-                                .color(egui::Color32::from_rgb(255, 112, 120)),
-                        )
-                        .on_hover_text(&update_preparation_error);
+                    if !preparing_update && ui.small_button("Check again").clicked() {
+                        check_requested = true;
                     }
                 } else {
-                    ui.label(format!("Latest stable: {}", check.latest.tag_name,));
+                    if !update_error.is_empty() {
+                        ui.label(
+                            egui::RichText::new("Update check unavailable")
+                                .color(egui::Color32::from_rgb(160, 170, 184)),
+                        )
+                        .on_hover_text(&update_error);
+                    }
+
+                    if ui.small_button("Check updates").clicked() {
+                        check_requested = true;
+                    }
                 }
+            });
 
-                if !preparing_update && ui.small_button("Check again").clicked() {
-                    check_requested = true;
-                }
-            } else {
-                if !update_error.is_empty() {
-                    ui.label(
-                        egui::RichText::new("Update check unavailable")
-                            .color(egui::Color32::from_rgb(160, 170, 184)),
-                    )
-                    .on_hover_text(&update_error);
-                }
+            ui.label(
+                "Automatic LAN, Direct Link, and explicit-IP orchestration with direct sender-to-receiver payload transfer.",
+            );
 
-                if ui.small_button("Check updates").clicked() {
-                    check_requested = true;
-                }
-            }
-        });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("{} LAN agent(s)", self.agents.len(),));
 
-        ui.label(
-            "Automatic LAN, Direct Link, and explicit-IP orchestration with direct sender-to-receiver payload transfer.",
-        );
+                ui.separator();
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label(format!("{} LAN agent(s)", self.agents.len(),));
+                ui.label(format!("{} Direct Link route(s)", self.direct_routes.len(),));
 
-            ui.separator();
+                ui.separator();
 
-            ui.label(format!("{} Direct Link route(s)", self.direct_routes.len(),));
+                ui.label(format!("{} queued transfer(s)", self.queue.len(),));
 
-            ui.separator();
+                ui.separator();
 
-            ui.label(format!("{} queued transfer(s)", self.queue.len(),));
+                ui.label(format!("{} retained transfer(s)", self.history.len(),));
 
-            ui.separator();
+                ui.separator();
 
-            ui.label(format!("{} retained transfer(s)", self.history.len(),));
-
-            ui.separator();
-
-            ui.label("Trusted LAN · management traffic is not yet encrypted");
+                ui.label("Trusted LAN · management traffic is not yet encrypted");
+            });
         });
 
         if arm_handoff {
@@ -4166,7 +4175,51 @@ impl NetworkCopyManager {
         ui.add_space(6.0);
 
         if self.agents.is_empty() {
-            ui.label("No agents discovered. Manual addresses remain available in Transfer setup.");
+            dashboard_card_frame(ui).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.set_min_height(105.0);
+
+                status_label(
+                    ui,
+                    "Waiting for agents",
+                    egui::Color32::from_rgb(
+                        95, 194, 255,
+                    ),
+                );
+
+                ui.add_space(8.0);
+
+                ui.label(
+                    egui::RichText::new(
+                        "No NetworkCopy Agents discovered yet",
+                    )
+                    .size(18.0)
+                    .strong()
+                    .color(
+                        egui::Color32::from_rgb(
+                            225, 238, 250,
+                        ),
+                    ),
+                );
+
+                ui.add_space(4.0);
+
+                ui.label(
+                    "Start networkcopy-agent.exe on the endpoint machines, then refresh LAN discovery.",
+                );
+
+                ui.label(
+                    egui::RichText::new(
+                        "Manual addresses remain available on the Transfers page.",
+                    )
+                    .small()
+                    .color(
+                        egui::Color32::from_rgb(
+                            126, 145, 163,
+                        ),
+                    ),
+                );
+            });
 
             return;
         }
@@ -4184,7 +4237,9 @@ impl NetworkCopyManager {
 
             let receiver_enabled = agent.capabilities.can_receive();
 
-            ui.group(|ui| {
+            dashboard_card_frame(ui).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+
                 ui.horizontal_wrapped(|ui| {
                     status_label(
                         ui,
@@ -4192,9 +4247,18 @@ impl NetworkCopyManager {
                         agent_state_color(agent.state.label()),
                     );
 
-                    ui.strong(&agent.hostname);
+                    ui.label(
+                        egui::RichText::new(&agent.hostname)
+                            .size(18.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(232, 242, 252)),
+                    );
 
-                    ui.label(egui::RichText::new(&endpoint_text).monospace());
+                    ui.label(
+                        egui::RichText::new(&endpoint_text)
+                            .monospace()
+                            .color(egui::Color32::from_rgb(132, 156, 178)),
+                    );
 
                     ui.label(format!("Protocol {}", agent.protocol_version,));
 
@@ -6083,28 +6147,24 @@ fn queued_transfer_state_color(state: QueuedTransferState) -> egui::Color32 {
     }
 }
 
-fn render_section_toggle(ui: &mut egui::Ui, title: &str, summary: &str, open: &mut bool) {
-    ui.horizontal_wrapped(|ui| {
-        let toggle = if *open { "-" } else { "+" };
-
-        if ui.small_button(toggle).clicked() {
-            *open = !*open;
-        }
-
-        ui.heading(title);
-
-        if !summary.is_empty() {
-            ui.label(summary);
-        }
-    });
-}
-
 fn status_label(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
-    ui.label(
-        egui::RichText::new(text.to_ascii_uppercase())
-            .color(color)
-            .strong(),
-    );
+    let fill = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 24);
+
+    egui::Frame::group(ui.style())
+        .fill(fill)
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 110),
+        ))
+        .corner_radius(egui::CornerRadius::same(6))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(text.to_ascii_uppercase())
+                    .small()
+                    .color(color)
+                    .strong(),
+            );
+        });
 }
 
 fn agent_state_color(state: &str) -> egui::Color32 {
@@ -6634,13 +6694,15 @@ fn render_manager_page_heading(ui: &mut egui::Ui, page: ManagerPage) {
 fn dashboard_card_frame(ui: &egui::Ui) -> egui::Frame {
     egui::Frame::group(ui.style())
         .fill(egui::Color32::from_rgb(11, 24, 38))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(25, 52, 76)))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(25, 58, 84)))
+        .corner_radius(egui::CornerRadius::same(9))
 }
 
 fn dashboard_section_frame(ui: &egui::Ui) -> egui::Frame {
     egui::Frame::group(ui.style())
-        .fill(egui::Color32::from_rgb(9, 20, 32))
-        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(22, 45, 66)))
+        .fill(egui::Color32::from_rgb(8, 19, 31))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(21, 48, 70)))
+        .corner_radius(egui::CornerRadius::same(9))
 }
 
 fn render_dashboard_metric(
@@ -6654,11 +6716,15 @@ fn render_dashboard_metric(
         ui.set_min_height(DASHBOARD_CARD_HEIGHT);
         ui.set_min_width(ui.available_width());
 
-        ui.label(
-            egui::RichText::new(title)
-                .color(egui::Color32::from_rgb(169, 187, 204))
-                .strong(),
-        );
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("●").size(10.0).color(accent));
+
+            ui.label(
+                egui::RichText::new(title)
+                    .color(egui::Color32::from_rgb(169, 187, 204))
+                    .strong(),
+            );
+        });
 
         ui.add_space(5.0);
 
@@ -6711,7 +6777,8 @@ fn render_dashboard_sidebar_item(
         [ui.available_width(), 36.0],
         egui::Button::new(egui::RichText::new(text).size(15.0).strong().color(color))
             .fill(fill)
-            .stroke(stroke),
+            .stroke(stroke)
+            .corner_radius(egui::CornerRadius::same(7)),
     )
     .clicked()
 }
