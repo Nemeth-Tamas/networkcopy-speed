@@ -6,10 +6,12 @@ use crate::cdc_reconstruction_bench::{
 use crate::content_defined_dedup_bench;
 use crate::manifest_scan::{FileClass, ManifestEntry};
 use crate::transfer_profile::TransferProfiler;
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::windows::fs::MetadataExt;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
@@ -20,9 +22,68 @@ const MAXIMUM_LITERAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAXIMUM_PLAN_WIRE_BYTES: usize = 20 * 1024 * 1024;
 
 const MAXIMUM_BASIS_CANDIDATES: usize = 32;
+const MAXIMUM_CACHED_BASIS_INDEXES: usize = MAXIMUM_BASIS_CANDIDATES;
 const SIMILARITY_SAMPLE_BYTES: u64 = 64 * 1024;
 
 const SESSION_CDC_PLAN_FIXED_WIRE_BYTES: u64 = 1 + 8 + 8 + 8 + 8;
+
+#[derive(Debug, Default)]
+pub(crate) struct SenderBasisIndexCache {
+    entries: Mutex<VecDeque<(usize, Arc<BasisFileIndex>)>>,
+}
+
+impl SenderBasisIndexCache {
+    fn get(&self, basis_file_id: usize) -> Option<Arc<BasisFileIndex>> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let position = entries
+            .iter()
+            .position(|(cached_file_id, _)| *cached_file_id == basis_file_id)?;
+
+        let entry = entries.remove(position)?;
+
+        let index = Arc::clone(&entry.1);
+
+        entries.push_back(entry);
+
+        Some(index)
+    }
+
+    fn insert(&self, basis_file_id: usize, index: Arc<BasisFileIndex>) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(position) = entries
+            .iter()
+            .position(|(cached_file_id, _)| *cached_file_id == basis_file_id)
+        {
+            if let Some(entry) = entries.remove(position) {
+                entries.push_back(entry);
+            }
+
+            return;
+        }
+
+        if entries.len() >= MAXIMUM_CACHED_BASIS_INDEXES {
+            let _ = entries.pop_front();
+        }
+
+        entries.push_back((basis_file_id, index));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+}
 
 pub(crate) fn sender_try_plan(
     writer: &mut impl Write,
@@ -30,6 +91,7 @@ pub(crate) fn sender_try_plan(
     manifest: &[ManifestEntry],
     target_file_id: usize,
     basis_file_ids: &[usize],
+    basis_index_cache: &SenderBasisIndexCache,
     profiler: &TransferProfiler,
 ) -> io::Result<CdcLaneDecision> {
     let target_entry = manifest.get(target_file_id).ok_or_else(|| {
@@ -91,18 +153,26 @@ pub(crate) fn sender_try_plan(
             continue;
         }
 
-        let index_started = Instant::now();
+        let (index, cache_miss) = if let Some(index) = basis_index_cache.get(basis_file_id) {
+            profiler.record_sender_session_cdc_basis_cache_hit();
 
-        let index = BasisFileIndex::build(
-            &basis_path,
-            content_defined_dedup_bench::DEFAULT_AVERAGE_KIB,
-        )?;
+            (index, false)
+        } else {
+            let index_started = Instant::now();
 
-        profiler.record_sender_session_cdc_basis_index(
-            basis_file_id,
-            index_started.elapsed(),
-            index.file_bytes(),
-        );
+            let index = Arc::new(BasisFileIndex::build(
+                &basis_path,
+                content_defined_dedup_bench::DEFAULT_AVERAGE_KIB,
+            )?);
+
+            profiler.record_sender_session_cdc_basis_index(
+                basis_file_id,
+                index_started.elapsed(),
+                index.file_bytes(),
+            );
+
+            (index, true)
+        };
 
         validate_source_file(&basis_path, basis_entry, "session CDC basis")?;
 
@@ -117,16 +187,23 @@ pub(crate) fn sender_try_plan(
             ));
         }
 
-        let plan =
-            match ReconstructionPlan::build_bounded(&target_path, &index, MAXIMUM_LITERAL_BYTES) {
-                Ok(plan) => plan,
+        if cache_miss {
+            basis_index_cache.insert(basis_file_id, Arc::clone(&index));
+        }
 
-                Err(error) if is_literal_limit_exceeded(&error) => {
-                    continue;
-                }
+        let plan = match ReconstructionPlan::build_bounded(
+            &target_path,
+            index.as_ref(),
+            MAXIMUM_LITERAL_BYTES,
+        ) {
+            Ok(plan) => plan,
 
-                Err(error) => return Err(error),
-            };
+            Err(error) if is_literal_limit_exceeded(&error) => {
+                continue;
+            }
+
+            Err(error) => return Err(error),
+        };
 
         validate_source_file(&target_path, target_entry, "session CDC target")?;
 
@@ -541,7 +618,9 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MESSAGE_SESSION_CDC_PLAN, receiver_apply_plan, sender_try_plan};
+    use super::{
+        MESSAGE_SESSION_CDC_PLAN, SenderBasisIndexCache, receiver_apply_plan, sender_try_plan,
+    };
     use crate::manifest_scan::{FileClass, ManifestEntry};
     use crate::transfer_profile::TransferProfiler;
     use std::env;
@@ -591,10 +670,20 @@ mod tests {
 
         let profiler = TransferProfiler::default();
 
+        let basis_index_cache = SenderBasisIndexCache::default();
+
         let mut wire = Vec::new();
 
-        let sender_decision =
-            sender_try_plan(&mut wire, &source_root, &manifest, 1, &[0], &profiler).unwrap();
+        let sender_decision = sender_try_plan(
+            &mut wire,
+            &source_root,
+            &manifest,
+            1,
+            &[0],
+            &basis_index_cache,
+            &profiler,
+        )
+        .unwrap();
 
         assert!(sender_decision.completed);
 
@@ -617,6 +706,10 @@ mod tests {
 
         assert_eq!(profile.sender_session_cdc_repeated_basis_builds, 0,);
 
+        assert_eq!(profile.sender_session_cdc_basis_cache_hits, 0,);
+
+        assert_eq!(basis_index_cache.len(), 1,);
+
         let mut reader = Cursor::new(&wire[1..]);
 
         let receiver_decision =
@@ -628,6 +721,92 @@ mod tests {
             fs::read(destination_root.join("target.bin")).unwrap(),
             target,
         );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_lane_reuses_cached_basis_index() {
+        let root = temporary_root("cache");
+
+        let source_root = root.join("source");
+
+        fs::create_dir_all(&source_root).unwrap();
+
+        let basis = deterministic_bytes(2 * 1024 * 1024, 0x1234_5678_90AB_CDEF);
+
+        let mut target_a = basis.clone();
+        let mut target_b = basis.clone();
+
+        for (index, byte) in target_a[1024 * 1024..1024 * 1024 + 4096]
+            .iter_mut()
+            .enumerate()
+        {
+            *byte = (index % 251) as u8;
+        }
+
+        for (index, byte) in target_b[1024 * 1024 + 8192..1024 * 1024 + 12288]
+            .iter_mut()
+            .enumerate()
+        {
+            *byte = ((index + 37) % 251) as u8;
+        }
+
+        fs::write(source_root.join("basis.bin"), &basis).unwrap();
+        fs::write(source_root.join("target-a.bin"), &target_a).unwrap();
+        fs::write(source_root.join("target-b.bin"), &target_b).unwrap();
+
+        let manifest = vec![
+            entry(&source_root, "basis.bin"),
+            entry(&source_root, "target-a.bin"),
+            entry(&source_root, "target-b.bin"),
+        ];
+
+        let profiler = TransferProfiler::default();
+
+        let basis_index_cache = SenderBasisIndexCache::default();
+
+        let mut first_wire = Vec::new();
+
+        let first = sender_try_plan(
+            &mut first_wire,
+            &source_root,
+            &manifest,
+            1,
+            &[0],
+            &basis_index_cache,
+            &profiler,
+        )
+        .unwrap();
+
+        assert!(first.completed);
+
+        let mut second_wire = Vec::new();
+
+        let second = sender_try_plan(
+            &mut second_wire,
+            &source_root,
+            &manifest,
+            2,
+            &[0],
+            &basis_index_cache,
+            &profiler,
+        )
+        .unwrap();
+
+        assert!(second.completed);
+
+        let profile = profiler.snapshot();
+
+        assert_eq!(profile.sender_session_cdc_basis_index.operations, 1,);
+
+        assert_eq!(profile.sender_session_cdc_distinct_basis_files, 1,);
+
+        assert_eq!(profile.sender_session_cdc_repeated_basis_builds, 0,);
+
+        assert_eq!(profile.sender_session_cdc_basis_cache_hits, 1,);
+
+        assert_eq!(basis_index_cache.len(), 1,);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -659,10 +838,20 @@ mod tests {
 
         let profiler = TransferProfiler::default();
 
+        let basis_index_cache = SenderBasisIndexCache::default();
+
         let mut wire = Vec::new();
 
-        let decision =
-            sender_try_plan(&mut wire, &source_root, &manifest, 1, &[0], &profiler).unwrap();
+        let decision = sender_try_plan(
+            &mut wire,
+            &source_root,
+            &manifest,
+            1,
+            &[0],
+            &basis_index_cache,
+            &profiler,
+        )
+        .unwrap();
 
         assert!(!decision.completed);
 
@@ -677,6 +866,8 @@ mod tests {
                 .operations,
             0,
         );
+
+        assert_eq!(basis_index_cache.len(), 0,);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -720,10 +911,20 @@ mod tests {
 
         let profiler = TransferProfiler::default();
 
+        let basis_index_cache = SenderBasisIndexCache::default();
+
         let mut wire = Vec::new();
 
-        let decision =
-            sender_try_plan(&mut wire, &source_root, &manifest, 1, &[0], &profiler).unwrap();
+        let decision = sender_try_plan(
+            &mut wire,
+            &source_root,
+            &manifest,
+            1,
+            &[0],
+            &basis_index_cache,
+            &profiler,
+        )
+        .unwrap();
 
         assert!(decision.completed);
 

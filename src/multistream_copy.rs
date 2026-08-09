@@ -359,6 +359,11 @@ impl MultistreamCopyReport {
                 "  Repeated index builds:  {}",
                 self.stage_profile.sender_session_cdc_repeated_basis_builds,
             );
+
+            println!(
+                "  Basis-index cache hits: {}",
+                self.stage_profile.sender_session_cdc_basis_cache_hits,
+            );
         }
 
         if let Some(receiver_stage_profile) = self.receiver_stage_profile {
@@ -1710,6 +1715,7 @@ fn send_internal(
             manifest.as_slice(),
             progress.clone(),
             None,
+            &session_cdc_lane::SenderBasisIndexCache::default(),
             LaneEnd::Stream,
             compression_lane_megabytes_per_second,
             profiler.as_ref(),
@@ -5403,6 +5409,7 @@ fn send_lane_group(
     manifest: &[ManifestEntry],
     progress: Option<ProgressCounter>,
     session_basis_file_ids: Option<&[usize]>,
+    basis_index_cache: &session_cdc_lane::SenderBasisIndexCache,
     lane_end: LaneEnd,
     compression_lane_megabytes_per_second: Option<f64>,
     profiler: &TransferProfiler,
@@ -5431,6 +5438,7 @@ fn send_lane_group(
                             tasks,
                             lane_progress,
                             session_basis_file_ids,
+                            basis_index_cache,
                             lane_end,
                             compression_lane_megabytes_per_second,
                             profiler,
@@ -5474,6 +5482,8 @@ fn send_fresh_generation_plan(
 
     let mut reports = Vec::with_capacity(report_capacity);
 
+    let basis_index_cache = session_cdc_lane::SenderBasisIndexCache::default();
+
     let mut basis =
         CatalogBasis::before_generation(&plan.catalog, plan.completed_generation_count)?;
 
@@ -5495,6 +5505,7 @@ fn send_fresh_generation_plan(
             manifest,
             progress.clone(),
             Some(basis.file_ids()),
+            &basis_index_cache,
             LaneEnd::Generation(generation.index),
             compression_lane_megabytes_per_second,
             profiler,
@@ -5524,6 +5535,7 @@ fn send_fresh_generation_plan(
         manifest,
         progress,
         None,
+        &basis_index_cache,
         LaneEnd::Stream,
         compression_lane_megabytes_per_second,
         profiler,
@@ -5785,6 +5797,7 @@ fn send_lane(
     tasks: &[TransferTask],
     progress: Option<ProgressCounter>,
     session_basis_file_ids: Option<&[usize]>,
+    basis_index_cache: &session_cdc_lane::SenderBasisIndexCache,
     lane_end: LaneEnd,
     compression_lane_megabytes_per_second: Option<f64>,
     profiler: &TransferProfiler,
@@ -5832,6 +5845,7 @@ fn send_lane(
                         manifest,
                         file_id,
                         basis_file_ids,
+                        basis_index_cache,
                         profiler,
                     )?
                 } else {
