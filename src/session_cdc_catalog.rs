@@ -307,13 +307,6 @@ pub fn validate_plan(plan: &CatalogPlan, limits: CatalogLimits) -> io::Result<()
                 ));
             }
 
-            if generation.basis_file_ids.contains(&candidate.file_id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "session CDC generation references one of its own transfer files",
-                ));
-            }
-
             let estimated_entries = candidate.estimated_entries()?;
 
             if estimated_entries > limits.max_catalog_entries {
