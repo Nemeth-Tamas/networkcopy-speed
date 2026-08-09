@@ -122,6 +122,88 @@ impl SenderBasisIndexCache {
     }
 }
 
+pub(crate) fn basis_eligible(entry: &ManifestEntry) -> bool {
+    matches!(entry.class, FileClass::Medium | FileClass::Large)
+        && entry.file_size >= MINIMUM_TARGET_BYTES
+}
+
+fn build_verified_basis_index(
+    basis_path: &Path,
+    basis_entry: &ManifestEntry,
+    basis_file_id: usize,
+    profiler: &TransferProfiler,
+) -> io::Result<Arc<BasisFileIndex>> {
+    let index_started = Instant::now();
+
+    let index = Arc::new(BasisFileIndex::build(
+        basis_path,
+        content_defined_dedup_bench::DEFAULT_AVERAGE_KIB,
+    )?);
+
+    profiler.record_sender_session_cdc_basis_index(
+        basis_file_id,
+        index_started.elapsed(),
+        index.file_bytes(),
+    );
+
+    validate_source_file(basis_path, basis_entry, "session CDC basis")?;
+
+    if index.file_bytes() != basis_entry.file_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "session CDC basis index contains {} bytes, expected {}",
+                index.file_bytes(),
+                basis_entry.file_size,
+            ),
+        ));
+    }
+
+    Ok(index)
+}
+
+pub(crate) fn prebuild_basis_index(
+    source_root: &Path,
+    manifest: &[ManifestEntry],
+    basis_file_id: usize,
+    basis_index_cache: &SenderBasisIndexCache,
+    profiler: &TransferProfiler,
+) -> io::Result<()> {
+    let basis_entry = manifest.get(basis_file_id).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("session CDC prebuild references unknown basis file ID {basis_file_id}"),
+        )
+    })?;
+
+    if !basis_eligible(basis_entry) {
+        return Ok(());
+    }
+
+    let basis_path = source_root.join(&basis_entry.relative_path);
+
+    validate_source_file(&basis_path, basis_entry, "session CDC basis")?;
+
+    let (index, _) = basis_index_cache.get_or_build(basis_file_id, || {
+        build_verified_basis_index(&basis_path, basis_entry, basis_file_id, profiler)
+    })?;
+
+    validate_source_file(&basis_path, basis_entry, "session CDC basis")?;
+
+    if index.file_bytes() != basis_entry.file_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "session CDC basis index contains {} bytes, expected {}",
+                index.file_bytes(),
+                basis_entry.file_size,
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn sender_try_plan(
     writer: &mut impl Write,
     source_root: &Path,
@@ -163,9 +245,7 @@ pub(crate) fn sender_try_plan(
             )
         })?;
 
-        if !matches!(basis_entry.class, FileClass::Medium | FileClass::Large)
-            || basis_entry.file_size < MINIMUM_TARGET_BYTES
-        {
+        if !basis_eligible(basis_entry) {
             continue;
         }
 
@@ -191,33 +271,7 @@ pub(crate) fn sender_try_plan(
         }
 
         let (index, cache_hit) = basis_index_cache.get_or_build(basis_file_id, || {
-            let index_started = Instant::now();
-
-            let index = Arc::new(BasisFileIndex::build(
-                &basis_path,
-                content_defined_dedup_bench::DEFAULT_AVERAGE_KIB,
-            )?);
-
-            profiler.record_sender_session_cdc_basis_index(
-                basis_file_id,
-                index_started.elapsed(),
-                index.file_bytes(),
-            );
-
-            validate_source_file(&basis_path, basis_entry, "session CDC basis")?;
-
-            if index.file_bytes() != basis_entry.file_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "session CDC basis index contains {} bytes, expected {}",
-                        index.file_bytes(),
-                        basis_entry.file_size,
-                    ),
-                ));
-            }
-
-            Ok(index)
+            build_verified_basis_index(&basis_path, basis_entry, basis_file_id, profiler)
         })?;
 
         if cache_hit {

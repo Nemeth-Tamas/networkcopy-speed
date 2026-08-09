@@ -364,6 +364,17 @@ impl MultistreamCopyReport {
                 "  Basis-index cache hits: {}",
                 self.stage_profile.sender_session_cdc_basis_cache_hits,
             );
+
+            let prebuild_wait = self.stage_profile.sender_session_cdc_prebuild_wait;
+
+            if prebuild_wait.operations != 0 {
+                println!("  Background prebuilds:  {}", prebuild_wait.operations,);
+
+                println!(
+                    "  Post-generation wait:  {:.6} s",
+                    prebuild_wait.elapsed.as_secs_f64(),
+                );
+            }
         }
 
         if let Some(receiver_stage_profile) = self.receiver_stage_profile {
@@ -726,6 +737,13 @@ struct ReceiverReady {
     completed_stripes: BTreeSet<ResumeStripe>,
 
     unchanged_file_ids: BTreeSet<usize>,
+}
+
+fn source_allows_background_cdc_prebuild(source_root: &Path) -> bool {
+    storage_media::inspect_path(source_root)
+        .ok()
+        .and_then(|report| report.incurs_seek_penalty())
+        == Some(false)
 }
 
 fn destination_seek_penalty(destination_root: &Path) -> bool {
@@ -1453,6 +1471,8 @@ fn send_internal(
 
     let source_root = source_root.canonicalize()?;
 
+    let background_cdc_prebuild = source_allows_background_cdc_prebuild(&source_root);
+
     let scan_result = manifest_scan::run(&source_root, worker_count)?;
 
     let scan_elapsed = scan_result.report.elapsed;
@@ -1705,6 +1725,7 @@ fn send_internal(
             generation_execution,
             progress.clone(),
             compression_lane_megabytes_per_second,
+            background_cdc_prebuild,
             profiler.as_ref(),
         )?
     } else {
@@ -5462,6 +5483,7 @@ fn send_fresh_generation_plan(
     execution: &FreshGenerationExecution,
     progress: Option<ProgressCounter>,
     compression_lane_megabytes_per_second: Option<f64>,
+    background_cdc_prebuild: bool,
     profiler: &TransferProfiler,
 ) -> io::Result<LaneReport> {
     let remaining_generation_count = plan
@@ -5498,18 +5520,73 @@ fn send_fresh_generation_plan(
             progress.check_cancelled()?;
         }
 
-        let report = send_lane_group(
-            data_streams,
-            lanes,
-            source_root,
-            manifest,
-            progress.clone(),
-            Some(basis.file_ids()),
-            &basis_index_cache,
-            LaneEnd::Generation(generation.index),
-            compression_lane_megabytes_per_second,
-            profiler,
-        )?;
+        let has_following_generation =
+            generation.index < plan.catalog.generations.len().saturating_sub(1);
+
+        let prebuild_file_id = if background_cdc_prebuild && has_following_generation {
+            generation
+                .published_file_ids()
+                .filter(|file_id| {
+                    manifest
+                        .get(*file_id)
+                        .is_some_and(session_cdc_lane::basis_eligible)
+                })
+                .last()
+        } else {
+            None
+        };
+
+        let report = if let Some(prebuild_file_id) = prebuild_file_id {
+            thread::scope(|scope| -> io::Result<LaneReport> {
+                let prebuild = thread::Builder::new()
+                    .name("networkcopy-cdc-prebuild".to_string())
+                    .spawn_scoped(scope, || {
+                        session_cdc_lane::prebuild_basis_index(
+                            source_root,
+                            manifest,
+                            prebuild_file_id,
+                            &basis_index_cache,
+                            profiler,
+                        )
+                    })?;
+
+                let report = send_lane_group(
+                    data_streams,
+                    lanes,
+                    source_root,
+                    manifest,
+                    progress.clone(),
+                    Some(basis.file_ids()),
+                    &basis_index_cache,
+                    LaneEnd::Generation(generation.index),
+                    compression_lane_megabytes_per_second,
+                    profiler,
+                )?;
+
+                let wait_started = Instant::now();
+
+                prebuild
+                    .join()
+                    .map_err(|_| io::Error::other("session CDC background prebuild panicked"))??;
+
+                profiler.record_sender_session_cdc_prebuild_wait(wait_started.elapsed());
+
+                Ok(report)
+            })?
+        } else {
+            send_lane_group(
+                data_streams,
+                lanes,
+                source_root,
+                manifest,
+                progress.clone(),
+                Some(basis.file_ids()),
+                &basis_index_cache,
+                LaneEnd::Generation(generation.index),
+                compression_lane_megabytes_per_second,
+                profiler,
+            )?
+        };
 
         if let Some(progress) = &progress {
             progress.check_cancelled()?;

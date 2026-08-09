@@ -29,6 +29,8 @@ pub struct TransferStageProfile {
 
     pub sender_session_cdc_basis_cache_hits: u64,
 
+    pub sender_session_cdc_prebuild_wait: StageSample,
+
     pub receiver_socket_read: StageSample,
 
     pub receiver_decompression: StageSample,
@@ -49,6 +51,8 @@ pub(crate) struct TransferProfiler {
     sender_session_cdc_basis_file_ids: Mutex<BTreeSet<usize>>,
 
     sender_session_cdc_basis_cache_hits: AtomicU64,
+
+    sender_session_cdc_prebuild_wait: StageAccumulator,
 
     receiver_socket_read: StageAccumulator,
 
@@ -123,6 +127,10 @@ impl TransferProfiler {
         atomic_saturating_add(&self.sender_session_cdc_basis_cache_hits, 1);
     }
 
+    pub(crate) fn record_sender_session_cdc_prebuild_wait(&self, elapsed: Duration) {
+        self.sender_session_cdc_prebuild_wait.record(elapsed, 0);
+    }
+
     pub(crate) fn record_receiver_decompression(&self, elapsed: Duration, bytes: u64) {
         self.receiver_decompression.record(elapsed, bytes);
     }
@@ -173,6 +181,8 @@ impl TransferProfiler {
             .sender_session_cdc_basis_cache_hits
             .load(Ordering::Relaxed);
 
+        let sender_session_cdc_prebuild_wait = self.sender_session_cdc_prebuild_wait.snapshot();
+
         TransferStageProfile {
             sender_source_read: self.sender_source_read.snapshot(),
 
@@ -187,6 +197,8 @@ impl TransferProfiler {
             sender_session_cdc_repeated_basis_builds,
 
             sender_session_cdc_basis_cache_hits,
+
+            sender_session_cdc_prebuild_wait,
 
             receiver_socket_read: self.receiver_socket_read.snapshot(),
 
@@ -293,6 +305,8 @@ mod tests {
         profiler.record_sender_session_cdc_basis_cache_hit();
         profiler.record_sender_session_cdc_basis_cache_hit();
 
+        profiler.record_sender_session_cdc_prebuild_wait(Duration::from_nanos(40));
+
         let profile = profiler.snapshot();
 
         assert_eq!(
@@ -309,6 +323,13 @@ mod tests {
         assert_eq!(profile.sender_session_cdc_repeated_basis_builds, 1,);
 
         assert_eq!(profile.sender_session_cdc_basis_cache_hits, 2,);
+
+        assert_eq!(
+            profile.sender_session_cdc_prebuild_wait.elapsed,
+            Duration::from_nanos(40),
+        );
+
+        assert_eq!(profile.sender_session_cdc_prebuild_wait.operations, 1,);
     }
 
     #[test]
