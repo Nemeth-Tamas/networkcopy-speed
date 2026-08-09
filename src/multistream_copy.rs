@@ -3743,27 +3743,23 @@ fn apply_fresh_resume_prefix(
         ));
     }
 
-    let mut expected_prefix_file_ids = BTreeSet::new();
     let mut completed_generation_count = 0_usize;
 
     for generation in &plan.catalog.generations {
-        let generation_file_ids: BTreeSet<usize> = generation
-            .transfer_files
-            .iter()
-            .map(|candidate| candidate.file_id)
-            .collect();
-
-        if generation_file_ids.is_empty() {
+        if generation.transfer_files.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "fresh-transfer catalog contains an empty generation",
             ));
         }
 
-        let completed_in_generation = generation_file_ids.intersection(completed_file_ids).count();
+        let completed_in_generation = generation
+            .transfer_files
+            .iter()
+            .filter(|candidate| completed_file_ids.contains(&candidate.file_id))
+            .count();
 
-        if completed_in_generation == generation_file_ids.len() {
-            expected_prefix_file_ids.extend(generation_file_ids);
+        if completed_in_generation == generation.transfer_files.len() {
             completed_generation_count = completed_generation_count
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("completed fresh-generation count overflowed"))?;
@@ -3784,21 +3780,47 @@ fn apply_fresh_resume_prefix(
         break;
     }
 
-    if let Some(file_id) = completed_file_ids
-        .difference(&expected_prefix_file_ids)
-        .next()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "resume journal completed file {file_id} does not belong to a contiguous generation prefix"
-            ),
-        ));
+    for &file_id in completed_file_ids {
+        let Some(generation_index) = catalog_generation_index_for_file_id(&plan.catalog, file_id)
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "resume journal completed file {file_id} does not belong to the fresh catalog"
+                ),
+            ));
+        };
+
+        if generation_index >= completed_generation_count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "resume journal completed file {file_id} does not belong to a contiguous generation prefix"
+                ),
+            ));
+        }
     }
 
     plan.completed_generation_count = completed_generation_count;
 
     Ok(())
+}
+
+fn catalog_generation_index_for_file_id(catalog: &CatalogPlan, file_id: usize) -> Option<usize> {
+    let generation_index = catalog.generations.partition_point(|generation| {
+        generation
+            .transfer_files
+            .last()
+            .is_some_and(|candidate| candidate.file_id < file_id)
+    });
+
+    let generation = catalog.generations.get(generation_index)?;
+
+    generation
+        .transfer_files
+        .binary_search_by_key(&file_id, |candidate| candidate.file_id)
+        .ok()
+        .map(|_| generation_index)
 }
 
 fn build_fresh_generation_execution(
@@ -3815,22 +3837,6 @@ fn build_fresh_generation_execution(
                 .checked_add(lane.len())
                 .ok_or_else(|| io::Error::other("remaining transfer task count overflowed"))
         })?;
-
-    let mut generation_by_file_id = BTreeMap::new();
-
-    for (generation_index, generation) in plan.catalog.generations.iter().enumerate() {
-        for candidate in &generation.transfer_files {
-            if generation_by_file_id
-                .insert(candidate.file_id, generation_index)
-                .is_some()
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "fresh-transfer catalog schedules the same file in multiple generations",
-                ));
-            }
-        }
-    }
 
     let mut generation_lanes: Vec<Vec<Vec<TransferTask>>> = (0..plan.catalog.generations.len())
         .map(|_| vec![Vec::new(); lane_count])
@@ -3849,17 +3855,14 @@ fn build_fresh_generation_execution(
             };
 
             let generation_index =
-                generation_by_file_id
-                    .get(&file_id)
-                    .copied()
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "remaining fresh-transfer task for file {file_id} is absent from the original catalog"
-                            ),
-                        )
-                    })?;
+                catalog_generation_index_for_file_id(&plan.catalog, file_id).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "remaining fresh-transfer task for file {file_id} is absent from the original catalog"
+                        ),
+                    )
+                })?;
 
             let generation = generation_lanes.get_mut(generation_index).ok_or_else(|| {
                 io::Error::new(
@@ -3941,12 +3944,6 @@ fn validate_fresh_generation_execution(
             ));
         }
 
-        let expected_file_ids: BTreeSet<usize> = generation
-            .transfer_files
-            .iter()
-            .map(|candidate| candidate.file_id)
-            .collect();
-
         for task in lanes.iter().flatten() {
             let file_id = catalog_task_file_id(task).ok_or_else(|| {
                 io::Error::new(
@@ -3955,7 +3952,11 @@ fn validate_fresh_generation_execution(
                 )
             })?;
 
-            if !expected_file_ids.contains(&file_id) {
+            if generation
+                .transfer_files
+                .binary_search_by_key(&file_id, |candidate| candidate.file_id)
+                .is_err()
+            {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("fresh generation contains unexpected file ID {file_id}"),
@@ -4013,7 +4014,7 @@ fn collect_fresh_catalog_candidates(
     manifest: &[ManifestEntry],
     transfer_plan: &TransferPlan,
 ) -> io::Result<Vec<CatalogCandidate>> {
-    let mut file_ids = BTreeSet::new();
+    let mut file_ids = Vec::new();
 
     for task in transfer_plan.lanes.iter().flatten() {
         let Some(file_id) = catalog_task_file_id(task) else {
@@ -4052,8 +4053,11 @@ fn collect_fresh_catalog_candidates(
             }
         }
 
-        file_ids.insert(file_id);
+        file_ids.push(file_id);
     }
+
+    file_ids.sort_unstable();
+    file_ids.dedup();
 
     file_ids
         .into_iter()
@@ -8182,18 +8186,18 @@ mod tests {
         ReceiverReady, TINY_PACK_TARGET_BYTES, TransferAck, TransferFault, TransferTask,
         accept_session, apply_fresh_resume_prefix, apply_resume_offer,
         build_fresh_generation_execution, build_fresh_generation_plan_with_limits,
-        build_transfer_plan, catalog_task_file_id, connect_with_retry_config,
-        expected_generation_commit, finalize_large_files, generation_commit_wire_bytes,
-        materialize_manifest_directories, negotiate_verified_fresh_resume_files,
-        persist_generation_commit, prepare_destination, read_desktop_layout_metadata,
-        read_generation_commit, read_lane_end, read_receiver_ready, read_source_directory_name,
-        read_transfer_ack, read_u8, read_verification_request, receive_once, run, run_update,
-        run_update_with_fault, run_with_fault, run_with_fault_and_layout, send, send_configured,
-        serialize_transfer_plan, temporary_path, tiny_pack_record_wire_bytes,
-        validate_generation_commit, validate_resume_offer, validate_source_metadata,
-        verify_content_digest, write_desktop_layout_metadata, write_generation_commit,
-        write_lane_end, write_receiver_ready, write_source_directory_name, write_transfer_ack,
-        write_u8, write_u64, write_verification_response,
+        build_transfer_plan, catalog_generation_index_for_file_id, catalog_task_file_id,
+        connect_with_retry_config, expected_generation_commit, finalize_large_files,
+        generation_commit_wire_bytes, materialize_manifest_directories,
+        negotiate_verified_fresh_resume_files, persist_generation_commit, prepare_destination,
+        read_desktop_layout_metadata, read_generation_commit, read_lane_end, read_receiver_ready,
+        read_source_directory_name, read_transfer_ack, read_u8, read_verification_request,
+        receive_once, run, run_update, run_update_with_fault, run_with_fault,
+        run_with_fault_and_layout, send, send_configured, serialize_transfer_plan, temporary_path,
+        tiny_pack_record_wire_bytes, validate_generation_commit, validate_resume_offer,
+        validate_source_metadata, verify_content_digest, write_desktop_layout_metadata,
+        write_generation_commit, write_lane_end, write_receiver_ready, write_source_directory_name,
+        write_transfer_ack, write_u8, write_u64, write_verification_response,
     };
     use crate::control_plane::{self, ManifestSummary};
     use crate::desktop_layout::{
@@ -8322,6 +8326,55 @@ mod tests {
         assert_eq!(whole_file_count, 1);
         assert_eq!(tiny_pack_count, 1);
         assert_eq!(tiny_file_count, 2);
+    }
+
+    #[test]
+    fn fresh_catalog_generation_lookup_handles_manifest_gaps() {
+        let manifest = vec![
+            entry("medium-a.bin", 100, FileClass::Medium),
+            entry("tiny-gap.bin", 10, FileClass::Tiny),
+            entry("medium-b.bin", 100, FileClass::Medium),
+            entry("medium-c.bin", 100, FileClass::Medium),
+        ];
+
+        let transfer_plan = build_transfer_plan(&manifest, 2).unwrap();
+
+        let generation_plan = build_fresh_generation_plan_with_limits(
+            &manifest,
+            &transfer_plan,
+            CatalogLimits {
+                generation_target_bytes: 100,
+                max_catalog_entries: 100,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(generation_plan.catalog.generations.len(), 3);
+
+        assert_eq!(
+            catalog_generation_index_for_file_id(&generation_plan.catalog, 0),
+            Some(0),
+        );
+
+        assert_eq!(
+            catalog_generation_index_for_file_id(&generation_plan.catalog, 1),
+            None,
+        );
+
+        assert_eq!(
+            catalog_generation_index_for_file_id(&generation_plan.catalog, 2),
+            Some(1),
+        );
+
+        assert_eq!(
+            catalog_generation_index_for_file_id(&generation_plan.catalog, 3),
+            Some(2),
+        );
+
+        assert_eq!(
+            catalog_generation_index_for_file_id(&generation_plan.catalog, 999),
+            None,
+        );
     }
 
     #[test]
