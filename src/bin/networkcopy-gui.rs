@@ -173,7 +173,6 @@ impl LiveProgress {
 #[derive(Clone, Copy)]
 struct Text {
     subtitle: &'static str,
-    language: &'static str,
     send: &'static str,
     receive: &'static str,
     direct_mode: &'static str,
@@ -283,8 +282,6 @@ struct Text {
 impl Text {
     const HUNGARIAN: Self = Self {
         subtitle: "Gyors fájlmásolás közvetlen hálózati kapcsolaton",
-
-        language: "Nyelv:",
 
         send: "Küldés",
 
@@ -471,8 +468,6 @@ impl Text {
 
     const ENGLISH: Self = Self {
         subtitle: "High-speed copying over a direct network connection",
-
-        language: "Language:",
 
         send: "Send",
 
@@ -2001,7 +1996,7 @@ fn standalone_mode_card(
             ui.set_min_height(MODE_CARD_HEIGHT);
 
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("●").size(11.0).color(accent));
+                ui.label(egui::RichText::new("|").size(16.0).strong().color(accent));
 
                 ui.label(
                     egui::RichText::new(title)
@@ -2017,11 +2012,7 @@ fn standalone_mode_card(
 
             ui.add_space(10.0);
 
-            let button_text = if selected {
-                format!("✓  {title}")
-            } else {
-                title.to_string()
-            };
+            let button_text = title.to_string();
 
             let button =
                 ui.add_sized(
@@ -2104,7 +2095,7 @@ fn card(ui: &mut egui::Ui, accent: egui::Color32, add_contents: impl FnOnce(&mut
             ui.set_min_width(ui.available_width());
 
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("●").size(9.0).color(accent));
+                ui.label(egui::RichText::new("|").size(14.0).strong().color(accent));
 
                 ui.label(
                     egui::RichText::new("NETWORKCOPY")
