@@ -3642,11 +3642,7 @@ impl NetworkCopyManager {
                     || self.peer_cleanup_receiver.is_some();
 
                 if show_transfer_panel {
-                    dashboard_section_frame(ui).show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-
-                        self.render_transfer(ui);
-                    });
+                    self.render_transfer(ui);
 
                     ui.add_space(DASHBOARD_CONTENT_GAP);
                 }
@@ -3664,11 +3660,7 @@ impl NetworkCopyManager {
                     || self.peer_cleanup_receiver.is_some();
 
                 if show_transfer_panel {
-                    dashboard_section_frame(ui).show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-
-                        self.render_transfer(ui);
-                    });
+                    self.render_transfer(ui);
 
                     ui.add_space(DASHBOARD_CONTENT_GAP);
                 }
@@ -4981,84 +4973,312 @@ impl NetworkCopyManager {
     }
 
     fn render_transfer(&mut self, ui: &mut egui::Ui) {
-        let (status, status_color) = self.manager_status();
-
-        ui.horizontal_wrapped(|ui| {
-            ui.heading("Current transfer");
-
-            status_label(ui, status, status_color);
-        });
+        let (manager_status, manager_status_color) = self.manager_status();
 
         let Some(transfer) = self.transfer.clone() else {
-            ui.label(
-                "No active transfer. Select two endpoint agents and configure a source and destination.",
-            );
+            dashboard_card_frame(ui).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+
+                status_label(
+                    ui,
+                    "No active transfer",
+                    egui::Color32::from_rgb(95, 194, 255),
+                );
+
+                ui.add_space(8.0);
+
+                ui.label(
+                    egui::RichText::new("Ready for the next transfer")
+                        .size(20.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(225, 238, 250)),
+                );
+
+                ui.label("Configure two endpoints and a source/destination pair to begin.");
+            });
 
             return;
         };
 
-        ui.label(format!(
-            "{}  →  {}",
-            transfer.source_root, transfer.destination_root,
-        ));
+        let sender_progress =
+            active_job_progress(self.sender_snapshot.as_ref(), transfer.sender_job_id);
 
-        ui.label(format!("Payload path: {}", transfer.receiver_payload,));
+        let receiver_progress =
+            active_job_progress(self.receiver_snapshot.as_ref(), transfer.receiver_job_id);
 
-        ui.label(format!(
-            "Sender job {} · Receiver job {}",
-            transfer.sender_job_id, transfer.receiver_job_id,
-        ));
+        let progress = sender_progress
+            .clone()
+            .or_else(|| receiver_progress.clone());
 
-        ui.add_space(8.0);
+        let sender_result =
+            terminal_result_for(self.sender_snapshot.as_ref(), transfer.sender_job_id);
 
-        ui.columns(2, |columns| {
-            let (left, right) = columns.split_at_mut(1);
+        let receiver_result =
+            terminal_result_for(self.receiver_snapshot.as_ref(), transfer.receiver_job_id);
 
-            render_endpoint_snapshot(
-                &mut left[0],
-                "Sender",
-                transfer.sender_agent,
-                transfer.sender_job_id,
-                self.sender_snapshot.as_ref(),
-            );
+        let terminal_outcome = match (sender_result, receiver_result) {
+            (Some(sender), Some(receiver)) => Some(paired_outcome(sender, receiver)),
 
-            render_endpoint_snapshot(
-                &mut right[0],
-                "Receiver",
-                transfer.receiver_agent,
-                transfer.receiver_job_id,
-                self.receiver_snapshot.as_ref(),
-            );
+            _ => None,
+        };
+
+        let (hero_status, hero_color) = if let Some(outcome) = terminal_outcome {
+            (outcome.label(), outcome_color(outcome))
+        } else {
+            (manager_status, manager_status_color)
+        };
+
+        dashboard_card_frame(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("Current transfer")
+                        .size(22.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(236, 245, 253)),
+                );
+
+                status_label(ui, hero_status, hero_color);
+
+                if let Some(queue_id) = self.active_queue_id {
+                    status_label(
+                        ui,
+                        &format!("Queue #{queue_id}"),
+                        egui::Color32::from_rgb(181, 124, 255),
+                    );
+                }
+            });
+
+            ui.add_space(12.0);
+
+            ui.columns(2, |columns| {
+                let (source, destination) = columns.split_at_mut(1);
+
+                source[0].label(
+                    egui::RichText::new("SOURCE")
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(64, 190, 255)),
+                );
+
+                source[0].label(
+                    egui::RichText::new(&transfer.source_root)
+                        .size(17.0)
+                        .monospace()
+                        .color(egui::Color32::from_rgb(220, 233, 245)),
+                );
+
+                destination[0].label(
+                    egui::RichText::new("DESTINATION")
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(181, 124, 255)),
+                );
+
+                destination[0].label(
+                    egui::RichText::new(&transfer.destination_root)
+                        .size(17.0)
+                        .monospace()
+                        .color(egui::Color32::from_rgb(220, 233, 245)),
+                );
+            });
+
+            ui.add_space(14.0);
+
+            if let Some((completed, total, phase)) = &progress {
+                if *total != 0 {
+                    let fraction = (*completed).min(*total) as f64 / *total as f64;
+
+                    ui.add(
+                        egui::ProgressBar::new(fraction as f32)
+                            .desired_height(20.0)
+                            .fill(egui::Color32::from_rgb(0, 164, 218))
+                            .corner_radius(egui::CornerRadius::same(7))
+                            .text(format!(
+                                "{} / {} · {}",
+                                format_bytes(*completed),
+                                format_bytes(*total),
+                                phase,
+                            )),
+                    );
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+
+                        ui.label(format!(
+                            "{} processed · {}",
+                            format_bytes(*completed),
+                            phase,
+                        ));
+                    });
+                }
+            } else if terminal_outcome == Some(ManagementJobOutcome::Completed) {
+                ui.add(
+                    egui::ProgressBar::new(1.0)
+                        .desired_height(20.0)
+                        .fill(egui::Color32::from_rgb(80, 190, 105))
+                        .corner_radius(egui::CornerRadius::same(7))
+                        .text("Transfer completed"),
+                );
+            } else if !self.monitoring_complete {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+
+                    ui.label("Waiting for endpoint progress...");
+                });
+            }
+
+            ui.add_space(14.0);
+
+            ui.columns(3, |columns| {
+                render_dashboard_metric(
+                    &mut columns[0],
+                    "Sender job",
+                    transfer.sender_job_id.to_string(),
+                    transfer.sender_agent.to_string(),
+                    egui::Color32::from_rgb(64, 190, 255),
+                );
+
+                render_dashboard_metric(
+                    &mut columns[1],
+                    "Receiver job",
+                    transfer.receiver_job_id.to_string(),
+                    transfer.receiver_agent.to_string(),
+                    egui::Color32::from_rgb(181, 124, 255),
+                );
+
+                render_dashboard_metric(
+                    &mut columns[2],
+                    "Payload endpoint",
+                    transfer.receiver_payload.port().to_string(),
+                    transfer.receiver_payload.to_string(),
+                    egui::Color32::from_rgb(0, 219, 199),
+                );
+            });
+
+            ui.add_space(DASHBOARD_CONTENT_GAP);
+
+            ui.columns(2, |columns| {
+                let (left, right) = columns.split_at_mut(1);
+
+                render_endpoint_snapshot(
+                    &mut left[0],
+                    "Sender",
+                    transfer.sender_agent,
+                    transfer.sender_job_id,
+                    self.sender_snapshot.as_ref(),
+                    egui::Color32::from_rgb(64, 190, 255),
+                );
+
+                render_endpoint_snapshot(
+                    &mut right[0],
+                    "Receiver",
+                    transfer.receiver_agent,
+                    transfer.receiver_job_id,
+                    self.receiver_snapshot.as_ref(),
+                    egui::Color32::from_rgb(181, 124, 255),
+                );
+            });
+
+            ui.add_space(12.0);
+
+            ui.horizontal_wrapped(|ui| {
+                let can_cancel = !self.monitoring_complete
+                    && self.cancel_receiver.is_none()
+                    && self.peer_cleanup_receiver.is_none();
+
+                if ui
+                    .add_enabled(
+                        can_cancel,
+                        egui::Button::new("Cancel transfer")
+                            .fill(egui::Color32::from_rgb(92, 43, 49))
+                            .corner_radius(egui::CornerRadius::same(7)),
+                    )
+                    .clicked()
+                {
+                    self.begin_cancel();
+                }
+
+                if self.cancel_receiver.is_some() {
+                    ui.spinner();
+
+                    ui.label("Cancelling...");
+                }
+
+                if self.peer_cleanup_receiver.is_some() {
+                    ui.spinner();
+
+                    ui.label("Cleaning up paired endpoint...");
+                }
+
+                if self.monitoring_complete && ui.button("Clear transfer").clicked() {
+                    self.clear_transfer_card();
+                }
+            });
         });
+    }
 
-        ui.add_space(8.0);
+    fn render_transfer_activity_bar(&mut self, ui: &mut egui::Ui) {
+        let Some(transfer) = self.transfer.clone() else {
+            return;
+        };
 
-        ui.horizontal(|ui| {
-            let can_cancel = !self.monitoring_complete
-                && self.cancel_receiver.is_none()
-                && self.peer_cleanup_receiver.is_none();
+        let (status, status_color) = self.manager_status();
 
-            if ui
-                .add_enabled(can_cancel, egui::Button::new("Cancel both endpoints"))
-                .clicked()
-            {
-                self.begin_cancel();
-            }
+        let progress = active_job_progress(self.sender_snapshot.as_ref(), transfer.sender_job_id)
+            .or_else(|| {
+                active_job_progress(self.receiver_snapshot.as_ref(), transfer.receiver_job_id)
+            });
 
-            if self.cancel_receiver.is_some() {
-                ui.spinner();
+        dashboard_card_frame(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
 
-                ui.label("Cancelling...");
-            }
+            ui.horizontal_wrapped(|ui| {
+                status_label(ui, status, status_color);
 
-            if self.peer_cleanup_receiver.is_some() {
-                ui.spinner();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} -> {}",
+                        transfer.source_root, transfer.destination_root,
+                    ))
+                    .monospace()
+                    .strong()
+                    .color(egui::Color32::from_rgb(215, 228, 240)),
+                );
 
-                ui.label("Cleaning up paired endpoint...");
-            }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("View transfer").clicked() {
+                        self.page = ManagerPage::Transfers;
+                    }
+                });
+            });
 
-            if self.monitoring_complete && ui.button("Clear transfer card").clicked() {
-                self.clear_transfer_card();
+            if let Some((completed, total, phase)) = progress {
+                ui.add_space(5.0);
+
+                if total == 0 {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+
+                        ui.label(format!("{} · {} processed", phase, format_bytes(completed),));
+                    });
+                } else {
+                    let fraction = completed.min(total) as f64 / total as f64;
+
+                    ui.add(
+                        egui::ProgressBar::new(fraction as f32)
+                            .desired_height(12.0)
+                            .fill(egui::Color32::from_rgb(0, 164, 218))
+                            .corner_radius(egui::CornerRadius::same(5))
+                            .text(format!(
+                                "{} · {} / {}",
+                                phase,
+                                format_bytes(completed),
+                                format_bytes(total),
+                            )),
+                    );
+                }
             }
         });
     }
@@ -5837,6 +6057,12 @@ impl eframe::App for NetworkCopyManager {
             ui.ctx().request_repaint_after(REPAINT_INTERVAL);
         }
 
+        if self.transfer.is_some() && !self.monitoring_complete {
+            egui::Panel::bottom("manager-transfer-activity").show(ui, |ui| {
+                self.render_transfer_activity_bar(ui);
+            });
+        }
+
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal_top(|ui| {
                 egui::Frame::default()
@@ -6373,6 +6599,18 @@ fn agent_state_color(state: &str) -> egui::Color32 {
     }
 }
 
+fn active_job_progress(
+    snapshot: Option<&ManagementAgentSnapshot>,
+    job_id: u64,
+) -> Option<(u64, u64, String)> {
+    let active = snapshot?
+        .active
+        .as_ref()
+        .filter(|active| active.job_id == job_id)?;
+
+    Some((active.completed, active.total, active.phase.clone()))
+}
+
 fn terminal_result_for(
     snapshot: Option<&ManagementAgentSnapshot>,
     job_id: u64,
@@ -6775,7 +7013,6 @@ fn render_remote_browser(
 fn join_remote_path(parent: &str, child: &str) -> String {
     Path::new(parent).join(child).to_string_lossy().into_owned()
 }
-
 fn parent_remote_path(path: &str) -> Option<String> {
     Path::new(path)
         .parent()
@@ -6789,49 +7026,82 @@ fn render_endpoint_snapshot(
     endpoint: SocketAddr,
     expected_job_id: u64,
     snapshot: Option<&ManagementAgentSnapshot>,
+    accent: egui::Color32,
 ) {
-    ui.group(|ui| {
-        ui.heading(title);
+    dashboard_section_frame(ui).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.set_min_height(150.0);
 
-        ui.label(endpoint.to_string());
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(title).size(18.0).strong().color(accent));
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(endpoint.to_string())
+                        .small()
+                        .monospace()
+                        .color(egui::Color32::from_rgb(124, 148, 169)),
+                );
+            });
+        });
+
+        ui.add_space(8.0);
 
         let Some(snapshot) = snapshot else {
-            ui.spinner();
+            ui.horizontal(|ui| {
+                ui.spinner();
 
-            ui.label("Waiting for first snapshot...");
+                ui.label("Waiting for first snapshot...");
+            });
 
             return;
         };
 
-        if let Some(active) = &snapshot.active
+        if let Some(active) = snapshot.active.as_ref()
             && active.job_id == expected_job_id
         {
-            ui.strong(format!("{} job {}", active.role.label(), active.job_id,));
+            status_label(ui, active.role.label(), accent);
 
-            ui.label(&active.phase);
+            ui.add_space(6.0);
+
+            ui.label(
+                egui::RichText::new(&active.phase)
+                    .strong()
+                    .color(egui::Color32::from_rgb(215, 228, 240)),
+            );
+
+            ui.add_space(6.0);
 
             if active.total == 0 {
                 ui.horizontal(|ui| {
                     ui.spinner();
 
-                    ui.label(format!("{} processed", format_bytes(active.completed),));
+                    ui.label(format!("{} processed", format_bytes(active.completed,),));
                 });
             } else {
                 let fraction = active.completed.min(active.total) as f64 / active.total as f64;
 
                 ui.add(
                     egui::ProgressBar::new(fraction as f32)
-                        .show_percentage()
+                        .desired_height(16.0)
+                        .fill(accent)
+                        .corner_radius(egui::CornerRadius::same(6))
                         .text(format!(
                             "{} / {}",
-                            format_bytes(active.completed),
-                            format_bytes(active.total),
+                            format_bytes(active.completed,),
+                            format_bytes(active.total,),
                         )),
                 );
             }
 
             if active.cancel_requested {
-                ui.label("Cancellation requested");
+                ui.add_space(4.0);
+
+                status_label(
+                    ui,
+                    "Cancellation requested",
+                    egui::Color32::from_rgb(255, 190, 82),
+                );
             }
         }
 
@@ -6841,34 +7111,47 @@ fn render_endpoint_snapshot(
             .filter(|result| result.job_id == expected_job_id);
 
         if let Some(result) = result {
-            ui.separator();
+            ui.add_space(8.0);
 
-            status_label(
-                ui,
-                &format!("Result: {}", result.outcome.label(),),
-                outcome_color(result.outcome),
-            );
+            status_label(ui, result.outcome.label(), outcome_color(result.outcome));
 
-            ui.label(format!("Files: {}", result.files,));
+            ui.add_space(8.0);
 
-            ui.label(format!(
-                "Logical data: {}",
-                format_bytes(result.logical_bytes,),
-            ));
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("{} file(s)", result.files,));
 
-            if result.wire_bytes > 0 {
-                ui.label(format!("Wire data: {}", format_bytes(result.wire_bytes,),));
-            }
+                ui.separator();
 
-            if result.data_stream_count > 0 {
-                ui.label(format!("Data streams: {}", result.data_stream_count,));
-            }
+                ui.label(format!("{} logical", format_bytes(result.logical_bytes,),));
+
+                if result.wire_bytes > 0 {
+                    ui.separator();
+
+                    ui.label(format!("{} wire", format_bytes(result.wire_bytes,),));
+                }
+
+                if result.data_stream_count > 0 {
+                    ui.separator();
+
+                    ui.label(format!("{} stream(s)", result.data_stream_count,));
+                }
+            });
 
             if !result.message.is_empty() {
-                ui.label(format!("Message: {}", result.message,));
+                ui.add_space(6.0);
+
+                ui.label(
+                    egui::RichText::new(&result.message)
+                        .small()
+                        .color(egui::Color32::from_rgb(145, 164, 182)),
+                );
             }
         } else if snapshot.active.is_none() {
-            ui.label("No retained result for this job yet.");
+            ui.label(
+                egui::RichText::new("No retained result for this job yet.")
+                    .small()
+                    .color(egui::Color32::from_rgb(126, 145, 163)),
+            );
         }
     });
 }
