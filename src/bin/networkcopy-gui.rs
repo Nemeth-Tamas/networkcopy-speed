@@ -841,29 +841,37 @@ impl NetworkCopyGui {
     }
 
     fn connection_selector(&mut self, ui: &mut egui::Ui, text: Text) {
-        ui.scope(|ui| {
-            ui.spacing_mut().button_padding = egui::vec2(18.0, 8.0);
+        let mut next_connection = self.connection;
 
-            ui.horizontal(|ui| {
-                ui.selectable_value(
-                    &mut self.connection,
-                    ConnectionChoice::Direct,
-                    egui::RichText::new(text.direct_connection).strong(),
-                );
+        ui.columns(2, |columns| {
+            if standalone_choice_card(
+                &mut columns[0],
+                text.direct_connection,
+                connection_choice_detail(self.language, ConnectionChoice::Direct),
+                self.connection == ConnectionChoice::Direct,
+                brand_blue_light(),
+            ) {
+                next_connection = ConnectionChoice::Direct;
+            }
 
-                ui.selectable_value(
-                    &mut self.connection,
-                    ConnectionChoice::Address,
-                    egui::RichText::new(text.ip_connection).strong(),
-                );
-            });
+            if standalone_choice_card(
+                &mut columns[1],
+                text.ip_connection,
+                connection_choice_detail(self.language, ConnectionChoice::Address),
+                self.connection == ConnectionChoice::Address,
+                egui::Color32::from_rgb(0, 219, 199),
+            ) {
+                next_connection = ConnectionChoice::Address;
+            }
         });
+
+        self.connection = next_connection;
 
         if self.connection != ConnectionChoice::Address {
             return;
         }
 
-        ui.add_space(8.0);
+        ui.add_space(10.0);
 
         let (label, address) = match self.mode {
             TransferMode::Send => (text.receiver_address, &mut self.receiver_address),
@@ -871,19 +879,25 @@ impl NetworkCopyGui {
             TransferMode::Receive => (text.bind_address, &mut self.bind_address),
         };
 
-        ui.label(label);
+        standalone_subcard_frame(egui::Color32::from_rgb(0, 219, 199)).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
 
-        ui.add_sized(
-            [ui.available_width(), 28.0],
-            egui::TextEdit::singleline(address).hint_text(text.address_hint),
-        );
+            ui.label(
+                egui::RichText::new(label)
+                    .strong()
+                    .color(egui::Color32::from_rgb(210, 225, 239)),
+            );
+
+            ui.add_space(5.0);
+
+            ui.add_sized(
+                [ui.available_width(), 36.0],
+                egui::TextEdit::singleline(address).hint_text(text.address_hint),
+            );
+        });
     }
 
     fn send_panel(&mut self, ui: &mut egui::Ui, text: Text) {
-        ui.label(text.send_description);
-
-        ui.add_space(8.0);
-
         let source_changed = folder_picker(
             ui,
             &mut self.source_folder,
@@ -891,46 +905,89 @@ impl NetworkCopyGui {
             text.source_hint,
             text.browse,
             text.choose_source,
+            brand_blue_light(),
         );
 
         if source_changed {
             self.refresh_desktop_layout_availability();
         }
 
+        ui.add_space(12.0);
+
+        ui.columns(2, |columns| {
+            standalone_subcard_frame(brand_blue_light()).show(&mut columns[0], |ui| {
+                ui.set_min_height(105.0);
+
+                ui.label(
+                    egui::RichText::new(text.scanner_workers)
+                        .small()
+                        .strong()
+                        .color(muted_text()),
+                );
+
+                ui.add_space(4.0);
+
+                ui.label(
+                    egui::RichText::new(self.scanner_workers.to_string())
+                        .size(25.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(235, 244, 252)),
+                );
+
+                ui.add(egui::Slider::new(&mut self.scanner_workers, 1..=32).show_value(false));
+            });
+
+            standalone_subcard_frame(egui::Color32::from_rgb(0, 219, 199)).show(
+                &mut columns[1],
+                |ui| {
+                    ui.set_min_height(105.0);
+
+                    ui.label(
+                        egui::RichText::new(text.calibration_mib)
+                            .small()
+                            .strong()
+                            .color(muted_text()),
+                    );
+
+                    ui.add_space(4.0);
+
+                    ui.label(
+                        egui::RichText::new(format!("{} MiB", self.calibration_mib,))
+                            .size(25.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(235, 244, 252)),
+                    );
+
+                    ui.add(
+                        egui::Slider::new(&mut self.calibration_mib, 1..=1024)
+                            .logarithmic(true)
+                            .show_value(false),
+                    );
+                },
+            );
+        });
+
         if self.desktop_layout_available {
             ui.add_space(12.0);
 
-            ui.checkbox(
-                &mut self.preserve_desktop_layout,
-                text.preserve_desktop_layout,
-            )
-            .on_hover_text(text.preserve_desktop_layout_hint);
+            standalone_subcard_frame(brand_green()).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
 
-            ui.label(
-                egui::RichText::new(text.preserve_desktop_layout_hint)
-                    .small()
-                    .color(muted_text()),
-            );
-        }
+                ui.checkbox(
+                    &mut self.preserve_desktop_layout,
+                    text.preserve_desktop_layout,
+                )
+                .on_hover_text(text.preserve_desktop_layout_hint);
 
-        ui.add_space(16.0);
+                ui.add_space(4.0);
 
-        egui::Grid::new("send_options")
-            .num_columns(2)
-            .spacing([24.0, 12.0])
-            .show(ui, |ui| {
-                ui.label(text.scanner_workers);
-
-                ui.add(egui::Slider::new(&mut self.scanner_workers, 1..=32));
-
-                ui.end_row();
-
-                ui.label(text.calibration_mib);
-
-                ui.add(egui::Slider::new(&mut self.calibration_mib, 1..=1024).logarithmic(true));
-
-                ui.end_row();
+                ui.label(
+                    egui::RichText::new(text.preserve_desktop_layout_hint)
+                        .small()
+                        .color(muted_text()),
+                );
             });
+        }
     }
 
     fn refresh_desktop_layout_availability(&mut self) {
@@ -945,10 +1002,6 @@ impl NetworkCopyGui {
     }
 
     fn receive_panel(&mut self, ui: &mut egui::Ui, text: Text) {
-        ui.label(text.receive_description);
-
-        ui.add_space(8.0);
-
         folder_picker(
             ui,
             &mut self.destination_folder,
@@ -956,25 +1009,49 @@ impl NetworkCopyGui {
             text.destination_hint,
             text.browse,
             text.choose_destination,
+            egui::Color32::from_rgb(181, 124, 255),
         );
 
         ui.add_space(12.0);
 
-        ui.label(text.destination_layout);
+        ui.label(
+            egui::RichText::new(text.destination_layout)
+                .size(17.0)
+                .strong()
+                .color(egui::Color32::from_rgb(225, 238, 250)),
+        );
 
-        ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(
-                &mut self.destination_layout,
-                DestinationLayout::Exact,
+        ui.add_space(7.0);
+
+        let mut selected_layout = None;
+
+        ui.columns(2, |columns| {
+            if standalone_choice_card(
+                &mut columns[0],
                 text.exact_destination,
-            );
+                destination_layout_detail(self.language, DestinationLayout::Exact),
+                self.destination_layout == DestinationLayout::Exact,
+                egui::Color32::from_rgb(181, 124, 255),
+            ) {
+                selected_layout = Some(DestinationLayout::Exact);
+            }
 
-            ui.selectable_value(
-                &mut self.destination_layout,
-                DestinationLayout::SourceNameUnderRoot,
+            if standalone_choice_card(
+                &mut columns[1],
                 text.destination_root_layout,
-            );
+                destination_layout_detail(self.language, DestinationLayout::SourceNameUnderRoot),
+                self.destination_layout == DestinationLayout::SourceNameUnderRoot,
+                egui::Color32::from_rgb(0, 219, 199),
+            ) {
+                selected_layout = Some(DestinationLayout::SourceNameUnderRoot);
+            }
         });
+
+        if let Some(layout) = selected_layout {
+            self.destination_layout = layout;
+        }
+
+        ui.add_space(8.0);
 
         ui.label(
             egui::RichText::new(text.destination_layout_hint)
@@ -982,16 +1059,22 @@ impl NetworkCopyGui {
                 .color(muted_text()),
         );
 
-        ui.add_space(14.0);
+        ui.add_space(12.0);
 
-        ui.checkbox(&mut self.update_existing, text.update_existing)
-            .on_hover_text(text.update_existing_hint);
+        standalone_subcard_frame(brand_green()).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
 
-        ui.label(
-            egui::RichText::new(text.update_existing_hint)
-                .small()
-                .color(muted_text()),
-        );
+            ui.checkbox(&mut self.update_existing, text.update_existing)
+                .on_hover_text(text.update_existing_hint);
+
+            ui.add_space(4.0);
+
+            ui.label(
+                egui::RichText::new(text.update_existing_hint)
+                    .small()
+                    .color(muted_text()),
+            );
+        });
     }
 
     fn transfer_request(&self, text: Text) -> Result<GuiTransferRequest, String> {
@@ -2039,6 +2122,125 @@ fn standalone_mode_card(
     clicked
 }
 
+fn standalone_subcard_frame(accent: egui::Color32) -> egui::Frame {
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(8, 24, 38))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 100),
+        ))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(12))
+}
+
+fn standalone_choice_card(
+    ui: &mut egui::Ui,
+    title: &str,
+    description: &str,
+    selected: bool,
+    accent: egui::Color32,
+) -> bool {
+    let fill = if selected {
+        egui::Color32::from_rgb(9, 43, 61)
+    } else {
+        egui::Color32::from_rgb(8, 24, 38)
+    };
+
+    let stroke = if selected {
+        accent
+    } else {
+        egui::Color32::from_rgb(24, 52, 75)
+    };
+
+    let mut clicked = false;
+
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(egui::Stroke::new(if selected { 1.5 } else { 1.0 }, stroke))
+        .corner_radius(egui::CornerRadius::same(8))
+        .inner_margin(egui::Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("|").size(15.0).strong().color(accent));
+
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(17.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(229, 239, 249)),
+                );
+            });
+
+            ui.add_space(5.0);
+
+            ui.label(egui::RichText::new(description).small().color(muted_text()));
+
+            ui.add_space(8.0);
+
+            clicked = ui
+                .add_sized(
+                    [ui.available_width(), 32.0],
+                    egui::Button::new(egui::RichText::new(title).strong().color(if selected {
+                        accent
+                    } else {
+                        egui::Color32::from_rgb(190, 205, 219)
+                    }))
+                    .fill(if selected {
+                        egui::Color32::from_rgb(10, 57, 78)
+                    } else {
+                        egui::Color32::from_rgb(11, 31, 47)
+                    })
+                    .stroke(egui::Stroke::new(1.0, stroke))
+                    .corner_radius(egui::CornerRadius::same(6)),
+                )
+                .clicked();
+        });
+
+    clicked
+}
+
+fn connection_choice_detail(language: Language, choice: ConnectionChoice) -> &'static str {
+    match (language, choice) {
+        (Language::Hungarian, ConnectionChoice::Direct) => {
+            "Automatikus partnerfelderítés a közvetlen hálózati kapcsolaton."
+        }
+
+        (Language::Hungarian, ConnectionChoice::Address) => {
+            "Kapcsolódás vagy figyelés kézzel megadott IP-címen."
+        }
+
+        (Language::English, ConnectionChoice::Direct) => {
+            "Automatic peer discovery over the direct network path."
+        }
+
+        (Language::English, ConnectionChoice::Address) => {
+            "Connect or listen on a manually specified IP endpoint."
+        }
+    }
+}
+
+fn destination_layout_detail(language: Language, layout: DestinationLayout) -> &'static str {
+    match (language, layout) {
+        (Language::Hungarian, DestinationLayout::Exact) => {
+            "A fájlok közvetlenül a kiválasztott célmappába kerülnek."
+        }
+
+        (Language::Hungarian, DestinationLayout::SourceNameUnderRoot) => {
+            "A forrásmappa neve automatikusan a célgyökér alá kerül."
+        }
+
+        (Language::English, DestinationLayout::Exact) => {
+            "Files are placed directly inside the selected destination."
+        }
+
+        (Language::English, DestinationLayout::SourceNameUnderRoot) => {
+            "The source folder name is automatically created beneath the destination root."
+        }
+    }
+}
+
 fn configure_style(context: &egui::Context) {
     context.set_theme(egui::Theme::Dark);
 
@@ -2390,34 +2592,51 @@ fn folder_picker(
     hint: &str,
     browse: &str,
     dialog_title: &str,
+    accent: egui::Color32,
 ) -> bool {
-    ui.label(label);
-
     let mut changed = false;
 
-    ui.horizontal(|ui| {
-        let button_width = 110.0;
+    standalone_subcard_frame(accent).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
 
-        let spacing = ui.spacing().item_spacing.x;
+        ui.label(
+            egui::RichText::new(label)
+                .strong()
+                .color(egui::Color32::from_rgb(215, 229, 241)),
+        );
 
-        let edit_width = (ui.available_width() - button_width - spacing).max(160.0);
+        ui.add_space(6.0);
 
-        changed |= ui
-            .add_sized(
-                [edit_width, 28.0],
-                egui::TextEdit::singleline(value).hint_text(hint),
-            )
-            .changed();
+        ui.horizontal(|ui| {
+            let button_width = 120.0;
 
-        let clicked = ui
-            .add_sized([button_width, 28.0], egui::Button::new(browse))
-            .clicked();
+            let spacing = ui.spacing().item_spacing.x;
 
-        if clicked && let Some(path) = FileDialog::new().set_title(dialog_title).pick_folder() {
-            *value = path.display().to_string();
+            let edit_width = (ui.available_width() - button_width - spacing).max(160.0);
 
-            changed = true;
-        }
+            changed |= ui
+                .add_sized(
+                    [edit_width, 36.0],
+                    egui::TextEdit::singleline(value).hint_text(hint),
+                )
+                .changed();
+
+            let clicked = ui
+                .add_sized(
+                    [button_width, 36.0],
+                    egui::Button::new(browse)
+                        .fill(egui::Color32::from_rgb(12, 41, 58))
+                        .stroke(egui::Stroke::new(1.0, accent))
+                        .corner_radius(egui::CornerRadius::same(6)),
+                )
+                .clicked();
+
+            if clicked && let Some(path) = FileDialog::new().set_title(dialog_title).pick_folder() {
+                *value = path.display().to_string();
+
+                changed = true;
+            }
+        });
     });
 
     changed

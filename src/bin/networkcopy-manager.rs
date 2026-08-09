@@ -7630,7 +7630,7 @@ fn render_dashboard_metric(
         ui.set_min_width(ui.available_width());
 
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("●").size(10.0).color(accent));
+            ui.label(egui::RichText::new("|").size(14.0).strong().color(accent));
 
             ui.label(
                 egui::RichText::new(title)
