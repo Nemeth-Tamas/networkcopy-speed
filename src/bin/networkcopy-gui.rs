@@ -259,6 +259,16 @@ struct Text {
     streams: &'static str,
     tiny_write_workers: &'static str,
     elapsed: &'static str,
+
+    remaining: &'static str,
+
+    current_phase: &'static str,
+
+    wire_data: &'static str,
+
+    resumed_stripes: &'static str,
+
+    resumed_data: &'static str,
     missing_source: &'static str,
     missing_destination: &'static str,
     invalid_address: &'static str,
@@ -428,6 +438,16 @@ impl Text {
         tiny_write_workers: "Aprófájl-író szálak",
 
         elapsed: "Idő",
+
+        remaining: "hátralévő",
+
+        current_phase: "Aktuális szakasz",
+
+        wire_data: "Hálózati adat",
+
+        resumed_stripes: "Folytatott fájlrészek",
+
+        resumed_data: "Folytatott adatmennyiség",
 
         missing_source: "Nincs kiválasztva forrásmappa",
 
@@ -614,6 +634,16 @@ impl Text {
         tiny_write_workers: "Tiny write workers",
 
         elapsed: "Time",
+
+        remaining: "remaining",
+
+        current_phase: "Current phase",
+
+        wire_data: "Wire data",
+
+        resumed_stripes: "Resumed stripes",
+
+        resumed_data: "Resumed data",
 
         missing_source: "No source folder has been selected",
 
@@ -1276,20 +1306,40 @@ impl NetworkCopyGui {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(context, |ui| {
-                ui.set_min_width(440.0);
+                ui.set_min_width(520.0);
 
-                ui.label(text.resume_question);
+                standalone_status_pill(ui, text.resume_title, warning_text());
 
-                ui.add_space(12.0);
+                ui.add_space(10.0);
 
-                resume_request_summary(ui, text, &request);
+                ui.label(
+                    egui::RichText::new(text.resume_question)
+                        .size(18.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(230, 241, 251)),
+                );
+
+                ui.add_space(14.0);
+
+                standalone_subcard_frame(warning_text()).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+
+                    resume_request_summary(ui, text, &request);
+                });
 
                 ui.add_space(16.0);
 
                 ui.horizontal(|ui| {
-                    resume = ui.button(text.resume_continue).clicked();
+                    resume = ui.add(resume_button(text.resume_continue)).clicked();
 
-                    discard = ui.button(text.resume_discard).clicked();
+                    discard = ui
+                        .add(
+                            egui::Button::new(egui::RichText::new(text.resume_discard).strong())
+                                .fill(danger_fill())
+                                .corner_radius(egui::CornerRadius::same(8))
+                                .min_size(egui::vec2(130.0, 40.0)),
+                        )
+                        .clicked();
                 });
             });
 
@@ -1602,9 +1652,9 @@ impl NetworkCopyGui {
                         text.files,
                         summary.files.to_string(),
                         if summary.skipped_files > 0 {
-                            format!("{} skipped", summary.skipped_files,)
+                            format!("{}: {}", text.skipped_files, summary.skipped_files,)
                         } else {
-                            "All processed".to_string()
+                            text.completed.to_string()
                         },
                         brand_blue_light(),
                     );
@@ -1629,7 +1679,7 @@ impl NetworkCopyGui {
                         &mut columns[3],
                         text.elapsed,
                         format!("{:.2} s", summary.elapsed.as_secs_f64(),),
-                        format!("{} TCP stream(s)", summary.data_stream_count,),
+                        format!("{}: {}", text.streams, summary.data_stream_count,),
                         egui::Color32::from_rgb(0, 219, 199),
                     );
                 });
@@ -1657,9 +1707,12 @@ impl NetworkCopyGui {
                     ui.add_space(5.0);
 
                     ui.label(
-                        egui::RichText::new(text.compression_strategy_adaptive)
-                            .small()
-                            .color(muted_text()),
+                        egui::RichText::new(format!(
+                            "{}: {}",
+                            text.compression_strategy, text.compression_strategy_adaptive,
+                        ))
+                        .small()
+                        .color(muted_text()),
                     );
                 });
 
@@ -1727,15 +1780,19 @@ impl NetworkCopyGui {
                             &mut columns[0],
                             text.cdc_updates,
                             format!("{} / {}", summary.cdc_files, summary.cdc_offered_files,),
-                            format!("{} fallback(s)", summary.cdc_fallback_files,),
+                            format!("{}: {}", text.cdc_fallbacks, summary.cdc_fallback_files,),
                             egui::Color32::from_rgb(181, 124, 255),
                         );
 
                         standalone_metric(
                             &mut columns[1],
-                            text.exact_reuse_data,
+                            text.cdc_data,
                             format_bytes(summary.cdc_reused_bytes),
-                            format!("{} logical", format_bytes(summary.cdc_logical_bytes,),),
+                            format!(
+                                "{}: {}",
+                                text.logical_data,
+                                format_bytes(summary.cdc_logical_bytes,),
+                            ),
                             brand_green(),
                         );
 
@@ -1743,7 +1800,11 @@ impl NetworkCopyGui {
                             &mut columns[2],
                             text.cdc_wire,
                             format_bytes(summary.cdc_wire_bytes),
-                            format!("{} literal", format_bytes(summary.cdc_literal_bytes,),),
+                            format!(
+                                "{}: {}",
+                                text.wire_data,
+                                format_bytes(summary.cdc_literal_bytes,),
+                            ),
                             brand_blue_light(),
                         );
 
@@ -1774,7 +1835,10 @@ impl NetworkCopyGui {
                             &mut columns[0],
                             text.tiny_packs,
                             summary.tiny_pack_count.to_string(),
-                            format!("{} compressed", summary.compressed_tiny_pack_count,),
+                            format!(
+                                "{}: {}",
+                                text.compressed_tiny_packs, summary.compressed_tiny_pack_count,
+                            ),
                             brand_blue_light(),
                         );
 
@@ -1782,7 +1846,10 @@ impl NetworkCopyGui {
                             &mut columns[1],
                             text.packed_tiny_files,
                             summary.tiny_files_packed.to_string(),
-                            format!("{} worker(s)", summary.tiny_materialization_workers,),
+                            format!(
+                                "{}: {}",
+                                text.tiny_write_workers, summary.tiny_materialization_workers,
+                            ),
                             brand_green(),
                         );
 
@@ -1798,7 +1865,7 @@ impl NetworkCopyGui {
                             &mut columns[3],
                             text.tiny_pack_savings,
                             format!("{:.2}%", summary.tiny_pack_wire_savings_percent,),
-                            format!("{} raw pack(s)", summary.raw_tiny_pack_count,),
+                            format!("{}: {}", text.raw_tiny_packs, summary.raw_tiny_pack_count,),
                             egui::Color32::from_rgb(0, 219, 199),
                         );
                     });
@@ -1814,12 +1881,16 @@ impl NetworkCopyGui {
                             if summary.resumed_stripes > 0 {
                                 standalone_status_pill(
                                     ui,
-                                    &format!("{} resumed stripe(s)", summary.resumed_stripes,),
+                                    &format!(
+                                        "{}: {}",
+                                        text.resumed_stripes, summary.resumed_stripes,
+                                    ),
                                     warning_text(),
                                 );
 
                                 ui.label(format!(
-                                    "{} resumed",
+                                    "{}: {}",
+                                    text.resumed_data,
                                     format_bytes(summary.resumed_bytes,),
                                 ));
                             }
@@ -1827,12 +1898,13 @@ impl NetworkCopyGui {
                             if summary.skipped_files > 0 {
                                 standalone_status_pill(
                                     ui,
-                                    &format!("{} skipped file(s)", summary.skipped_files,),
+                                    &format!("{}: {}", text.skipped_files, summary.skipped_files,),
                                     brand_green(),
                                 );
 
                                 ui.label(format!(
-                                    "{} skipped",
+                                    "{}: {}",
+                                    text.skipped_data,
                                     format_bytes(summary.skipped_bytes,),
                                 ));
                             }
@@ -1950,8 +2022,9 @@ impl NetworkCopyGui {
                             text.logical_data,
                             format_bytes(completed),
                             format!(
-                                "{} remaining",
+                                "{} {}",
                                 format_bytes(progress.total.saturating_sub(completed,),),
+                                text.remaining,
                             ),
                             brand_green(),
                         );
@@ -1960,7 +2033,7 @@ impl NetworkCopyGui {
                             &mut columns[2],
                             text.elapsed,
                             format!("{:.1} s", phase_elapsed.as_secs_f64(),),
-                            "Current phase",
+                            text.current_phase,
                             egui::Color32::from_rgb(0, 219, 199),
                         );
                     });
@@ -2057,9 +2130,17 @@ impl NetworkCopyGui {
 
     fn status_panel(&mut self, ui: &mut egui::Ui, text: Text) {
         if let Some(warning) = &self.session_warning {
-            ui.label(egui::RichText::new(warning).italics().color(warning_text()));
+            standalone_subcard_frame(warning_text()).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
 
-            ui.add_space(10.0);
+                standalone_status_pill(ui, "WARNING", warning_text());
+
+                ui.add_space(7.0);
+
+                ui.label(egui::RichText::new(warning).color(warning_text()));
+            });
+
+            ui.add_space(STANDALONE_CONTENT_GAP);
         }
 
         let can_resume = self.pending_session.is_some() && self.transfer_receiver.is_none();
@@ -2067,58 +2148,158 @@ impl NetworkCopyGui {
         if let Some(error) = self.last_error.clone() {
             let mut resume = false;
 
-            card(ui, danger_text(), |ui| {
-                ui.heading(egui::RichText::new(text.failed).color(danger_text()));
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(34, 17, 23))
+                .stroke(egui::Stroke::new(1.5, danger_text()))
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::same(16))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
 
-                ui.add_space(6.0);
+                    standalone_status_pill(ui, text.failed, danger_text());
 
-                ui.label(error);
+                    ui.add_space(10.0);
 
-                if can_resume {
-                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(text.failed)
+                            .size(21.0)
+                            .strong()
+                            .color(danger_text()),
+                    );
 
-                    resume = ui.add(resume_button(text.resume_continue)).clicked();
-                }
-            });
+                    ui.add_space(6.0);
+
+                    ui.label(error);
+
+                    if can_resume {
+                        ui.add_space(14.0);
+
+                        resume = ui.add(resume_button(text.resume_continue)).clicked();
+                    }
+                });
 
             if resume {
                 self.resume_pending(text);
             }
-        } else if self.last_cancelled {
+
+            return;
+        }
+
+        if self.last_cancelled {
             let mut resume = false;
 
-            card(ui, warning_text(), |ui| {
-                ui.heading(egui::RichText::new(text.cancelled).color(warning_text()));
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(31, 26, 14))
+                .stroke(egui::Stroke::new(1.5, warning_text()))
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::same(16))
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
 
-                ui.add_space(6.0);
+                    standalone_status_pill(ui, text.cancelled, warning_text());
 
-                ui.label(text.cancelled_detail);
+                    ui.add_space(10.0);
 
-                if can_resume {
-                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(text.cancelled)
+                            .size(21.0)
+                            .strong()
+                            .color(warning_text()),
+                    );
 
-                    resume = ui.add(resume_button(text.resume_continue)).clicked();
-                }
-            });
+                    ui.add_space(6.0);
+
+                    ui.label(text.cancelled_detail);
+
+                    if can_resume {
+                        ui.add_space(14.0);
+
+                        resume = ui.add(resume_button(text.resume_continue)).clicked();
+                    }
+                });
 
             if resume {
                 self.resume_pending(text);
             }
-        } else if self.last_summary.is_some() {
+
+            return;
+        }
+
+        if self.last_summary.is_some() {
             self.summary_panel(ui, text);
-        } else {
-            card(ui, brand_blue(), |ui| {
-                ui.label(
-                    egui::RichText::new(text.development_status)
-                        .strong()
-                        .color(brand_blue_light()),
+
+            return;
+        }
+
+        standalone_subcard_frame(brand_blue_light()).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            standalone_status_pill(ui, text.development_status, brand_blue_light());
+
+            ui.label(
+                egui::RichText::new(text.development_status)
+                    .size(18.0)
+                    .strong()
+                    .color(egui::Color32::from_rgb(225, 238, 250)),
+            );
+
+            ui.add_space(4.0);
+
+            ui.label(egui::RichText::new(text.engine_pending).color(muted_text()));
+        });
+    }
+
+    fn render_transfer_setup(&mut self, ui: &mut egui::Ui, text: Text) {
+        self.mode_selector(ui, text);
+
+        ui.add_space(STANDALONE_CONTENT_GAP);
+
+        let setup_accent = match self.mode {
+            TransferMode::Send => brand_blue_light(),
+
+            TransferMode::Receive => egui::Color32::from_rgb(181, 124, 255),
+        };
+
+        card(ui, setup_accent, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                standalone_status_pill(
+                    ui,
+                    match self.mode {
+                        TransferMode::Send => text.send,
+
+                        TransferMode::Receive => text.receive,
+                    },
+                    setup_accent,
                 );
 
-                ui.add_space(4.0);
-
-                ui.label(egui::RichText::new(text.engine_pending).color(muted_text()));
+                ui.label(
+                    egui::RichText::new(text.direct_mode)
+                        .size(19.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(229, 239, 249)),
+                );
             });
-        }
+
+            ui.add_space(10.0);
+
+            self.connection_selector(ui, text);
+
+            ui.add_space(14.0);
+
+            ui.separator();
+
+            ui.add_space(14.0);
+
+            match self.mode {
+                TransferMode::Send => {
+                    self.send_panel(ui, text);
+                }
+
+                TransferMode::Receive => {
+                    self.receive_panel(ui, text);
+                }
+            }
+        });
     }
 }
 
@@ -2144,64 +2325,34 @@ impl eframe::App for NetworkCopyGui {
 
                     ui.add_space(STANDALONE_CONTENT_GAP);
 
-                    self.mode_selector(ui, text);
+                    let running = self.transfer_receiver.is_some();
 
-                    ui.add_space(STANDALONE_CONTENT_GAP);
+                    let has_terminal_state = self.last_summary.is_some()
+                        || self.last_error.is_some()
+                        || self.last_cancelled
+                        || self.session_warning.is_some();
 
-                    let setup_accent = match self.mode {
-                        TransferMode::Send => brand_blue_light(),
+                    if running {
+                        self.action_buttons(ui, text);
+                    } else {
+                        if has_terminal_state {
+                            self.status_panel(ui, text);
 
-                        TransferMode::Receive => egui::Color32::from_rgb(181, 124, 255),
-                    };
-
-                    card(ui, setup_accent, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            standalone_status_pill(
-                                ui,
-                                match self.mode {
-                                    TransferMode::Send => text.send,
-
-                                    TransferMode::Receive => text.receive,
-                                },
-                                setup_accent,
-                            );
-
-                            ui.label(
-                                egui::RichText::new(text.direct_mode)
-                                    .size(19.0)
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(229, 239, 249)),
-                            );
-                        });
-
-                        ui.add_space(10.0);
-
-                        self.connection_selector(ui, text);
-
-                        ui.add_space(14.0);
-
-                        ui.separator();
-
-                        ui.add_space(14.0);
-
-                        match self.mode {
-                            TransferMode::Send => {
-                                self.send_panel(ui, text);
-                            }
-
-                            TransferMode::Receive => {
-                                self.receive_panel(ui, text);
-                            }
+                            ui.add_space(STANDALONE_CONTENT_GAP);
                         }
-                    });
 
-                    ui.add_space(STANDALONE_CONTENT_GAP);
+                        self.render_transfer_setup(ui, text);
 
-                    self.action_buttons(ui, text);
+                        ui.add_space(STANDALONE_CONTENT_GAP);
 
-                    ui.add_space(STANDALONE_CONTENT_GAP);
+                        self.action_buttons(ui, text);
 
-                    self.status_panel(ui, text);
+                        if !has_terminal_state {
+                            ui.add_space(STANDALONE_CONTENT_GAP);
+
+                            self.status_panel(ui, text);
+                        }
+                    }
 
                     ui.add_space(18.0);
                 });
