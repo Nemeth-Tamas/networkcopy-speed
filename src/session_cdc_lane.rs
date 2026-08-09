@@ -5,10 +5,12 @@ use crate::cdc_reconstruction_bench::{
 };
 use crate::content_defined_dedup_bench;
 use crate::manifest_scan::{FileClass, ManifestEntry};
+use crate::transfer_profile::TransferProfiler;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::windows::fs::MetadataExt;
 use std::path::Path;
+use std::time::Instant;
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
 pub(crate) const MESSAGE_SESSION_CDC_PLAN: u8 = 0x40;
@@ -28,6 +30,7 @@ pub(crate) fn sender_try_plan(
     manifest: &[ManifestEntry],
     target_file_id: usize,
     basis_file_ids: &[usize],
+    profiler: &TransferProfiler,
 ) -> io::Result<CdcLaneDecision> {
     let target_entry = manifest.get(target_file_id).ok_or_else(|| {
         io::Error::new(
@@ -88,10 +91,18 @@ pub(crate) fn sender_try_plan(
             continue;
         }
 
+        let index_started = Instant::now();
+
         let index = BasisFileIndex::build(
             &basis_path,
             content_defined_dedup_bench::DEFAULT_AVERAGE_KIB,
         )?;
+
+        profiler.record_sender_session_cdc_basis_index(
+            basis_file_id,
+            index_started.elapsed(),
+            index.file_bytes(),
+        );
 
         validate_source_file(&basis_path, basis_entry, "session CDC basis")?;
 
@@ -532,6 +543,7 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 mod tests {
     use super::{MESSAGE_SESSION_CDC_PLAN, receiver_apply_plan, sender_try_plan};
     use crate::manifest_scan::{FileClass, ManifestEntry};
+    use crate::transfer_profile::TransferProfiler;
     use std::env;
     use std::fs;
     use std::io::Cursor;
@@ -577,9 +589,12 @@ mod tests {
             entry(&source_root, "target.bin"),
         ];
 
+        let profiler = TransferProfiler::default();
+
         let mut wire = Vec::new();
 
-        let sender_decision = sender_try_plan(&mut wire, &source_root, &manifest, 1, &[0]).unwrap();
+        let sender_decision =
+            sender_try_plan(&mut wire, &source_root, &manifest, 1, &[0], &profiler).unwrap();
 
         assert!(sender_decision.completed);
 
@@ -588,6 +603,19 @@ mod tests {
         assert_eq!(sender_decision.stats.index_wire_bytes, 0);
 
         assert!(sender_decision.stats.reused_bytes > sender_decision.stats.literal_bytes,);
+
+        let profile = profiler.snapshot();
+
+        assert_eq!(profile.sender_session_cdc_basis_index.operations, 1,);
+
+        assert_eq!(
+            profile.sender_session_cdc_basis_index.bytes,
+            basis.len() as u64,
+        );
+
+        assert_eq!(profile.sender_session_cdc_distinct_basis_files, 1,);
+
+        assert_eq!(profile.sender_session_cdc_repeated_basis_builds, 0,);
 
         let mut reader = Cursor::new(&wire[1..]);
 
@@ -629,15 +657,26 @@ mod tests {
             entry(&source_root, "target.bin"),
         ];
 
+        let profiler = TransferProfiler::default();
+
         let mut wire = Vec::new();
 
-        let decision = sender_try_plan(&mut wire, &source_root, &manifest, 1, &[0]).unwrap();
+        let decision =
+            sender_try_plan(&mut wire, &source_root, &manifest, 1, &[0], &profiler).unwrap();
 
         assert!(!decision.completed);
 
         assert_eq!(decision.stats, Default::default());
 
         assert!(wire.is_empty());
+
+        assert_eq!(
+            profiler
+                .snapshot()
+                .sender_session_cdc_basis_index
+                .operations,
+            0,
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -679,9 +718,12 @@ mod tests {
             entry(&source_root, "target.bin"),
         ];
 
+        let profiler = TransferProfiler::default();
+
         let mut wire = Vec::new();
 
-        let decision = sender_try_plan(&mut wire, &source_root, &manifest, 1, &[0]).unwrap();
+        let decision =
+            sender_try_plan(&mut wire, &source_root, &manifest, 1, &[0], &profiler).unwrap();
 
         assert!(decision.completed);
 

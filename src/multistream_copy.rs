@@ -341,6 +341,26 @@ impl MultistreamCopyReport {
 
         print_stage_sample("Socket writes:", self.stage_profile.sender_socket_write);
 
+        let session_cdc_basis = self.stage_profile.sender_session_cdc_basis_index;
+
+        if session_cdc_basis.operations != 0 {
+            println!();
+
+            println!("Session CDC basis-index profile");
+
+            print_stage_sample("Basis indexing:", session_cdc_basis);
+
+            println!(
+                "  Distinct basis files:   {}",
+                self.stage_profile.sender_session_cdc_distinct_basis_files,
+            );
+
+            println!(
+                "  Repeated index builds:  {}",
+                self.stage_profile.sender_session_cdc_repeated_basis_builds,
+            );
+        }
+
         if let Some(receiver_stage_profile) = self.receiver_stage_profile {
             println!();
 
@@ -5812,6 +5832,7 @@ fn send_lane(
                         manifest,
                         file_id,
                         basis_file_ids,
+                        profiler,
                     )?
                 } else {
                     writer.flush()?;

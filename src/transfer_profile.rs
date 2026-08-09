@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -19,6 +21,12 @@ pub struct TransferStageProfile {
 
     pub sender_socket_write: StageSample,
 
+    pub sender_session_cdc_basis_index: StageSample,
+
+    pub sender_session_cdc_distinct_basis_files: u64,
+
+    pub sender_session_cdc_repeated_basis_builds: u64,
+
     pub receiver_socket_read: StageSample,
 
     pub receiver_decompression: StageSample,
@@ -33,6 +41,10 @@ pub(crate) struct TransferProfiler {
     sender_compression: StageAccumulator,
 
     sender_socket_write: StageAccumulator,
+
+    sender_session_cdc_basis_index: StageAccumulator,
+
+    sender_session_cdc_basis_file_ids: Mutex<BTreeSet<usize>>,
 
     receiver_socket_read: StageAccumulator,
 
@@ -87,6 +99,22 @@ impl TransferProfiler {
         self.sender_compression.record(elapsed, bytes);
     }
 
+    pub(crate) fn record_sender_session_cdc_basis_index(
+        &self,
+        basis_file_id: usize,
+        elapsed: Duration,
+        bytes: u64,
+    ) {
+        self.sender_session_cdc_basis_index.record(elapsed, bytes);
+
+        let mut file_ids = self
+            .sender_session_cdc_basis_file_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let _ = file_ids.insert(basis_file_id);
+    }
+
     pub(crate) fn record_receiver_decompression(&self, elapsed: Duration, bytes: u64) {
         self.receiver_decompression.record(elapsed, bytes);
     }
@@ -118,12 +146,33 @@ impl TransferProfiler {
     }
 
     pub(crate) fn snapshot(&self) -> TransferStageProfile {
+        let sender_session_cdc_basis_index = self.sender_session_cdc_basis_index.snapshot();
+
+        let sender_session_cdc_distinct_basis_files = {
+            let file_ids = self
+                .sender_session_cdc_basis_file_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            u64::try_from(file_ids.len()).unwrap_or(u64::MAX)
+        };
+
+        let sender_session_cdc_repeated_basis_builds = sender_session_cdc_basis_index
+            .operations
+            .saturating_sub(sender_session_cdc_distinct_basis_files);
+
         TransferStageProfile {
             sender_source_read: self.sender_source_read.snapshot(),
 
             sender_compression: self.sender_compression.snapshot(),
 
             sender_socket_write: self.sender_socket_write.snapshot(),
+
+            sender_session_cdc_basis_index,
+
+            sender_session_cdc_distinct_basis_files,
+
+            sender_session_cdc_repeated_basis_builds,
 
             receiver_socket_read: self.receiver_socket_read.snapshot(),
 
@@ -215,6 +264,32 @@ mod tests {
         assert_eq!(profile.sender_source_read.bytes, 300,);
 
         assert_eq!(profile.sender_source_read.operations, 2,);
+    }
+
+    #[test]
+    fn session_cdc_basis_profile_tracks_repeated_builds() {
+        let profiler = TransferProfiler::default();
+
+        profiler.record_sender_session_cdc_basis_index(7, Duration::from_nanos(10), 100);
+
+        profiler.record_sender_session_cdc_basis_index(7, Duration::from_nanos(20), 100);
+
+        profiler.record_sender_session_cdc_basis_index(9, Duration::from_nanos(30), 200);
+
+        let profile = profiler.snapshot();
+
+        assert_eq!(
+            profile.sender_session_cdc_basis_index.elapsed,
+            Duration::from_nanos(60),
+        );
+
+        assert_eq!(profile.sender_session_cdc_basis_index.bytes, 400,);
+
+        assert_eq!(profile.sender_session_cdc_basis_index.operations, 3,);
+
+        assert_eq!(profile.sender_session_cdc_distinct_basis_files, 2,);
+
+        assert_eq!(profile.sender_session_cdc_repeated_basis_builds, 1,);
     }
 
     #[test]
