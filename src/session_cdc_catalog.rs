@@ -78,8 +78,6 @@ impl CatalogLimits {
 pub struct CatalogGeneration {
     pub index: usize,
 
-    pub basis_file_ids: Vec<usize>,
-
     pub transfer_files: Vec<CatalogCandidate>,
 
     pub published_file_ids: Vec<usize>,
@@ -106,6 +104,57 @@ pub struct CatalogPlan {
     pub peak_catalog_entries: u64,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CatalogBasis {
+    file_ids: Vec<usize>,
+}
+
+impl CatalogBasis {
+    pub fn before_generation(plan: &CatalogPlan, generation_index: usize) -> io::Result<Self> {
+        if generation_index > plan.generations.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session CDC basis generation index exceeds the catalog plan",
+            ));
+        }
+
+        let mut basis = Self::default();
+
+        for generation in plan.generations.iter().take(generation_index) {
+            basis.apply_generation(generation)?;
+        }
+
+        Ok(basis)
+    }
+
+    pub fn file_ids(&self) -> &[usize] {
+        &self.file_ids
+    }
+
+    pub fn apply_generation(&mut self, generation: &CatalogGeneration) -> io::Result<()> {
+        self.file_ids
+            .extend_from_slice(&generation.published_file_ids);
+
+        let evicted_count = generation.evicted_file_ids.len();
+
+        if self.file_ids.get(..evicted_count) != Some(generation.evicted_file_ids.as_slice()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "session CDC generation {} eviction order does not match the rolling catalog",
+                    generation.index,
+                ),
+            ));
+        }
+
+        if evicted_count != 0 {
+            drop(self.file_ids.drain(..evicted_count));
+        }
+
+        Ok(())
+    }
+}
+
 pub fn plan(candidates: &[CatalogCandidate], limits: CatalogLimits) -> io::Result<CatalogPlan> {
     limits.validate()?;
 
@@ -130,8 +179,6 @@ pub fn plan(candidates: &[CatalogCandidate], limits: CatalogLimits) -> io::Resul
     let mut candidate_bytes = 0_u64;
 
     for (generation_index, transfer_files) in batches.into_iter().enumerate() {
-        let basis_file_ids = catalog.iter().map(|(file_id, _)| *file_id).collect();
-
         let catalog_entries_before = catalog_entries;
 
         let logical_bytes = sum_candidate_bytes(&transfer_files)?;
@@ -195,8 +242,6 @@ pub fn plan(candidates: &[CatalogCandidate], limits: CatalogLimits) -> io::Resul
         generations.push(CatalogGeneration {
             index: generation_index,
 
-            basis_file_ids,
-
             transfer_files,
 
             published_file_ids,
@@ -255,15 +300,6 @@ pub fn validate_plan(plan: &CatalogPlan, limits: CatalogLimits) -> io::Result<()
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "session CDC generation is empty",
-            ));
-        }
-
-        let expected_basis: Vec<usize> = catalog.iter().map(|(file_id, _)| *file_id).collect();
-
-        if generation.basis_file_ids != expected_basis {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "session CDC generation basis does not match the committed catalog",
             ));
         }
 
@@ -476,7 +512,9 @@ fn sum_candidate_bytes(candidates: &[CatalogCandidate]) -> io::Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AVERAGE_CHUNK_BYTES, CatalogCandidate, CatalogLimits, plan, validate_plan};
+    use super::{
+        AVERAGE_CHUNK_BYTES, CatalogBasis, CatalogCandidate, CatalogLimits, plan, validate_plan,
+    };
 
     fn candidate(file_id: usize, logical_bytes: u64) -> CatalogCandidate {
         CatalogCandidate::new(file_id, logical_bytes).unwrap()
@@ -504,7 +542,9 @@ mod tests {
 
         assert_eq!(plan.generations.len(), 2,);
 
-        assert_eq!(plan.generations[0].basis_file_ids, Vec::<usize>::new(),);
+        let first_basis = CatalogBasis::before_generation(&plan, 0).unwrap();
+
+        assert!(first_basis.file_ids().is_empty());
 
         assert_eq!(
             plan.generations[0]
@@ -515,7 +555,9 @@ mod tests {
             vec![0, 1],
         );
 
-        assert_eq!(plan.generations[1].basis_file_ids, vec![0, 1],);
+        let second_basis = CatalogBasis::before_generation(&plan, 1).unwrap();
+
+        assert_eq!(second_basis.file_ids(), &[0, 1]);
 
         assert_eq!(
             plan.generations[1].transfer_files,
@@ -545,15 +587,49 @@ mod tests {
 
         assert_eq!(plan.generations.len(), 3,);
 
-        assert_eq!(plan.generations[2].basis_file_ids, vec![0, 1],);
+        let third_basis = CatalogBasis::before_generation(&plan, 2).unwrap();
+
+        assert_eq!(third_basis.file_ids(), &[0, 1]);
 
         assert_eq!(plan.generations[2].evicted_file_ids, vec![0],);
 
         assert_eq!(plan.generations[2].published_file_ids, vec![2],);
 
+        let final_basis = CatalogBasis::before_generation(&plan, 3).unwrap();
+
+        assert_eq!(final_basis.file_ids(), &[1, 2]);
+
         assert_eq!(plan.generations[2].catalog_entries_after, 2,);
 
         assert_eq!(plan.peak_catalog_entries, 2,);
+    }
+
+    #[test]
+    fn rolling_basis_handles_same_generation_eviction() {
+        let limits = CatalogLimits {
+            generation_target_bytes: 3 * AVERAGE_CHUNK_BYTES,
+            max_catalog_entries: 2,
+        };
+
+        let plan = plan(
+            &[
+                candidate(0, AVERAGE_CHUNK_BYTES),
+                candidate(1, AVERAGE_CHUNK_BYTES),
+                candidate(2, AVERAGE_CHUNK_BYTES),
+            ],
+            limits,
+        )
+        .unwrap();
+
+        assert_eq!(plan.generations.len(), 1);
+
+        assert_eq!(plan.generations[0].published_file_ids, vec![0, 1, 2],);
+
+        assert_eq!(plan.generations[0].evicted_file_ids, vec![0]);
+
+        let final_basis = CatalogBasis::before_generation(&plan, 1).unwrap();
+
+        assert_eq!(final_basis.file_ids(), &[1, 2]);
     }
 
     #[test]

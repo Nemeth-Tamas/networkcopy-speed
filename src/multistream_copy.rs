@@ -12,7 +12,7 @@ use crate::file_metadata;
 use crate::manifest_scan::{self, DirectoryEntry, FileClass, ManifestEntry};
 use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
 use crate::session_cdc_catalog::{
-    self, CatalogCandidate, CatalogGeneration, CatalogLimits, CatalogPlan,
+    self, CatalogBasis, CatalogCandidate, CatalogGeneration, CatalogLimits, CatalogPlan,
 };
 use crate::session_cdc_lane;
 use crate::storage_media;
@@ -5619,6 +5619,9 @@ fn send_fresh_generation_plan(
 
     let mut reports = Vec::with_capacity(report_capacity);
 
+    let mut basis =
+        CatalogBasis::before_generation(&plan.catalog, plan.completed_generation_count)?;
+
     for (generation, lanes) in plan
         .catalog
         .generations
@@ -5636,7 +5639,7 @@ fn send_fresh_generation_plan(
             source_root,
             manifest,
             progress.clone(),
-            Some(&generation.basis_file_ids),
+            Some(basis.file_ids()),
             LaneEnd::Generation(generation.index),
             compression_lane_megabytes_per_second,
             profiler,
@@ -5649,6 +5652,8 @@ fn send_fresh_generation_plan(
         let commit = read_generation_commit(control_stream)?;
 
         validate_generation_commit(&commit, generation, manifest.len())?;
+
+        basis.apply_generation(generation)?;
 
         reports.push(report);
     }
@@ -5763,6 +5768,9 @@ fn receive_fresh_generation_plan(
 
     let mut reports = Vec::with_capacity(report_capacity);
 
+    let mut basis =
+        CatalogBasis::before_generation(&plan.catalog, plan.completed_generation_count)?;
+
     for (generation, lanes) in plan
         .catalog
         .generations
@@ -5784,7 +5792,7 @@ fn receive_fresh_generation_plan(
             tiny_materializer,
             progress.clone(),
             false,
-            Some(&generation.basis_file_ids),
+            Some(basis.file_ids()),
             LaneEnd::Generation(generation.index),
             profiler,
         )?;
@@ -5799,6 +5807,8 @@ fn receive_fresh_generation_plan(
         persist_generation_commit(destination_root, resume_journal, &commit, fault_injection)?;
 
         write_generation_commit(control_stream, &commit)?;
+
+        basis.apply_generation(generation)?;
 
         reports.push(report);
     }
@@ -8363,7 +8373,7 @@ mod tests {
     use crate::file_metadata;
     use crate::manifest_scan::{self, DirectoryEntry, FileClass, ManifestEntry};
     use crate::resume_state::{JOURNAL_FILE_NAME, ResumeJournal, ResumeStripe};
-    use crate::session_cdc_catalog::CatalogLimits;
+    use crate::session_cdc_catalog::{CatalogBasis, CatalogLimits};
     use crate::transfer_path::TransferPathKind;
     use std::collections::BTreeSet;
     use std::env;
@@ -8506,21 +8516,18 @@ mod tests {
         assert_eq!(generation_plan.catalog.generations.len(), 2);
         assert_eq!(generation_plan.generation_lanes.len(), 2);
 
-        assert!(
-            generation_plan.catalog.generations[0]
-                .basis_file_ids
-                .is_empty()
-        );
+        let first_basis = CatalogBasis::before_generation(&generation_plan.catalog, 0).unwrap();
+
+        assert!(first_basis.file_ids().is_empty());
 
         assert_eq!(
             generation_plan.catalog.generations[0].published_file_ids,
             vec![0],
         );
 
-        assert_eq!(
-            generation_plan.catalog.generations[1].basis_file_ids,
-            vec![0],
-        );
+        let second_basis = CatalogBasis::before_generation(&generation_plan.catalog, 1).unwrap();
+
+        assert_eq!(second_basis.file_ids(), &[0]);
 
         assert_eq!(
             generation_plan.catalog.generations[1].published_file_ids,
@@ -8647,12 +8654,19 @@ mod tests {
             .map(|generation| generation.transfer_files.len())
             .sum::<usize>();
 
-        let basis_file_id_slots = generation_plan
-            .catalog
-            .generations
-            .iter()
-            .map(|generation| generation.basis_file_ids.len())
-            .sum::<usize>();
+        let mut rolling_basis = CatalogBasis::default();
+
+        let mut peak_rolling_basis_file_ids = 0_usize;
+
+        for generation in &generation_plan.catalog.generations {
+            peak_rolling_basis_file_ids =
+                peak_rolling_basis_file_ids.max(rolling_basis.file_ids().len());
+
+            rolling_basis.apply_generation(generation).unwrap();
+
+            peak_rolling_basis_file_ids =
+                peak_rolling_basis_file_ids.max(rolling_basis.file_ids().len());
+        }
 
         let published_file_id_slots = generation_plan
             .catalog
@@ -8690,7 +8704,8 @@ mod tests {
 
         let cloned_execution_task_count = generation_task_count + trailing_task_count;
 
-        let basis_payload_bytes = basis_file_id_slots * std::mem::size_of::<usize>();
+        let rolling_basis_payload_bytes =
+            peak_rolling_basis_file_ids * std::mem::size_of::<usize>();
 
         let catalog_candidate_payload_bytes = catalog_candidate_slots
             * std::mem::size_of::<crate::session_cdc_catalog::CatalogCandidate>();
@@ -8705,11 +8720,11 @@ mod tests {
         println!("  Original transfer tasks:     {transfer_task_count}");
         println!("  Cloned execution tasks:      {cloned_execution_task_count}");
         println!("  Catalog candidate slots:     {catalog_candidate_slots}");
-        println!("  Basis file-ID slots:         {basis_file_id_slots}");
+        println!("  Peak rolling basis IDs:      {peak_rolling_basis_file_ids}");
         println!("  Published file-ID slots:     {published_file_id_slots}");
         println!("  Uncataloged file-ID slots:   {uncataloged_file_id_slots}");
         println!("  Evicted file-ID slots:       {evicted_file_id_slots}");
-        println!("  Basis ID payload:            {basis_payload_bytes} bytes");
+        println!("  Rolling basis payload:       {rolling_basis_payload_bytes} bytes");
         println!("  Catalog candidate payload:   {catalog_candidate_payload_bytes} bytes");
         println!("  Cloned task payload:         {cloned_execution_task_payload_bytes} bytes");
         println!(
@@ -8722,8 +8737,8 @@ mod tests {
         assert_eq!(cloned_execution_task_count, transfer_task_count);
 
         assert!(
-            basis_file_id_slots > FILE_COUNT,
-            "basis snapshots should expose cross-generation amplification"
+            peak_rolling_basis_file_ids < FILE_COUNT,
+            "rolling catalog basis should remain bounded below the full candidate set"
         );
     }
 
@@ -8755,18 +8770,22 @@ mod tests {
             .map(|candidate| candidate.file_id)
             .collect();
 
-        let expected_next_basis = generation_plan.catalog.generations[1]
-            .basis_file_ids
-            .clone();
+        let expected_next_basis = CatalogBasis::before_generation(&generation_plan.catalog, 1)
+            .unwrap()
+            .file_ids()
+            .to_vec();
 
         apply_fresh_resume_prefix(&mut generation_plan, &completed_file_ids).unwrap();
 
         assert_eq!(generation_plan.completed_generation_count, 1,);
 
-        assert_eq!(
-            generation_plan.catalog.generations[1].basis_file_ids,
-            expected_next_basis,
-        );
+        let resumed_basis = CatalogBasis::before_generation(
+            &generation_plan.catalog,
+            generation_plan.completed_generation_count,
+        )
+        .unwrap();
+
+        assert_eq!(resumed_basis.file_ids(), expected_next_basis.as_slice());
 
         assert!(
             expected_next_basis
@@ -10624,11 +10643,10 @@ mod tests {
             vec![target_file_id],
         );
 
-        assert!(
-            generation_plan.catalog.generations[1]
-                .basis_file_ids
-                .contains(&basis_file_id),
-        );
+        let second_generation_basis =
+            CatalogBasis::before_generation(&generation_plan.catalog, 1).unwrap();
+
+        assert!(second_generation_basis.file_ids().contains(&basis_file_id),);
 
         let first_fault =
             TransferFault::with_catalog_limits_and_persisted_generation_failure(catalog_limits, 1)
