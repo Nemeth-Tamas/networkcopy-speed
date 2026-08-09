@@ -7,8 +7,8 @@ use eframe::egui;
 use networkcopy_speed::destination_layout::DestinationLayout;
 use networkcopy_speed::gui_session;
 use networkcopy_speed::gui_transfer::{
-    GuiConnectionMode, GuiTransferControl, GuiTransferDiagnostic, GuiTransferProgress,
-    GuiTransferRequest, GuiTransferSummary, run_gui_transfer_with_control,
+    GuiConnectionMode, GuiTransferControl, GuiTransferDiagnostic, GuiTransferDirection,
+    GuiTransferProgress, GuiTransferRequest, GuiTransferSummary, run_gui_transfer_with_control,
 };
 use networkcopy_speed::windows_desktop_layout;
 use networkcopy_speed::windows_elevation;
@@ -1533,216 +1533,313 @@ impl NetworkCopyGui {
             return;
         };
 
-        card(ui, brand_green(), |ui| {
-            ui.heading(egui::RichText::new(text.completed).color(brand_green()));
+        let role = match summary.direction {
+            GuiTransferDirection::Send => text.send,
 
-            ui.add_space(10.0);
+            GuiTransferDirection::Receive => text.receive,
+        };
 
-            egui::Grid::new("transfer_summary")
-                .num_columns(2)
-                .spacing([32.0, 10.0])
-                .show(ui, |ui| {
-                    ui.label(text.files);
+        let diagnostic = match summary.diagnostic() {
+            GuiTransferDiagnostic::AllFilesSkipped => text.diagnostic_all_skipped,
 
-                    ui.strong(summary.files.to_string());
+            GuiTransferDiagnostic::TinyFileHeavy => text.diagnostic_tiny_files,
 
-                    ui.end_row();
+            GuiTransferDiagnostic::ExactReuseEffective => text.diagnostic_exact_reuse,
 
-                    if summary.skipped_files > 0 {
-                        ui.label(text.skipped_files);
+            GuiTransferDiagnostic::CdcEffective => text.diagnostic_cdc_effective,
 
-                        ui.strong(summary.skipped_files.to_string());
+            GuiTransferDiagnostic::CompressionEffective => text.diagnostic_compression_effective,
 
-                        ui.end_row();
+            GuiTransferDiagnostic::CompressionBypassed => text.diagnostic_compression_bypassed,
 
-                        ui.label(text.skipped_data);
+            GuiTransferDiagnostic::Balanced => text.diagnostic_balanced,
+        };
 
-                        ui.strong(format_bytes(summary.skipped_bytes));
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(8, 22, 31))
+            .stroke(egui::Stroke::new(1.5, brand_green()))
+            .corner_radius(egui::CornerRadius::same(11))
+            .inner_margin(egui::Margin::same(16))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
 
-                        ui.end_row();
-                    }
+                ui.horizontal_wrapped(|ui| {
+                    standalone_status_pill(ui, text.completed, brand_green());
 
-                    ui.label(text.logical_data);
+                    standalone_status_pill(
+                        ui,
+                        role,
+                        match summary.direction {
+                            GuiTransferDirection::Send => brand_blue_light(),
 
-                    ui.strong(format_bytes(summary.logical_bytes));
+                            GuiTransferDirection::Receive => egui::Color32::from_rgb(181, 124, 255),
+                        },
+                    );
 
-                    ui.end_row();
-
-                    ui.label(text.speed);
-
-                    ui.strong(format!("{:.2} MB/s", summary.logical_megabytes_per_second,));
-
-                    ui.end_row();
-
-                    ui.label(text.wire_savings);
-
-                    ui.strong(format!("{:.2}%", summary.wire_savings_percent,));
-
-                    ui.end_row();
-
-                    if summary.exact_reused_files > 0 {
-                        ui.label(text.exact_reuse_files);
-
-                        ui.strong(summary.exact_reused_files.to_string());
-
-                        ui.end_row();
-
-                        ui.label(text.exact_reuse_data);
-
-                        ui.strong(format_bytes(summary.exact_reused_bytes));
-
-                        ui.end_row();
-
-                        ui.label(text.exact_reuse_wire);
-
-                        ui.strong(format_bytes(summary.exact_reuse_plan_wire_bytes));
-
-                        ui.end_row();
-
-                        ui.label(text.exact_reuse_savings);
-
-                        ui.strong(format!("{:.2}%", summary.exact_reuse_wire_savings_percent,));
-
-                        ui.end_row();
-                    }
-
-                    if summary.cdc_offered_files > 0 {
-                        ui.label(text.cdc_updates);
-
-                        ui.strong(format!(
-                            "{} / {}",
-                            summary.cdc_files, summary.cdc_offered_files,
-                        ));
-
-                        ui.end_row();
-
-                        ui.label(text.cdc_fallbacks);
-
-                        ui.strong(summary.cdc_fallback_files.to_string());
-
-                        ui.end_row();
-
-                        ui.label(text.cdc_data);
-
-                        ui.strong(format!(
-                            "{} / {} / {}",
-                            format_bytes(summary.cdc_logical_bytes,),
-                            format_bytes(summary.cdc_reused_bytes,),
-                            format_bytes(summary.cdc_literal_bytes,),
-                        ));
-
-                        ui.end_row();
-
-                        ui.label(text.cdc_wire);
-
-                        ui.strong(format!(
-                            "{} / {}",
-                            format_bytes(summary.cdc_index_wire_bytes,),
-                            format_bytes(summary.cdc_plan_wire_bytes,),
-                        ));
-
-                        ui.end_row();
-
-                        ui.label(text.cdc_savings);
-
-                        ui.strong(format!("{:.2}%", summary.cdc_wire_savings_percent,));
-
-                        ui.end_row();
-                    }
-
-                    ui.label(text.compression_strategy);
-
-                    ui.strong(text.compression_strategy_adaptive);
-
-                    ui.end_row();
-
-                    ui.label(text.transfer_diagnostic);
-
-                    let diagnostic = match summary.diagnostic() {
-                        GuiTransferDiagnostic::AllFilesSkipped => text.diagnostic_all_skipped,
-
-                        GuiTransferDiagnostic::TinyFileHeavy => text.diagnostic_tiny_files,
-
-                        GuiTransferDiagnostic::ExactReuseEffective => text.diagnostic_exact_reuse,
-
-                        GuiTransferDiagnostic::CdcEffective => text.diagnostic_cdc_effective,
-
-                        GuiTransferDiagnostic::CompressionEffective => {
-                            text.diagnostic_compression_effective
-                        }
-
-                        GuiTransferDiagnostic::CompressionBypassed => {
-                            text.diagnostic_compression_bypassed
-                        }
-
-                        GuiTransferDiagnostic::Balanced => text.diagnostic_balanced,
-                    };
-
-                    ui.strong(diagnostic);
-
-                    ui.end_row();
-
-                    if summary.tiny_pack_count > 0 {
-                        ui.label(text.tiny_packs);
-
-                        ui.strong(summary.tiny_pack_count.to_string());
-
-                        ui.end_row();
-
-                        ui.label(text.compressed_tiny_packs);
-
-                        ui.strong(summary.compressed_tiny_pack_count.to_string());
-
-                        ui.end_row();
-
-                        ui.label(text.raw_tiny_packs);
-
-                        ui.strong(summary.raw_tiny_pack_count.to_string());
-
-                        ui.end_row();
-
-                        ui.label(text.packed_tiny_files);
-
-                        ui.strong(summary.tiny_files_packed.to_string());
-
-                        ui.end_row();
-
-                        ui.label(text.tiny_write_workers);
-
-                        ui.strong(summary.tiny_materialization_workers.to_string());
-
-                        ui.end_row();
-
-                        ui.label(text.tiny_pack_data);
-
-                        ui.strong(format!(
-                            "{} / {}",
-                            format_bytes(summary.tiny_bytes_packed),
-                            format_bytes(summary.tiny_pack_wire_bytes),
-                        ));
-
-                        ui.end_row();
-
-                        ui.label(text.tiny_pack_savings);
-
-                        ui.strong(format!("{:.2}%", summary.tiny_pack_wire_savings_percent,));
-
-                        ui.end_row();
-                    }
-
-                    ui.label(text.streams);
-
-                    ui.strong(summary.data_stream_count.to_string());
-
-                    ui.end_row();
-
-                    ui.label(text.elapsed);
-
-                    ui.strong(format!("{:.2} s", summary.elapsed.as_secs_f64(),));
-
-                    ui.end_row();
+                    ui.label(
+                        egui::RichText::new(text.completed)
+                            .size(21.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(230, 242, 250)),
+                    );
                 });
-        });
+
+                ui.add_space(12.0);
+
+                ui.add(
+                    egui::ProgressBar::new(1.0)
+                        .desired_height(18.0)
+                        .fill(brand_green())
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .text(text.completed),
+                );
+
+                ui.add_space(14.0);
+
+                ui.columns(4, |columns| {
+                    standalone_metric(
+                        &mut columns[0],
+                        text.files,
+                        summary.files.to_string(),
+                        if summary.skipped_files > 0 {
+                            format!("{} skipped", summary.skipped_files,)
+                        } else {
+                            "All processed".to_string()
+                        },
+                        brand_blue_light(),
+                    );
+
+                    standalone_metric(
+                        &mut columns[1],
+                        text.logical_data,
+                        format_bytes(summary.logical_bytes),
+                        format!("{:.2} MB/s", summary.logical_megabytes_per_second,),
+                        brand_green(),
+                    );
+
+                    standalone_metric(
+                        &mut columns[2],
+                        text.wire_savings,
+                        format!("{:.2}%", summary.wire_savings_percent,),
+                        format!("{} wire", format_bytes(summary.wire_bytes,),),
+                        egui::Color32::from_rgb(181, 124, 255),
+                    );
+
+                    standalone_metric(
+                        &mut columns[3],
+                        text.elapsed,
+                        format!("{:.2} s", summary.elapsed.as_secs_f64(),),
+                        format!("{} TCP stream(s)", summary.data_stream_count,),
+                        egui::Color32::from_rgb(0, 219, 199),
+                    );
+                });
+
+                ui.add_space(STANDALONE_CONTENT_GAP);
+
+                standalone_subcard_frame(brand_green()).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+
+                    ui.label(
+                        egui::RichText::new(text.transfer_diagnostic)
+                            .small()
+                            .strong()
+                            .color(brand_green()),
+                    );
+
+                    ui.add_space(5.0);
+
+                    ui.label(
+                        egui::RichText::new(diagnostic)
+                            .size(16.0)
+                            .color(egui::Color32::from_rgb(220, 233, 244)),
+                    );
+
+                    ui.add_space(5.0);
+
+                    ui.label(
+                        egui::RichText::new(text.compression_strategy_adaptive)
+                            .small()
+                            .color(muted_text()),
+                    );
+                });
+
+                if summary.exact_reused_files > 0 {
+                    ui.add_space(STANDALONE_CONTENT_GAP);
+
+                    ui.label(
+                        egui::RichText::new(text.exact_reuse_files)
+                            .size(17.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(0, 219, 199)),
+                    );
+
+                    ui.add_space(7.0);
+
+                    ui.columns(4, |columns| {
+                        standalone_metric(
+                            &mut columns[0],
+                            text.exact_reuse_files,
+                            summary.exact_reused_files.to_string(),
+                            "Files",
+                            egui::Color32::from_rgb(0, 219, 199),
+                        );
+
+                        standalone_metric(
+                            &mut columns[1],
+                            text.exact_reuse_data,
+                            format_bytes(summary.exact_reused_bytes),
+                            "Reused locally",
+                            brand_green(),
+                        );
+
+                        standalone_metric(
+                            &mut columns[2],
+                            text.exact_reuse_wire,
+                            format_bytes(summary.exact_reuse_plan_wire_bytes),
+                            "Plan traffic",
+                            brand_blue_light(),
+                        );
+
+                        standalone_metric(
+                            &mut columns[3],
+                            text.exact_reuse_savings,
+                            format!("{:.2}%", summary.exact_reuse_wire_savings_percent,),
+                            "Network saved",
+                            egui::Color32::from_rgb(181, 124, 255),
+                        );
+                    });
+                }
+
+                if summary.cdc_offered_files > 0 {
+                    ui.add_space(STANDALONE_CONTENT_GAP);
+
+                    ui.label(
+                        egui::RichText::new("CDC")
+                            .size(17.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(181, 124, 255)),
+                    );
+
+                    ui.add_space(7.0);
+
+                    ui.columns(4, |columns| {
+                        standalone_metric(
+                            &mut columns[0],
+                            text.cdc_updates,
+                            format!("{} / {}", summary.cdc_files, summary.cdc_offered_files,),
+                            format!("{} fallback(s)", summary.cdc_fallback_files,),
+                            egui::Color32::from_rgb(181, 124, 255),
+                        );
+
+                        standalone_metric(
+                            &mut columns[1],
+                            text.exact_reuse_data,
+                            format_bytes(summary.cdc_reused_bytes),
+                            format!("{} logical", format_bytes(summary.cdc_logical_bytes,),),
+                            brand_green(),
+                        );
+
+                        standalone_metric(
+                            &mut columns[2],
+                            text.cdc_wire,
+                            format_bytes(summary.cdc_wire_bytes),
+                            format!("{} literal", format_bytes(summary.cdc_literal_bytes,),),
+                            brand_blue_light(),
+                        );
+
+                        standalone_metric(
+                            &mut columns[3],
+                            text.cdc_savings,
+                            format!("{:.2}%", summary.cdc_wire_savings_percent,),
+                            "CDC network saved",
+                            egui::Color32::from_rgb(0, 219, 199),
+                        );
+                    });
+                }
+
+                if summary.tiny_pack_count > 0 {
+                    ui.add_space(STANDALONE_CONTENT_GAP);
+
+                    ui.label(
+                        egui::RichText::new(text.tiny_packs)
+                            .size(17.0)
+                            .strong()
+                            .color(brand_blue_light()),
+                    );
+
+                    ui.add_space(7.0);
+
+                    ui.columns(4, |columns| {
+                        standalone_metric(
+                            &mut columns[0],
+                            text.tiny_packs,
+                            summary.tiny_pack_count.to_string(),
+                            format!("{} compressed", summary.compressed_tiny_pack_count,),
+                            brand_blue_light(),
+                        );
+
+                        standalone_metric(
+                            &mut columns[1],
+                            text.packed_tiny_files,
+                            summary.tiny_files_packed.to_string(),
+                            format!("{} worker(s)", summary.tiny_materialization_workers,),
+                            brand_green(),
+                        );
+
+                        standalone_metric(
+                            &mut columns[2],
+                            text.tiny_pack_data,
+                            format_bytes(summary.tiny_bytes_packed),
+                            format!("{} wire", format_bytes(summary.tiny_pack_wire_bytes,),),
+                            egui::Color32::from_rgb(181, 124, 255),
+                        );
+
+                        standalone_metric(
+                            &mut columns[3],
+                            text.tiny_pack_savings,
+                            format!("{:.2}%", summary.tiny_pack_wire_savings_percent,),
+                            format!("{} raw pack(s)", summary.raw_tiny_pack_count,),
+                            egui::Color32::from_rgb(0, 219, 199),
+                        );
+                    });
+                }
+
+                if summary.resumed_stripes > 0 || summary.skipped_files > 0 {
+                    ui.add_space(STANDALONE_CONTENT_GAP);
+
+                    standalone_subcard_frame(warning_text()).show(ui, |ui| {
+                        ui.set_min_width(ui.available_width());
+
+                        ui.horizontal_wrapped(|ui| {
+                            if summary.resumed_stripes > 0 {
+                                standalone_status_pill(
+                                    ui,
+                                    &format!("{} resumed stripe(s)", summary.resumed_stripes,),
+                                    warning_text(),
+                                );
+
+                                ui.label(format!(
+                                    "{} resumed",
+                                    format_bytes(summary.resumed_bytes,),
+                                ));
+                            }
+
+                            if summary.skipped_files > 0 {
+                                standalone_status_pill(
+                                    ui,
+                                    &format!("{} skipped file(s)", summary.skipped_files,),
+                                    brand_green(),
+                                );
+
+                                ui.label(format!(
+                                    "{} skipped",
+                                    format_bytes(summary.skipped_bytes,),
+                                ));
+                            }
+                        });
+                    });
+                }
+            });
     }
 
     fn live_progress_panel(&self, ui: &mut egui::Ui, text: Text) {
@@ -1752,53 +1849,141 @@ impl NetworkCopyGui {
 
         let phase = localized_phase(self.language, &progress.phase);
 
-        card(ui, brand_blue(), |ui| {
-            ui.horizontal(|ui| {
-                ui.spinner();
+        let accent = match self.mode {
+            TransferMode::Send => brand_blue_light(),
 
-                ui.heading(if progress.cancel_requested {
-                    text.cancelling
-                } else {
-                    text.running
-                });
-            });
+            TransferMode::Receive => egui::Color32::from_rgb(181, 124, 255),
+        };
 
-            ui.add_space(8.0);
+        let role = match self.mode {
+            TransferMode::Send => text.send,
 
-            if !progress.cancel_requested {
-                ui.label(egui::RichText::new(phase).color(muted_text()));
-            }
+            TransferMode::Receive => text.receive,
+        };
 
-            ui.add_space(10.0);
+        let current_path = self.pending_session.as_ref().map(|request| match request {
+            GuiTransferRequest::Send { source_root, .. } => source_root.display().to_string(),
 
-            if progress.total > 0 {
-                let amount = format!(
-                    "{} / {}",
-                    format_bytes(progress.completed.min(progress.total,),),
-                    format_bytes(progress.total,),
-                );
-
-                ui.add(
-                    egui::ProgressBar::new(progress.fraction())
-                        .show_percentage()
-                        .text(amount)
-                        .animate(true),
-                );
-
-                ui.add_space(8.0);
-
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{}: {:.2} MB/s",
-                        text.speed,
-                        progress.megabytes_per_second(),
-                    ))
-                    .strong(),
-                );
-            } else if progress.completed > 0 {
-                ui.label(format_bytes(progress.completed));
-            }
+            GuiTransferRequest::Receive {
+                destination_root, ..
+            } => destination_root.display().to_string(),
         });
+
+        let speed = progress.megabytes_per_second();
+
+        let phase_elapsed = progress.phase_started.elapsed();
+
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(8, 20, 32))
+            .stroke(egui::Stroke::new(1.5, accent))
+            .corner_radius(egui::CornerRadius::same(11))
+            .inner_margin(egui::Margin::same(16))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+
+                ui.horizontal_wrapped(|ui| {
+                    standalone_status_pill(
+                        ui,
+                        if progress.cancel_requested {
+                            text.cancelling
+                        } else {
+                            text.running
+                        },
+                        if progress.cancel_requested {
+                            warning_text()
+                        } else {
+                            accent
+                        },
+                    );
+
+                    standalone_status_pill(ui, role, accent);
+
+                    ui.label(
+                        egui::RichText::new(&phase)
+                            .size(18.0)
+                            .strong()
+                            .color(egui::Color32::from_rgb(225, 238, 250)),
+                    );
+                });
+
+                if let Some(path) = current_path {
+                    ui.add_space(8.0);
+
+                    ui.label(egui::RichText::new(path).monospace().color(muted_text()));
+                }
+
+                ui.add_space(14.0);
+
+                if progress.total > 0 {
+                    let completed = progress.completed.min(progress.total);
+
+                    let amount = format!(
+                        "{} / {}",
+                        format_bytes(completed),
+                        format_bytes(progress.total,),
+                    );
+
+                    let percent = progress.fraction() * 100.0;
+
+                    ui.add(
+                        egui::ProgressBar::new(progress.fraction())
+                            .desired_height(24.0)
+                            .fill(accent)
+                            .corner_radius(egui::CornerRadius::same(7))
+                            .animate(true)
+                            .text(format!("{percent:.1}%   |   {amount}")),
+                    );
+
+                    ui.add_space(14.0);
+
+                    ui.columns(3, |columns| {
+                        standalone_metric(
+                            &mut columns[0],
+                            text.speed,
+                            format!("{speed:.2} MB/s"),
+                            phase.clone(),
+                            accent,
+                        );
+
+                        standalone_metric(
+                            &mut columns[1],
+                            text.logical_data,
+                            format_bytes(completed),
+                            format!(
+                                "{} remaining",
+                                format_bytes(progress.total.saturating_sub(completed,),),
+                            ),
+                            brand_green(),
+                        );
+
+                        standalone_metric(
+                            &mut columns[2],
+                            text.elapsed,
+                            format!("{:.1} s", phase_elapsed.as_secs_f64(),),
+                            "Current phase",
+                            egui::Color32::from_rgb(0, 219, 199),
+                        );
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+
+                        ui.label(egui::RichText::new(&phase).strong());
+                    });
+
+                    if progress.completed > 0 {
+                        ui.add_space(8.0);
+
+                        standalone_metric(
+                            ui,
+                            text.logical_data,
+                            format_bytes(progress.completed),
+                            phase,
+                            accent,
+                        );
+                    }
+                }
+            });
     }
 
     fn action_buttons(&mut self, ui: &mut egui::Ui, text: Text) {
@@ -1809,49 +1994,58 @@ impl NetworkCopyGui {
             .as_ref()
             .is_some_and(|progress| progress.cancel_requested);
 
-        ui.horizontal_wrapped(|ui| {
-            let start_button = egui::Button::new(
-                egui::RichText::new(text.start)
-                    .strong()
-                    .size(17.0)
-                    .color(egui::Color32::WHITE),
-            )
-            .fill(brand_blue())
-            .stroke(egui::Stroke::new(1.0, brand_blue_light()))
-            .corner_radius(egui::CornerRadius::same(8))
-            .min_size(egui::vec2(160.0, 44.0));
+        standalone_subcard_frame(if running {
+            brand_green()
+        } else {
+            brand_blue_light()
+        })
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
 
-            let start = ui.add_enabled(!running, start_button);
+            ui.horizontal_wrapped(|ui| {
+                let start_button = egui::Button::new(
+                    egui::RichText::new(text.start)
+                        .strong()
+                        .size(17.0)
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(brand_blue())
+                .stroke(egui::Stroke::new(1.0, brand_blue_light()))
+                .corner_radius(egui::CornerRadius::same(8))
+                .min_size(egui::vec2(160.0, 44.0));
 
-            if start.clicked() {
-                self.start_transfer(text);
+                let start = ui.add_enabled(!running, start_button);
 
-                ui.ctx().request_repaint_after(Duration::from_millis(100));
-            }
+                if start.clicked() {
+                    self.start_transfer(text);
 
-            let cancel_button =
-                egui::Button::new(egui::RichText::new(text.cancel).strong().size(16.0))
-                    .fill(if running {
-                        danger_fill()
-                    } else {
-                        inactive_fill()
-                    })
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .min_size(egui::vec2(150.0, 44.0));
-
-            let cancel = ui.add_enabled(running && !cancel_requested, cancel_button);
-
-            if cancel.clicked() {
-                if let Some(control) = self.transfer_control.as_ref() {
-                    control.cancel();
+                    ui.ctx().request_repaint_after(Duration::from_millis(100));
                 }
 
-                if let Some(progress) = self.live_progress.as_mut() {
-                    progress.cancel_requested = true;
-                }
+                let cancel_button =
+                    egui::Button::new(egui::RichText::new(text.cancel).strong().size(16.0))
+                        .fill(if running {
+                            danger_fill()
+                        } else {
+                            inactive_fill()
+                        })
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .min_size(egui::vec2(150.0, 44.0));
 
-                ui.ctx().request_repaint_after(Duration::from_millis(50));
-            }
+                let cancel = ui.add_enabled(running && !cancel_requested, cancel_button);
+
+                if cancel.clicked() {
+                    if let Some(control) = self.transfer_control.as_ref() {
+                        control.cancel();
+                    }
+
+                    if let Some(progress) = self.live_progress.as_mut() {
+                        progress.cancel_requested = true;
+                    }
+
+                    ui.ctx().request_repaint_after(Duration::from_millis(50));
+                }
+            });
         });
 
         if running {
@@ -2239,6 +2433,43 @@ fn destination_layout_detail(language: Language, layout: DestinationLayout) -> &
             "The source folder name is automatically created beneath the destination root."
         }
     }
+}
+
+fn standalone_metric(
+    ui: &mut egui::Ui,
+    title: &str,
+    value: impl Into<String>,
+    detail: impl Into<String>,
+    accent: egui::Color32,
+) {
+    standalone_subcard_frame(accent).show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        ui.set_min_height(88.0);
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("|").size(13.0).strong().color(accent));
+
+            ui.label(
+                egui::RichText::new(title)
+                    .small()
+                    .strong()
+                    .color(muted_text()),
+            );
+        });
+
+        ui.add_space(5.0);
+
+        ui.label(
+            egui::RichText::new(value.into())
+                .size(24.0)
+                .strong()
+                .color(egui::Color32::from_rgb(235, 244, 252)),
+        );
+
+        ui.add_space(2.0);
+
+        ui.label(egui::RichText::new(detail.into()).small().color(accent));
+    });
 }
 
 fn configure_style(context: &egui::Context) {

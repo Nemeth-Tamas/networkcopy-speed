@@ -1,5 +1,0 @@
-"Configuration","Streams","RequestedSendKiB","RequestedReceiveKiB","Runs","SenderMeanMBps","SenderStdDevMBps","SenderCvPercent","SenderMinMBps","SenderMaxMBps","ReceiverMeanMBps","ReceiverStdDevMBps","ReceiverCvPercent","ReceiverMinMBps","ReceiverMaxMBps","ActualSenderSendBufferBytes","ActualReceiverReceiveBufferBytes"
-"streams-8__send-default__recv-1024KiB","8","default","1024","10","25443,77","2077,68","8,17","20431,11","27691,77","25398,02","2070,67","8,15","20401,94","27637,96","65536","1048576"
-"streams-4__send-default__recv-1024KiB","4","default","1024","10","22279,36","1811,72","8,13","18801,53","23945,83","22243,99","1805,98","8,12","18776,98","23905,75","65536","1048576"
-"streams-2__send-default__recv-1024KiB","2","default","1024","10","15972,1","1397,19","8,75","13255,13","17009,48","15952,94","1393,69","8,74","13242","16988,96","65536","1048576"
-"streams-1__send-default__recv-1024KiB","1","default","1024","10","9977,75","82,5","0,83","9823,62","10083,69","9970,73","82,48","0,83","9816,72","10076,5","65536","1048576"
