@@ -42,7 +42,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 const REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 
-const REMOTE_BROWSER_HEIGHT: f32 = 460.0;
+const REMOTE_BROWSER_HEIGHT: f32 = 340.0;
 
 const MAX_TRANSFER_HISTORY: usize = 20;
 
@@ -622,7 +622,7 @@ impl NetworkCopyManager {
 
             show_setup: true,
 
-            show_browsers: false,
+            show_browsers: true,
 
             show_queue: true,
 
@@ -3541,11 +3541,11 @@ impl NetworkCopyManager {
 
                 ui.add_space(8.0);
 
-                ui.label(egui::RichText::new(format!("{sender}  →  {receiver}")).monospace());
+                ui.label(egui::RichText::new(format!("{sender}  ->  {receiver}")).monospace());
 
                 ui.add_space(4.0);
 
-                ui.label(format!("{source}  →  {destination}"));
+                ui.label(format!("{source}  ->  {destination}"));
 
                 ui.add_space(12.0);
 
@@ -4635,6 +4635,61 @@ impl NetworkCopyManager {
             });
         });
 
+        ui.add_space(12.0);
+
+        ui.horizontal_wrapped(|ui| {
+            let label = if self.show_browsers {
+                "Hide remote folders"
+            } else {
+                "Show remote folders"
+            };
+
+            if ui.button(label).clicked() {
+                self.show_browsers = !self.show_browsers;
+            }
+
+            ui.label(
+                egui::RichText::new(
+                    "Browse both endpoint filesystems without leaving the transfer setup.",
+                )
+                .color(egui::Color32::from_rgb(126, 145, 163)),
+            );
+        });
+
+        if self.show_browsers {
+            ui.add_space(8.0);
+
+            let sender_agent = self.sender_agent.clone();
+
+            let receiver_agent = self.receiver_agent.clone();
+
+            ui.columns(2, |columns| {
+                let (left, right) = columns.split_at_mut(1);
+
+                left[0].push_id("sender_remote_browser", |ui| {
+                    render_remote_browser(
+                        ui,
+                        "Source browser",
+                        &sender_agent,
+                        &mut self.source_root,
+                        &mut self.sender_browser,
+                        egui::Color32::from_rgb(64, 190, 255),
+                    );
+                });
+
+                right[0].push_id("receiver_remote_browser", |ui| {
+                    render_remote_browser(
+                        ui,
+                        "Destination browser",
+                        &receiver_agent,
+                        &mut self.destination_root,
+                        &mut self.receiver_browser,
+                        egui::Color32::from_rgb(181, 124, 255),
+                    );
+                });
+            });
+        }
+
         ui.add_space(8.0);
 
         ui.group(|ui| {
@@ -4845,56 +4900,6 @@ impl NetworkCopyManager {
 
         if add_batch_to_queue {
             self.add_batch_to_queue();
-        }
-
-        ui.add_space(12.0);
-
-        ui.horizontal_wrapped(|ui| {
-            let label = if self.show_browsers {
-                "Hide remote browser"
-            } else {
-                "Browse remote folders"
-            };
-
-            if ui.button(label).clicked() {
-                self.show_browsers = !self.show_browsers;
-            }
-
-            if !self.show_browsers {
-                ui.label("The source and destination paths can also be entered manually above.");
-            }
-        });
-
-        if self.show_browsers {
-            ui.add_space(8.0);
-
-            let sender_agent = self.sender_agent.clone();
-
-            let receiver_agent = self.receiver_agent.clone();
-
-            ui.columns(2, |columns| {
-                let (left, right) = columns.split_at_mut(1);
-
-                left[0].push_id("sender_remote_browser", |ui| {
-                    render_remote_browser(
-                        ui,
-                        "Sender folders",
-                        &sender_agent,
-                        &mut self.source_root,
-                        &mut self.sender_browser,
-                    );
-                });
-
-                right[0].push_id("receiver_remote_browser", |ui| {
-                    render_remote_browser(
-                        ui,
-                        "Receiver folders",
-                        &receiver_agent,
-                        &mut self.destination_root,
-                        &mut self.receiver_browser,
-                    );
-                });
-            });
         }
 
         if !self.sender_agent.is_empty() && self.sender_agent == self.receiver_agent {
@@ -6251,6 +6256,7 @@ fn render_remote_browser(
     endpoint_text: &str,
     selected_path: &mut String,
     browser: &mut RemoteBrowserPane,
+    accent: egui::Color32,
 ) {
     let parsed_endpoint = endpoint_text.trim().parse::<SocketAddr>().ok();
 
@@ -6262,28 +6268,81 @@ fn render_remote_browser(
 
     let mut use_current = false;
 
-    ui.group(|ui| {
+    dashboard_card_frame(ui).show(ui, |ui| {
         ui.set_min_width(ui.available_width());
 
-        ui.set_min_height(REMOTE_BROWSER_HEIGHT + 120.0);
+        ui.set_min_height(REMOTE_BROWSER_HEIGHT + 150.0);
 
-        ui.heading(title);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(title)
+                    .size(18.0)
+                    .strong()
+                    .color(egui::Color32::from_rgb(232, 242, 252)),
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if browser.is_loading() {
+                    ui.spinner();
+                } else {
+                    ui.label(egui::RichText::new("REMOTE").small().strong().color(accent));
+                }
+            });
+        });
+
+        ui.add_space(2.0);
 
         if endpoint_text.trim().is_empty() {
-            ui.label("Select or enter a management agent first.");
+            ui.label(
+                egui::RichText::new("No management endpoint selected")
+                    .monospace()
+                    .color(egui::Color32::from_rgb(116, 137, 157)),
+            );
+
+            ui.add_space(14.0);
+
+            dashboard_section_frame(ui).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+
+                ui.label(
+                    egui::RichText::new(
+                        "Select a sender or receiver Agent to browse this machine.",
+                    )
+                    .color(egui::Color32::from_rgb(145, 164, 182)),
+                );
+            });
 
             return;
         }
 
         if parsed_endpoint.is_none() {
-            ui.label("The management agent address is invalid.");
+            status_label(
+                ui,
+                "Invalid endpoint",
+                egui::Color32::from_rgb(255, 112, 120),
+            );
+
+            ui.add_space(6.0);
+
+            ui.label(egui::RichText::new(endpoint_text.trim()).monospace());
 
             return;
         }
 
+        ui.label(
+            egui::RichText::new(endpoint_text.trim())
+                .monospace()
+                .color(egui::Color32::from_rgb(125, 148, 170)),
+        );
+
+        ui.add_space(10.0);
+
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(!browser.is_loading(), egui::Button::new("Load drives"))
+                .add_enabled(
+                    !browser.is_loading(),
+                    egui::Button::new("Drives").corner_radius(egui::CornerRadius::same(6)),
+                )
                 .clicked()
             {
                 request_roots = true;
@@ -6292,7 +6351,10 @@ fn render_remote_browser(
             let can_go_up = !browser.current_path.is_empty();
 
             if ui
-                .add_enabled(can_go_up && !browser.is_loading(), egui::Button::new("Up"))
+                .add_enabled(
+                    can_go_up && !browser.is_loading(),
+                    egui::Button::new("Up").corner_radius(egui::CornerRadius::same(6)),
+                )
                 .clicked()
             {
                 match parent_remote_path(&browser.current_path) {
@@ -6309,7 +6371,10 @@ fn render_remote_browser(
             let can_refresh = browser.endpoint.is_some() && !browser.is_loading();
 
             if ui
-                .add_enabled(can_refresh, egui::Button::new("Refresh"))
+                .add_enabled(
+                    can_refresh,
+                    egui::Button::new("Refresh").corner_radius(egui::CornerRadius::same(6)),
+                )
                 .clicked()
             {
                 if browser.current_path.is_empty() {
@@ -6318,19 +6383,58 @@ fn render_remote_browser(
                     request_directory = Some(browser.current_path.clone());
                 }
             }
-
-            if ui
-                .add_enabled(
-                    !browser.current_path.is_empty(),
-                    egui::Button::new("Use current folder"),
-                )
-                .clicked()
-            {
-                use_current = true;
-            }
         });
 
+        ui.add_space(8.0);
+
+        dashboard_section_frame(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            ui.horizontal(|ui| {
+                let path_text = if browser.current_path.is_empty() {
+                    "Remote drives"
+                } else {
+                    browser.current_path.as_str()
+                };
+
+                ui.label(
+                    egui::RichText::new(path_text)
+                        .monospace()
+                        .strong()
+                        .color(egui::Color32::from_rgb(210, 225, 239)),
+                );
+
+                if !browser.current_path.is_empty() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new("Use folder")
+                                    .fill(egui::Color32::from_rgb(12, 74, 83))
+                                    .stroke(egui::Stroke::new(1.0, accent))
+                                    .corner_radius(egui::CornerRadius::same(6)),
+                            )
+                            .clicked()
+                        {
+                            use_current = true;
+                        }
+                    });
+                }
+            });
+        });
+
+        if !selected_path.trim().is_empty() {
+            ui.add_space(4.0);
+
+            ui.label(
+                egui::RichText::new(format!("Selected: {}", selected_path.trim(),))
+                    .small()
+                    .color(egui::Color32::from_rgb(111, 137, 158)),
+            );
+        }
+
         if browser.is_loading() {
+            ui.add_space(6.0);
+
             ui.horizontal(|ui| {
                 ui.spinner();
 
@@ -6339,39 +6443,56 @@ fn render_remote_browser(
         }
 
         if !browser.error.is_empty() {
+            ui.add_space(6.0);
+
+            status_label(ui, "Browser error", egui::Color32::from_rgb(255, 112, 120));
+
             ui.label(
-                egui::RichText::new(&browser.error).color(egui::Color32::from_rgb(255, 112, 120)),
+                egui::RichText::new(&browser.error).color(egui::Color32::from_rgb(255, 145, 151)),
             );
         }
 
-        ui.add_space(6.0);
-
-        if browser.current_path.is_empty() {
-            ui.strong("Remote drives");
-
-            if browser.roots.is_empty() && !browser.is_loading() {
-                ui.label("Click Load drives to browse this machine.");
-            }
-
-            let roots = browser.roots.clone();
-
-            for root in roots {
-                if ui.button(&root.path).clicked() {
-                    request_directory = Some(root.path);
-                }
-            }
-
-            return;
-        }
-
-        ui.label(egui::RichText::new(&browser.current_path).strong());
-
-        ui.add_space(4.0);
+        ui.add_space(8.0);
 
         egui::ScrollArea::vertical()
             .max_height(REMOTE_BROWSER_HEIGHT)
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+
+                if browser.current_path.is_empty() {
+                    if browser.roots.is_empty() && !browser.is_loading() {
+                        ui.label(
+                            egui::RichText::new("Load the remote drives to begin browsing.")
+                                .color(egui::Color32::from_rgb(125, 146, 166)),
+                        );
+                    }
+
+                    let roots = browser.roots.clone();
+
+                    for root in roots {
+                        let response = ui.add_sized(
+                            [ui.available_width(), 36.0],
+                            egui::Button::new(
+                                egui::RichText::new(format!("DRIVE  {}", root.path,))
+                                    .strong()
+                                    .color(accent),
+                            )
+                            .fill(egui::Color32::from_rgb(8, 27, 42))
+                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(24, 53, 76)))
+                            .corner_radius(egui::CornerRadius::same(6)),
+                        );
+
+                        if response.clicked() {
+                            request_directory = Some(root.path);
+                        }
+
+                        ui.add_space(4.0);
+                    }
+
+                    return;
+                }
+
                 let entries = browser.entries.clone();
 
                 if entries.is_empty() && !browser.is_loading() {
@@ -6381,9 +6502,18 @@ fn render_remote_browser(
                 for entry in entries {
                     match entry.kind {
                         ManagementEntryKind::Directory => {
-                            let label = format!("DIR  {}", entry.name,);
+                            let response = ui.add_sized(
+                                [ui.available_width(), 34.0],
+                                egui::Button::new(
+                                    egui::RichText::new(format!("DIR   {}", entry.name,))
+                                        .color(accent),
+                                )
+                                .fill(egui::Color32::from_rgb(8, 27, 42))
+                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(22, 48, 68)))
+                                .corner_radius(egui::CornerRadius::same(5)),
+                            );
 
-                            if ui.button(label).clicked() {
+                            if response.clicked() {
                                 request_directory =
                                     Some(join_remote_path(&browser.current_path, &entry.name));
                             }
@@ -6391,21 +6521,47 @@ fn render_remote_browser(
 
                         ManagementEntryKind::File => {
                             ui.horizontal(|ui| {
-                                ui.label(entry.name);
+                                ui.label(
+                                    egui::RichText::new("FILE")
+                                        .small()
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(106, 129, 149)),
+                                );
+
+                                ui.label(&entry.name);
 
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        ui.label(format_bytes(entry.size));
+                                        ui.label(
+                                            egui::RichText::new(format_bytes(entry.size))
+                                                .small()
+                                                .monospace()
+                                                .color(egui::Color32::from_rgb(112, 136, 157)),
+                                        );
                                     },
                                 );
                             });
+
+                            ui.separator();
                         }
 
                         ManagementEntryKind::Other => {
-                            ui.label(format!("OTHER  {}", entry.name,));
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("OTHER")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(145, 145, 155)),
+                                );
+
+                                ui.label(entry.name);
+                            });
+
+                            ui.separator();
                         }
                     }
+
+                    ui.add_space(3.0);
                 }
             });
     });
