@@ -3715,7 +3715,7 @@ fn build_fresh_generation_plan_with_limits(
 ) -> io::Result<FreshGenerationPlan> {
     let candidates = collect_fresh_catalog_candidates(manifest, transfer_plan)?;
 
-    let catalog = session_cdc_catalog::plan(&candidates, limits)?;
+    let catalog = session_cdc_catalog::plan(candidates, limits)?;
 
     for (generation_index, generation) in catalog.generations.iter().enumerate() {
         if generation.index != generation_index {

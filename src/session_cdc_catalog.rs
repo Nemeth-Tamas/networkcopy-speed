@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::io;
 
 pub const AVERAGE_CHUNK_BYTES: u64 = 64 * 1024;
@@ -155,16 +155,20 @@ impl CatalogBasis {
     }
 }
 
-pub fn plan(candidates: &[CatalogCandidate], limits: CatalogLimits) -> io::Result<CatalogPlan> {
+pub fn plan(
+    mut candidates: Vec<CatalogCandidate>,
+    limits: CatalogLimits,
+) -> io::Result<CatalogPlan> {
     limits.validate()?;
-
-    let mut candidates = candidates.to_vec();
 
     candidates.sort_unstable_by_key(|candidate| candidate.file_id);
 
     validate_candidates(&candidates)?;
 
-    let batches = build_generation_batches(candidates, limits)?;
+    let candidate_files = u64::try_from(candidates.len())
+        .map_err(|_| io::Error::other("session CDC candidate count cannot be represented"))?;
+
+    let candidate_bytes = sum_candidate_bytes(&candidates)?;
 
     let mut catalog = VecDeque::<(usize, u64)>::new();
 
@@ -172,90 +176,46 @@ pub fn plan(candidates: &[CatalogCandidate], limits: CatalogLimits) -> io::Resul
 
     let mut peak_catalog_entries = 0_u64;
 
-    let mut generations = Vec::with_capacity(batches.len());
+    let mut generations = Vec::new();
 
-    let mut candidate_files = 0_u64;
+    let mut current_transfer_files = Vec::new();
 
-    let mut candidate_bytes = 0_u64;
+    let mut current_generation_bytes = 0_u64;
 
-    for (generation_index, transfer_files) in batches.into_iter().enumerate() {
-        let catalog_entries_before = catalog_entries;
+    for candidate in candidates {
+        let combined_bytes = current_generation_bytes
+            .checked_add(candidate.logical_bytes)
+            .ok_or_else(|| io::Error::other("session CDC generation byte count overflowed"))?;
 
-        let logical_bytes = sum_candidate_bytes(&transfer_files)?;
+        if !current_transfer_files.is_empty() && combined_bytes > limits.generation_target_bytes {
+            finish_catalog_generation(
+                &mut generations,
+                std::mem::take(&mut current_transfer_files),
+                &mut catalog,
+                &mut catalog_entries,
+                &mut peak_catalog_entries,
+                limits,
+            )?;
 
-        candidate_files = candidate_files
-            .checked_add(u64::try_from(transfer_files.len()).map_err(|_| {
-                io::Error::other("session CDC candidate count cannot be represented")
-            })?)
-            .ok_or_else(|| io::Error::other("session CDC candidate count overflowed"))?;
-
-        candidate_bytes = candidate_bytes
-            .checked_add(logical_bytes)
-            .ok_or_else(|| io::Error::other("session CDC candidate byte count overflowed"))?;
-
-        let mut published_file_ids = Vec::new();
-
-        let mut uncataloged_file_ids = Vec::new();
-
-        let mut evicted_file_ids = Vec::new();
-
-        for candidate in &transfer_files {
-            let estimated_entries = candidate.estimated_entries()?;
-
-            if estimated_entries > limits.max_catalog_entries {
-                uncataloged_file_ids.push(candidate.file_id);
-
-                continue;
-            }
-
-            while catalog_entries
-                .checked_add(estimated_entries)
-                .is_none_or(|entries| entries > limits.max_catalog_entries)
-            {
-                let Some((evicted_file_id, evicted_entries)) = catalog.pop_front() else {
-                    return Err(io::Error::other(
-                        "session CDC catalog could not satisfy its entry limit",
-                    ));
-                };
-
-                catalog_entries =
-                    catalog_entries
-                        .checked_sub(evicted_entries)
-                        .ok_or_else(|| {
-                            io::Error::other("session CDC catalog entry count underflowed")
-                        })?;
-
-                evicted_file_ids.push(evicted_file_id);
-            }
-
-            catalog.push_back((candidate.file_id, estimated_entries));
-
-            catalog_entries = catalog_entries
-                .checked_add(estimated_entries)
-                .ok_or_else(|| io::Error::other("session CDC catalog entry count overflowed"))?;
-
-            published_file_ids.push(candidate.file_id);
+            current_generation_bytes = 0;
         }
 
-        peak_catalog_entries = peak_catalog_entries.max(catalog_entries);
+        current_generation_bytes = current_generation_bytes
+            .checked_add(candidate.logical_bytes)
+            .ok_or_else(|| io::Error::other("session CDC generation byte count overflowed"))?;
 
-        generations.push(CatalogGeneration {
-            index: generation_index,
+        current_transfer_files.push(candidate);
+    }
 
-            transfer_files,
-
-            published_file_ids,
-
-            uncataloged_file_ids,
-
-            evicted_file_ids,
-
-            logical_bytes,
-
-            catalog_entries_before,
-
-            catalog_entries_after: catalog_entries,
-        });
+    if !current_transfer_files.is_empty() {
+        finish_catalog_generation(
+            &mut generations,
+            current_transfer_files,
+            &mut catalog,
+            &mut catalog_entries,
+            &mut peak_catalog_entries,
+            limits,
+        )?;
     }
 
     let plan = CatalogPlan {
@@ -273,6 +233,91 @@ pub fn plan(candidates: &[CatalogCandidate], limits: CatalogLimits) -> io::Resul
     Ok(plan)
 }
 
+fn finish_catalog_generation(
+    generations: &mut Vec<CatalogGeneration>,
+    transfer_files: Vec<CatalogCandidate>,
+    catalog: &mut VecDeque<(usize, u64)>,
+    catalog_entries: &mut u64,
+    peak_catalog_entries: &mut u64,
+    limits: CatalogLimits,
+) -> io::Result<()> {
+    if transfer_files.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "session CDC attempted to finalize an empty generation",
+        ));
+    }
+
+    let generation_index = generations.len();
+
+    let catalog_entries_before = *catalog_entries;
+
+    let logical_bytes = sum_candidate_bytes(&transfer_files)?;
+
+    let mut published_file_ids = Vec::new();
+
+    let mut uncataloged_file_ids = Vec::new();
+
+    let mut evicted_file_ids = Vec::new();
+
+    for candidate in &transfer_files {
+        let estimated_entries = candidate.estimated_entries()?;
+
+        if estimated_entries > limits.max_catalog_entries {
+            uncataloged_file_ids.push(candidate.file_id);
+
+            continue;
+        }
+
+        while (*catalog_entries)
+            .checked_add(estimated_entries)
+            .is_none_or(|entries| entries > limits.max_catalog_entries)
+        {
+            let Some((evicted_file_id, evicted_entries)) = catalog.pop_front() else {
+                return Err(io::Error::other(
+                    "session CDC catalog could not satisfy its entry limit",
+                ));
+            };
+
+            *catalog_entries = (*catalog_entries)
+                .checked_sub(evicted_entries)
+                .ok_or_else(|| io::Error::other("session CDC catalog entry count underflowed"))?;
+
+            evicted_file_ids.push(evicted_file_id);
+        }
+
+        catalog.push_back((candidate.file_id, estimated_entries));
+
+        *catalog_entries = (*catalog_entries)
+            .checked_add(estimated_entries)
+            .ok_or_else(|| io::Error::other("session CDC catalog entry count overflowed"))?;
+
+        published_file_ids.push(candidate.file_id);
+    }
+
+    *peak_catalog_entries = (*peak_catalog_entries).max(*catalog_entries);
+
+    generations.push(CatalogGeneration {
+        index: generation_index,
+
+        transfer_files,
+
+        published_file_ids,
+
+        uncataloged_file_ids,
+
+        evicted_file_ids,
+
+        logical_bytes,
+
+        catalog_entries_before,
+
+        catalog_entries_after: *catalog_entries,
+    });
+
+    Ok(())
+}
+
 pub fn validate_plan(plan: &CatalogPlan, limits: CatalogLimits) -> io::Result<()> {
     limits.validate()?;
 
@@ -282,7 +327,7 @@ pub fn validate_plan(plan: &CatalogPlan, limits: CatalogLimits) -> io::Result<()
 
     let mut peak_catalog_entries = 0_u64;
 
-    let mut seen_file_ids = BTreeSet::new();
+    let mut previous_file_id = None;
 
     let mut candidate_files = 0_u64;
 
@@ -336,12 +381,23 @@ pub fn validate_plan(plan: &CatalogPlan, limits: CatalogLimits) -> io::Result<()
         let mut expected_evicted = Vec::new();
 
         for candidate in &generation.transfer_files {
-            if !seen_file_ids.insert(candidate.file_id) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "session CDC plan transfers the same file more than once",
-                ));
+            if let Some(previous) = previous_file_id {
+                if candidate.file_id == previous {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "session CDC plan transfers the same file more than once",
+                    ));
+                }
+
+                if candidate.file_id < previous {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "session CDC plan file IDs are not strictly ordered",
+                    ));
+                }
             }
+
+            previous_file_id = Some(candidate.file_id);
 
             let estimated_entries = candidate.estimated_entries()?;
 
@@ -444,7 +500,7 @@ pub fn validate_plan(plan: &CatalogPlan, limits: CatalogLimits) -> io::Result<()
 }
 
 fn validate_candidates(candidates: &[CatalogCandidate]) -> io::Result<()> {
-    let mut file_ids = BTreeSet::new();
+    let mut previous_file_id = None;
 
     for candidate in candidates {
         if candidate.logical_bytes == 0 {
@@ -454,52 +510,28 @@ fn validate_candidates(candidates: &[CatalogCandidate]) -> io::Result<()> {
             ));
         }
 
-        if !file_ids.insert(candidate.file_id) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "session CDC candidate list contains a duplicate file ID",
-            ));
+        if let Some(previous) = previous_file_id {
+            if candidate.file_id == previous {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "session CDC candidate list contains a duplicate file ID",
+                ));
+            }
+
+            if candidate.file_id < previous {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "session CDC candidate list is not sorted by file ID",
+                ));
+            }
         }
+
+        previous_file_id = Some(candidate.file_id);
 
         candidate.estimated_entries()?;
     }
 
     Ok(())
-}
-
-fn build_generation_batches(
-    candidates: Vec<CatalogCandidate>,
-    limits: CatalogLimits,
-) -> io::Result<Vec<Vec<CatalogCandidate>>> {
-    let mut generations = Vec::new();
-
-    let mut current = Vec::new();
-
-    let mut current_bytes = 0_u64;
-
-    for candidate in candidates {
-        let combined_bytes = current_bytes
-            .checked_add(candidate.logical_bytes)
-            .ok_or_else(|| io::Error::other("session CDC generation byte count overflowed"))?;
-
-        if !current.is_empty() && combined_bytes > limits.generation_target_bytes {
-            generations.push(std::mem::take(&mut current));
-
-            current_bytes = 0;
-        }
-
-        current_bytes = current_bytes
-            .checked_add(candidate.logical_bytes)
-            .ok_or_else(|| io::Error::other("session CDC generation byte count overflowed"))?;
-
-        current.push(candidate);
-    }
-
-    if !current.is_empty() {
-        generations.push(current);
-    }
-
-    Ok(generations)
 }
 
 fn sum_candidate_bytes(candidates: &[CatalogCandidate]) -> io::Result<u64> {
@@ -531,7 +563,7 @@ mod tests {
         };
 
         let plan = plan(
-            &[
+            vec![
                 candidate(0, four_mib),
                 candidate(1, four_mib),
                 candidate(2, four_mib),
@@ -576,7 +608,7 @@ mod tests {
         };
 
         let plan = plan(
-            &[
+            vec![
                 candidate(0, AVERAGE_CHUNK_BYTES),
                 candidate(1, AVERAGE_CHUNK_BYTES),
                 candidate(2, AVERAGE_CHUNK_BYTES),
@@ -612,7 +644,7 @@ mod tests {
         };
 
         let plan = plan(
-            &[
+            vec![
                 candidate(0, AVERAGE_CHUNK_BYTES),
                 candidate(1, AVERAGE_CHUNK_BYTES),
                 candidate(2, AVERAGE_CHUNK_BYTES),
@@ -640,7 +672,7 @@ mod tests {
             max_catalog_entries: 2,
         };
 
-        let plan = plan(&[candidate(7, 3 * AVERAGE_CHUNK_BYTES)], limits).unwrap();
+        let plan = plan(vec![candidate(7, 3 * AVERAGE_CHUNK_BYTES)], limits).unwrap();
 
         assert_eq!(plan.generations.len(), 1,);
 
@@ -656,7 +688,7 @@ mod tests {
     #[test]
     fn duplicate_file_ids_are_rejected() {
         let error = plan(
-            &[
+            vec![
                 candidate(4, AVERAGE_CHUNK_BYTES),
                 candidate(4, AVERAGE_CHUNK_BYTES),
             ],
@@ -670,9 +702,40 @@ mod tests {
     }
 
     #[test]
+    fn unsorted_candidates_are_canonicalized() {
+        let limits = CatalogLimits {
+            generation_target_bytes: 4 * AVERAGE_CHUNK_BYTES,
+            max_catalog_entries: 100,
+        };
+
+        let plan = plan(
+            vec![
+                candidate(2, AVERAGE_CHUNK_BYTES),
+                candidate(0, AVERAGE_CHUNK_BYTES),
+                candidate(1, AVERAGE_CHUNK_BYTES),
+            ],
+            limits,
+        )
+        .unwrap();
+
+        assert_eq!(plan.generations.len(), 1);
+
+        assert_eq!(
+            plan.generations[0]
+                .transfer_files
+                .iter()
+                .map(|candidate| candidate.file_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+        );
+
+        validate_plan(&plan, limits).unwrap();
+    }
+
+    #[test]
     fn zero_limits_are_rejected() {
         let generation_error = plan(
-            &[],
+            Vec::new(),
             CatalogLimits {
                 generation_target_bytes: 0,
 
@@ -684,7 +747,7 @@ mod tests {
         assert_eq!(generation_error.kind(), std::io::ErrorKind::InvalidInput,);
 
         let catalog_error = plan(
-            &[],
+            Vec::new(),
             CatalogLimits {
                 generation_target_bytes: 1,
 
@@ -700,7 +763,7 @@ mod tests {
     fn empty_candidate_set_produces_empty_plan() {
         let limits = CatalogLimits::default();
 
-        let plan = plan(&[], limits).unwrap();
+        let plan = plan(Vec::new(), limits).unwrap();
 
         assert!(plan.generations.is_empty(),);
 
