@@ -5066,11 +5066,33 @@ impl NetworkCopyManager {
     fn render_queue(&mut self, ui: &mut egui::Ui) {
         let mut paused_after_current = self.queue.paused_after_current();
 
-        let has_pending = self
+        let pending_count = self
             .queue
             .items()
             .iter()
-            .any(|item| item.state == QueuedTransferState::Pending);
+            .filter(|item| item.state == QueuedTransferState::Pending)
+            .count();
+
+        let completed_count = self
+            .queue
+            .items()
+            .iter()
+            .filter(|item| item.state == QueuedTransferState::Completed)
+            .count();
+
+        let attention_count = self
+            .queue
+            .items()
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.state,
+                    QueuedTransferState::Blocked | QueuedTransferState::Failed
+                )
+            })
+            .count();
+
+        let has_pending = pending_count != 0;
 
         let has_interrupted_items = self.queue.items().iter().any(|item| {
             matches!(
@@ -5092,71 +5114,154 @@ impl NetworkCopyManager {
             && self.peer_cleanup_receiver.is_none()
             && !transfer_active;
 
-        ui.horizontal_wrapped(|ui| {
-            let start_label = if has_interrupted_items {
-                "Continue queue"
-            } else {
-                "Start queue"
-            };
+        let queue_state = if self.queue_running {
+            "Running"
+        } else if self.queue.paused_after_current() {
+            "Pausing"
+        } else if self.queue.is_empty() {
+            "Empty"
+        } else {
+            "Ready"
+        };
 
-            if ui
-                .add_enabled(
-                    can_start_queue,
-                    egui::Button::new(
-                        egui::RichText::new(start_label).strong(),
-                    )
-                    .fill(egui::Color32::from_rgb(0, 112, 170)),
-                )
-                .clicked()
-            {
-                self.start_queue();
-            }
-
-            if self.queue_running {
-                status_label(
-                    ui,
-                    "Queue running",
-                    egui::Color32::from_rgb(126, 230, 64),
-                );
-            }
-
-            ui.label(
-                "Queued transfers are retained across manager restarts and run in their displayed order.",
+        ui.columns(3, |columns| {
+            render_dashboard_metric(
+                &mut columns[0],
+                "Queued transfers",
+                self.queue.len().to_string(),
+                format!("{pending_count} waiting"),
+                egui::Color32::from_rgb(95, 194, 255),
             );
 
-            if ui
-                .checkbox(
-                    &mut paused_after_current,
-                    "Pause after current transfer",
-                )
-                .changed()
-            {
-                self.queue
-                    .set_paused_after_current(paused_after_current);
-            }
+            render_dashboard_metric(
+                &mut columns[1],
+                "Completed",
+                completed_count.to_string(),
+                if attention_count == 0 {
+                    "No items need attention".to_string()
+                } else {
+                    format!("{attention_count} need attention")
+                },
+                if attention_count == 0 {
+                    egui::Color32::from_rgb(105, 225, 111)
+                } else {
+                    egui::Color32::from_rgb(255, 190, 82)
+                },
+            );
 
-            if ui
-                .add_enabled(
-                    self.queue
-                        .items()
-                        .iter()
-                        .any(|item| item.state == QueuedTransferState::Completed),
-                    egui::Button::new("Clear completed"),
-                )
-                .clicked()
-            {
-                let removed = self.queue.clear_completed();
-
-                self.notice = format!(
-                    "Removed {removed} completed queued transfer(s).",
-                );
-            }
+            render_dashboard_metric(
+                &mut columns[2],
+                "Queue state",
+                queue_state,
+                if self.queue_running {
+                    "Sequential processing active"
+                } else {
+                    "Persistent across restarts"
+                },
+                if self.queue_running {
+                    egui::Color32::from_rgb(105, 225, 111)
+                } else {
+                    egui::Color32::from_rgb(181, 124, 255)
+                },
+            );
         });
 
-        ui.add_space(6.0);
+        ui.add_space(DASHBOARD_CONTENT_GAP);
+
+        dashboard_card_frame(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            ui.horizontal_wrapped(|ui| {
+                let start_label = if has_interrupted_items {
+                    "Continue queue"
+                } else {
+                    "Start queue"
+                };
+
+                if ui
+                    .add_enabled(
+                        can_start_queue,
+                        egui::Button::new(egui::RichText::new(start_label).strong())
+                            .fill(egui::Color32::from_rgb(0, 112, 170))
+                            .corner_radius(egui::CornerRadius::same(7)),
+                    )
+                    .clicked()
+                {
+                    self.start_queue();
+                }
+
+                if self.queue_running {
+                    status_label(ui, "Queue running", egui::Color32::from_rgb(126, 230, 64));
+                }
+
+                ui.separator();
+
+                if ui
+                    .checkbox(&mut paused_after_current, "Pause after current")
+                    .changed()
+                {
+                    self.queue.set_paused_after_current(paused_after_current);
+                }
+
+                ui.separator();
+
+                if ui
+                    .add_enabled(
+                        completed_count != 0,
+                        egui::Button::new("Clear completed")
+                            .corner_radius(egui::CornerRadius::same(7)),
+                    )
+                    .clicked()
+                {
+                    let removed = self.queue.clear_completed();
+
+                    self.notice = format!("Removed {removed} completed queued transfer(s).",);
+                }
+            });
+
+            ui.add_space(4.0);
+
+            ui.label(
+            egui::RichText::new(
+                "Transfers run sequentially in the displayed order and survive Manager restarts.",
+            )
+            .small()
+            .color(
+                egui::Color32::from_rgb(
+                    126, 145, 163,
+                ),
+            ),
+        );
+        });
+
+        ui.add_space(DASHBOARD_CONTENT_GAP);
 
         if self.queue.is_empty() {
-            ui.label("The queue is empty. Configure a transfer and click Add to queue.");
+            dashboard_card_frame(ui).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.set_min_height(145.0);
+
+                status_label(ui, "Queue empty", egui::Color32::from_rgb(95, 194, 255));
+
+                ui.add_space(10.0);
+
+                ui.label(
+                    egui::RichText::new("Nothing waiting to transfer")
+                        .size(20.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(225, 238, 250)),
+                );
+
+                ui.add_space(4.0);
+
+                ui.label("Configure a transfer, then choose Add to queue.");
+
+                ui.add_space(12.0);
+
+                if ui.button("Configure transfer").clicked() {
+                    self.page = ManagerPage::Transfers;
+                }
+            });
 
             return;
         }
@@ -5204,71 +5309,134 @@ impl NetworkCopyManager {
 
             let can_move_down = index + 1 < items.len() && !item_running && !next_running;
 
-            ui.group(|ui| {
+            dashboard_card_frame(ui).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
 
                 ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{:02}", index + 1,))
+                            .size(20.0)
+                            .strong()
+                            .monospace()
+                            .color(egui::Color32::from_rgb(94, 119, 141)),
+                    );
+
                     status_label(
                         ui,
                         queued_transfer_state_label(item.state),
                         queued_transfer_state_color(item.state),
                     );
 
-                    ui.strong(format!(
-                        "#{} · {}",
-                        item.id,
-                        queued_transfer_kind_label(item.request.kind),
-                    ));
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "#{} · {}",
+                            item.id,
+                            queued_transfer_kind_label(item.request.kind,),
+                        ))
+                        .size(17.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(230, 241, 251)),
+                    );
 
                     ui.separator();
 
-                    ui.label(item.request.route_mode.label());
+                    status_label(
+                        ui,
+                        item.request.route_mode.label(),
+                        egui::Color32::from_rgb(0, 219, 199),
+                    );
                 });
 
-                ui.add_space(4.0);
+                ui.add_space(10.0);
 
-                ui.label(format!(
-                    "{}  →  {}",
-                    item.request.source_root, item.request.destination_root,
-                ));
+                ui.columns(2, |columns| {
+                    let (source, destination) = columns.split_at_mut(1);
 
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{}  →  {}",
-                        item.request.sender_agent, item.request.receiver_agent,
-                    ))
-                    .monospace(),
-                );
+                    source[0].label(
+                        egui::RichText::new("SOURCE")
+                            .small()
+                            .strong()
+                            .color(egui::Color32::from_rgb(64, 190, 255)),
+                    );
 
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("{} worker(s)", item.request.worker_count,));
+                    source[0].label(
+                        egui::RichText::new(&item.request.source_root)
+                            .monospace()
+                            .color(egui::Color32::from_rgb(213, 227, 240)),
+                    );
 
-                    ui.separator();
+                    destination[0].label(
+                        egui::RichText::new("DESTINATION")
+                            .small()
+                            .strong()
+                            .color(egui::Color32::from_rgb(181, 124, 255)),
+                    );
 
-                    ui.label(format!("{} MiB calibration", item.request.calibration_mib,));
+                    destination[0].label(
+                        egui::RichText::new(&item.request.destination_root)
+                            .monospace()
+                            .color(egui::Color32::from_rgb(213, 227, 240)),
+                    );
+                });
 
-                    ui.separator();
+                ui.add_space(8.0);
 
-                    ui.label(if item.request.update_existing {
-                        "Update mode"
-                    } else {
-                        "Fresh destination mode"
-                    });
+                dashboard_section_frame(ui).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
 
-                    if item.preserve_desktop_layout {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} -> {}",
+                                item.request.sender_agent, item.request.receiver_agent,
+                            ))
+                            .monospace()
+                            .small(),
+                        );
+
                         ui.separator();
 
-                        status_label(ui, "Desktop layout", egui::Color32::from_rgb(95, 194, 255));
-                    }
+                        ui.label(format!("{} scanner worker(s)", item.request.worker_count,));
+
+                        ui.separator();
+
+                        ui.label(format!("{} MiB calibration", item.request.calibration_mib,));
+
+                        ui.separator();
+
+                        ui.label(if item.request.update_existing {
+                            "Update mode"
+                        } else {
+                            "Fresh destination"
+                        });
+
+                        if item.preserve_desktop_layout {
+                            ui.separator();
+
+                            status_label(
+                                ui,
+                                "Desktop layout",
+                                egui::Color32::from_rgb(95, 194, 255),
+                            );
+                        }
+                    });
                 });
 
                 if !item.status_message.is_empty() {
-                    ui.add_space(4.0);
+                    ui.add_space(8.0);
 
-                    ui.label(&item.status_message);
+                    let message_color = match item.state {
+                        QueuedTransferState::Failed => egui::Color32::from_rgb(255, 145, 151),
+
+                        QueuedTransferState::Blocked => egui::Color32::from_rgb(255, 205, 115),
+
+                        _ => egui::Color32::from_rgb(145, 164, 182),
+                    };
+
+                    ui.label(egui::RichText::new(&item.status_message).color(message_color));
                 }
 
-                ui.add_space(6.0);
+                ui.add_space(10.0);
 
                 ui.horizontal_wrapped(|ui| {
                     let retry_label = if item.state == QueuedTransferState::Completed {
@@ -5278,69 +5446,92 @@ impl NetworkCopyManager {
                     };
 
                     if ui
-                        .add_enabled(can_retry, egui::Button::new(retry_label))
+                        .add_enabled(
+                            can_retry,
+                            egui::Button::new(retry_label)
+                                .corner_radius(egui::CornerRadius::same(6)),
+                        )
                         .clicked()
                     {
                         retry = Some(item.id);
                     }
 
                     if ui
-                        .add_enabled(can_skip, egui::Button::new("Skip"))
+                        .add_enabled(
+                            can_skip,
+                            egui::Button::new("Skip").corner_radius(egui::CornerRadius::same(6)),
+                        )
                         .clicked()
                     {
                         skip = Some(item.id);
                     }
 
+                    ui.separator();
+
                     if ui
-                        .add_enabled(can_move_up, egui::Button::new("Move up"))
+                        .add_enabled(
+                            can_move_up,
+                            egui::Button::new("Move up").corner_radius(egui::CornerRadius::same(6)),
+                        )
                         .clicked()
                     {
                         move_up = Some(item.id);
                     }
 
                     if ui
-                        .add_enabled(can_move_down, egui::Button::new("Move down"))
+                        .add_enabled(
+                            can_move_down,
+                            egui::Button::new("Move down")
+                                .corner_radius(egui::CornerRadius::same(6)),
+                        )
                         .clicked()
                     {
                         move_down = Some(item.id);
                     }
 
                     if ui
-                        .add_enabled(!item_running, egui::Button::new("Remove"))
+                        .add_enabled(
+                            !item_running,
+                            egui::Button::new("Remove").corner_radius(egui::CornerRadius::same(6)),
+                        )
                         .clicked()
                     {
                         remove = Some(item.id);
                     }
 
                     if item_running {
-                        ui.label("A running queue item cannot be moved or removed.");
+                        ui.label(
+                            egui::RichText::new("Running items are locked in place.")
+                                .small()
+                                .color(egui::Color32::from_rgb(126, 145, 163)),
+                        );
                     }
                 });
             });
 
-            ui.add_space(8.0);
+            ui.add_space(DASHBOARD_CONTENT_GAP);
         }
 
         if let Some(id) = retry {
             self.retry_queue_item(id);
         } else if let Some(id) = skip {
             if self.queue.skip(id) {
-                self.notice = format!("Queued transfer #{id} was skipped.");
+                self.notice = format!("Queued transfer #{id} was skipped.",);
 
                 self.error.clear();
             }
         } else if let Some(id) = move_up {
             if self.queue.move_up(id) {
-                self.notice = format!("Moved queued transfer #{id} up.");
+                self.notice = format!("Moved queued transfer #{id} up.",);
             }
         } else if let Some(id) = move_down {
             if self.queue.move_down(id) {
-                self.notice = format!("Moved queued transfer #{id} down.");
+                self.notice = format!("Moved queued transfer #{id} down.",);
             }
         } else if let Some(id) = remove
             && self.queue.remove(id).is_some()
         {
-            self.notice = format!("Removed queued transfer #{id}.");
+            self.notice = format!("Removed queued transfer #{id}.",);
         }
     }
 
