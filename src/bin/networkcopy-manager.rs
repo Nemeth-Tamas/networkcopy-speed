@@ -3695,7 +3695,7 @@ impl NetworkCopyManager {
             }
 
             ManagerPage::History => {
-                let response = dashboard_section_frame(ui).show(ui, |ui| {
+                let response = ui.scope(|ui| {
                     ui.set_min_width(ui.available_width());
 
                     self.render_history(ui);
@@ -3705,113 +3705,7 @@ impl NetworkCopyManager {
             }
 
             ManagerPage::Settings => {
-                dashboard_section_frame(ui)
-                    .show(ui, |ui| {
-                        ui.set_min_width(
-                            ui.available_width(),
-                        );
-
-                        ui.label(
-                            egui::RichText::new(
-                                "Application",
-                            )
-                            .size(18.0)
-                            .strong(),
-                        );
-
-                        ui.add_space(8.0);
-
-                        ui.label(format!(
-                            "NetworkCopy Manager v{}",
-                            env!(
-                                "CARGO_PKG_VERSION"
-                            ),
-                        ));
-
-                        match &self.state_path {
-                            Some(path) => {
-                                ui.label(
-                                    egui::RichText::new(
-                                        format!(
-                                            "State: {}",
-                                            path.display(),
-                                        ),
-                                    )
-                                    .monospace(),
-                                );
-                            }
-
-                            None => {
-                                ui.label(
-                                    "Manager persistence path is unavailable.",
-                                );
-                            }
-                        }
-
-                        ui.add_space(14.0);
-
-                        ui.label(
-                            egui::RichText::new(
-                                "Security model",
-                            )
-                            .size(18.0)
-                            .strong(),
-                        );
-
-                        ui.add_space(6.0);
-
-                        status_label(
-                            ui,
-                            "Trusted LAN",
-                            egui::Color32::from_rgb(
-                                0, 219, 199,
-                            ),
-                        );
-
-                        ui.label(
-                            "Management traffic is currently unauthenticated and unencrypted.",
-                        );
-
-                        ui.label(
-                            "Do not expose the NetworkCopy management Agent directly to an untrusted network or the public Internet.",
-                        );
-
-                        ui.add_space(14.0);
-
-                        ui.label(
-                            egui::RichText::new(
-                                "Updates",
-                            )
-                            .size(18.0)
-                            .strong(),
-                        );
-
-                        ui.add_space(6.0);
-
-                        if let Some(check) =
-                            &self.update_check
-                        {
-                            ui.label(format!(
-                                "Latest stable release: {}",
-                                check.latest.tag_name,
-                            ));
-                        } else if self
-                            .update_receiver
-                            .is_some()
-                        {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-
-                                ui.label(
-                                    "Checking stable releases...",
-                                );
-                            });
-                        } else {
-                            ui.label(
-                                "No completed update check is available.",
-                            );
-                        }
-                    });
+                self.render_settings(ui);
 
                 None
             }
@@ -4061,7 +3955,7 @@ impl NetworkCopyManager {
         if !self.notice.is_empty() {
             let mut dismiss = false;
 
-            ui.group(|ui| {
+            dashboard_section_frame(ui).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
 
                 ui.horizontal_wrapped(|ui| {
@@ -4083,7 +3977,7 @@ impl NetworkCopyManager {
         if !self.error.is_empty() {
             let mut dismiss = false;
 
-            ui.group(|ui| {
+            dashboard_section_frame(ui).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
 
                 ui.horizontal_wrapped(|ui| {
@@ -4105,7 +3999,7 @@ impl NetworkCopyManager {
         if !self.persistence_error.is_empty() {
             let mut dismiss = false;
 
-            ui.group(|ui| {
+            dashboard_section_frame(ui).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
 
                 ui.horizontal_wrapped(|ui| {
@@ -5756,27 +5650,151 @@ impl NetworkCopyManager {
     }
 
     fn render_history(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                "Completed, cancelled, and failed paired transfers are retained across manager restarts.",
+        let completed_count = self
+            .history
+            .iter()
+            .filter(|entry| entry.outcome() == ManagementJobOutcome::Completed)
+            .count();
+
+        let interrupted_count = self.history.len().saturating_sub(completed_count);
+
+        let total_logical_bytes = self
+            .history
+            .iter()
+            .map(PairedTransferHistoryEntry::logical_bytes)
+            .sum::<u64>();
+
+        ui.columns(3, |columns| {
+            render_dashboard_metric(
+                &mut columns[0],
+                "Retained transfers",
+                self.history.len().to_string(),
+                format!(
+                    "{} / {} slots used",
+                    self.history.len(),
+                    MAX_TRANSFER_HISTORY,
+                ),
+                egui::Color32::from_rgb(95, 194, 255),
             );
 
-            if ui
-                .add_enabled(!self.history.is_empty(), egui::Button::new("Clear history"))
-                .clicked()
-            {
-                self.history.clear();
+            render_dashboard_metric(
+                &mut columns[1],
+                "Completed",
+                completed_count.to_string(),
+                if interrupted_count == 0 {
+                    "No interrupted transfers".to_string()
+                } else {
+                    format!("{interrupted_count} need attention")
+                },
+                if interrupted_count == 0 {
+                    egui::Color32::from_rgb(105, 225, 111)
+                } else {
+                    egui::Color32::from_rgb(255, 190, 82)
+                },
+            );
 
-                self.show_history = false;
-
-                self.notice = "Transfer history cleared.".to_string();
-            }
+            render_dashboard_metric(
+                &mut columns[2],
+                "Logical data",
+                format_bytes(total_logical_bytes),
+                "Across retained history",
+                egui::Color32::from_rgb(181, 124, 255),
+            );
         });
 
-        ui.add_space(6.0);
+        ui.add_space(DASHBOARD_CONTENT_GAP);
+
+        dashboard_card_frame(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Transfer history",
+                    )
+                    .size(18.0)
+                    .strong()
+                    .color(
+                        egui::Color32::from_rgb(
+                            225, 238, 250,
+                        ),
+                    ),
+                );
+
+                ui.separator();
+
+                ui.label(
+                    egui::RichText::new(
+                        "Completed, cancelled, and failed paired transfers survive Manager restarts.",
+                    )
+                    .small()
+                    .color(
+                        egui::Color32::from_rgb(
+                            126, 145, 163,
+                        ),
+                    ),
+                );
+
+                ui.with_layout(
+                    egui::Layout::right_to_left(
+                        egui::Align::Center,
+                    ),
+                    |ui| {
+                        if ui
+                            .add_enabled(
+                                !self.history.is_empty(),
+                                egui::Button::new(
+                                    "Clear history",
+                                )
+                                .corner_radius(
+                                    egui::CornerRadius::same(
+                                        7,
+                                    ),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            self.history.clear();
+
+                            self.show_history = false;
+
+                            self.notice =
+                                "Transfer history cleared."
+                                    .to_string();
+                        }
+                    },
+                );
+            });
+        });
+
+        ui.add_space(DASHBOARD_CONTENT_GAP);
 
         if self.history.is_empty() {
-            ui.label("No terminal paired transfers have been recorded in this manager session.");
+            dashboard_card_frame(ui).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.set_min_height(145.0);
+
+                status_label(ui, "History empty", egui::Color32::from_rgb(95, 194, 255));
+
+                ui.add_space(10.0);
+
+                ui.label(
+                    egui::RichText::new("No completed transfers yet")
+                        .size(20.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(225, 238, 250)),
+                );
+
+                ui.add_space(4.0);
+
+                ui.label("Completed, failed, and cancelled paired transfers will appear here.");
+
+                ui.add_space(12.0);
+
+                if ui.button("Configure transfer").clicked() {
+                    self.page = ManagerPage::Transfers;
+                }
+            });
 
             return;
         }
@@ -5798,106 +5816,139 @@ impl NetworkCopyManager {
             && !transfer_active;
 
         for entry in entries {
-            ui.group(|ui| {
+            let outcome = entry.outcome();
+
+            dashboard_card_frame(ui).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
 
-                let outcome = entry.outcome();
-
                 ui.horizontal_wrapped(|ui| {
-                    ui.strong(
-                        egui::RichText::new(format!("Result: {}", outcome.label(),))
-                            .color(outcome_color(outcome)),
+                    status_label(ui, outcome.label(), outcome_color(outcome));
+
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Sender #{} · Receiver #{}",
+                            entry.transfer.sender_job_id, entry.transfer.receiver_job_id,
+                        ))
+                        .size(17.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(230, 241, 251)),
                     );
 
-                    ui.separator();
-
-                    ui.label(format!("Sender job {}", entry.transfer.sender_job_id,));
-
-                    ui.label(format!("Receiver job {}", entry.transfer.receiver_job_id,));
+                    if entry.transfer.update_existing {
+                        status_label(ui, "Update mode", egui::Color32::from_rgb(0, 219, 199));
+                    }
                 });
 
-                ui.add_space(6.0);
+                ui.add_space(12.0);
 
-                ui.label(format!(
-                    "{}  →  {}",
-                    entry.transfer.source_root, entry.transfer.destination_root,
-                ));
+                ui.columns(2, |columns| {
+                    let (source, destination) = columns.split_at_mut(1);
 
-                ui.label(format!(
-                    "{}  →  {}",
-                    entry.transfer.sender_agent, entry.transfer.receiver_agent,
-                ));
+                    source[0].label(
+                        egui::RichText::new("SOURCE")
+                            .small()
+                            .strong()
+                            .color(egui::Color32::from_rgb(64, 190, 255)),
+                    );
 
-                ui.add_space(8.0);
+                    source[0].label(
+                        egui::RichText::new(&entry.transfer.source_root)
+                            .monospace()
+                            .color(egui::Color32::from_rgb(213, 227, 240)),
+                    );
 
-                egui::Grid::new(format!(
-                    "history-{}-{}",
-                    entry.transfer.sender_job_id, entry.transfer.receiver_job_id,
-                ))
-                .num_columns(2)
-                .spacing([24.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Files");
+                    destination[0].label(
+                        egui::RichText::new("DESTINATION")
+                            .small()
+                            .strong()
+                            .color(egui::Color32::from_rgb(181, 124, 255)),
+                    );
 
-                    ui.strong(entry.files().to_string());
+                    destination[0].label(
+                        egui::RichText::new(&entry.transfer.destination_root)
+                            .monospace()
+                            .color(egui::Color32::from_rgb(213, 227, 240)),
+                    );
+                });
 
-                    ui.end_row();
+                ui.add_space(10.0);
 
-                    ui.label("Logical data");
+                ui.columns(4, |columns| {
+                    render_dashboard_metric(
+                        &mut columns[0],
+                        "Files",
+                        entry.files().to_string(),
+                        "Transferred",
+                        egui::Color32::from_rgb(95, 194, 255),
+                    );
 
-                    ui.strong(format_bytes(entry.logical_bytes()));
+                    render_dashboard_metric(
+                        &mut columns[1],
+                        "Logical",
+                        format_bytes(entry.logical_bytes()),
+                        "Source data",
+                        egui::Color32::from_rgb(105, 225, 111),
+                    );
 
-                    ui.end_row();
+                    render_dashboard_metric(
+                        &mut columns[2],
+                        "Wire",
+                        format_bytes(entry.wire_bytes()),
+                        match wire_savings_percent(entry.logical_bytes(), entry.wire_bytes()) {
+                            Some(savings) => {
+                                format!("{savings:.2}% savings")
+                            }
 
-                    ui.label("Wire data");
+                            None => "No savings sample".to_string(),
+                        },
+                        egui::Color32::from_rgb(181, 124, 255),
+                    );
 
-                    ui.strong(format_bytes(entry.wire_bytes()));
+                    render_dashboard_metric(
+                        &mut columns[3],
+                        "Streams",
+                        entry.data_stream_count().to_string(),
+                        "Data lanes",
+                        egui::Color32::from_rgb(0, 219, 199),
+                    );
+                });
 
-                    ui.end_row();
+                ui.add_space(10.0);
 
-                    if let Some(savings) =
-                        wire_savings_percent(entry.logical_bytes(), entry.wire_bytes())
-                    {
-                        ui.label("Wire savings");
+                dashboard_section_frame(ui).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
 
-                        ui.strong(format!("{savings:.2}%"));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} -> {}",
+                                entry.transfer.sender_agent, entry.transfer.receiver_agent,
+                            ))
+                            .monospace()
+                            .small(),
+                        );
 
-                        ui.end_row();
-                    }
+                        ui.separator();
 
-                    ui.label("Data streams");
+                        ui.label(format!("{} scanner worker(s)", entry.transfer.worker_count,));
 
-                    ui.strong(entry.data_stream_count().to_string());
+                        ui.separator();
 
-                    ui.end_row();
-
-                    ui.label("Update mode");
-
-                    ui.strong(if entry.transfer.update_existing {
-                        "enabled"
-                    } else {
-                        "disabled"
+                        ui.label(format!(
+                            "{} MiB calibration",
+                            entry.transfer.calibration_mib,
+                        ));
                     });
-
-                    ui.end_row();
-
-                    ui.label("Scanner workers");
-
-                    ui.strong(entry.transfer.worker_count.to_string());
-
-                    ui.end_row();
-
-                    ui.label("Calibration");
-
-                    ui.strong(format!("{} MiB", entry.transfer.calibration_mib,));
-
-                    ui.end_row();
                 });
 
                 if !entry.sender_result.message.is_empty() {
-                    ui.add_space(6.0);
+                    ui.add_space(8.0);
 
-                    ui.label(format!("Sender: {}", entry.sender_result.message,));
+                    ui.label(
+                        egui::RichText::new(format!("Sender: {}", entry.sender_result.message,))
+                            .small()
+                            .color(egui::Color32::from_rgb(145, 164, 182)),
+                    );
                 }
 
                 if !entry.receiver_result.message.is_empty()
@@ -5905,40 +5956,53 @@ impl NetworkCopyManager {
                 {
                     ui.add_space(4.0);
 
-                    ui.label(format!("Receiver: {}", entry.receiver_result.message,));
-                }
-
-                ui.add_space(8.0);
-
-                if ui.button("Use this setup again").clicked() {
-                    reuse = Some(entry.transfer.clone());
-                }
-
-                if let Some(data_stream_count) = entry.resume_data_stream_count() {
-                    if ui
-                        .add_enabled(
-                            can_resume,
-                            egui::Button::new(format!(
-                                "Resume interrupted transfer ({data_stream_count} streams)"
-                            )),
+                    ui.label(
+                        egui::RichText::new(
+                            format!("Receiver: {}", entry.receiver_result.message,),
                         )
-                        .clicked()
-                    {
-                        resume = Some(entry.clone());
+                        .small()
+                        .color(egui::Color32::from_rgb(145, 164, 182)),
+                    );
+                }
+
+                ui.add_space(10.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Use setup again").clicked() {
+                        reuse = Some(entry.transfer.clone());
                     }
 
-                    if ui
-                        .button(format!("Add resume to queue ({data_stream_count} streams)"))
-                        .clicked()
-                    {
-                        queue_resume = Some(entry.clone());
+                    if let Some(data_stream_count) = entry.resume_data_stream_count() {
+                        if ui
+                            .add_enabled(
+                                can_resume,
+                                egui::Button::new(format!(
+                                    "Resume now · {data_stream_count} streams"
+                                ))
+                                .corner_radius(egui::CornerRadius::same(6)),
+                            )
+                            .clicked()
+                        {
+                            resume = Some(entry.clone());
+                        }
+
+                        if ui
+                            .button(format!("Add resume to queue · {data_stream_count} streams"))
+                            .clicked()
+                        {
+                            queue_resume = Some(entry.clone());
+                        }
+                    } else if outcome != ManagementJobOutcome::Completed {
+                        status_label(
+                            ui,
+                            "No resume journal",
+                            egui::Color32::from_rgb(255, 190, 82),
+                        );
                     }
-                } else if outcome != ManagementJobOutcome::Completed {
-                    ui.label("Receiver resume journal unavailable.");
-                }
+                });
             });
 
-            ui.add_space(8.0);
+            ui.add_space(DASHBOARD_CONTENT_GAP);
         }
 
         if let Some(entry) = resume {
@@ -5962,9 +6026,230 @@ impl NetworkCopyManager {
 
             self.show_setup = true;
 
+            self.page = ManagerPage::Transfers;
+
             self.notice =
                 "The selected history entry was copied into the transfer setup.".to_string();
         }
+    }
+
+    fn render_settings(&mut self, ui: &mut egui::Ui) {
+        let version = env!("CARGO_PKG_VERSION");
+
+        let latest_stable = self
+            .update_check
+            .as_ref()
+            .map(|check| check.latest.tag_name.clone());
+
+        let update_available = self
+            .update_check
+            .as_ref()
+            .is_some_and(|check| check.update_available);
+
+        let state_text = self
+            .state_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "Unavailable".to_string());
+
+        ui.columns(3, |columns| {
+            render_dashboard_metric(
+                &mut columns[0],
+                "Manager version",
+                format!("v{version}"),
+                "Development build",
+                egui::Color32::from_rgb(95, 194, 255),
+            );
+
+            render_dashboard_metric(
+                &mut columns[1],
+                "Persistence",
+                if self.state_path.is_some() {
+                    "Available"
+                } else {
+                    "Unavailable"
+                },
+                "Queue + history state",
+                if self.state_path.is_some() {
+                    egui::Color32::from_rgb(105, 225, 111)
+                } else {
+                    egui::Color32::from_rgb(255, 190, 82)
+                },
+            );
+
+            render_dashboard_metric(
+                &mut columns[2],
+                "Latest stable",
+                latest_stable
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string()),
+                if update_available {
+                    "Update available"
+                } else {
+                    "Release channel"
+                },
+                if update_available {
+                    egui::Color32::from_rgb(105, 225, 111)
+                } else {
+                    egui::Color32::from_rgb(181, 124, 255)
+                },
+            );
+        });
+
+        ui.add_space(DASHBOARD_CONTENT_GAP);
+
+        ui.columns(2, |columns| {
+            let (application, updates) = columns.split_at_mut(1);
+
+            dashboard_card_frame(&application[0]).show(&mut application[0], |ui| {
+                ui.set_min_height(185.0);
+
+                ui.label(
+                    egui::RichText::new("Application")
+                        .size(19.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(225, 238, 250)),
+                );
+
+                ui.add_space(10.0);
+
+                status_label(
+                    ui,
+                    "NetworkCopy Manager",
+                    egui::Color32::from_rgb(95, 194, 255),
+                );
+
+                ui.add_space(8.0);
+
+                ui.label(format!("Version: {version}",));
+
+                ui.add_space(4.0);
+
+                ui.label(
+                    egui::RichText::new("Manager state")
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(126, 145, 163)),
+                );
+
+                ui.label(egui::RichText::new(state_text).monospace().small());
+            });
+
+            dashboard_card_frame(&updates[0]).show(&mut updates[0], |ui| {
+                ui.set_min_height(185.0);
+
+                ui.label(
+                    egui::RichText::new("Updates")
+                        .size(19.0)
+                        .strong()
+                        .color(egui::Color32::from_rgb(225, 238, 250)),
+                );
+
+                ui.add_space(10.0);
+
+                if self.update_receiver.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+
+                        ui.label("Checking GitHub Releases...");
+                    });
+                } else if let Some(check) = &self.update_check {
+                    status_label(
+                        ui,
+                        if check.update_available {
+                            "Update available"
+                        } else {
+                            "Up to date"
+                        },
+                        if check.update_available {
+                            egui::Color32::from_rgb(105, 225, 111)
+                        } else {
+                            egui::Color32::from_rgb(0, 219, 199)
+                        },
+                    );
+
+                    ui.add_space(8.0);
+
+                    ui.label(format!("Latest stable: {}", check.latest.tag_name,));
+                } else {
+                    status_label(ui, "Not checked", egui::Color32::from_rgb(160, 170, 184));
+
+                    if !self.update_error.is_empty() {
+                        ui.add_space(6.0);
+
+                        ui.label(
+                            egui::RichText::new(&self.update_error)
+                                .small()
+                                .color(egui::Color32::from_rgb(255, 145, 151)),
+                        );
+                    }
+                }
+
+                ui.add_space(12.0);
+
+                if ui
+                    .add_enabled(
+                        self.update_receiver.is_none()
+                            && self.update_preparation_receiver.is_none(),
+                        egui::Button::new("Check for updates")
+                            .corner_radius(egui::CornerRadius::same(7)),
+                    )
+                    .clicked()
+                {
+                    self.begin_update_check();
+                }
+            });
+        });
+
+        ui.add_space(DASHBOARD_CONTENT_GAP);
+
+        dashboard_card_frame(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            ui.label(
+                egui::RichText::new(
+                    "Security model",
+                )
+                .size(19.0)
+                .strong()
+                .color(
+                    egui::Color32::from_rgb(
+                        225, 238, 250,
+                    ),
+                ),
+            );
+
+            ui.add_space(10.0);
+
+            status_label(
+                ui,
+                "Trusted LAN",
+                egui::Color32::from_rgb(
+                    0, 219, 199,
+                ),
+            );
+
+            ui.add_space(8.0);
+
+            ui.label(
+                "NetworkCopy Manager and Agent are intended for trusted local networks.",
+            );
+
+            ui.label(
+                "Management traffic is currently unauthenticated and unencrypted.",
+            );
+
+            ui.label(
+                egui::RichText::new(
+                    "Do not expose the management Agent directly to an untrusted network or the public Internet.",
+                )
+                .color(
+                    egui::Color32::from_rgb(
+                        255, 190, 82,
+                    ),
+                ),
+            );
+        });
     }
 
     fn update_history_drag_scroll(
@@ -6087,8 +6372,6 @@ impl eframe::App for NetworkCopyManager {
                         .vertical_scroll_offset(self.main_scroll_offset)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-
                             ui.set_width(ui.available_width());
 
                             self.render_app_header(ui);
