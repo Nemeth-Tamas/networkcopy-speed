@@ -8,6 +8,7 @@ use crate::tcp_connect;
 use std::io;
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::atomic::AtomicUsize;
 
 pub(crate) fn receive_once(destination_root: &Path) -> io::Result<CalibratedReceiveReport> {
     receive_configured(
@@ -114,14 +115,24 @@ pub(crate) fn send(
     worker_count: usize,
     calibration_bytes: u64,
 ) -> io::Result<CalibratedSendReport> {
-    send_configured(source_root, worker_count, calibration_bytes, None, None)
+    send_configured(
+        source_root,
+        worker_count,
+        calibration_bytes,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
-pub(crate) fn send_with_progress_and_desktop_layout(
+pub(crate) fn send_with_progress_stream_count_and_desktop_layout(
     source_root: &Path,
     worker_count: usize,
     calibration_bytes: u64,
     progress: ProgressCounter,
+    forced_data_stream_count: Option<usize>,
+    selected_data_stream_count: &AtomicUsize,
     desktop_layout: Option<DesktopLayoutSnapshot>,
 ) -> io::Result<CalibratedSendReport> {
     send_configured(
@@ -129,6 +140,8 @@ pub(crate) fn send_with_progress_and_desktop_layout(
         worker_count,
         calibration_bytes,
         Some(progress),
+        forced_data_stream_count,
+        Some(selected_data_stream_count),
         desktop_layout,
     )
 }
@@ -138,6 +151,8 @@ fn send_configured(
     worker_count: usize,
     calibration_bytes: u64,
     progress: Option<ProgressCounter>,
+    forced_data_stream_count: Option<usize>,
+    selected_data_stream_count: Option<&AtomicUsize>,
     desktop_layout: Option<DesktopLayoutSnapshot>,
 ) -> io::Result<CalibratedSendReport> {
     if let Some(progress) = &progress {
@@ -185,12 +200,14 @@ fn send_configured(
 
     match (progress, desktop_layout) {
         (Some(progress), desktop_layout) => {
-            calibrated_transfer::send_with_progress_and_desktop_layout(
+            calibrated_transfer::send_with_progress_stream_count_and_selection(
                 receiver_address,
                 source_root,
                 worker_count,
                 calibration_bytes,
                 progress,
+                forced_data_stream_count,
+                selected_data_stream_count,
                 desktop_layout,
             )
         }

@@ -1143,6 +1143,8 @@ impl NetworkCopyGui {
 
                     calibration_mib: self.calibration_mib,
 
+                    forced_data_stream_count: None,
+
                     preserve_desktop_layout: self.preserve_desktop_layout
                         && self.desktop_layout_available,
                 })
@@ -1175,6 +1177,7 @@ impl NetworkCopyGui {
                 source_root,
                 worker_count,
                 calibration_mib,
+                forced_data_stream_count: _,
                 preserve_desktop_layout,
             } => {
                 self.mode = TransferMode::Send;
@@ -1242,7 +1245,7 @@ impl NetworkCopyGui {
 
         self.show_resume_prompt = false;
 
-        self.start_transfer(text);
+        self.start_request(request, text, false, false);
     }
 
     fn discard_pending(&mut self, text: Text) {
@@ -1495,6 +1498,42 @@ impl NetworkCopyGui {
         }
     }
 
+    fn persist_selected_data_stream_count(&mut self, text: Text) {
+        let Some(data_stream_count) = self
+            .transfer_control
+            .as_ref()
+            .and_then(GuiTransferControl::selected_data_stream_count)
+        else {
+            return;
+        };
+
+        let updated_request = {
+            let Some(request) = self.pending_session.as_mut() else {
+                return;
+            };
+
+            let GuiTransferRequest::Send {
+                forced_data_stream_count,
+                ..
+            } = request
+            else {
+                return;
+            };
+
+            if *forced_data_stream_count == Some(data_stream_count) {
+                return;
+            }
+
+            *forced_data_stream_count = Some(data_stream_count);
+
+            request.clone()
+        };
+
+        if let Err(error) = gui_session::save(&updated_request) {
+            self.session_warning = Some(format!("{}: {error}", text.session_save_failed,));
+        }
+    }
+
     fn poll_transfer(&mut self, context: &egui::Context, text: Text) {
         if let Some(control) = self.transfer_control.as_ref() {
             let snapshot = control.progress();
@@ -1511,6 +1550,8 @@ impl NetworkCopyGui {
 
             context.request_repaint_after(Duration::from_millis(100));
         }
+
+        self.persist_selected_data_stream_count(text);
 
         let Some(receiver) = self.transfer_receiver.as_ref() else {
             return;
@@ -2802,6 +2843,7 @@ fn resume_request_summary(ui: &mut egui::Ui, text: Text, request: &GuiTransferRe
             source_root,
             worker_count,
             calibration_mib,
+            forced_data_stream_count: _,
             preserve_desktop_layout,
         } => (
             text.send,
@@ -3117,6 +3159,8 @@ mod tests {
             worker_count: 4,
 
             calibration_mib: 64,
+
+            forced_data_stream_count: None,
 
             preserve_desktop_layout: false,
         };

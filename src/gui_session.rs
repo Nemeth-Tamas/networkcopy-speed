@@ -265,12 +265,14 @@ fn encode_request(request: &GuiTransferRequest) -> io::Result<String> {
         update_existing,
         destination_layout,
         preserve_desktop_layout,
+        forced_data_stream_count,
     ) = match request {
         GuiTransferRequest::Send {
             connection,
             source_root,
             worker_count,
             calibration_mib,
+            forced_data_stream_count,
             preserve_desktop_layout,
         } => (
             "send",
@@ -281,6 +283,7 @@ fn encode_request(request: &GuiTransferRequest) -> io::Result<String> {
             false,
             DestinationLayout::Exact,
             *preserve_desktop_layout,
+            *forced_data_stream_count,
         ),
 
         GuiTransferRequest::Receive {
@@ -297,6 +300,7 @@ fn encode_request(request: &GuiTransferRequest) -> io::Result<String> {
             *update_existing,
             *destination_layout,
             false,
+            None,
         ),
     };
 
@@ -306,6 +310,10 @@ fn encode_request(request: &GuiTransferRequest) -> io::Result<String> {
         GuiConnectionMode::Address(address) => ("address", address.to_string()),
     };
 
+    let forced_data_stream_count = forced_data_stream_count
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+
     Ok(format!(
         "{SESSION_MAGIC}\n\
          direction={direction}\n\
@@ -314,6 +322,7 @@ fn encode_request(request: &GuiTransferRequest) -> io::Result<String> {
          path_utf16={}\n\
          worker_count={worker_count}\n\
          calibration_mib={calibration_mib}\n\
+         forced_data_stream_count={forced_data_stream_count}\n\
          update_existing={update_existing}\n\
          destination_layout={}\n\
          preserve_desktop_layout={preserve_desktop_layout}\n",
@@ -401,6 +410,25 @@ fn decode_request(contents: &str) -> io::Result<GuiTransferRequest> {
         None => false,
     };
 
+    let forced_data_stream_count = match fields.get("forced_data_stream_count").map(String::as_str)
+    {
+        None | Some("") => None,
+
+        Some(value) => {
+            let value = value.parse::<usize>().map_err(|error| {
+                invalid_data(format!(
+                    "invalid GUI session field 'forced_data_stream_count': {error}",
+                ))
+            })?;
+
+            if value == 0 {
+                return Err(invalid_data("saved transfer stream count must not be zero"));
+            }
+
+            Some(value)
+        }
+    };
+
     match direction {
         "send" => {
             let worker_count = parse_field::<usize>(&fields, "worker_count")?;
@@ -420,6 +448,7 @@ fn decode_request(contents: &str) -> io::Result<GuiTransferRequest> {
                 source_root: path,
                 worker_count,
                 calibration_mib,
+                forced_data_stream_count,
                 preserve_desktop_layout,
             })
         }
@@ -509,6 +538,8 @@ mod tests {
 
             worker_count: 6,
             calibration_mib: 128,
+
+            forced_data_stream_count: Some(1),
 
             preserve_desktop_layout: true,
         };

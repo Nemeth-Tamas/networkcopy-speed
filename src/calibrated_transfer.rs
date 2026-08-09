@@ -8,6 +8,7 @@ use crate::storage_media::{self, StorageMediaKind};
 use std::io;
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub const DEFAULT_CALIBRATION_MIB: u64 = 256;
 
@@ -172,25 +173,6 @@ pub fn send(
     })
 }
 
-pub(crate) fn send_with_progress_and_desktop_layout(
-    receiver_address: SocketAddr,
-    source_root: &Path,
-    worker_count: usize,
-    calibration_bytes: u64,
-    progress: ProgressCounter,
-    desktop_layout: Option<DesktopLayoutSnapshot>,
-) -> io::Result<CalibratedSendReport> {
-    send_with_progress_and_stream_count(
-        receiver_address,
-        source_root,
-        worker_count,
-        calibration_bytes,
-        progress,
-        None,
-        desktop_layout,
-    )
-}
-
 pub(crate) fn send_with_progress_and_stream_count(
     receiver_address: SocketAddr,
     source_root: &Path,
@@ -198,6 +180,28 @@ pub(crate) fn send_with_progress_and_stream_count(
     calibration_bytes: u64,
     progress: ProgressCounter,
     forced_data_stream_count: Option<usize>,
+    desktop_layout: Option<DesktopLayoutSnapshot>,
+) -> io::Result<CalibratedSendReport> {
+    send_with_progress_stream_count_and_selection(
+        receiver_address,
+        source_root,
+        worker_count,
+        calibration_bytes,
+        progress,
+        forced_data_stream_count,
+        None,
+        desktop_layout,
+    )
+}
+
+pub(crate) fn send_with_progress_stream_count_and_selection(
+    receiver_address: SocketAddr,
+    source_root: &Path,
+    worker_count: usize,
+    calibration_bytes: u64,
+    progress: ProgressCounter,
+    forced_data_stream_count: Option<usize>,
+    selected_data_stream_count: Option<&AtomicUsize>,
     desktop_layout: Option<DesktopLayoutSnapshot>,
 ) -> io::Result<CalibratedSendReport> {
     if let Some(data_stream_count) = forced_data_stream_count {
@@ -225,6 +229,10 @@ pub(crate) fn send_with_progress_and_stream_count(
         forced_data_stream_count,
         source_storage,
     );
+
+    if let Some(selected_data_stream_count) = selected_data_stream_count {
+        selected_data_stream_count.store(data_stream_count, Ordering::Release);
+    }
 
     let compression_lane_megabytes_per_second =
         compression_lane_megabytes_per_second(&calibration, data_stream_count)?;

@@ -12,6 +12,8 @@ use crate::windows_setup;
 use std::io;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, TcpListener};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +32,8 @@ pub enum GuiTransferRequest {
         worker_count: usize,
 
         calibration_mib: u64,
+
+        forced_data_stream_count: Option<usize>,
 
         preserve_desktop_layout: bool,
     },
@@ -54,6 +58,8 @@ pub enum GuiTransferDirection {
 #[derive(Clone, Debug)]
 pub struct GuiTransferControl {
     progress: ProgressCounter,
+
+    selected_data_stream_count: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Debug)]
@@ -68,11 +74,19 @@ impl GuiTransferControl {
     pub fn new() -> Self {
         Self {
             progress: ProgressCounter::new("Preparing transfer", 0),
+
+            selected_data_stream_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub fn cancel(&self) {
         self.progress.cancel();
+    }
+
+    pub fn selected_data_stream_count(&self) -> Option<usize> {
+        let data_stream_count = self.selected_data_stream_count.load(Ordering::Acquire);
+
+        (data_stream_count != 0).then_some(data_stream_count)
     }
 
     pub fn progress(&self) -> GuiTransferProgress {
@@ -270,6 +284,7 @@ pub fn run_gui_transfer_with_control(
             source_root,
             worker_count,
             calibration_mib,
+            forced_data_stream_count,
             preserve_desktop_layout,
         } => {
             manifest_scan::validate_worker_count(worker_count)?;
@@ -320,22 +335,26 @@ pub fn run_gui_transfer_with_control(
 
             let report = match connection {
                 GuiConnectionMode::Direct => {
-                    direct_transfer::send_with_progress_and_desktop_layout(
+                    direct_transfer::send_with_progress_stream_count_and_desktop_layout(
                         &source_root,
                         worker_count,
                         calibration_bytes,
                         control.progress.clone(),
+                        forced_data_stream_count,
+                        control.selected_data_stream_count.as_ref(),
                         desktop_layout,
                     )?
                 }
 
                 GuiConnectionMode::Address(receiver_address) => {
-                    calibrated_transfer::send_with_progress_and_desktop_layout(
+                    calibrated_transfer::send_with_progress_stream_count_and_selection(
                         receiver_address,
                         &source_root,
                         worker_count,
                         calibration_bytes,
                         control.progress.clone(),
+                        forced_data_stream_count,
+                        Some(control.selected_data_stream_count.as_ref()),
                         desktop_layout,
                     )?
                 }
@@ -875,6 +894,8 @@ mod tests {
 
             calibration_mib: 1,
 
+            forced_data_stream_count: None,
+
             preserve_desktop_layout: false,
         })
         .unwrap();
@@ -1030,6 +1051,8 @@ mod tests {
 
             calibration_mib: 1,
 
+            forced_data_stream_count: None,
+
             preserve_desktop_layout: false,
         })
         .unwrap();
@@ -1068,6 +1091,8 @@ mod tests {
             worker_count: 2,
 
             calibration_mib: 1,
+
+            forced_data_stream_count: None,
 
             preserve_desktop_layout: false,
         })
@@ -1142,6 +1167,8 @@ mod tests {
             worker_count: 2,
             calibration_mib: 1,
 
+            forced_data_stream_count: None,
+
             preserve_desktop_layout: false,
         })
         .unwrap();
@@ -1185,6 +1212,8 @@ mod tests {
 
             worker_count: 2,
             calibration_mib: 1,
+
+            forced_data_stream_count: None,
 
             preserve_desktop_layout: false,
         })
