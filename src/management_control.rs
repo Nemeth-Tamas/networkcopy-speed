@@ -262,11 +262,19 @@ impl ManagementControlServer {
             ManagementMessageKind::PrepareReceiveRequest => {
                 let result = crate::management_jobs::decode_prepare_request(&request.payload)
                     .and_then(|prepared| {
-                        self.jobs.prepare_receive_on(
-                            &prepared.destination_root,
-                            prepared.update_existing,
-                            self.receiver_bind_address,
-                        )
+                        if prepared.resume {
+                            self.jobs.prepare_receive_resume_on(
+                                &prepared.destination_root,
+                                prepared.update_existing,
+                                self.receiver_bind_address,
+                            )
+                        } else {
+                            self.jobs.prepare_receive_on(
+                                &prepared.destination_root,
+                                prepared.update_existing,
+                                self.receiver_bind_address,
+                            )
+                        }
                     })
                     .and_then(|job| crate::management_jobs::encode_prepared_response(&job));
 
@@ -455,8 +463,32 @@ pub fn prepare_receive(
     destination_root: &str,
     update_existing: bool,
 ) -> io::Result<PreparedReceiveJob> {
-    let payload =
-        crate::management_jobs::encode_prepare_request(destination_root, update_existing)?;
+    prepare_receive_configured(endpoint, destination_root, update_existing, false)
+}
+
+pub fn prepare_receive_resume(
+    endpoint: SocketAddr,
+    destination_root: &str,
+    update_existing: bool,
+) -> io::Result<PreparedReceiveJob> {
+    prepare_receive_configured(endpoint, destination_root, update_existing, true)
+}
+
+fn prepare_receive_configured(
+    endpoint: SocketAddr,
+    destination_root: &str,
+    update_existing: bool,
+    resume: bool,
+) -> io::Result<PreparedReceiveJob> {
+    let payload = if resume {
+        crate::management_jobs::encode_prepare_request_with_resume(
+            destination_root,
+            update_existing,
+            true,
+        )?
+    } else {
+        crate::management_jobs::encode_prepare_request(destination_root, update_existing)?
+    };
 
     let response = exchange(
         endpoint,
@@ -472,7 +504,10 @@ pub fn prepare_receive(
         unexpected => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "management agent returned unexpected message {unexpected:?} for PrepareReceiveRequest"
+                "management agent returned \
+                 unexpected message \
+                 {unexpected:?} for \
+                 PrepareReceiveRequest"
             ),
         )),
     }

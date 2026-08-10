@@ -93,7 +93,7 @@ pub fn resume_transfer_with_desktop_layout(
     start_transfer_with(
         request,
         preserve_desktop_layout,
-        management_control::prepare_receive,
+        management_control::prepare_receive_resume,
         move |endpoint,
               receiver_address,
               source_root,

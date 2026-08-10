@@ -1,12 +1,13 @@
 use crate::calibrated_transfer;
 use crate::console_progress::{ProgressCounter, ProgressSnapshot};
+use crate::destination_layout::DestinationLayout;
 use crate::management_instance::AgentInstanceId;
 use crate::management_snapshot::{
     ManagementActiveJobDetails, ManagementActiveJobSnapshot, ManagementAgentSnapshot,
     ManagementJobOutcome, ManagementJobResult, ManagementJobRole,
 };
 use crate::manifest_scan;
-use crate::multistream_copy::DestinationMode;
+use crate::multistream_copy::{self, DestinationMode, MultistreamCopyReport, ReceiveReport};
 use crate::network_calibration;
 use crate::resume_state::ResumeJournal;
 use crate::windows_desktop_layout;
@@ -45,7 +46,11 @@ const CANCEL_REQUEST_VERSION: u16 = 1;
 const CANCEL_REQUEST_BYTES: usize = 12;
 
 const UPDATE_EXISTING_FLAG: u8 = 0x01;
+const RESUME_TRANSFER_FLAG: u8 = 0x02;
+
 const KNOWN_JOB_FLAGS: u8 = UPDATE_EXISTING_FLAG;
+
+const KNOWN_PREPARE_FLAGS: u8 = UPDATE_EXISTING_FLAG | RESUME_TRANSFER_FLAG;
 
 const MAX_DESTINATION_PATH_BYTES: usize = 32 * 1024;
 const MAX_SOURCE_PATH_BYTES: usize = 32 * 1024;
@@ -132,6 +137,8 @@ pub(crate) struct PrepareReceiveRequest {
     pub(crate) destination_root: String,
 
     pub(crate) update_existing: bool,
+
+    pub(crate) resume: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -215,6 +222,25 @@ impl ManagementJobRegistry {
         destination_root: &str,
         update_existing: bool,
         bind_address: SocketAddr,
+    ) -> io::Result<PreparedReceiveJob> {
+        self.prepare_receive_on_configured(destination_root, update_existing, bind_address, false)
+    }
+
+    pub(crate) fn prepare_receive_resume_on(
+        self: &Arc<Self>,
+        destination_root: &str,
+        update_existing: bool,
+        bind_address: SocketAddr,
+    ) -> io::Result<PreparedReceiveJob> {
+        self.prepare_receive_on_configured(destination_root, update_existing, bind_address, true)
+    }
+
+    fn prepare_receive_on_configured(
+        self: &Arc<Self>,
+        destination_root: &str,
+        update_existing: bool,
+        bind_address: SocketAddr,
+        resume: bool,
     ) -> io::Result<PreparedReceiveJob> {
         validate_destination_path(destination_root)?;
 
@@ -304,6 +330,63 @@ impl ManagementJobRegistry {
         let spawn_result = thread::Builder::new()
             .name(format!("networkcopy-managed-receiver-{job_id}"))
             .spawn(move || {
+                if resume {
+                    worker_progress.set_label("Waiting for resumed transfer");
+
+                    worker_progress.set_completed(0);
+                    worker_progress.set_total(0);
+
+                    let result =
+                        multistream_copy::receive_on_listener_with_progress_mode_and_layout(
+                            &listener,
+                            &worker_destination,
+                            worker_progress,
+                            destination_mode,
+                            DestinationLayout::Exact,
+                        );
+
+                    let terminal_result =
+                        build_resumed_receive_result(job_id, &worker_destination, &result);
+
+                    if let Err(error) = worker_registry.finish_receive(job_id, terminal_result) {
+                        eprintln!(
+                            "failed to finalize managed resumed \
+                             receiver job {job_id}: {error}"
+                        );
+                    }
+
+                    match result {
+                        Ok(report) => {
+                            println!(
+                                "Managed resumed receiver job \
+                                 {job_id} complete"
+                            );
+
+                            println!("  Files received: {}", report.files_received,);
+
+                            println!("  Bytes received: {}", report.bytes_received,);
+
+                            println!("  Data streams: {}", report.data_stream_count,);
+                        }
+
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                            println!(
+                                "Managed resumed receiver job \
+                                 {job_id} cancelled"
+                            );
+                        }
+
+                        Err(error) => {
+                            eprintln!(
+                                "Managed resumed receiver job \
+                                 {job_id} failed: {error}"
+                            );
+                        }
+                    }
+
+                    return;
+                }
+
                 let result = calibrated_transfer::receive_once_with_progress_and_mode(
                     listener,
                     &worker_destination,
@@ -314,7 +397,10 @@ impl ManagementJobRegistry {
                 let terminal_result = build_receive_result(job_id, &worker_destination, &result);
 
                 if let Err(error) = worker_registry.finish_receive(job_id, terminal_result) {
-                    eprintln!("failed to finalize managed receiver job {job_id}: {error}");
+                    eprintln!(
+                        "failed to finalize managed receiver job \
+                         {job_id}: {error}"
+                    );
                 }
 
                 match result {
@@ -331,7 +417,10 @@ impl ManagementJobRegistry {
                     }
 
                     Err(error) => {
-                        eprintln!("Managed receiver job {job_id} failed: {error}");
+                        eprintln!(
+                            "Managed receiver job {job_id} failed: \
+                             {error}"
+                        );
                     }
                 }
             });
@@ -468,39 +557,162 @@ impl ManagementJobRegistry {
                     None
                 };
 
-                let result = calibrated_transfer::send_with_progress_and_stream_count(
-                    receiver_address,
-                    &worker_source,
-                    worker_count,
-                    calibration_bytes,
-                    worker_progress,
-                    forced_data_stream_count,
-                    desktop_layout,
-                );
+                match forced_data_stream_count {
+                    Some(data_stream_count) => {
+                        worker_progress.set_label(
+                            format!(
+                                "Scanning source - resuming with \
+                                 {data_stream_count} streams"
+                            ),
+                        );
 
-                let terminal_result = build_send_result(job_id, &result);
+                        worker_progress.set_completed(0);
+                        worker_progress.set_total(0);
 
-                if let Err(error) = worker_registry.finish_send(job_id, terminal_result) {
-                    eprintln!("failed to finalize managed sender job {job_id}: {error}");
-                }
+                        let result =
+                            multistream_copy::send_with_progress(
+                                receiver_address,
+                                &worker_source,
+                                worker_count,
+                                data_stream_count,
+                                worker_progress,
+                                desktop_layout,
+                            );
 
-                match result {
-                    Ok(report) => {
-                        println!("Managed sender job {job_id} complete");
+                        let terminal_result =
+                            build_resumed_send_result(
+                                job_id,
+                                &result,
+                            );
 
-                        println!("  Files sent: {}", report.transfer.files_copied,);
+                        if let Err(error) =
+                            worker_registry.finish_send(
+                                job_id,
+                                terminal_result,
+                            )
+                        {
+                            eprintln!(
+                                "failed to finalize managed resumed \
+                                 sender job {job_id}: {error}"
+                            );
+                        }
 
-                        println!("  Bytes sent: {}", report.transfer.bytes_copied,);
+                        match result {
+                            Ok(report) => {
+                                println!(
+                                    "Managed resumed sender job \
+                                     {job_id} complete"
+                                );
 
-                        println!("  Data streams: {}", report.transfer.data_stream_count,);
+                                println!(
+                                    "  Files sent: {}",
+                                    report.files_copied,
+                                );
+
+                                println!(
+                                    "  Bytes sent: {}",
+                                    report.bytes_copied,
+                                );
+
+                                println!(
+                                    "  Data streams: {}",
+                                    report.data_stream_count,
+                                );
+
+                                println!(
+                                    "  Wire bytes: {}",
+                                    report.data_wire_bytes,
+                                );
+                            }
+
+                            Err(error)
+                                if error.kind()
+                                    == io::ErrorKind::Interrupted =>
+                            {
+                                println!(
+                                    "Managed resumed sender job \
+                                     {job_id} cancelled"
+                                );
+                            }
+
+                            Err(error) => {
+                                eprintln!(
+                                    "Managed resumed sender job \
+                                     {job_id} failed: {error}"
+                                );
+                            }
+                        }
                     }
 
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {
-                        println!("Managed sender job {job_id} cancelled");
-                    }
+                    None => {
+                        let result =
+                            calibrated_transfer::
+                                send_with_progress_and_stream_count(
+                                    receiver_address,
+                                    &worker_source,
+                                    worker_count,
+                                    calibration_bytes,
+                                    worker_progress,
+                                    None,
+                                    desktop_layout,
+                                );
 
-                    Err(error) => {
-                        eprintln!("Managed sender job {job_id} failed: {error}");
+                        let terminal_result =
+                            build_send_result(
+                                job_id,
+                                &result,
+                            );
+
+                        if let Err(error) =
+                            worker_registry.finish_send(
+                                job_id,
+                                terminal_result,
+                            )
+                        {
+                            eprintln!(
+                                "failed to finalize managed sender job \
+                                 {job_id}: {error}"
+                            );
+                        }
+
+                        match result {
+                            Ok(report) => {
+                                println!(
+                                    "Managed sender job {job_id} complete"
+                                );
+
+                                println!(
+                                    "  Files sent: {}",
+                                    report.transfer.files_copied,
+                                );
+
+                                println!(
+                                    "  Bytes sent: {}",
+                                    report.transfer.bytes_copied,
+                                );
+
+                                println!(
+                                    "  Data streams: {}",
+                                    report.transfer.data_stream_count,
+                                );
+                            }
+
+                            Err(error)
+                                if error.kind()
+                                    == io::ErrorKind::Interrupted =>
+                            {
+                                println!(
+                                    "Managed sender job {job_id} cancelled"
+                                );
+                            }
+
+                            Err(error) => {
+                                eprintln!(
+                                    "Managed sender job {job_id} failed: \
+                                     {error}"
+                                );
+                            }
+                        }
                     }
                 }
             });
@@ -836,6 +1048,67 @@ fn build_send_result(
     }
 }
 
+fn build_resumed_receive_result(
+    job_id: u64,
+    destination_root: &Path,
+    result: &io::Result<ReceiveReport>,
+) -> ManagementJobResult {
+    match result {
+        Ok(report) => ManagementJobResult {
+            role: ManagementJobRole::Receiver,
+
+            outcome: ManagementJobOutcome::Completed,
+
+            job_id,
+
+            files: report.files_received,
+
+            logical_bytes: report.bytes_received,
+
+            wire_bytes: 0,
+
+            data_stream_count: stream_count_u32(report.data_stream_count),
+
+            message: String::new(),
+        },
+
+        Err(error) => {
+            let mut result = build_error_result(ManagementJobRole::Receiver, job_id, error);
+
+            result.data_stream_count = resume_stream_count(destination_root);
+
+            result
+        }
+    }
+}
+
+fn build_resumed_send_result(
+    job_id: u64,
+    result: &io::Result<MultistreamCopyReport>,
+) -> ManagementJobResult {
+    match result {
+        Ok(report) => ManagementJobResult {
+            role: ManagementJobRole::Sender,
+
+            outcome: ManagementJobOutcome::Completed,
+
+            job_id,
+
+            files: report.files_copied,
+
+            logical_bytes: report.bytes_copied,
+
+            wire_bytes: report.data_wire_bytes,
+
+            data_stream_count: stream_count_u32(report.data_stream_count),
+
+            message: String::new(),
+        },
+
+        Err(error) => build_error_result(ManagementJobRole::Sender, job_id, error),
+    }
+}
+
 fn build_error_result(
     role: ManagementJobRole,
     job_id: u64,
@@ -881,24 +1154,38 @@ pub(crate) fn encode_prepare_request(
     destination_root: &str,
     update_existing: bool,
 ) -> io::Result<Vec<u8>> {
+    encode_prepare_request_with_resume(destination_root, update_existing, false)
+}
+
+pub(crate) fn encode_prepare_request_with_resume(
+    destination_root: &str,
+    update_existing: bool,
+    resume: bool,
+) -> io::Result<Vec<u8>> {
     validate_destination_path(destination_root)?;
 
     let path_length = u32::try_from(destination_root.len()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "receiver destination length cannot be represented",
+            "receiver destination length \
+                 cannot be represented",
         )
     })?;
 
     let total_length = PREPARE_REQUEST_HEADER_BYTES
         .checked_add(destination_root.len())
-        .ok_or_else(|| io::Error::other("prepare-receive request length overflowed"))?;
+        .ok_or_else(|| {
+            io::Error::other(
+                "prepare-receive request \
+                     length overflowed",
+            )
+        })?;
 
     let mut payload = Vec::with_capacity(total_length);
 
     payload.extend_from_slice(&PREPARE_REQUEST_VERSION.to_le_bytes());
 
-    payload.push(encode_job_flags(update_existing));
+    payload.push(encode_prepare_flags(update_existing, resume));
 
     payload.push(0);
 
@@ -934,7 +1221,7 @@ pub(crate) fn decode_prepare_request(payload: &[u8]) -> io::Result<PrepareReceiv
         ));
     }
 
-    let update_existing = decode_job_flags(payload[2])?;
+    let (update_existing, resume) = decode_prepare_flags(payload[2])?;
 
     if payload[3] != 0 {
         return Err(io::Error::new(
@@ -981,7 +1268,10 @@ pub(crate) fn decode_prepare_request(payload: &[u8]) -> io::Result<PrepareReceiv
 
     Ok(PrepareReceiveRequest {
         destination_root,
+
         update_existing,
+
+        resume,
     })
 }
 
@@ -1865,6 +2155,33 @@ pub(crate) fn decode_cancel_request(payload: &[u8]) -> io::Result<u64> {
     Ok(job_id)
 }
 
+fn encode_prepare_flags(update_existing: bool, resume: bool) -> u8 {
+    let mut flags = encode_job_flags(update_existing);
+
+    if resume {
+        flags |= RESUME_TRANSFER_FLAG;
+    }
+
+    flags
+}
+
+fn decode_prepare_flags(flags: u8) -> io::Result<(bool, bool)> {
+    if flags & !KNOWN_PREPARE_FLAGS != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "prepare-receive flags contained \
+                 unknown bits 0x{flags:02X}",
+            ),
+        ));
+    }
+
+    Ok((
+        flags & UPDATE_EXISTING_FLAG != 0,
+        flags & RESUME_TRANSFER_FLAG != 0,
+    ))
+}
+
 fn encode_job_flags(update_existing: bool) -> u8 {
     if update_existing {
         UPDATE_EXISTING_FLAG
@@ -2004,7 +2321,7 @@ mod tests {
         ManagementJobPhase, ManagementJobRegistry, ManagementJobStatus, StartedSendJob,
         decode_prepare_request, decode_prepared_response, decode_start_send_request,
         decode_started_send_response, decode_status, encode_prepare_request,
-        encode_prepared_response, encode_start_send_request,
+        encode_prepare_request_with_resume, encode_prepared_response, encode_start_send_request,
         encode_start_send_request_with_stream_count,
         encode_start_send_request_with_stream_count_and_desktop_layout,
         encode_started_send_response, encode_status,
@@ -2026,6 +2343,20 @@ mod tests {
         assert_eq!(decoded.destination_root, r"C:\Destination",);
 
         assert!(decoded.update_existing);
+        assert!(!decoded.resume);
+    }
+
+    #[test]
+    fn resumed_prepare_request_round_trips() {
+        let encoded = encode_prepare_request_with_resume(r"C:\Destination", false, true).unwrap();
+
+        let decoded = decode_prepare_request(&encoded).unwrap();
+
+        assert_eq!(decoded.destination_root, r"C:\Destination",);
+
+        assert!(!decoded.update_existing);
+
+        assert!(decoded.resume);
     }
 
     #[test]

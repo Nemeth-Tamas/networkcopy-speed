@@ -1320,6 +1320,25 @@ pub fn send(
     )
 }
 
+pub(crate) fn send_with_progress(
+    receiver_address: SocketAddr,
+    source_root: &Path,
+    worker_count: usize,
+    data_stream_count: usize,
+    progress: ProgressCounter,
+    desktop_layout: Option<DesktopLayoutSnapshot>,
+) -> io::Result<MultistreamCopyReport> {
+    send_configured(
+        receiver_address,
+        source_root,
+        worker_count,
+        data_stream_count,
+        Some(progress),
+        desktop_layout,
+        None,
+    )
+}
+
 pub(crate) fn send_with_progress_calibrated(
     receiver_address: SocketAddr,
     source_root: &Path,
