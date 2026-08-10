@@ -570,6 +570,8 @@ struct NetworkCopyManager {
 
     monitoring_complete: bool,
 
+    current_transfer_archived: bool,
+
     last_poll: Instant,
 
     notice: String,
@@ -689,6 +691,8 @@ impl NetworkCopyManager {
             persistence_error: String::new(),
 
             monitoring_complete: false,
+
+            current_transfer_archived: false,
 
             last_poll: Instant::now(),
 
@@ -2804,6 +2808,8 @@ impl NetworkCopyManager {
 
                 self.transfer = Some(transfer);
 
+                self.current_transfer_archived = false;
+
                 self.peer_cleanup_receiver = None;
 
                 self.peer_cleanup_attempted = false;
@@ -2864,6 +2870,8 @@ impl NetworkCopyManager {
                 self.receiver_snapshot = Some(receiver_snapshot);
 
                 self.transfer = Some(transfer);
+
+                self.current_transfer_archived = false;
 
                 self.peer_cleanup_receiver = None;
 
@@ -2950,6 +2958,8 @@ impl NetworkCopyManager {
                 self.receiver_snapshot = Some(receiver_snapshot);
 
                 self.transfer = Some(transfer);
+
+                self.current_transfer_archived = false;
 
                 self.peer_cleanup_receiver = None;
 
@@ -3125,6 +3135,10 @@ impl NetworkCopyManager {
     }
 
     fn archive_terminal_transfer(&mut self) {
+        if self.current_transfer_archived {
+            return;
+        }
+
         let Some(transfer) = self.transfer.clone() else {
             return;
         };
@@ -3151,6 +3165,8 @@ impl NetworkCopyManager {
                 receiver_result,
             },
         );
+
+        self.current_transfer_archived = true;
 
         self.show_history = true;
     }
@@ -6342,7 +6358,10 @@ impl eframe::App for NetworkCopyManager {
             ui.ctx().request_repaint_after(REPAINT_INTERVAL);
         }
 
-        if self.transfer.is_some() && !self.monitoring_complete {
+        if self.page != ManagerPage::Transfers
+            && self.transfer.is_some()
+            && !self.monitoring_complete
+        {
             egui::Panel::bottom("manager-transfer-activity").show(ui, |ui| {
                 self.render_transfer_activity_bar(ui);
             });
@@ -6921,24 +6940,10 @@ fn paired_outcome(
     }
 }
 
-fn same_transfer_identity(left: &ManagedTransferRecord, right: &ManagedTransferRecord) -> bool {
-    left.sender_agent == right.sender_agent
-        && left.sender_job_id == right.sender_job_id
-        && left.receiver_agent == right.receiver_agent
-        && left.receiver_job_id == right.receiver_job_id
-}
-
 fn remember_history(
     history: &mut VecDeque<PairedTransferHistoryEntry>,
     entry: PairedTransferHistoryEntry,
 ) {
-    if history
-        .iter()
-        .any(|existing| same_transfer_identity(&existing.transfer, &entry.transfer))
-    {
-        return;
-    }
-
     history.push_front(entry);
 
     history.truncate(MAX_TRANSFER_HISTORY);
@@ -8372,7 +8377,7 @@ mod tests {
     }
 
     #[test]
-    fn history_is_deduplicated_and_bounded() {
+    fn history_keeps_repeated_jobs_and_is_bounded() {
         let mut history = VecDeque::new();
 
         let first = history_entry(1, ManagementJobOutcome::Completed);
@@ -8381,7 +8386,7 @@ mod tests {
 
         remember_history(&mut history, first);
 
-        assert_eq!(history.len(), 1);
+        assert_eq!(history.len(), 2);
 
         for sequence in 2..=(MAX_TRANSFER_HISTORY as u64 + 5) {
             remember_history(
