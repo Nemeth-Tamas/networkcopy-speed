@@ -2373,13 +2373,13 @@ impl NetworkCopyManager {
         self.cancel_receiver = Some(receiver);
 
         thread::spawn(move || {
-            let sender_result =
-                management_control::cancel_job(transfer.sender_agent, transfer.sender_job_id)
-                    .map_err(|error| format!("Sender cancellation failed: {error}"));
-
             let receiver_result =
                 management_control::cancel_job(transfer.receiver_agent, transfer.receiver_job_id)
                     .map_err(|error| format!("Receiver cancellation failed: {error}"));
+
+            let sender_result =
+                management_control::cancel_job(transfer.sender_agent, transfer.sender_job_id)
+                    .map_err(|error| format!("Sender cancellation failed: {error}"));
 
             let _ = sender.send(CancelResponse {
                 sender: sender_result,
