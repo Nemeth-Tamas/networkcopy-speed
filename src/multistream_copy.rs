@@ -92,6 +92,7 @@ const GENERATION_COMMIT_FIXED_WIRE_BYTES: u64 = 1 + 8 + 4 + 4 + 4;
 const GENERATION_COMMIT_FILE_ID_WIRE_BYTES: u64 = 8;
 
 const MAX_RESUME_OFFER_STRIPES: u32 = 1_000_000;
+const MAX_RESUME_STRIPE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_UNCHANGED_OFFER_FILES: u32 = 1_000_000;
 const MAX_GENERATION_COMMIT_FILE_IDS: u32 = 1_000_000;
 const MAX_SOURCE_DIRECTORY_NAME_UTF8_BYTES: usize = 1024;
@@ -3701,6 +3702,26 @@ fn remove_file_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
+fn large_file_stripe_count(file_size: u64, data_stream_count: usize) -> io::Result<usize> {
+    if data_stream_count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "large-file planning requires at least one data stream",
+        ));
+    }
+
+    let checkpoint_count = file_size.div_ceil(MAX_RESUME_STRIPE_BYTES);
+
+    let checkpoint_count = usize::try_from(checkpoint_count).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "large-file resume stripe count cannot be represented",
+        )
+    })?;
+
+    Ok(data_stream_count.max(checkpoint_count.max(1)))
+}
+
 fn build_transfer_plan(
     manifest: &[ManifestEntry],
     data_stream_count: usize,
@@ -3715,21 +3736,25 @@ fn build_transfer_plan(
     for (file_id, entry) in manifest.iter().enumerate() {
         match entry.class {
             FileClass::Large => {
-                for lane_id in 0..data_stream_count {
+                let stripe_count = large_file_stripe_count(entry.file_size, data_stream_count)?;
+
+                for stripe_id in 0..stripe_count {
                     let (offset, length) =
-                        striped_file::stripe_range(entry.file_size, lane_id, data_stream_count)?;
+                        striped_file::stripe_range(entry.file_size, stripe_id, stripe_count)?;
 
                     if length == 0 {
                         continue;
                     }
 
-                    lanes[lane_id].push(TransferTask::Stripe {
+                    let lane = least_loaded_lane(&lanes, &assigned_bytes)?;
+
+                    lanes[lane].push(TransferTask::Stripe {
                         file_id,
                         offset,
                         length,
                     });
 
-                    assigned_bytes[lane_id] = assigned_bytes[lane_id]
+                    assigned_bytes[lane] = assigned_bytes[lane]
                         .checked_add(length)
                         .ok_or_else(|| io::Error::other("striped lane size overflowed"))?;
                 }
@@ -8311,11 +8336,11 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
 mod tests {
     use super::{
         DestinationMode, GenerationCommit, LaneEnd, MAX_DESKTOP_LAYOUT_BYTES,
-        MAX_SOURCE_DIRECTORY_NAME_UTF8_BYTES, MESSAGE_DESKTOP_LAYOUT_METADATA,
-        MESSAGE_FRESH_RESUME_VERIFY_REQUEST, MESSAGE_FRESH_RESUME_VERIFY_RESPONSE,
-        MESSAGE_GENERATION_COMMIT, MESSAGE_RECEIVER_READY, MESSAGE_SOURCE_DIRECTORY_NAME,
-        ReceiverReady, TINY_PACK_TARGET_BYTES, TransferAck, TransferFault, TransferTask,
-        accept_session, apply_fresh_resume_prefix, apply_resume_offer,
+        MAX_RESUME_STRIPE_BYTES, MAX_SOURCE_DIRECTORY_NAME_UTF8_BYTES,
+        MESSAGE_DESKTOP_LAYOUT_METADATA, MESSAGE_FRESH_RESUME_VERIFY_REQUEST,
+        MESSAGE_FRESH_RESUME_VERIFY_RESPONSE, MESSAGE_GENERATION_COMMIT, MESSAGE_RECEIVER_READY,
+        MESSAGE_SOURCE_DIRECTORY_NAME, ReceiverReady, TINY_PACK_TARGET_BYTES, TransferAck,
+        TransferFault, TransferTask, accept_session, apply_fresh_resume_prefix, apply_resume_offer,
         build_fresh_generation_execution, build_fresh_generation_plan_with_limits,
         build_transfer_plan, catalog_generation_index_for_file_id, catalog_task_file_id,
         connect_with_retry_config, expected_generation_commit, finalize_large_files,
@@ -8457,6 +8482,58 @@ mod tests {
         assert_eq!(whole_file_count, 1);
         assert_eq!(tiny_pack_count, 1);
         assert_eq!(tiny_file_count, 2);
+    }
+
+    #[test]
+    fn one_stream_large_file_uses_bounded_resume_stripes() {
+        const FILE_BYTES: u64 = 1024 * 1024 * 1024;
+
+        let manifest = vec![entry("large.bin", FILE_BYTES, FileClass::Large)];
+
+        let plan = build_transfer_plan(&manifest, 1).unwrap();
+
+        assert_eq!(plan.lanes.len(), 1);
+
+        let mut stripes = plan.lanes[0]
+            .iter()
+            .filter_map(|task| {
+                let TransferTask::Stripe {
+                    file_id,
+                    offset,
+                    length,
+                } = task
+                else {
+                    return None;
+                };
+
+                assert_eq!(*file_id, 0);
+
+                Some((*offset, *length))
+            })
+            .collect::<Vec<_>>();
+
+        stripes.sort_unstable_by_key(|(offset, _)| *offset);
+
+        assert_eq!(stripes.len(), 8);
+
+        let mut expected_offset = 0_u64;
+        let mut total_bytes = 0_u64;
+
+        for (offset, length) in stripes {
+            assert_eq!(offset, expected_offset,);
+
+            assert!(length <= MAX_RESUME_STRIPE_BYTES);
+
+            assert!(length > 0);
+
+            expected_offset = expected_offset.checked_add(length).unwrap();
+
+            total_bytes = total_bytes.checked_add(length).unwrap();
+        }
+
+        assert_eq!(expected_offset, FILE_BYTES,);
+
+        assert_eq!(total_bytes, FILE_BYTES,);
     }
 
     #[test]
